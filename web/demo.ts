@@ -18,6 +18,7 @@ const playPause = document.querySelector<HTMLButtonElement>("#playpause")!;
 const seek = document.querySelector<HTMLInputElement>("#seek")!;
 const time = document.querySelector<HTMLElement>("#time")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
+const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const details = document.querySelector<HTMLElement>("#details")!;
 const fps = document.querySelector<HTMLElement>("#fps")!;
@@ -87,7 +88,7 @@ function createPlayer(): Mpeg2TsPlayer {
   const mediaSource = placement.value as "auto" | "worker" | "main";
   const created = new Mpeg2TsPlayer(video, {
     mediaSource,
-    deinterlace: deinterlace.checked,
+    deinterlace: deinterlace.checked && { doubleRate: doubleRate.checked },
   });
   created.addEventListener("statechange", (event) => {
     const { state } = event.detail;
@@ -210,9 +211,16 @@ seek.addEventListener("change", () => {
   if (duration !== null) video.currentTime = scrubbedTime();
 });
 
-deinterlace.addEventListener("change", () => {
-  if (player) player.deinterlace = deinterlace.checked;
-});
+// Both settings take effect where they stand, which is the point of them:
+// the difference between a field at a time and a frame at a time is a thing
+// to be seen on the same motion, not on two loads of it.
+function applyDeinterlace() {
+  if (!player) return;
+  player.deinterlace = deinterlace.checked;
+  if (player.deinterlacer) player.deinterlacer.doubleRate = doubleRate.checked;
+}
+deinterlace.addEventListener("change", applyDeinterlace);
+doubleRate.addEventListener("change", applyDeinterlace);
 
 urlForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -232,6 +240,8 @@ fileInput.addEventListener("change", () => {
 if (!supportsDeinterlace()) {
   deinterlace.checked = false;
   deinterlace.disabled = true;
+  doubleRate.checked = false;
+  doubleRate.disabled = true;
   deinterlace.labels?.[0]?.append("（このブラウザーでは使えません）");
 }
 

@@ -207,6 +207,15 @@ export class Mpeg2TsPlayer extends EventTarget {
     return this.#deinterlacer?.running ?? false;
   }
 
+  /**
+   * The deinterlacer itself, once there has been one, for the settings that
+   * are its own -- the field order, and whether a picture goes up per field
+   * or per frame. Null until `deinterlace` has been turned on.
+   */
+  get deinterlacer(): Deinterlacer | null {
+    return this.#deinterlacer;
+  }
+
   set deinterlace(enabled: boolean) {
     if (!enabled) {
       this.#deinterlacer?.stop();

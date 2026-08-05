@@ -94,6 +94,25 @@ export interface DeinterlacerOptions {
    */
   topFieldFirst?: boolean;
   /**
+   * Whether to show a picture for every field rather than for every frame.
+   *
+   * Interlaced video carries two moments in each frame, and one output frame
+   * per input frame throws the second one away: motion that was captured
+   * fifty or sixty times a second is shown twenty-five or thirty. With this
+   * on, each frame is filtered twice -- once keeping the field that came
+   * first and once keeping the other -- and the second picture is put up half
+   * a frame after the first, which is the moment it was taken at. Motion is
+   * as smooth as the broadcast was, at twice the filtering.
+   *
+   * It needs a display that can show them: at 59.94 fields a second there is
+   * one refresh of a 60 Hz screen for each, and nothing to spare.
+   *
+   * With `spatialCheck`, this is which of yadif's four modes runs: off/on is
+   * `send_frame`, on/on is `send_field`, and the two with `spatialCheck` off
+   * are the `nospatial` pair.
+   */
+  doubleRate?: boolean;
+  /**
    * Whether to let the local vertical range widen what the temporal check
    * allows. This is yadif's default and its `nospatial` mode turns it off.
    */
@@ -144,7 +163,13 @@ export class Deinterlacer {
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver;
   #topFieldFirst: boolean;
+  #doubleRate: boolean;
   #spatialCheck: boolean;
+  /** The rAF waiting to put up the second field, and when it should. */
+  #secondHandle: number | null = null;
+  #secondAt = 0;
+  /** How long a frame lasts in wall time, from what the frames themselves say. */
+  #periodMs = 0;
   /** The size of a frame as it is coded, which is what a texture holds. */
   #width = 0;
   #height = 0;
@@ -170,6 +195,7 @@ export class Deinterlacer {
   constructor(video: HTMLVideoElement, options: DeinterlacerOptions = {}) {
     this.#video = video;
     this.#topFieldFirst = options.topFieldFirst ?? true;
+    this.#doubleRate = options.doubleRate ?? false;
     this.#spatialCheck = options.spatialCheck ?? true;
     this.#onStats = options.onStats;
     this.canvas = document.createElement("canvas");
@@ -226,6 +252,19 @@ export class Deinterlacer {
     this.#topFieldFirst = topFieldFirst;
   }
 
+  /** Whether a picture goes up for every field rather than every frame. */
+  get doubleRate(): boolean {
+    return this.#doubleRate;
+  }
+
+  set doubleRate(doubleRate: boolean) {
+    if (doubleRate === this.#doubleRate) return;
+    this.#doubleRate = doubleRate;
+    // Turning it off leaves a second field on its way to a canvas that is
+    // about to stop expecting one.
+    if (!doubleRate) this.#cancelSecond();
+  }
+
   start(): void {
     if (this.#running || this.#lost) return;
     this.#running = true;
@@ -241,6 +280,7 @@ export class Deinterlacer {
     if (this.#handle !== null)
       this.#video.cancelVideoFrameCallback(this.#handle);
     this.#handle = null;
+    this.#cancelSecond();
     this.#frames = 0;
     this.canvas.style.visibility = "hidden";
   }
@@ -271,6 +311,8 @@ export class Deinterlacer {
   ): void => {
     this.#handle = null;
     if (!this.#running || this.#lost) return;
+    // Whatever was still to be drawn belongs to the frame this one replaces.
+    this.#cancelSecond();
     // The size of the frame as it is coded, which is what the upload carries
     // and what the filter has to work in. It is not `videoWidth`: that is the
     // size the frame is meant to be seen at, which for anamorphic video --
@@ -303,6 +345,13 @@ export class Deinterlacer {
         this.#request();
         return;
       }
+      // How long this frame is on screen, which is what half a frame later
+      // is measured against. Taken from the frames rather than from a frame
+      // rate nobody reports, and in wall time, so a rate other than 1 moves
+      // the second field with it.
+      if (!stale && elapsed > 0) {
+        this.#periodMs = (elapsed * 1000) / (this.#video.playbackRate || 1);
+      }
       this.#lastMediaTime = metadata.mediaTime;
       const at = performance.now();
       // Frames stopped arriving for a while -- a pause, a stall, a tab in the
@@ -315,13 +364,51 @@ export class Deinterlacer {
       }
       this.#lastFrameAt = at;
       this.#push();
-      this.#render(false);
+      this.#render(false, false);
       this.#msSinceReport += performance.now() - at;
       this.#framesSinceReport++;
+      if (this.#doubleRate && this.#periodMs > 0) {
+        this.#scheduleSecond(metadata.expectedDisplayTime);
+      }
       this.#report(at);
     }
     this.#request();
   };
+
+  /**
+   * Arrange for the other field of this frame to go up half a frame later.
+   *
+   * `expectedDisplayTime` is when the element's own frame reaches the screen,
+   * which is the moment the first field stands for; the second field belongs
+   * half a frame after it. Animation frames are the only clock the page has
+   * that the screen keeps, so the draw goes on the first one that is near
+   * enough -- a quarter of a frame short of the mark, which on any refresh
+   * rate is the tick that lands closest to it.
+   */
+  #scheduleSecond(displayAt: number): void {
+    this.#secondAt = displayAt + this.#periodMs / 4;
+    this.#secondHandle = requestAnimationFrame(this.#onSecond);
+  }
+
+  #onSecond = (now: DOMHighResTimeStamp): void => {
+    this.#secondHandle = null;
+    if (!this.#running || this.#lost || !this.#doubleRate) return;
+    if (now < this.#secondAt) {
+      this.#secondHandle = requestAnimationFrame(this.#onSecond);
+      return;
+    }
+    const at = performance.now();
+    this.#render(false, true);
+    // Counted in the cost of the frame it belongs to rather than as a frame
+    // of its own, so `frameMs` stays the price of one frame of video.
+    this.#msSinceReport += performance.now() - at;
+  };
+
+  #cancelSecond(): void {
+    if (this.#secondHandle === null) return;
+    cancelAnimationFrame(this.#secondHandle);
+    this.#secondHandle = null;
+  }
 
   /**
    * Account for the frames between this one and the last one seen.
@@ -383,8 +470,13 @@ export class Deinterlacer {
    * `flush` because the last frame has been presented and no more are coming
    * -- that side is the frame itself, which is what the reference filter does
    * at the ends of its input.
+   *
+   * `second` asks for the frame's other field: the same three frames filtered
+   * the other way round, keeping the field that came second and rebuilding
+   * the first. The shader takes the pair of frames the missing line sits
+   * between from the parity, so this is the whole of it.
    */
-  #render(flush: boolean): void {
+  #render(flush: boolean, second: boolean): void {
     if (this.#frames === 0 || this.#lost) return;
     if (this.#frames === HISTORY && !flush) this.#stats.filtered++;
     else this.#stats.degraded++;
@@ -423,9 +515,11 @@ export class Deinterlacer {
     gl.uniform1i(this.#location.cur, 1);
     gl.uniform1i(this.#location.next, 2);
     gl.uniform2i(this.#location.size, this.#width, this.#height);
-    // One output frame per input frame keeps the field that came first, so the
-    // lines that survive are the top ones when the top field leads.
-    gl.uniform1i(this.#location.parity, this.#topFieldFirst ? 0 : 1);
+    // The lines that survive are the ones of the field being shown: the first
+    // field is the top one when the top field leads, and the second is the
+    // other. A frame at a time is always the first.
+    const first = this.#topFieldFirst ? 0 : 1;
+    gl.uniform1i(this.#location.parity, second ? 1 - first : first);
     gl.uniform1i(this.#location.tff, this.#topFieldFirst ? 1 : 0);
     gl.uniform1i(this.#location.spatialCheck, this.#spatialCheck ? 1 : 0);
     gl.uniform1i(this.#location.temporal, this.#frames > 1 ? 1 : 0);
@@ -551,8 +645,14 @@ export class Deinterlacer {
     this.#msSinceReport = 0;
   }
 
+  /**
+   * Playback stopped, so the frame being held back goes up now. One picture,
+   * whatever the rate: a still frame stands for a moment, and the moment is
+   * the one the first field was taken at.
+   */
   #onFlush = (): void => {
-    if (this.#running) this.#render(true);
+    this.#cancelSecond();
+    if (this.#running) this.#render(true, false);
   };
 
   /**
