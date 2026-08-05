@@ -68,9 +68,13 @@ impl MotionField {
         }
     }
 
+    /// Empty the field for a new picture.
+    ///
+    /// Only the coded flags are cleared. `at` reads a block's reference indices
+    /// and vectors solely after finding it coded, so what the previous picture
+    /// left in them is never visible -- and they are nine tenths of the field,
+    /// two megabytes a picture the browser build would write by hand.
     pub fn reset(&mut self) {
-        self.ref_idx.fill(-1);
-        self.mv.fill(0);
         self.coded.fill(0);
     }
 
