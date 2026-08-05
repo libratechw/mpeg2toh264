@@ -16,5 +16,13 @@
     // put Node's globals into a program that has none of them.
     "types": []
   },
-  "include": ["main.ts"]
+  // Listed one by one rather than by glob: src/ holds both halves, and the
+  // worker's ambient MSE declarations would collide with lib.dom here.
+  "include": [
+    "demo.ts",
+    "src/index.ts",
+    "src/player.ts",
+    "src/mse.ts",
+    "src/protocol.ts"
+  ]
 }

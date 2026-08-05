@@ -24,15 +24,23 @@
             <span>TSファイルを選択</span>
             <input id="file" type="file" accept=".ts,.m2ts,.m2t,.mts,video/mp2t" />
           </label>
+          <label>
+            <span>MediaSourceの置き場所</span>
+            <select id="placement">
+              <option value="auto">自動</option>
+              <option value="worker">Worker（MSE in Workers）</option>
+              <option value="main">メインスレッド</option>
+            </select>
+          </label>
           <div>
-            <p id="status">MPEG-2 TSのURLを指定するか、ファイルを選択してください。</p>
+            <p id="status"></p>
             <p id="details"></p>
             <p id="fps">変換FPS: 瞬間 — · トータル —</p>
           </div>
         </div>
       </section>
-      <p>MPEG-2映像 + AAC-LC音声 · 処理はWeb Worker内で完結 · ローカルファイルはアップロードされません</p>
+      <p>MPEG-2映像 + AAC-LC音声 · 取得も変換もWeb Worker内で完結 · ローカルファイルはアップロードされません</p>
     </main>
-    <script type="module" src="./main.ts"></script>
+    <script type="module" src="./demo.ts"></script>
   </body>
 </html>

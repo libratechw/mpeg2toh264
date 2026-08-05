@@ -12,7 +12,7 @@ crates/
   mpeg2toh264-wasm/   # Sessionのwasm-bindgenラッパー
 testdata/             # 合成MPEG-2テストストリーム
 tools/                # テーブル生成・解析スクリプト（Python）
-web/                  # ブラウザMSEプレイヤー（後述）
+web/                  # ブラウザプレイヤー（src/がライブラリ、demo.tsが利用例）
 ```
 
 ## CLI
@@ -96,21 +96,47 @@ cargo test --release
 
 `crates/mpeg2toh264/tests/fixtures.rs`は各フィクスチャの出力バイト列をハッシュで固定しています。係数が1つでも変わればここで落ちるので、変わった理由を説明できないなら意図しない変更です。
 
-## ブラウザMSEプレイヤー
+## ブラウザプレイヤー
 
-TSファイルを選ぶと、Web Worker内のWASM `Session`が変換し、返ってきたフラグメントをそのままMSEへappendします。ファイルはページの外へ出ません。
+`web/src/`が、URLと`<video>`を渡すだけのライブラリです。ページ側に残るのはメディア要素だけで、取得・変換・（可能なら）MSEはすべてWorker内で完結します。
+
+```ts
+import { Mpeg2TsPlayer } from './src/index.js';
+
+const player = new Mpeg2TsPlayer(video);
+player.addEventListener('statechange', (e) => console.log(e.detail.state));
+player.addEventListener('stats', (e) => console.log(e.detail.instantFps));
+await player.load('https://example.com/video.ts');
+```
+
+`load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
+
+オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds`。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`web/demo.ts`がそうしています）。ファイルはページの外へ出ません。
+
+### MediaSourceの置き場所
+
+`MediaSource`はWorker側とページ側のどちらでも動きます。既定の`mediaSource: 'auto'`は`MediaSource.canConstructInDedicatedWorker`を見て決めます。
+
+- **Worker（MSE in Workers）** — `MediaSource`をWorker内に作り、`handle`をtransferしてページが`video.srcObject`へ付けます。フラグメントがスレッドをまたがないので、ページ側は再生ヘッドを200 msごとに送り返すだけです。現状Chromium系のみ。
+- **メインスレッド** — フラグメントをtransferでページへ送り、ページの`MseSink`がappendします。FirefoxとSafariはこちらになります。
+
+バッファ管理は`web/src/mse.ts`の`MseSink`ひとつで、どちらの経路も同じコードを通ります。メディア要素に触る2箇所（再生ヘッドの読み書き）だけがコールバックです。溢れたときの破棄は、`Session`が24 GOPごとに置くIDRを境界に使います。
+
+背圧はメッセージを持ちません。Workerの読み出しループが「sinkに置き場所ができるまで待ってから次のスライスを読む」ので、`ReadyGate`ひとつで表現できます。
+
+### ビルド
 
 ```bash
 ./tools/build-wasm.sh    # 先にWASMを生成しておく
 npm install
 npm run web:dev          # 開発サーバー
 npm run web:build        # dist/ へ出力
-npm run typecheck
+npm run typecheck        # ページ側とWorker側の2プログラム
 ```
 
 `web/wasm/`はビルド生成物なのでgit管理外です。`build-wasm.sh`を通していないと`npm run typecheck`もvite buildもimportを解決できません。
 
-`web/worker.ts`はメッセージの受け渡しだけで、変換の中身は持ちません。フラグメントの`data`はwasm-bindgenが作ったコピーなので、ページへはtransferで渡していて再コピーは起きません。バッファが溢れたときの破棄（`main.ts`の`relieveQuota`）は、`Session`が24 GOPごとに置くIDRを境界に使います。
+`web/src/mse.ts`は両方のプログラムに属します。ページ側は`lib.dom`のMSE宣言を使い、Worker側は`web/src/worker-mse.d.ts`を使います（`lib.webworker.d.ts`は`MediaSourceHandle`しか宣言していないため）。tsconfigの`include`を明示しているのはこの衝突を避けるためです。
 
 ## 残作業
 
