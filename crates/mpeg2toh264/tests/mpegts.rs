@@ -164,6 +164,61 @@ fn prefers_the_service_the_announcement_puts_first() {
     assert_eq!(demuxer.service_id(), Some(101));
 }
 
+/// A lower-ranked PMT may be followed by its PES before the first service's
+/// PMT appears. That must not make the provisional service permanent.
+#[test]
+fn waits_for_the_first_announced_services_pmt_before_emitting() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO};
+
+    let main: &[(u16, u8)] = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO),
+        (0x110, STREAM_TYPE_AAC_ADTS),
+    ];
+    let sub: &[(u16, u8)] = &[
+        (0x200, STREAM_TYPE_MPEG2_VIDEO),
+        (0x210, STREAM_TYPE_AAC_ADTS),
+    ];
+    let tables = mux_programs(&[(101, 0x1f0, main), (102, 0x1f1, sub)], &[]);
+    let sub_pes = mux_programs(
+        &[(101, 0x1f0, main), (102, 0x1f1, sub)],
+        &[
+            PesUnit {
+                pid: 0x200,
+                stream_id: 0xe0,
+                pts: Some(9000),
+                payload: &[1],
+            },
+            PesUnit {
+                pid: 0x200,
+                stream_id: 0xe0,
+                pts: Some(18000),
+                payload: &[2],
+            },
+        ],
+    );
+    let main_pes = mux_programs(
+        &[(101, 0x1f0, main), (102, 0x1f1, sub)],
+        &[PesUnit {
+            pid: 0x100,
+            stream_id: 0xe0,
+            pts: Some(27000),
+            payload: &[3],
+        }],
+    );
+
+    // PAT, second service's PMT, its PES, first service's PMT, then its PES.
+    let mut stream = tables[..2 * 188].to_vec();
+    stream.extend_from_slice(&sub_pes[3 * 188..]);
+    stream.extend_from_slice(&tables[2 * 188..3 * 188]);
+    stream.extend_from_slice(&main_pes[3 * 188..]);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let packets = demuxer.push(&stream).expect("demuxes");
+    assert_eq!(demuxer.service_id(), Some(101));
+    assert!(packets.iter().all(|packet| packet.pid == 0x100));
+}
+
 #[test]
 fn emits_private_stream_pes_from_the_selected_service() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};

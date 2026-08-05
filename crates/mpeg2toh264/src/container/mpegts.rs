@@ -160,6 +160,14 @@ impl SectionAssembler {
     }
 }
 
+struct DeferredProgram {
+    service: u16,
+    rank: usize,
+    video: Option<u16>,
+    audio: Option<u16>,
+    private: Vec<u16>,
+}
+
 /// The elementary stream PIDs a program advertises.
 struct ProgramMap {
     pmt_pids: HashSet<u16>,
@@ -172,6 +180,9 @@ struct ProgramMap {
     /// where it sits in the program association table.
     service: Option<u16>,
     rank: usize,
+    /// Best playable map seen while waiting for the PAT's first service. It is
+    /// only a fallback for the case where that first service has no picture.
+    deferred: Option<DeferredProgram>,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
     private_pids: Vec<u16>,
@@ -194,6 +205,7 @@ impl Default for ProgramMap {
             wanted_service: None,
             service: None,
             rank: usize::MAX,
+            deferred: None,
             video_pid: None,
             audio_pid: None,
             private_pids: Vec::new(),
@@ -290,6 +302,37 @@ impl ProgramMap {
             // A service with no picture in it is not the one being watched,
             // unless the caller named it.
             if video.is_none() && self.wanted_service.is_none() {
+                // Once the first announced service has been inspected, a
+                // playable service encountered ahead of its PMT may be used.
+                if rank == 0 {
+                    if let Some(deferred) = self.deferred.take() {
+                        self.service = Some(deferred.service);
+                        self.rank = deferred.rank;
+                        self.video_pid = deferred.video;
+                        self.audio_pid = deferred.audio;
+                        self.private_pids = deferred.private;
+                    }
+                }
+                return;
+            }
+            // PMTs and PES packets are interleaved in real broadcasts. Do not
+            // start emitting a lower-ranked programme merely because its PMT
+            // arrived before the first programme's PMT; by the time that map
+            // arrives, switching may already have been locked out.
+            if self.wanted_service.is_none() && rank > 0 && self.rank == usize::MAX {
+                if self
+                    .deferred
+                    .as_ref()
+                    .is_none_or(|deferred| rank < deferred.rank)
+                {
+                    self.deferred = Some(DeferredProgram {
+                        service,
+                        rank,
+                        video,
+                        audio,
+                        private,
+                    });
+                }
                 return;
             }
             // Moving to a better-placed service is free while it names the
