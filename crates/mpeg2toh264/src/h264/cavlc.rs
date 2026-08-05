@@ -104,14 +104,28 @@ pub fn write_residual_levels(
     max_num_coeff: usize,
     n_c: i32,
 ) -> Result<usize> {
-    // Which levels are non-zero, one bit each, lowest frequency in bit 0. This
-    // runs on every block of every macroblock, and most blocks are empty or
-    // nearly so, so the positions are read off the mask afterwards rather than
-    // built by a branch per coefficient.
+    // Which levels are non-zero, one bit each, lowest frequency in bit 0.
     let mut mask = 0u32;
     for i in 0..max_num_coeff {
         mask |= u32::from(levels[i] != 0) << i;
     }
+    write_masked_levels(w, levels, mask, max_num_coeff, n_c)
+}
+
+/// [`write_residual_levels`] for a caller that already knows which levels are
+/// non-zero. The luma path gathers its 4x4 sub-block out of the 8x8 scan and can
+/// note that while it copies, rather than walking the sixteen values again.
+///
+/// Bit `i` of `mask` is set when `levels[i]` is non-zero; the positions are read
+/// off it below rather than built by a branch per coefficient, since this runs
+/// for every block of every macroblock.
+pub fn write_masked_levels(
+    w: &mut BitWriter,
+    levels: &[i32],
+    mask: u32,
+    max_num_coeff: usize,
+    n_c: i32,
+) -> Result<usize> {
     let total_coeff = mask.count_ones() as usize;
 
     if total_coeff == 0 {

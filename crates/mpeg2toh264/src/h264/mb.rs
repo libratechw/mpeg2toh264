@@ -9,7 +9,7 @@
 
 use crate::error::Result;
 use crate::h264::bitwriter::BitWriter;
-use crate::h264::cavlc::write_residual_levels;
+use crate::h264::cavlc::{write_masked_levels, write_residual_levels};
 use crate::h264::cavlc_tables::CBP_TO_CODE_NUM_INTER;
 use crate::h264::chroma::ChromaBlockLevels;
 use crate::h264::params::ZIGZAG_8X8;
@@ -460,10 +460,13 @@ fn write_luma_residual_8x8(
                 continue;
             };
 
+            let mut mask = 0u32;
             for i in 0..16 {
-                sub[i] = block[4 * i + i4x4];
+                let level = block[4 * i + i4x4];
+                sub[i] = level;
+                mask |= u32::from(level != 0) << i;
             }
-            let total = write_residual_levels(w, &sub, 16, counts.n_c(bx, by))?;
+            let total = write_masked_levels(w, &sub, mask, 16, counts.n_c(bx, by))?;
             counts.set(bx, by, total);
         }
     }
