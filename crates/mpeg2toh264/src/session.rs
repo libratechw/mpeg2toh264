@@ -17,6 +17,7 @@ use crate::container::fmp4::{
 use crate::container::mpegts::{ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
 use crate::error::Result;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
+use crate::mpeg2::headers::Interlacing;
 use crate::round_half_up;
 use crate::transcode::{IncrementalTranscoder, TranscodeOptions};
 
@@ -58,6 +59,11 @@ pub enum Fragment {
         random_access: bool,
         video_samples: usize,
         audio_samples: usize,
+        /// What the source pictures of this fragment said about their fields.
+        /// A player deinterlacing the picture itself has nowhere else to learn
+        /// it: the H.264 this produces is decoded into frames, and by then the
+        /// two moments in one are indistinguishable from one.
+        interlacing: Interlacing,
     },
 }
 
@@ -363,6 +369,7 @@ impl Session {
             random_access: starts_at_idr,
             video_samples: fragment.sample_count,
             audio_samples: audio_frames.len(),
+            interlacing: timeline.interlacing,
         });
         Ok(())
     }

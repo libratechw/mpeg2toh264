@@ -73,6 +73,25 @@ export const SEEK_LEAD_SECONDS = 1;
 /** Which side of the wire owns the `MediaSource`. */
 export type SinkKind = "worker" | "main";
 
+/**
+ * How the source pictures were captured, as the MPEG-2 headers said.
+ *
+ * This is the one thing about the picture that the conversion cannot carry:
+ * H.264 is decoded into frames, and a frame holding two moments is not
+ * distinguishable from one holding a single moment once it has been decoded.
+ * A player that deinterlaces has to be told, and this is the telling -- which
+ * lines to keep, and whether to filter at all.
+ *
+ * A broadcast can change it mid-stream, where a station cuts between film and
+ * a live camera, so it arrives whenever it changes rather than once.
+ */
+export interface Scan {
+  /** Whether the pictures hold two moments each. */
+  interlaced: boolean;
+  /** Which of the two came first. Only meaningful with `interlaced`. */
+  topFieldFirst: boolean;
+}
+
 export type PlayerState =
   | "idle"
   | "loading"
@@ -130,6 +149,11 @@ export type Notification =
   | { type: "seekable"; id: number; duration: number }
   /** Throw away everything buffered; a seek is about to refill it. */
   | { type: "reset"; id: number }
+  /**
+   * What the source said about its fields, when it first says it and whenever
+   * it changes. See `Scan`.
+   */
+  | { type: "scan"; id: number; scan: Scan }
   /** A step of the load happened, for whoever is measuring. See `TimingMark`. */
   | { type: "mark"; id: number; name: TimingMark; at: number }
   /** Put the playhead here; the media does not begin at zero. See MseSink. */

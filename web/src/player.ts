@@ -22,6 +22,7 @@ import {
   type Notification,
   type PlayerState,
   type Progress,
+  type Scan,
   type SinkKind,
   type Stats,
   type Timing,
@@ -84,6 +85,12 @@ export interface Mpeg2TsPlayerEventMap {
    * arriving. Only while it is on, and only on a browser that can run it.
    */
   deinterlace: CustomEvent<DeinterlaceStats>;
+  /**
+   * What the source said about its fields: whether the pictures are
+   * interlaced, and which field came first. Arrives with the first fragment
+   * converted and again whenever it changes. See `Scan`.
+   */
+  scan: CustomEvent<Scan>;
   /**
    * The input turned out to be one that can be seeked in, and this is how long
    * it is. Until this arrives -- and for a live stream it never does -- the
@@ -162,6 +169,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     null;
   /** How long the input is, when it turned out to be one that can be seeked. */
   #duration: number | null = null;
+  /** What the source last said about its fields. See `Scan`. */
+  #scan: Scan | null = null;
   /** When `load()` was called, as epoch milliseconds; every mark counts from it. */
   #loadedAt = 0;
   /** When the last mark was, so each one can say what it cost on its own. */
@@ -204,6 +213,14 @@ export class Mpeg2TsPlayer extends EventTarget {
    */
   get duration(): number | null {
     return this.#duration;
+  }
+
+  /**
+   * What the source last said about its fields, or null before the first
+   * fragment of a load has been converted. See `Scan`.
+   */
+  get scan(): Scan | null {
+    return this.#scan;
   }
 
   /** Which side of the wire ended up owning the MediaSource. */
@@ -266,6 +283,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.stop();
     const id = this.#generation;
     this.#duration = null;
+    this.#scan = null;
     this.#loadedAt = now();
     this.#markedAt = this.#loadedAt;
     const worker = this.#ensureWorker();
@@ -397,6 +415,15 @@ export class Mpeg2TsPlayer extends EventTarget {
         break;
       case "reset":
         this.#sink?.reset();
+        break;
+      case "scan":
+        this.#scan = notification.scan;
+        // The one setting the filter cannot guess at. Everything else about it
+        // is a preference; this is a fact about the picture, and getting it
+        // wrong moves every other line half a field the wrong way.
+        if (this.#deinterlacer)
+          this.#deinterlacer.topFieldFirst = notification.scan.topFieldFirst;
+        this.#emit("scan", notification.scan);
         break;
       case "mark":
         this.#mark(notification.name, notification.at);

@@ -5,8 +5,8 @@ use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
 use crate::mpeg2::constants::{PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
-    parse_elementary_stream, picture_geometry, sequence_sample_aspect_ratio, Picture,
-    SampleAspectRatio,
+    parse_elementary_stream, picture_geometry, pictures_interlacing, sequence_sample_aspect_ratio,
+    Interlacing, Picture, SampleAspectRatio,
 };
 use crate::mpeg2::macroblock::{decode_slice, MacroblockGrid};
 use crate::round_half_up;
@@ -162,6 +162,12 @@ pub struct Mpeg2VideoTimeline {
     /// Presentation index for each coded picture, excluding the IDR clone.
     pub presentation_indices: Vec<u32>,
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
+    /// What the source pictures said about their fields. Nothing in the MP4
+    /// carries this -- H.264 could say it in a picture timing SEI, and the
+    /// browsers that would read one do not deinterlace anyway -- so it is
+    /// reported alongside instead, for a player that filters the picture
+    /// itself.
+    pub interlacing: Interlacing,
 }
 
 /// Whether every slice in a source picture reaches its end cleanly. The
@@ -263,6 +269,7 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
         sample_duration,
         presentation_indices,
         sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
+        interlacing: pictures_interlacing(&pictures),
     })
 }
 

@@ -77,6 +77,7 @@ let label = "";
 let progress = "";
 let counts = "";
 let length = "";
+let scan = "";
 /** How long the input is, once it turns out to be one that can be seeked. */
 let duration: number | null = null;
 /** Whether the bar is being dragged, which owns the position until let go. */
@@ -88,7 +89,7 @@ function setStatus(message: string, error = false) {
 }
 
 function setDetails() {
-  details.textContent = [label, length, progress, counts]
+  details.textContent = [label, length, scan, progress, counts]
     .filter(Boolean)
     .join(" · ");
 }
@@ -125,6 +126,17 @@ function createPlayer(): Mpeg2TsPlayer {
       `[timing] ${sinceLoad.toFixed(0).padStart(6)}ms  ${name.padEnd(14)} ` +
         `(+${sincePrevious.toFixed(0)}ms)`,
     );
+  });
+  // What the MPEG-2 headers said about the fields. The player has already
+  // pointed the filter at the right ones by the time this arrives; showing it
+  // is how a viewer can tell a stream that is worth filtering from one that
+  // is not.
+  created.addEventListener("scan", (event) => {
+    const { interlaced, topFieldFirst } = event.detail;
+    scan = interlaced
+      ? `インターレース（${topFieldFirst ? "TFF" : "BFF"}）`
+      : "プログレッシブ";
+    setDetails();
   });
   created.addEventListener("seekable", (event) => {
     duration = event.detail.duration;
@@ -174,6 +186,7 @@ function play(
   progress = "";
   counts = "";
   length = "";
+  scan = "";
   duration = null;
   seek.value = "0";
   bufferedBar.value = 0;

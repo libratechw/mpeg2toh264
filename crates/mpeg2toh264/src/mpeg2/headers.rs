@@ -66,6 +66,69 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+/// How the pictures of a coded unit were captured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Interlacing {
+    /// Whether any picture holds two moments rather than one, which is what a
+    /// deinterlacer is for and what nothing else here can tell a player.
+    pub interlaced: bool,
+    /// Which of the two moments came first, where there are two. Nothing in a
+    /// progressive picture is ordered by it, so it is only worth reading with
+    /// `interlaced`.
+    pub top_field_first: bool,
+}
+
+impl Default for Interlacing {
+    fn default() -> Self {
+        Self {
+            interlaced: false,
+            // Every interlaced broadcast format worth the name is top field
+            // first, so a stream that never says is assumed to be one.
+            top_field_first: true,
+        }
+    }
+}
+
+/// Read the field order out of a unit's pictures.
+///
+/// A picture says it in one of two ways. Coded as two field pictures, it is
+/// interlaced by construction and the field that came first is whichever one
+/// was coded first. Coded as a frame, `progressive_frame` says whether its two
+/// fields hold one moment or two, and `top_field_first` orders them where they
+/// hold two. A unit that mixes the two -- which is legal, and which a station
+/// switching between film and live camera produces -- counts as interlaced if
+/// any of it is, since that is the part a viewer would see combed.
+pub fn pictures_interlacing(pictures: &[Picture]) -> Interlacing {
+    let mut interlacing = Interlacing {
+        interlaced: false,
+        top_field_first: Interlacing::default().top_field_first,
+    };
+    let mut ordered = false;
+    for picture in pictures {
+        let (interlaced, top_field_first) = match picture.coding.picture_structure {
+            PictureStructure::TopField => (true, Some(true)),
+            PictureStructure::BottomField => (true, Some(false)),
+            PictureStructure::Frame => (
+                !picture.coding.progressive_frame,
+                (!picture.coding.progressive_frame).then_some(picture.coding.top_field_first),
+            ),
+            PictureStructure::Reserved => (false, None),
+        };
+        interlacing.interlaced |= interlaced;
+        // The first picture that has an order to give is the one to take it
+        // from: later ones in the same unit are the same field pair or the
+        // pairs after it, and a mid-unit disagreement is not something a
+        // single answer can carry anyway.
+        if let Some(top_field_first) = top_field_first {
+            if !ordered {
+                interlacing.top_field_first = top_field_first;
+                ordered = true;
+            }
+        }
+    }
+    interlacing
+}
+
 /// Convert MPEG-2 display aspect ratio signalling to a pixel aspect ratio.
 pub fn sequence_sample_aspect_ratio(sequence: &SequenceHeader) -> Option<SampleAspectRatio> {
     if sequence.aspect_ratio_information == 1 {

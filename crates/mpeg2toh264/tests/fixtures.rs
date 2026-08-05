@@ -7,7 +7,7 @@
 mod support;
 
 use mpeg2toh264::mpeg2::constants::PictureType;
-use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
+use mpeg2toh264::mpeg2::headers::{parse_elementary_stream, pictures_interlacing};
 use mpeg2toh264::{
     h264_to_fmp4, mpeg2_video_timeline, transcode, IncrementalTranscoder, TranscodeOptions,
 };
@@ -163,6 +163,40 @@ fn packages_each_fixture_as_a_fragmented_mp4() {
             timeline.presentation_indices.len() + 1,
             "{name} sample count"
         );
+    }
+}
+
+/// fixture, interlaced, top field first. Checked against what ffprobe reports
+/// for the same files: `tt` for hd1080i, `bb` for altscan, progressive for the
+/// rest. A player has no other way to learn this -- the H.264 that comes out
+/// is decoded into frames, and a frame of two moments looks like one of one --
+/// so getting it wrong deinterlaces a progressive picture, or moves an
+/// interlaced one half a field the wrong way.
+const SCAN: [(&str, bool, bool); 6] = [
+    ("altscan.m2v", true, false),
+    ("escape.m2v", false, true),
+    ("hd1080i.m2v", true, true),
+    ("i_only.m2v", false, true),
+    ("ibbp.m2v", false, true),
+    ("ip.m2v", false, true),
+];
+
+#[test]
+fn reads_the_field_order_of_every_fixture() {
+    for &(name, interlaced, top_field_first) in &SCAN {
+        let source = read_fixture(name);
+        let pictures = parse_elementary_stream(&source).expect("parse");
+        let interlacing = pictures_interlacing(&pictures);
+        assert_eq!(interlacing.interlaced, interlaced, "{name} interlaced");
+        if interlaced {
+            assert_eq!(
+                interlacing.top_field_first, top_field_first,
+                "{name} top field first"
+            );
+        }
+        // The timeline is where a session reads it from, so it has to agree.
+        let timeline = mpeg2_video_timeline(&source, false).expect("timeline");
+        assert_eq!(timeline.interlacing, interlacing, "{name} timeline");
     }
 }
 

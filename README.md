@@ -121,7 +121,7 @@ await player.load('https://example.com/video.ts');
 放送のTSはインターレースで、変換後のH.264もそのままなので、`<video>`が出す絵は動いた場所が櫛状になります。`deinterlace`を有効にすると、要素の上に`<canvas>`を重ね、要素が出したフレームをWebGL2で**yadif**にかけて表示します。`player.deinterlace = true/false`で再生中に切り替えられるので、同じフレームで見比べられます。
 
 - フレームの取得は`requestVideoFrameCallback`です。yadifは前後1枚ずつを見るので、次のフレームが来るまで1枚分（約33 ms）遅れて表示されます。音より33 ms遅れる代わりに、動き検出の3つの尺度が全部揃います。シークやストリームの切り替わりは`mediaTime`の飛びで検知して履歴を捨てます。
-- 既定は1フレームあたり1枚出力（`send_frame`＝mode 0相当）です。先に来たフィールドの行を残し、もう一方を補間します。トップフィールドファーストが既定で、`topFieldFirst`で変えられます。放送の情報から自動で決めてはいません（トランスコーダーがまだフレームごとのフィールド順を報告しないため）。
+- 既定は1フレームあたり1枚出力（`send_frame`＝mode 0相当）です。先に来たフィールドの行を残し、もう一方を補間します。**フィールド順はストリームから取ります**（下記）。`topFieldFirst`で上書きもできます。
 - `doubleRate`で**フィールドごとに1枚**出力（`send_field`＝mode 1相当）になります。`spatialCheck`と組み合わせてyadifの4つのモードすべてに対応します（`send_frame` / `send_field` / それぞれの`nospatial`）。
 
 #### 倍レート（mode 1相当）
@@ -136,6 +136,16 @@ await player.load('https://example.com/video.ts');
 - テクスチャは**コード化サイズ**（例: 1440x1080）で、canvasのCSS上の箱は**表示サイズ**（例: 16:9）に合わせて`#layout`が置きます。この引き伸ばしがSARの反映そのものです。`videoWidth`はSAR適用後の幅なので、これでテクスチャを確保すると右端が埋まらないまま残ります。アップロードされるのは`VideoFrameCallbackMetadata.width/height`のほうです。
 - canvasは要素の絵を覆うので、要素自身のコントロールも隠れます。デモページが再生ボタンとシークバーを自前で持っているのはそのためです。
 - 同じ絵が再提示されたら（一時停止中・末尾での停止・デコードが間に合っていないとき、コンポジターは表示リフレッシュのたびに提示します）`mediaTime`が動いていないことで見分けて捨てます。捨てないと同じ絵にフレーム1枚分の仕事をかけ続けるうえ、リングに同じ瞬間が2枚入ってyadifがそれを「動き」として読みます。
+
+#### インターレースかどうか・TFFかBFFか
+
+**変換後のH.264からは分かりません。** デコードされてしまえば「2つの瞬間を持つフレーム」も「1つの瞬間のフレーム」も見た目上は同じフレームで、どの行を残すべきかを言うものが残っていません。なのでMPEG-2ヘッダーを読んだ時点の答えを、フラグメントに載せて運びます。
+
+- Rust側は`pictures_interlacing()`が`Interlacing { interlaced, top_field_first }`を返します。フィールドピクチャ（`picture_structure`が`TopField`/`BottomField`）なら構造的にインターレースで、先に符号化されたほうが先のフィールド。フレームピクチャなら`progressive_frame`が2つの瞬間かどうかを、`top_field_first`が順序を言います。1つのGOPに両方が混ざる（局が映画と生カメラを切り替えると起きます）場合は、どれか一つでもインターレースならインターレース扱いです
+- `Fragment::Media`に`interlacing`が付き、WASMでは`interlaced` / `topFieldFirst`として出ます。Workerは**変わったときだけ**`scan`通知を送り、プレイヤーが`scan`イベントとして中継しつつ、デインタレーサーの`topFieldFirst`を差し替えます。フィールド順だけは好みではなく事実なので、間違えると1行おきに半フィールドぶん逆へ動きます
+- 放送の途中で変わりうるので、1回きりではなく変化のたびに流れます
+
+検証は`crates/mpeg2toh264/tests/fixtures.rs`の`reads_the_field_order_of_every_fixture`が6フィクスチャ全部でffprobeの`field_order`と一致することを確認しています（`hd1080i`＝tt、`altscan`＝**bb**、残り4つはprogressive）。ブラウザでも同じ3ケースを通しで確認済みで、BFFのストリームでは`deinterlacer.topFieldFirst`が実際に`false`に切り替わります。
 
 #### 端末が勝手にデインタレースする場合
 

@@ -23,6 +23,7 @@ export {
   DEFAULT_QUEUE_HIGH_WATER_MARK,
   type PlayerState,
   type Progress,
+  type Scan,
   type SinkKind,
   type Stats,
   type Timing,

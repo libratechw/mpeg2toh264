@@ -86,15 +86,21 @@ fn report(
             random_access,
             video_samples,
             audio_samples,
+            interlacing,
         } => {
             totals.media += 1;
             totals.video_samples += video_samples;
             totals.audio_samples += audio_samples;
             // Restart points are what a player evicts up to, so call them out.
             if *random_access {
+                let scan = match (interlacing.interlaced, interlacing.top_field_first) {
+                    (false, _) => "progressive",
+                    (true, true) => "interlaced tff",
+                    (true, false) => "interlaced bff",
+                };
                 println!(
                     "fragment {} at {start:.3}s: restart point, {video_samples} video, \
-                     {audio_samples} audio",
+                     {audio_samples} audio, {scan}",
                     totals.media
                 );
             }
