@@ -18,6 +18,7 @@ function buildStream(
   width: number,
   height: number,
   interlaced: boolean,
+  fieldPairs = false,
 ): Uint8Array {
   const frameMbsOnly = !interlaced;
   const g = frameGeometry(width, height, frameMbsOnly);
@@ -42,6 +43,7 @@ function buildStream(
     log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
     ppsInitQp: PPS_INIT_QP,
     mbaff: interlaced,
+    fieldPairs,
   });
   const out = new Uint8Array(sps.length + pps.length + gray.length);
   out.set(sps, 0);
@@ -115,6 +117,12 @@ describe("all-grey long-term reference frame", () => {
 
   it.runIf(ffmpeg)("decodes to uniform 128 under MBAFF", () => {
     const samples = decode(buildStream(1440, 1080, true), 1440, 1080);
+    expect(samples.length).toBe((1440 * 1080 * 3) / 2);
+    expect(new Set(samples)).toEqual(new Set([128]));
+  });
+
+  it.runIf(ffmpeg)("decodes field-coded MBAFF pairs to uniform 128", () => {
+    const samples = decode(buildStream(1440, 1080, true, true), 1440, 1080);
     expect(samples.length).toBe((1440 * 1080 * 3) / 2);
     expect(new Set(samples)).toEqual(new Set([128]));
   });

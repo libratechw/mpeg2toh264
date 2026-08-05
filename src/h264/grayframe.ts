@@ -39,6 +39,8 @@ export interface GrayFrameConfig {
   ppsInitQp: number;
   /** True when the SPS signals MBAFF, which adds mb_field_decoding_flag. */
   mbaff: boolean;
+  /** Test/support path: code every MBAFF pair as two field macroblocks. */
+  fieldPairs?: boolean;
   /** Keep grey as a long-term reference; unnecessary when all content is non-reference. */
   longTermReference?: boolean;
 }
@@ -69,7 +71,7 @@ export function writeGrayIdr(cfg: GrayFrameConfig): Uint8Array {
     // Under MBAFF the flag is sent once per macroblock pair, on the top
     // macroblock. A uniform frame has no field structure to preserve, so the
     // pairs are coded as frame pairs.
-    if (cfg.mbaff && i % 2 === 0) w.flag(0); // mb_field_decoding_flag
+    if (cfg.mbaff && i % 2 === 0) w.flag(cfg.fieldPairs ?? false);
 
     w.ue(MB_TYPE_I16X16_DC_NO_RESIDUAL);
     w.ue(INTRA_CHROMA_PRED_DC);
