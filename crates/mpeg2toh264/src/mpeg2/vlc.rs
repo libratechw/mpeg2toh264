@@ -10,9 +10,10 @@ use crate::error::{bail, Result};
 pub struct VlcTable {
     name: &'static str,
     max_len: u32,
-    /// Code length at each index; 0 means "no code here".
-    lengths: Vec<u8>,
-    values: Vec<i32>,
+    /// Value in the high 27 bits and code length in the low five. A zero
+    /// length means "no code here". Packing both fields makes decoding one
+    /// table lookup rather than two parallel vector lookups.
+    entries: Vec<u32>,
 }
 
 impl VlcTable {
@@ -26,11 +27,15 @@ impl VlcTable {
             .max()
             .unwrap_or(0);
         let size = 1usize << max_len;
-        let mut lengths = vec![0u8; size];
-        let mut values = vec![0i32; size];
+        let mut expanded = vec![0u32; size];
 
         for (code, value) in entries {
             let len = code.len() as u32;
+            assert!(
+                (-1 << 26..1 << 26).contains(value),
+                "{name}: value {value} does not fit the packed VLC entry"
+            );
+            let entry = ((*value as u32) << 5) | len;
             let prefix = (u32::from_str_radix(code, 2)
                 .unwrap_or_else(|_| panic!("{name}: code '{code}' is not binary"))
                 << (max_len - len)) as usize;
@@ -38,19 +43,17 @@ impl VlcTable {
             for i in 0..fill {
                 let index = prefix | i;
                 assert_eq!(
-                    lengths[index], 0,
+                    expanded[index], 0,
                     "{name}: code '{code}' collides at index {index}"
                 );
-                lengths[index] = len as u8;
-                values[index] = *value;
+                expanded[index] = entry;
             }
         }
 
         Self {
             name,
             max_len,
-            lengths,
-            values,
+            entries: expanded,
         }
     }
 
@@ -58,7 +61,8 @@ impl VlcTable {
     #[inline]
     pub fn decode(&self, r: &mut BitReader<'_>) -> Result<i32> {
         let index = r.peek(self.max_len) as usize;
-        let len = self.lengths[index];
+        let entry = self.entries[index];
+        let len = entry & 31;
         if len == 0 {
             bail!(
                 "{}: invalid code 0b{:0width$b} at bit {}",
@@ -68,17 +72,18 @@ impl VlcTable {
                 width = self.max_len as usize
             );
         }
-        r.skip(len as u32);
-        Ok(self.values[index])
+        r.skip(len);
+        Ok((entry as i32) >> 5)
     }
 
     /// Peek at the symbol without consuming it; `None` if the code is invalid.
     pub fn peek_symbol(&self, r: &BitReader<'_>) -> Option<i32> {
         let index = r.peek(self.max_len) as usize;
-        if self.lengths[index] == 0 {
+        let entry = self.entries[index];
+        if entry & 31 == 0 {
             None
         } else {
-            Some(self.values[index])
+            Some((entry as i32) >> 5)
         }
     }
 }
