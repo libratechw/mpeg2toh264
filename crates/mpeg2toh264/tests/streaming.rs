@@ -142,6 +142,32 @@ fn strips_adts_headers_without_touching_the_payload() {
     }
 }
 
+/// A broadcast mono or dual-mono service sends neither a channel
+/// configuration in the header nor a program_config_element to carry one: what
+/// the service is lives in the PMT. A stream opened part way through, as one
+/// resumed at a seek is, has only the element to go on.
+#[test]
+fn takes_a_single_channel_element_with_no_channel_configuration() {
+    // The empty SCE of the mono case, with the header saying nothing.
+    let frame = adts_frame_with_payload(3, 0, &[0, 0, 0, 7]);
+    let frames = AdtsStream::new().push(&frame).expect("frame decodes");
+    let config = &frames[0].config;
+    // Every single-element service comes out as a stereo pair, so the track
+    // keeps one configuration however the broadcast switches about.
+    assert_eq!(config.channel_count, 2);
+    assert_eq!(config.audio_specific_config, [0x11, 0x90]);
+    assert_eq!(frames[0].data[0] >> 5, 1, "SCE became a CPE");
+}
+
+#[test]
+fn takes_a_channel_pair_with_no_channel_configuration() {
+    let mut frame = adts_frame(3, 0, 16);
+    frame[7] = 0x20; // id_syn_ele=CPE
+    let frames = AdtsStream::new().push(&frame).expect("frame decodes");
+    assert_eq!(frames[0].config.channel_count, 2);
+    assert_eq!(frames[0].config.audio_specific_config, [0x11, 0x90]);
+}
+
 #[test]
 fn reassembles_frames_split_across_chunks() {
     let stream = adts_stream(8, 3, 2);

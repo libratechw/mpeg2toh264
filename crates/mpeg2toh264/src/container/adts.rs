@@ -306,7 +306,20 @@ impl AdtsStream {
             } else if let Some(current) = &self.current_config {
                 current.channel_count
             } else {
-                bail!("ADTS channel_configuration=0 has no program_config_element");
+                // A broadcast mono or dual-mono service leaves the header's
+                // channel configuration at zero and sends no
+                // program_config_element to carry one either: what the service
+                // is lives in the PMT, which is not where anything reading a
+                // raw ADTS stream would look. The element itself says enough
+                // for the repackaging below -- a single channel element is one
+                // channel, a channel pair is two -- and a stream that opens
+                // mid-way, as one resumed at a seek does, has nothing else to
+                // go on.
+                if first_element == 0 {
+                    1
+                } else {
+                    2
+                }
             };
             let sce_service = input_channels <= 2 && (input_channels == 1 || first_element == 0);
             let output_channels = if sce_service { 2 } else { input_channels };
@@ -323,11 +336,13 @@ impl AdtsStream {
                         audio_object_type,
                         sampling_frequency_index,
                     )
+                } else if let Some(current) = &self.current_config {
+                    current.audio_specific_config.clone()
                 } else {
-                    self.current_config
-                        .as_ref()
-                        .map(|current| current.audio_specific_config.clone())
-                        .ok_or_else(|| crate::Error::new("missing AAC program configuration"))?
+                    vec![
+                        (audio_object_type << 3) | (sampling_frequency_index >> 1),
+                        ((sampling_frequency_index & 1) << 7) | (input_channels << 3),
+                    ]
                 }
             } else {
                 vec![
