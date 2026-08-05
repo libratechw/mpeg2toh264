@@ -119,6 +119,9 @@ export class Transcoder {
       convertingMs: this.#intervalMs,
       readingMs: loop.readingMs,
       waitingMs: loop.waitingMs,
+      dropped: this.#session.dropped,
+      scrambled: this.#session.scrambled,
+      errors: this.#session.errors,
     };
     this.#intervalMs = 0;
     this.#intervalFrames = 0;

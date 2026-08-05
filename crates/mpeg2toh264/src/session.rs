@@ -147,6 +147,16 @@ impl Session {
         self.demuxer.service_ids()
     }
 
+    pub fn dropped(&self) -> u64 {
+        self.demuxer.dropped()
+    }
+    pub fn scrambled(&self) -> u64 {
+        self.demuxer.scrambled()
+    }
+    pub fn errors(&self) -> u64 {
+        self.demuxer.errors() + self.transcoder.errors()
+    }
+
     /// Start a session whose timeline is measured from a PES timestamp of the
     /// caller's choosing, rather than from wherever this input happens to open.
     ///

@@ -269,6 +269,9 @@ export interface Timing {
 }
 
 export interface Stats {
+  dropped: number;
+  scrambled: number;
+  errors: number;
   /** Conversion rate over the last slice of input, in frames per second. */
   instantFps: number;
   /** Conversion rate over the whole load so far. */

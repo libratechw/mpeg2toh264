@@ -148,6 +148,21 @@ impl Session {
         self.inner.origin_ticks().map(|ticks| ticks as f64)
     }
 
+    #[wasm_bindgen(getter)]
+    pub fn dropped(&self) -> f64 {
+        self.inner.dropped() as f64
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn scrambled(&self) -> f64 {
+        self.inner.scrambled() as f64
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn errors(&self) -> f64 {
+        self.inner.errors() as f64
+    }
+
     /// Feed the next slice of the transport stream.
     pub fn push(&mut self, chunk: &[u8]) -> Result<FragmentArray, JsError> {
         to_js_array(self.inner.push(chunk).map_err(to_js_error)?)

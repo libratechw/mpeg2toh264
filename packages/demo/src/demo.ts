@@ -200,12 +200,21 @@ function createPlayer(): Mpeg2TsPlayer {
     setPlayhead();
   });
   created.addEventListener("stats", (event) => {
-    const { instantFps, totalFps, videoFrames, audioFrames } = event.detail;
+    const {
+      instantFps,
+      totalFps,
+      videoFrames,
+      audioFrames,
+      dropped,
+      scrambled,
+      errors,
+    } = event.detail;
     const { convertingMs, readingMs, waitingMs } = event.detail;
     fps.textContent =
       `瞬間 ${instantFps.toFixed(1)} · トータル ${totalFps.toFixed(1)}` +
       ` · 変換 ${convertingMs.toFixed(0)}ms / 読み込み ${readingMs.toFixed(0)}ms` +
       ` / MSE待ち ${waitingMs.toFixed(0)}ms`;
+    fps.textContent += ` · drop ${dropped} · scrambled ${scrambled} · error ${errors}`;
     counts = `${videoFrames} video frames`;
     if (audioFrames > 0) counts += ` · ${audioFrames} AAC frames`;
     setDetails();

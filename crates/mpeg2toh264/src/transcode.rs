@@ -107,6 +107,10 @@ pub struct Stats {
     pub bidirectional_vectors: u64,
     pub intra_macroblocks: u64,
     pub inter_macroblocks: u64,
+    /// Pictures discarded because they could not be decoded.
+    pub dropped: u64,
+    /// Pictures containing at least one malformed slice.
+    pub errors: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +258,10 @@ impl IncrementalTranscoder {
     /// same pictures, so it asks.
     pub fn awaiting_random_access(&self) -> bool {
         self.awaiting_idr
+    }
+
+    pub fn errors(&self) -> u64 {
+        self.stats.errors
     }
 
     pub fn push(&mut self, data: &[u8]) -> Result<TranscodeResult> {
@@ -471,6 +479,9 @@ impl IncrementalTranscoder {
             // the MP4 timeline reaches the same verdict from the same slices,
             // so the two stay in step; what was lost is in `pictures_skipped`.
             if first_slice_error.is_some() || decoded_slices == 0 {
+                if first_slice_error.is_some() {
+                    self.stats.errors += 1;
+                }
                 pictures_skipped += 1;
                 continue;
             }
@@ -495,6 +506,9 @@ impl IncrementalTranscoder {
                     }
                 }
                 if first_slice_error.is_some() || decoded_slices == 0 {
+                    if first_slice_error.is_some() {
+                        self.stats.errors += 1;
+                    }
                     pictures_skipped += 1;
                     continue 'pictures;
                 }
