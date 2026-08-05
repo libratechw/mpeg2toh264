@@ -12,14 +12,16 @@ pub mod nal_type {
 
 /// Writes an RBSP (raw byte sequence payload) bit by bit.
 ///
-/// Bits land in an accumulator and leave it a whole byte at a time, so a
-/// syntax element costs one shift rather than a trip around a loop per byte it
-/// straddles. `buf` therefore holds only the bytes that are already full, and
-/// the up-to-seven bits after them live in `acc`.
+/// Bits land in an accumulator and leave it four bytes at a time, as one store
+/// rather than four pushes. `buf` therefore holds only whole groups of four,
+/// and the up-to-thirty-one bits after them live in `acc` until [`bytes`]
+/// drains them.
+///
+/// [`bytes`]: BitWriter::bytes
 pub struct BitWriter {
     buf: Vec<u8>,
     /// The bits not yet in `buf`, in the low `bits` bits, most significant
-    /// first. Never eight or more: every full byte is flushed as it forms.
+    /// first. Never thirty-two or more: a full word is flushed as it forms.
     acc: u64,
     bits: u32,
 }
@@ -50,7 +52,7 @@ impl BitWriter {
     }
 
     pub fn is_byte_aligned(&self) -> bool {
-        self.bits == 0
+        self.bits % 8 == 0
     }
 
     /// Write the low `n` bits of `value`, most significant first.
@@ -60,18 +62,19 @@ impl BitWriter {
         if n == 0 {
             return;
         }
-        // Fewer than eight bits are held, so at most 39 end up in the
-        // accumulator and nothing is shifted out of the top.
+        // Fewer than 32 bits are held, so at most 63 end up in the accumulator
+        // and nothing is shifted out of the top.
         let value = (value as u64) & (u64::MAX >> (64 - n));
         self.acc = (self.acc << n) | value;
         self.bits += n;
-        while self.bits >= 8 {
-            self.bits -= 8;
-            self.buf.push((self.acc >> self.bits) as u8);
+        if self.bits >= 32 {
+            self.bits -= 32;
+            self.buf
+                .extend_from_slice(&((self.acc >> self.bits) as u32).to_be_bytes());
+            // Drop what was flushed, so the accumulator holds the tail and
+            // nothing else. `bits` is below 32 here, so the shift is in range.
+            self.acc &= (1u64 << self.bits) - 1;
         }
-        // Drop what was flushed, so the accumulator holds the tail and nothing
-        // else. `bits` is below eight here, so the shift is always in range.
-        self.acc &= (1u64 << self.bits) - 1;
     }
 
     #[inline]
@@ -114,12 +117,19 @@ impl BitWriter {
 
     /// The bytes written. Panics unless the payload is byte aligned, which is a
     /// defect in the caller's syntax rather than anything the stream can cause.
-    pub fn bytes(&self) -> &[u8] {
+    pub fn bytes(&mut self) -> &[u8] {
         assert!(
             self.is_byte_aligned(),
             "RBSP is not byte aligned ({} bits)",
             self.bit_length()
         );
+        // Whole bytes the accumulator is still holding: it flushes four at a
+        // time, so up to three wait here for the end of the payload.
+        while self.bits > 0 {
+            self.bits -= 8;
+            self.buf.push((self.acc >> self.bits) as u8);
+        }
+        self.acc = 0;
         &self.buf
     }
 }
