@@ -407,6 +407,20 @@ function lengthPrefixed(nal: Uint8Array): Uint8Array {
   return concat([u32(nal.length), nal]);
 }
 
+function makeVideoPayloads(
+  samples: Uint8Array[],
+  firstSamplePrefixes: Uint8Array[] = [],
+): Uint8Array[] {
+  return samples.map((sample, index) =>
+    index === 0 && firstSamplePrefixes.length > 0
+      ? concat([
+          ...firstSamplePrefixes.map(lengthPrefixed),
+          lengthPrefixed(sample),
+        ])
+      : lengthPrefixed(sample),
+  );
+}
+
 function makeMediaSegment(
   samples: Uint8Array[],
   durations: number[],
@@ -414,8 +428,9 @@ function makeMediaSegment(
   syncSamples: boolean[],
   sequenceNumber = 1,
   baseDecodeTime = 0,
+  firstSamplePrefixes: Uint8Array[] = [],
 ) {
-  const payloads = samples.map(lengthPrefixed);
+  const payloads = makeVideoPayloads(samples, firstSamplePrefixes);
   const entries: Uint8Array[] = [];
   for (let i = 0; i < samples.length; i++) {
     const sync = syncSamples[i]!;
@@ -479,8 +494,9 @@ function makeAvMediaSegment(
   sequenceNumber: number,
   videoBaseDecodeTime: number,
   audioBaseDecodeTime: number,
+  firstSamplePrefixes: Uint8Array[] = [],
 ) {
-  const videoPayloads = videoSamples.map(lengthPrefixed);
+  const videoPayloads = makeVideoPayloads(videoSamples, firstSamplePrefixes);
   const videoEntries: Uint8Array[] = [];
   for (let index = 0; index < videoSamples.length; index++) {
     const sync = videoSyncSamples[index]!;
@@ -550,6 +566,7 @@ export function h264ToFmp4(
   const nals = splitAnnexB(h264);
   const sps = nals.find((nal) => (nal[0]! & 0x1f) === 7);
   const pps = nals.find((nal) => (nal[0]! & 0x1f) === 8);
+  const sei = nals.find((nal) => (nal[0]! & 0x1f) === 6);
   const samples = nals.filter((nal) => {
     const type = nal[0]! & 0x1f;
     return type === 1 || type === 5;
@@ -577,9 +594,12 @@ export function h264ToFmp4(
       samples,
       samples.map(() => timeline.sampleDuration),
       presentation.map(
-        (value, index) => (value - index) * timeline.sampleDuration,
+        (value, index) => (value - 1 - index) * timeline.sampleDuration,
       ),
       samples.map((sample, index) => (sample[0]! & 0x1f) === 5 || index === 0),
+      1,
+      0,
+      sei ? [sei] : [],
     ),
     mimeCodec: `video/mp4; codecs="avc1.${codec}"`,
     sampleCount: samples.length,
@@ -610,6 +630,7 @@ export function h264GopToFmp4(
   const nals = splitAnnexB(h264);
   const sps = nals.find((nal) => (nal[0]! & 0x1f) === 7);
   const pps = nals.find((nal) => (nal[0]! & 0x1f) === 8);
+  const sei = nals.find((nal) => (nal[0]! & 0x1f) === 6);
   const samples = nals.filter((nal) => {
     const type = nal[0]! & 0x1f;
     return type === 1 || type === 5;
@@ -678,6 +699,7 @@ export function h264GopToFmp4(
           sequenceNumber,
           baseDecodeTime,
           audioTrack.baseDecodeTime,
+          sei ? [sei] : [],
         )
       : makeMediaSegment(
           samples,
@@ -686,6 +708,7 @@ export function h264GopToFmp4(
           syncSamples,
           sequenceNumber,
           baseDecodeTime,
+          sei ? [sei] : [],
         ),
     mimeCodec: codec
       ? `video/mp4; codecs="avc1.${codec}${audio ? ",mp4a.40.2" : ""}"`

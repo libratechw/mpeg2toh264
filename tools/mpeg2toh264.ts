@@ -1,19 +1,21 @@
 #!/usr/bin/env -S node --experimental-strip-types
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { extname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import { h264ToFmp4, mpeg2VideoTimeline } from "../src/fmp4.ts";
 import { extractMpeg2VideoEs, isMpegTransportStream } from "../src/mpegts.ts";
 import { transcode, type TranscodeOptions } from "../src/transcode.ts";
 
-const USAGE = `Usage: mpeg2toh264 [options] <input.ts|input.m2v> <output.h264>
+const USAGE = `Usage: mpeg2toh264 [options] <input.ts|input.m2v> <output.h264|output.mp4>
 
-Transcode an MPEG transport stream or MPEG-2 video elementary stream to a raw
-Annex B H.264 bitstream. The first MPEG-2 video program in a TS is selected.
+Transcode an MPEG transport stream or MPEG-2 video elementary stream to raw
+Annex B H.264 or video-only fragmented MP4. The output format is selected from
+the output extension. The first MPEG-2 video program in a TS is selected.
 
 Arguments:
   input.ts|input.m2v        MPEG-TS or MPEG-2 video elementary stream
-  output.h264               Raw H.264/AVC Annex B bitstream
+  output.h264|output.mp4    Raw H.264/AVC or timestamped fragmented MP4
 
 Options:
   -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
@@ -91,14 +93,25 @@ function main(): void {
   const started = performance.now();
   const result = transcode(source, options);
   const elapsed = performance.now() - started;
-  writeFileSync(output, result.bitstream);
+  let outputData = result.bitstream;
+  let outputKind = "raw H.264";
+  if (extname(output).toLowerCase() === ".mp4") {
+    const mp4 = h264ToFmp4(result.bitstream, mpeg2VideoTimeline(source));
+    outputData = new Uint8Array(
+      mp4.initSegment.length + mp4.mediaSegment.length,
+    );
+    outputData.set(mp4.initSegment);
+    outputData.set(mp4.mediaSegment, mp4.initSegment.length);
+    outputKind = "fragmented MP4";
+  }
+  writeFileSync(output, outputData);
 
   if (!quiet) {
     const fps = (result.picturesConverted * 1000) / elapsed;
     process.stdout.write(
-      `${input} (${transportStream ? "MPEG-TS" : "MPEG-2 ES"}) -> ${output}\n` +
+      `${input} (${transportStream ? "MPEG-TS" : "MPEG-2 ES"}) -> ${output} (${outputKind})\n` +
         `${result.picturesConverted} pictures converted, ` +
-        `${result.picturesSkipped} skipped, ${result.bitstream.length} bytes, ` +
+        `${result.picturesSkipped} skipped, ${outputData.length} bytes, ` +
         `${elapsed.toFixed(1)} ms (${fps.toFixed(2)} fps)\n`,
     );
   }

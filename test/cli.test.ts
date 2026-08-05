@@ -51,6 +51,18 @@ describe("mpeg2toh264 CLI", () => {
     ]);
   });
 
+  it("writes timestamped fragmented MP4 when the output ends in .mp4", () => {
+    const output = join(temp, "output.mp4");
+    const result = run([join(root, "test/fixtures/ibbp.m2v"), output]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("(fragmented MP4)");
+    const text = new TextDecoder("latin1").decode(readFileSync(output));
+    expect(text).toContain("ftyp");
+    expect(text).toContain("moov");
+    expect(text).toContain("moof");
+    expect(text).toContain("mdat");
+  });
+
   it("demuxes an MPEG transport stream before transcoding", () => {
     const es = new Uint8Array(
       readFileSync(join(root, "test/fixtures/i_only.m2v")),
