@@ -65,6 +65,15 @@ pub enum Fragment {
         /// two moments in one are indistinguishable from one.
         interlacing: Interlacing,
     },
+    /// A private PES payload selected from the same service as the media.
+    /// It is kept out of fMP4 and exposed to browser consumers as an event.
+    PrivateStream {
+        stream_id: u8,
+        pid: u16,
+        data: Vec<u8>,
+        /// Absolute 90 kHz PES timestamp. private_stream_2 has no PES PTS.
+        pts: Option<u64>,
+    },
 }
 
 /// Streaming transcode of one transport stream.
@@ -210,6 +219,18 @@ impl Session {
                         self.audio_config = frames.first().map(|frame| frame.config.clone());
                     }
                     self.pending_audio.extend(frames);
+                }
+                ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2 => {
+                    out.push(Fragment::PrivateStream {
+                        stream_id: if packet.kind == ElementaryKind::PrivateStream1 {
+                            0xbd
+                        } else {
+                            0xbf
+                        },
+                        pid: packet.pid,
+                        data: packet.data,
+                        pts: packet.pts,
+                    });
                 }
             }
             self.flush_pending(false, out)?;

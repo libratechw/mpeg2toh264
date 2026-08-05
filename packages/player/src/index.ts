@@ -20,6 +20,7 @@ export {
   DEFAULT_MAX_AHEAD_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
   type PlayerState,
+  type PrivateStream,
   type Progress,
   type Scan,
   type Services,

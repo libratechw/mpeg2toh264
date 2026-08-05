@@ -47,6 +47,7 @@ for chunk in stream.chunks(1 << 20) {
         match fragment {
             Fragment::Init { data, mime_codec } => open_source_buffer(&mime_codec, &data),
             Fragment::Media { data, start, random_access, .. } => append(&data, start, random_access),
+            Fragment::PrivateStream { .. } => { /* subtitle/data event */ }
         }
     }
 }
@@ -87,7 +88,8 @@ await init({ module_or_path: new URL('./wasm/mpeg2toh264_wasm_bg.wasm', import.m
 const session = new Session();
 for (const fragment of session.push(chunk)) {
   if (fragment.kind === 'init') openSourceBuffer(fragment.mimeCodec, fragment.data);
-  else append(fragment.data, fragment.start, fragment.randomAccess);
+  else if (fragment.kind === 'media') append(fragment.data, fragment.start, fragment.randomAccess);
+  else handlePrivateStream(fragment.streamId, fragment.pid, fragment.data, fragment.pts);
 }
 ```
 
@@ -117,6 +119,8 @@ await player.load('https://example.com/video.ts');
 ```
 
 `load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`・`seekable`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
+
+選択サービスのprivate PESはfMP4へ入れず、`private_stream_1`（stream_id `0xbd`）または`private_stream_2`（`0xbf`）イベントで通知します。`event.detail`は`{ pid, data, pts }`で、`data`はPESヘッダーを除いた`ArrayBuffer`、`pts`は動画の時刻原点に合わせた秒です。PTSを持たないPESでは`null`になります。デモは`aribb24.js`の`MPEGTSFeeder`へこのpayloadを渡し、`SVGDOMRenderer`で字幕（data_identifier `0x80`）と文字スーパー（`0x81`）を映像上へ重ねます。
 
 オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds` / `deinterlace` / `deinterlacer`。`deinterlacer`には`PlayerDeinterlacer`を返すfactoryを渡します。player自身は特定の方式に依存せず、`enabled`とストリームの`scan`情報を実装へ渡します。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`packages/demo/src/demo.ts`がそうしています）。ファイルはページの外へ出ません。
 

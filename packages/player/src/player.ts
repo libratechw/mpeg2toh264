@@ -15,6 +15,7 @@ import {
   type Command,
   type Notification,
   type PlayerState,
+  type PrivateStream,
   type Progress,
   type Scan,
   type Services,
@@ -104,6 +105,10 @@ export interface Mpeg2TsPlayerEventMap {
    * choice, which `serviceId` makes on the next `load()`. See `Services`.
    */
   services: CustomEvent<Services>;
+  /** A private_stream_1 (stream_id 0xbd) PES payload from the selected service. */
+  private_stream_1: CustomEvent<PrivateStream>;
+  /** A private_stream_2 (stream_id 0xbf) PES payload from the selected service. */
+  private_stream_2: CustomEvent<PrivateStream>;
   /**
    * The input turned out to be one that can be seeked in, and this is how long
    * it is. Until this arrives -- and for a live stream it never does -- the
@@ -452,6 +457,10 @@ export class Mpeg2TsPlayer extends EventTarget {
         break;
       case "services":
         this.#emit("services", notification.services);
+        break;
+      case "private_stream_1":
+      case "private_stream_2":
+        this.#emit(notification.type, notification.stream);
         break;
       case "mark":
         this.#mark(notification.name, notification.at);

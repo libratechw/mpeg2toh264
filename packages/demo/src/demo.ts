@@ -12,8 +12,10 @@ import {
   probeDecoder,
   supportsDeinterlace,
 } from "@mpeg2toh264/yadif";
+import { Controller, MPEGTSFeeder, SVGDOMRenderer } from "aribb24.js";
 
 const video = document.querySelector<HTMLVideoElement>("#video")!;
+const picture = document.querySelector<HTMLElement>("#picture")!;
 const urlForm = document.querySelector<HTMLFormElement>("#url-form")!;
 const urlInput = document.querySelector<HTMLInputElement>("#url")!;
 const fileInput = document.querySelector<HTMLInputElement>("#file")!;
@@ -76,6 +78,7 @@ function formatDuration(seconds: number): string {
 
 let player: Mpeg2TsPlayer | null = null;
 let yadif: Deinterlacer | null = null;
+let captions: { destroy(): void } | null = null;
 /** The blob URL for a picked file, revoked when the next source replaces it. */
 let fileUrl: string | null = null;
 let label = "";
@@ -104,6 +107,8 @@ function setDetails() {
  * means building a new one. Each source gets a fresh player for that reason.
  */
 function createPlayer(): Mpeg2TsPlayer {
+  captions?.destroy();
+  captions = null;
   player?.destroy();
   yadif = null;
   const mediaSource = placement.value as "auto" | "worker" | "main";
@@ -119,6 +124,7 @@ function createPlayer(): Mpeg2TsPlayer {
       return yadif;
     },
   });
+  captions = createCaptionOverlay(created);
   created.addEventListener("statechange", (event) => {
     const { state } = event.detail;
     if (state === "converting") setStatus(`${STATES.converting}${progress}`);
@@ -202,6 +208,47 @@ function createPlayer(): Mpeg2TsPlayer {
   player = created;
   syncControls();
   return created;
+}
+
+/** Render ARIB captions and character superimpose as SVG over the picture. */
+function createCaptionOverlay(created: Mpeg2TsPlayer): { destroy(): void } {
+  const entries = (["Caption", "Superimpose"] as const).map((type) => {
+    const feeder = new MPEGTSFeeder({
+      recieve: { type },
+      tokenizer: {},
+      offset: {},
+    });
+    const renderer = new SVGDOMRenderer();
+    const controller = new Controller();
+    controller.attachFeeder(feeder);
+    controller.attachRenderer(renderer);
+    controller.attachMedia(video, picture);
+    return { controller, feeder, renderer };
+  });
+
+  const feed = (
+    event: CustomEvent<import("@mpeg2toh264/player").PrivateStream>,
+  ): void => {
+    const { data, pts } = event.detail;
+    if (pts === null) return;
+    for (const { feeder } of entries) feeder.feedB24(data, pts);
+  };
+  created.addEventListener("private_stream_1", feed);
+  created.addEventListener("private_stream_2", feed);
+
+  return {
+    destroy(): void {
+      created.removeEventListener("private_stream_1", feed);
+      created.removeEventListener("private_stream_2", feed);
+      for (const { controller, feeder, renderer } of entries) {
+        controller.detachMedia();
+        controller.detachFeeder();
+        controller.detachRenderer(renderer);
+        feeder.destroy();
+        renderer.destroy();
+      }
+    },
+  };
 }
 
 function showDeinterlaceStats(

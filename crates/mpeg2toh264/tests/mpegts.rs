@@ -163,3 +163,71 @@ fn prefers_the_service_the_announcement_puts_first() {
     demuxer.push(&stream).expect("demuxes");
     assert_eq!(demuxer.service_id(), Some(101));
 }
+
+#[test]
+fn emits_private_stream_pes_from_the_selected_service() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{
+        mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, STREAM_TYPE_PRIVATE_DATA,
+    };
+
+    let caption = vec![0x80; 300];
+    let superimpose = vec![0x81; 40];
+    let streams = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO),
+        (0x120, STREAM_TYPE_PRIVATE_DATA),
+    ];
+    let ts = mux_transport_stream(
+        streams,
+        &[
+            PesUnit {
+                pid: 0x120,
+                stream_id: 0xbd,
+                pts: Some(90_000),
+                payload: &caption,
+            },
+            // A following start flushes the first packet during push(), including
+            // its continuation TS packet.
+            PesUnit {
+                pid: 0x120,
+                stream_id: 0xbd,
+                pts: Some(180_000),
+                payload: &[0x80],
+            },
+            PesUnit {
+                pid: 0x120,
+                stream_id: 0xbf,
+                pts: None,
+                payload: &superimpose,
+            },
+            PesUnit {
+                pid: 0x100,
+                stream_id: 0xe0,
+                pts: Some(90_000),
+                payload: &[0, 0, 1, 0xb3],
+            },
+        ],
+    );
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&ts).expect("private streams demux");
+    packets.extend(demuxer.finish().expect("private streams flush"));
+
+    let private1 = packets
+        .iter()
+        .find(|packet| {
+            packet.kind == ElementaryKind::PrivateStream1 && packet.data.len() == caption.len()
+        })
+        .expect("private_stream_1 packet");
+    assert_eq!(private1.pid, 0x120);
+    assert_eq!(private1.pts, Some(90_000));
+    assert_eq!(private1.data, caption);
+
+    let private2 = packets
+        .iter()
+        .find(|packet| packet.kind == ElementaryKind::PrivateStream2)
+        .expect("private_stream_2 packet");
+    assert_eq!(private2.pid, 0x120);
+    assert_eq!(private2.pts, None);
+    assert_eq!(private2.data, superimpose);
+}

@@ -39,6 +39,15 @@ export type Fragment =
       interlaced: boolean;
       /** Which of the two came first. Only meaningful with `interlaced`. */
       topFieldFirst: boolean;
+    }
+  | {
+      kind: "private-stream";
+      /** PES stream_id: 0xbd (private_stream_1) or 0xbf (private_stream_2). */
+      streamId: number;
+      pid: number;
+      data: Uint8Array;
+      /** Absolute 90 kHz PES timestamp, absent for private_stream_2. */
+      pts: number | null;
     };
 "#;
 
@@ -211,6 +220,22 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
                 &object,
                 "topFieldFirst",
                 &interlacing.top_field_first.into(),
+            )?;
+        }
+        Fragment::PrivateStream {
+            stream_id,
+            pid,
+            data,
+            pts,
+        } => {
+            set(&object, "kind", &"private-stream".into())?;
+            set(&object, "streamId", &(stream_id as f64).into())?;
+            set(&object, "pid", &(pid as f64).into())?;
+            set(&object, "data", &copy_out(&data))?;
+            set(
+                &object,
+                "pts",
+                &pts.map_or(JsValue::NULL, |ticks| (ticks as f64).into()),
             )?;
         }
     }

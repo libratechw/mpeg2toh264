@@ -110,6 +110,16 @@ export interface Scan {
   topFieldFirst: boolean;
 }
 
+/** A private PES payload from the selected service. */
+export interface PrivateStream {
+  /** Elementary stream PID from the program map. */
+  pid: number;
+  /** Payload after the PES header. Ownership belongs to the event receiver. */
+  data: ArrayBuffer;
+  /** Presentation time in media seconds, or null when the PES form has no PTS. */
+  pts: number | null;
+}
+
 export type PlayerState =
   | "idle"
   | "loading"
@@ -195,6 +205,8 @@ export type Notification =
    * seek re-reads them.
    */
   | { type: "services"; id: number; services: Services }
+  | { type: "private_stream_1"; id: number; stream: PrivateStream }
+  | { type: "private_stream_2"; id: number; stream: PrivateStream }
   | { type: "stats"; id: number; stats: Stats }
   /** The MSE buffer filled up, or made room again. Worker-sink loads only. */
   | { type: "blocked"; id: number; blocked: boolean }

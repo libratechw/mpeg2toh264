@@ -116,6 +116,9 @@ fn report(
             }
             write(out, data, totals)?;
         }
+        Fragment::PrivateStream { .. } => {
+            // This example writes only the fragmented MP4 output.
+        }
     }
     Ok(())
 }

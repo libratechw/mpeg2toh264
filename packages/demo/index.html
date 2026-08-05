@@ -8,6 +8,13 @@
          below is the browser's own, drawn the way the browser draws it. -->
     <style>
       #video {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+      }
+      #picture {
+        position: relative;
+        width: fit-content;
         max-width: 100%;
       }
       #playback {
@@ -39,9 +46,10 @@
         display: flex;
         flex-direction: column;
       }
-      #stage:fullscreen > :first-child {
+      #stage:fullscreen > #picture {
         flex: 1 1 auto;
         min-height: 0;
+        width: 100%;
       }
       #stage:fullscreen #video {
         width: 100%;
@@ -66,7 +74,9 @@
              picture on the screen, so the demo takes them away while it runs
              and gives them back when it stops. #playback works either way. -->
         <div id="stage">
-          <video id="video" controls playsinline></video>
+          <div id="picture">
+            <video id="video" controls playsinline></video>
+          </div>
           <div id="playback">
             <button id="playpause" type="button" aria-label="再生" title="再生" disabled>▶</button>
             <button id="back" type="button" disabled>10秒戻る</button>

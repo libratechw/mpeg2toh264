@@ -16,6 +16,8 @@ const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
 pub enum ElementaryKind {
     Video,
     Audio,
+    PrivateStream1,
+    PrivateStream2,
 }
 
 impl ElementaryKind {
@@ -23,6 +25,8 @@ impl ElementaryKind {
         match self {
             Self::Video => (0xe0..=0xef).contains(&stream_id),
             Self::Audio => (0xc0..=0xdf).contains(&stream_id),
+            Self::PrivateStream1 => stream_id == 0xbd,
+            Self::PrivateStream2 => stream_id == 0xbf,
         }
     }
 
@@ -30,6 +34,8 @@ impl ElementaryKind {
         match self {
             Self::Video => "video",
             Self::Audio => "audio",
+            Self::PrivateStream1 => "private_stream_1",
+            Self::PrivateStream2 => "private_stream_2",
         }
     }
 }
@@ -37,6 +43,7 @@ impl ElementaryKind {
 #[derive(Clone, Debug)]
 pub struct ElementaryPacket {
     pub kind: ElementaryKind,
+    pub pid: u16,
     pub data: Vec<u8>,
     /// The PES presentation timestamp in 90 kHz units, when one is present.
     /// Video and audio rarely start at the same timestamp in a broadcast
@@ -167,6 +174,7 @@ struct ProgramMap {
     rank: usize,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
+    private_pids: Vec<u16>,
     /// Every service seen in the program association table, in the order they
     /// were announced.
     services: Vec<u16>,
@@ -188,6 +196,7 @@ impl Default for ProgramMap {
             rank: usize::MAX,
             video_pid: None,
             audio_pid: None,
+            private_pids: Vec::new(),
             services: Vec::new(),
             may_switch_streams: true,
             changed_streams: false,
@@ -261,6 +270,7 @@ impl ProgramMap {
             let mut i = 12 + program_info_length;
             let mut video = None;
             let mut audio = None;
+            let mut private = Vec::new();
             while i + 4 < end {
                 let stream_type = section[i];
                 let stream_pid = (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
@@ -271,6 +281,9 @@ impl ProgramMap {
                 }
                 if audio.is_none() && stream_type == STREAM_TYPE_AAC_ADTS {
                     audio = Some(stream_pid);
+                }
+                if stream_type == 0x06 {
+                    private.push(stream_pid);
                 }
                 i += 5 + info_length;
             }
@@ -285,7 +298,8 @@ impl ProgramMap {
             // name. Where it names different ones, the packets gathered so far
             // belong to the wrong programme and have to go, so it is only worth
             // doing before any of them have been handed on.
-            let same_streams = self.video_pid == video && self.audio_pid == audio;
+            let same_streams =
+                self.video_pid == video && self.audio_pid == audio && self.private_pids == private;
             if self.service.is_some() && !same_streams && !self.may_switch_streams {
                 return;
             }
@@ -294,6 +308,7 @@ impl ProgramMap {
             self.rank = rank;
             self.video_pid = video;
             self.audio_pid = audio;
+            self.private_pids = private;
         }
     }
 }
@@ -323,7 +338,11 @@ fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
         bail!("unexpected {} stream_id 0x{stream_id:02x}", kind.name());
     }
     let pes_length = ((packet[4] as usize) << 8) | packet[5] as usize;
-    let start = if packet[6] & 0xc0 == 0x80 {
+    let start = if kind == ElementaryKind::PrivateStream2 {
+        // private_stream_2 is one of the stream ids with no optional PES
+        // header (ISO/IEC 13818-1 table 2-17).
+        6
+    } else if packet[6] & 0xc0 == 0x80 {
         9 + packet[8] as usize
     } else {
         // MPEG-1 PES header form, retained for older transport streams.
@@ -378,15 +397,23 @@ struct PesState {
 }
 
 impl PesState {
-    fn flush(&mut self, kind: ElementaryKind, output: &mut Vec<ElementaryPacket>) -> Result<()> {
+    fn flush(
+        &mut self,
+        kind: ElementaryKind,
+        pid: u16,
+        output: &mut Vec<ElementaryPacket>,
+    ) -> Result<()> {
         if self.parts.is_empty() {
             return Ok(());
         }
         let packet = std::mem::take(&mut self.parts);
         output.push(ElementaryPacket {
             kind,
+            pid,
             data: pes_payload(&packet, kind)?.to_vec(),
-            pts: pes_pts(&packet),
+            pts: (kind != ElementaryKind::PrivateStream2)
+                .then(|| pes_pts(&packet))
+                .flatten(),
         });
         self.collecting = false;
         Ok(())
@@ -402,6 +429,7 @@ pub struct MpegTsAvDemuxer {
     program: ProgramMap,
     video: PesState,
     audio: PesState,
+    private: HashMap<u16, PesState>,
 }
 
 impl MpegTsAvDemuxer {
@@ -469,12 +497,26 @@ impl MpegTsAvDemuxer {
                         // of anything.
                         self.video = PesState::default();
                         self.audio = PesState::default();
+                        self.private.clear();
                     }
                 }
                 let kind = if Some(packet.pid) == self.program.video_pid {
                     Some(ElementaryKind::Video)
                 } else if Some(packet.pid) == self.program.audio_pid {
                     Some(ElementaryKind::Audio)
+                } else if self.program.private_pids.contains(&packet.pid) {
+                    let stream_id = if packet.payload_unit_start {
+                        packet.data.get(3)
+                    } else {
+                        self.private
+                            .get(&packet.pid)
+                            .and_then(|state| state.parts.get(3))
+                    };
+                    stream_id.and_then(|stream_id| match stream_id {
+                        0xbd => Some(ElementaryKind::PrivateStream1),
+                        0xbf => Some(ElementaryKind::PrivateStream2),
+                        _ => None,
+                    })
                 } else {
                     None
                 };
@@ -482,9 +524,17 @@ impl MpegTsAvDemuxer {
                     let state = match kind {
                         ElementaryKind::Video => &mut self.video,
                         ElementaryKind::Audio => &mut self.audio,
+                        ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2 => {
+                            self.private.entry(packet.pid).or_default()
+                        }
                     };
                     if packet.payload_unit_start {
-                        state.flush(kind, &mut output)?;
+                        let previous_kind = match state.parts.get(3) {
+                            Some(0xbd) => ElementaryKind::PrivateStream1,
+                            Some(0xbf) => ElementaryKind::PrivateStream2,
+                            _ => kind,
+                        };
+                        state.flush(previous_kind, packet.pid, &mut output)?;
                         state.collecting = is_pes_start(packet.data, kind);
                     }
                     if state.collecting {
@@ -513,8 +563,24 @@ impl MpegTsAvDemuxer {
             bail!("MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)");
         }
         let mut output = Vec::new();
-        self.video.flush(ElementaryKind::Video, &mut output)?;
-        self.audio.flush(ElementaryKind::Audio, &mut output)?;
+        self.video.flush(
+            ElementaryKind::Video,
+            self.program.video_pid.unwrap_or(0),
+            &mut output,
+        )?;
+        self.audio.flush(
+            ElementaryKind::Audio,
+            self.program.audio_pid.unwrap_or(0),
+            &mut output,
+        )?;
+        for (&pid, state) in self.private.iter_mut() {
+            let kind = match state.parts.get(3) {
+                Some(0xbd) => ElementaryKind::PrivateStream1,
+                Some(0xbf) => ElementaryKind::PrivateStream2,
+                _ => continue,
+            };
+            state.flush(kind, pid, &mut output)?;
+        }
         Ok(output)
     }
 }

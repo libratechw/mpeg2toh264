@@ -231,6 +231,8 @@ class Playback {
   /** Which leg is current. Anything from an older one is dropped. */
   #legNumber = 0;
   #transcoder: Transcoder | null = null;
+  /** Private PES packets waiting for the media timeline origin to be known. */
+  #private: Array<Extract<Fragment, { kind: "private-stream" }>> = [];
   /** Wall time the read loop spent on each of the two things it waits for. */
   #readingMs = 0;
   /** The last services reported, so the same news is not sent twice. */
@@ -386,6 +388,7 @@ class Playback {
     this.#legNumber++;
     this.#transcoder?.free();
     this.#transcoder = null;
+    this.#private = [];
     this.#sink.close();
   }
 
@@ -445,6 +448,7 @@ class Playback {
     this.#leg = new AbortController();
     this.#transcoder?.free();
     this.#transcoder = null;
+    this.#private = [];
     return ++this.#legNumber;
   }
 
@@ -618,7 +622,10 @@ class Playback {
       if (queuedBytes <= INPUT_QUEUE_LOW_WATER_BYTES) refill.set(true);
       const fragments = converter.push(chunk);
       this.#announceServices(id, converter);
-      if (!converted && fragments.length > 0) {
+      if (
+        !converted &&
+        fragments.some((fragment) => fragment.kind === "media")
+      ) {
         converted = true;
         mark(id, "first-fragment");
         // Where the leg actually opened, which is a better sample of the file
@@ -627,14 +634,15 @@ class Playback {
         const first = fragments.find((fragment) => fragment.kind === "media");
         if (first) this.#record({ byte: source.offset, seconds: first.start });
       }
-      if (!(await this.#deliver(leg, fragments))) return;
       this.#place(converter);
+      if (!(await this.#deliver(leg, fragments))) return;
       this.#report(converter);
     }
     await reading;
     if (readError) throw readError;
-    if (!(await this.#deliver(leg, converter.finish()))) return;
+    const final = converter.finish();
     this.#place(converter);
+    if (!(await this.#deliver(leg, final))) return;
     this.#report(converter);
     await this.#sink.finish();
     if (!this.#running(leg)) return;
@@ -655,13 +663,17 @@ class Playback {
         if (!this.#running(leg)) return false;
         mark(this.#command.id, "opened");
         post({ type: "opened", id: this.#command.id });
-      } else {
+      } else if (fragment.kind === "media") {
         this.#tellScan(fragment.interlaced, fragment.topFieldFirst);
         this.#sink.push(
           detach(fragment),
           fragment.start,
           fragment.randomAccess,
         );
+      } else if (fragment.pts === null || this.#origin !== null) {
+        this.#postPrivate(fragment);
+      } else {
+        this.#private.push(fragment);
       }
     }
     return true;
@@ -694,6 +706,22 @@ class Playback {
     if (origin === null) return;
     this.#origin = origin;
     this.#announceDuration();
+    for (const fragment of this.#private) this.#postPrivate(fragment);
+    this.#private = [];
+  }
+
+  #postPrivate(fragment: Extract<Fragment, { kind: "private-stream" }>): void {
+    const pts =
+      fragment.pts === null || this.#origin === null
+        ? null
+        : ticksSince(this.#origin, fragment.pts) / TICKS_PER_SECOND;
+    const type =
+      fragment.streamId === 0xbd ? "private_stream_1" : "private_stream_2";
+    const data = detach(fragment);
+    post(
+      { type, id: this.#command.id, stream: { pid: fragment.pid, data, pts } },
+      [data],
+    );
   }
 
   /**

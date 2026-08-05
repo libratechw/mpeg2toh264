@@ -222,12 +222,16 @@ pub fn mux_programs(programs: &[Program<'_>], units: &[PesUnit<'_>]) -> Vec<u8> 
 fn mux_payloads(mut out: Vec<u8>, units: &[PesUnit<'_>]) -> Vec<u8> {
     let mut continuity: HashMap<u16, u8> = HashMap::new();
     for unit in units {
-        let mut pes: Vec<u8> = match unit.pts {
-            None => vec![0, 0, 1, unit.stream_id, 0, 0, 0x80, 0, 0],
-            Some(pts) => {
-                let mut header = vec![0, 0, 1, unit.stream_id, 0, 0, 0x80, 0x80, 5];
-                header.extend_from_slice(&pts_field(pts));
-                header
+        let mut pes: Vec<u8> = if unit.stream_id == 0xbf {
+            vec![0, 0, 1, unit.stream_id, 0, 0]
+        } else {
+            match unit.pts {
+                None => vec![0, 0, 1, unit.stream_id, 0, 0, 0x80, 0, 0],
+                Some(pts) => {
+                    let mut header = vec![0, 0, 1, unit.stream_id, 0, 0, 0x80, 0x80, 5];
+                    header.extend_from_slice(&pts_field(pts));
+                    header
+                }
             }
         };
         pes.extend_from_slice(unit.payload);
@@ -316,6 +320,7 @@ pub fn adts_stream(frames: usize, sampling_frequency_index: u8, channel_count: u
 }
 
 pub const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
+pub const STREAM_TYPE_PRIVATE_DATA: u8 = 0x06;
 pub const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
 pub const VIDEO_PID: u16 = 0x101;
 pub const AUDIO_PID: u16 = 0x102;
