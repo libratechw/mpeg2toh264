@@ -54,13 +54,14 @@
         <!-- What goes fullscreen: the picture and the controls together, so
              the controls are on the screen as well.
 
-             The element has no `controls` of its own. The deinterlacer covers
-             it with a canvas, which hides them in the page and -- since a
-             fullscreen browser draws media controls above everything -- leaves
-             them floating over the deinterlaced picture on the screen. There
-             is nothing they did that #playback does not. -->
+             The element keeps its own `controls` for as long as they are any
+             use. The deinterlacer covers it with a canvas, which hides them in
+             the page and -- since a fullscreen browser draws media controls
+             above everything -- leaves them floating over the deinterlaced
+             picture on the screen, so the demo takes them away while it runs
+             and gives them back when it stops. #playback works either way. -->
         <div id="stage">
-          <video id="video" playsinline></video>
+          <video id="video" controls playsinline></video>
           <div id="playback">
             <button id="playpause" type="button" disabled>再生</button>
             <button id="back" type="button" disabled>10秒戻る</button>

@@ -280,6 +280,7 @@ export class Deinterlacer {
     this.#running = true;
     this.#resetStats();
     this.#mount();
+    this.#showCurrent();
     this.#request();
   }
 
@@ -308,6 +309,27 @@ export class Deinterlacer {
     this.#textures = [];
     this.#gl.deleteProgram(this.#program);
     this.#gl.getExtension("WEBGL_lose_context")?.loseContext();
+  }
+
+  /**
+   * Filter what is on the element now, without waiting to be handed a frame.
+   *
+   * Being turned on while playback is stopped would otherwise leave the woven
+   * picture up until something moves: nothing is presented while paused, so
+   * no callback comes. One frame has nothing to be compared to, which makes
+   * this the spatial half of the filter; the full one takes over with the
+   * next frame presented. Only possible once the size of a coded frame is
+   * known, which is to say after a first frame has been seen.
+   */
+  #showCurrent(): void {
+    if (
+      this.#width === 0 ||
+      this.#video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+    )
+      return;
+    this.#frames = 0;
+    this.#push();
+    this.#render(false, false);
   }
 
   #request(): void {

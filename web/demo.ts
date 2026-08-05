@@ -157,6 +157,7 @@ function createPlayer(): Mpeg2TsPlayer {
     setStatus(event.detail.error.message, true),
   );
   player = created;
+  syncControls();
   return created;
 }
 
@@ -352,6 +353,18 @@ function applyDeinterlace() {
   if (!player) return;
   player.deinterlace = deinterlace.checked;
   if (player.deinterlacer) player.deinterlacer.doubleRate = doubleRate.checked;
+  syncControls();
+}
+
+/**
+ * The element's own controls, for as long as they can be seen and used. A
+ * running deinterlacer covers them with its canvas -- and on the screen the
+ * browser draws them over the top of it instead, which is worse -- so they go
+ * while it runs. Whether it is running is the thing to ask: a browser that
+ * cannot run it keeps them, which is the fallback that matters.
+ */
+function syncControls() {
+  video.controls = !(player?.deinterlace ?? false);
 }
 deinterlace.addEventListener("change", applyDeinterlace);
 doubleRate.addEventListener("change", applyDeinterlace);
