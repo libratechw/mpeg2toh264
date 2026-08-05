@@ -243,6 +243,16 @@ export class Deinterlacer {
     return this.#running;
   }
 
+  /**
+   * What to put on the screen for fullscreen: the `<div>` holding both the
+   * element and the canvas once there is one, and the element itself before
+   * that. Fullscreening the element alone would leave the canvas behind in
+   * the page, and with it the only deinterlaced picture there is.
+   */
+  get container(): HTMLElement {
+    return this.#wrapper ?? this.#video;
+  }
+
   /** Whether the top field of a frame is the one captured first. */
   get topFieldFirst(): boolean {
     return this.#topFieldFirst;

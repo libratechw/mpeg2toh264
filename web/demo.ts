@@ -23,6 +23,8 @@ const time = document.querySelector<HTMLElement>("#time")!;
 const volume = document.querySelector<HTMLInputElement>("#volume")!;
 const mute = document.querySelector<HTMLButtonElement>("#mute")!;
 const rate = document.querySelector<HTMLSelectElement>("#rate")!;
+const stage = document.querySelector<HTMLElement>("#stage")!;
+const fullscreen = document.querySelector<HTMLButtonElement>("#fullscreen")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
 const status = document.querySelector<HTMLElement>("#status")!;
@@ -280,6 +282,24 @@ rate.addEventListener(
   () => (video.playbackRate = Number(rate.value)),
 );
 
+/**
+ * The whole stage goes on the screen, controls and all. The element on its own
+ * would be the wrong thing twice over: the deinterlaced picture is on a canvas
+ * beside it, and everything that drives playback is under it.
+ */
+function toggleFullscreen() {
+  if (document.fullscreenElement)
+    void document.exitFullscreen().catch(() => {});
+  else void stage.requestFullscreen().catch(() => {});
+}
+
+fullscreen.addEventListener("click", toggleFullscreen);
+document.addEventListener("fullscreenchange", () => {
+  fullscreen.textContent = document.fullscreenElement
+    ? "全画面を解除"
+    : "全画面";
+});
+
 // The page's keys, not a control's: a focused button already takes the space
 // bar as a click, and a text field takes every key there is.
 document.addEventListener("keydown", (event) => {
@@ -315,6 +335,9 @@ document.addEventListener("keydown", (event) => {
       break;
     case "m":
       video.muted = !video.muted;
+      break;
+    case "f":
+      toggleFullscreen();
       break;
     default:
       return;

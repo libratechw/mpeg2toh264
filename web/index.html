@@ -27,6 +27,21 @@
       #buffered {
         width: 100%;
       }
+      /* On the screen, the controls keep their row at the bottom and the
+         picture takes everything they leave. The first child is the element
+         itself, or the <div> the deinterlacer puts around it and its canvas. */
+      #stage:fullscreen {
+        display: flex;
+        flex-direction: column;
+      }
+      #stage:fullscreen > :first-child {
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+      #stage:fullscreen #video {
+        width: 100%;
+        height: 100%;
+      }
     </style>
   </head>
   <body>
@@ -36,33 +51,41 @@
         <p>映像をH.264へ変換し、fragmented MP4としてMedia Source Extensionsへ渡します。</p>
       </header>
       <section>
-        <!-- `controls` is the fallback for when the deinterlacer is off: with
-             it on, a canvas covers the element and its controls with it, and
-             everything below drives playback instead. -->
-        <video id="video" controls playsinline></video>
-        <div id="playback">
-          <button id="playpause" type="button" disabled>再生</button>
-          <button id="back" type="button" disabled>10秒戻る</button>
-          <button id="forward" type="button" disabled>10秒進む</button>
-          <div id="timeline">
-            <input id="seek" type="range" min="0" max="1000" step="1" value="0" disabled
-                   aria-label="再生位置" />
-            <progress id="buffered" max="1000" value="0" aria-label="変換済みの範囲">0%</progress>
+        <!-- What goes fullscreen: the picture and the controls together, so
+             the controls are on the screen as well.
+
+             The element has no `controls` of its own. The deinterlacer covers
+             it with a canvas, which hides them in the page and -- since a
+             fullscreen browser draws media controls above everything -- leaves
+             them floating over the deinterlaced picture on the screen. There
+             is nothing they did that #playback does not. -->
+        <div id="stage">
+          <video id="video" playsinline></video>
+          <div id="playback">
+            <button id="playpause" type="button" disabled>再生</button>
+            <button id="back" type="button" disabled>10秒戻る</button>
+            <button id="forward" type="button" disabled>10秒進む</button>
+            <div id="timeline">
+              <input id="seek" type="range" min="0" max="1000" step="1" value="0" disabled
+                     aria-label="再生位置" />
+              <progress id="buffered" max="1000" value="0" aria-label="変換済みの範囲">0%</progress>
+            </div>
+            <output id="time" for="seek">0:00</output>
+            <label for="volume">音量</label>
+            <input id="volume" type="range" min="0" max="100" step="1" value="100" />
+            <button id="mute" type="button">消音</button>
+            <label for="rate">速度</label>
+            <select id="rate">
+              <option value="0.25">0.25倍</option>
+              <option value="0.5">0.5倍</option>
+              <option value="1" selected>等速</option>
+              <option value="1.5">1.5倍</option>
+              <option value="2">2倍</option>
+            </select>
+            <button id="fullscreen" type="button">全画面</button>
           </div>
-          <output id="time" for="seek">0:00</output>
-          <label for="volume">音量</label>
-          <input id="volume" type="range" min="0" max="100" step="1" value="100" />
-          <button id="mute" type="button">消音</button>
-          <label for="rate">速度</label>
-          <select id="rate">
-            <option value="0.25">0.25倍</option>
-            <option value="0.5">0.5倍</option>
-            <option value="1" selected>等速</option>
-            <option value="1.5">1.5倍</option>
-            <option value="2">2倍</option>
-          </select>
         </div>
-        <p>キーボード: スペース／K 再生・停止 · ←→ 5秒 · J／L 10秒 · ↑↓ 音量 · M 消音</p>
+        <p>キーボード: スペース／K 再生・停止 · ←→ 5秒 · J／L 10秒 · ↑↓ 音量 · M 消音 · F 全画面</p>
       </section>
       <fieldset>
         <legend>ソース</legend>
