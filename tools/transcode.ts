@@ -11,8 +11,15 @@ import { PictureType } from "../src/mpeg2/constants.ts";
 import { transcode } from "../src/transcode.ts";
 
 const input = process.argv[2];
-const oversample = Number(process.argv[3] ?? 2);
-if (!input) throw new Error("usage: transcode.ts <in.m2v> [oversample]");
+const args = process.argv.slice(3);
+const iFramesOnly = args.includes("--i-frames-only");
+const oversampleArg = args.find((arg) => arg !== "--i-frames-only");
+const oversample = Number(oversampleArg ?? 2);
+if (!input || !Number.isFinite(oversample) || oversample <= 0) {
+  throw new Error(
+    "usage: transcode.ts <in.m2v> [oversample] [--i-frames-only]",
+  );
+}
 
 const data = new Uint8Array(readFileSync(input));
 const pics = parseElementaryStream(data);
@@ -20,7 +27,7 @@ const width = pics[0]!.sequence.horizontalSize;
 const height = pics[0]!.sequence.verticalSize;
 
 const started = Date.now();
-const result = transcode(data, { oversample });
+const result = transcode(data, { oversample, iFramesOnly });
 const elapsed = Date.now() - started;
 
 console.log(`source      : ${input}  ${width}x${height}`);
@@ -46,6 +53,7 @@ console.log(
   `  bidirectional        ${String(result.bidirectionalVectors).padStart(7)}  ${pc(result.bidirectionalVectors).padStart(6)}  both slots used, H.264 interpolates`,
 );
 console.log(`oversample  : ${oversample}x`);
+console.log(`picture mode: ${iFramesOnly ? "I frames only" : "all frames"}`);
 console.log(`output      : ${result.bitstream.length} bytes in ${elapsed} ms`);
 
 const dir = mkdtempSync(join(tmpdir(), "transcode-"));
@@ -56,21 +64,19 @@ try {
   // Both sides now carry every picture, in display order.
   const srcYuv = join(dir, "src.yuv");
   const outYuv = join(dir, "out.yuv");
-  execFileSync(
-    "ffmpeg",
-    [
-      "-v",
-      "error",
-      "-i",
-      input,
-      "-f",
-      "rawvideo",
-      "-pix_fmt",
-      "yuv420p",
-      srcYuv,
-    ],
-    { stdio: ["ignore", "ignore", "inherit"] },
-  );
+  const sourceDecodeArgs = ["-v", "error", "-i", input];
+  if (iFramesOnly) {
+    sourceDecodeArgs.push(
+      "-vf",
+      "select=eq(pict_type\\,I)",
+      "-fps_mode",
+      "passthrough",
+    );
+  }
+  sourceDecodeArgs.push("-f", "rawvideo", "-pix_fmt", "yuv420p", srcYuv);
+  execFileSync("ffmpeg", sourceDecodeArgs, {
+    stdio: ["ignore", "ignore", "inherit"],
+  });
   execFileSync(
     "ffmpeg",
     [

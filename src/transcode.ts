@@ -74,7 +74,9 @@ const CHROMA_QP_OFFSET = -6;
 const MAX_FRAME_NUM = 1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4);
 
 export interface TranscodeOptions {
-  oversample: number;
+  oversample?: number;
+  /** Convert only MPEG-2 I pictures; P and B pictures are counted as skipped. */
+  iFramesOnly?: boolean;
 }
 
 export interface TranscodeResult {
@@ -214,6 +216,10 @@ export function transcode(
       type !== PictureType.P &&
       type !== PictureType.B
     ) {
+      picturesSkipped++;
+      continue;
+    }
+    if (options.iFramesOnly && type !== PictureType.I) {
       picturesSkipped++;
       continue;
     }
@@ -462,7 +468,10 @@ function writePicture(
       ) {
         const quantiserScale =
           QUANTISER_SCALE[pic.coding.qScaleType]![source.quantiserScaleCode]!;
-        qp = quant.chooseQp(quantiserScale, ctx.options.oversample);
+        qp = quant.chooseQp(
+          quantiserScale,
+          ctx.options.oversample ?? DEFAULT_QUANTISER_OPTIONS.oversample,
+        );
         const matrix = intra ? pic.quant.intra : pic.quant.nonIntra;
         const chromaMatrix = intra
           ? pic.quant.chromaIntra
