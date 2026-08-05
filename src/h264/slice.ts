@@ -50,6 +50,16 @@ export interface SliceHeaderConfig {
   /** Number of active L0 references, when it differs from the PPS default. */
   numRefIdxL0Active?: number;
   numRefIdxL1Active?: number;
+  /**
+   * Force list 1 to begin with a short-term picture, given as the difference
+   * between the current frame_num and that picture's.
+   *
+   * List 1 needs this because its default construction ends with a rule that
+   * swaps the first two entries whenever it comes out identical to list 0 --
+   * which is exactly the case here, since the half-sample mapping wants the
+   * same picture reachable through both lists.
+   */
+  l1FirstShortTermDelta?: number;
 }
 
 export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
@@ -90,12 +100,19 @@ export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
     }
   }
 
-  // ref_pic_list_modification: the default list order is used for now.
+  // ref_pic_list_modification. List 0's default order already puts the nearest
+  // preceding reference first, so only list 1 needs correcting.
   if (!isIType(cfg.sliceType)) {
     w.flag(0); // ref_pic_list_modification_flag_l0
   }
   if (isB) {
-    w.flag(0); // ref_pic_list_modification_flag_l1
+    const delta = cfg.l1FirstShortTermDelta;
+    w.flag(delta !== undefined);
+    if (delta !== undefined) {
+      w.ue(0); // modification_of_pic_nums_idc 0: subtract from the predicted picNum
+      w.ue(delta - 1); // abs_diff_pic_num_minus1
+      w.ue(3); // modification_of_pic_nums_idc 3: end of the list
+    }
   }
 
   // weighted_pred_flag is 0 and weighted_bipred_idc is 0, so no pred_weight_table.

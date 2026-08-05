@@ -114,7 +114,34 @@ export function intraTargets(
   out[0] = intraDcMult * levels[0]! - GRAY_DC;
   for (let pos = 1; pos < 64; pos++) {
     const level = levels[pos]!;
+    // The division truncates toward zero, matching what a decoder computes.
     out[pos] =
-      level === 0 ? 0 : (2 * level * weightScale[pos]! * quantiserScale) / 32;
+      level === 0
+        ? 0
+        : Math.trunc((2 * level * weightScale[pos]! * quantiserScale) / 32);
+  }
+}
+
+/**
+ * MPEG-2 dequantisation of a non-intra block, clause 7.4.2.1. The prediction is
+ * the source's motion-compensated block, which the H.264 side reproduces, so
+ * nothing is subtracted here -- the residual carries across as it stands.
+ */
+export function interTargets(
+  levels: Int16Array,
+  weightScale: readonly number[],
+  quantiserScale: number,
+  out: Float64Array,
+): void {
+  for (let pos = 0; pos < 64; pos++) {
+    const level = levels[pos]!;
+    if (level === 0) {
+      out[pos] = 0;
+      continue;
+    }
+    const sign = level < 0 ? -1 : 1;
+    out[pos] = Math.trunc(
+      ((2 * level + sign) * weightScale[pos]! * quantiserScale) / 32,
+    );
   }
 }

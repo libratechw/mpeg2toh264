@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseElementaryStream } from "../src/mpeg2/headers.ts";
 import { PictureType } from "../src/mpeg2/constants.ts";
-import { transcodeIntraOnly } from "../src/transcode.ts";
+import { transcode } from "../src/transcode.ts";
 
 const input = process.argv[2];
 const oversample = Number(process.argv[3] ?? 2);
@@ -20,25 +20,28 @@ const width = pics[0]!.sequence.horizontalSize;
 const height = pics[0]!.sequence.verticalSize;
 
 const started = Date.now();
-const result = transcodeIntraOnly(data, { oversample });
+const result = transcode(data, { oversample });
 const elapsed = Date.now() - started;
 
 console.log(`source      : ${input}  ${width}x${height}`);
 console.log(
-  `pictures    : ${result.picturesConverted} converted, ${result.picturesSkipped} skipped (not I)`,
+  `pictures    : ${result.picturesConverted} converted, ` +
+    `${result.picturesSkipped} skipped (B pictures, not yet handled)`,
+);
+console.log(
+  `macroblocks : ${result.intraMacroblocks} intra, ${result.interMacroblocks} inter, ` +
+    `${result.inexactVectors} vectors approximated`,
 );
 console.log(`oversample  : ${oversample}x`);
 console.log(`output      : ${result.bitstream.length} bytes in ${elapsed} ms`);
-console.log(
-  `worst coeff error: ${result.worstCoefficientError.toFixed(3)} (orthonormal DCT units)`,
-);
 
 const dir = mkdtempSync(join(tmpdir(), "transcode-"));
 try {
   const h264 = join(dir, "out.h264");
   writeFileSync(h264, result.bitstream);
 
-  // Decode both, keeping only the I pictures of the source so the frames line up.
+  // Keep the same pictures on both sides: B pictures are not converted yet, so
+  // the source is filtered down to its I and P pictures to line the frames up.
   const srcYuv = join(dir, "src.yuv");
   const outYuv = join(dir, "out.yuv");
   execFileSync(
@@ -49,7 +52,7 @@ try {
       "-i",
       input,
       "-vf",
-      "select='eq(pict_type\\,I)'",
+      "select='eq(pict_type\\,I)+eq(pict_type\\,P)'",
       "-vsync",
       "0",
       "-f",
@@ -123,6 +126,33 @@ try {
     console.log(
       `${name.padEnd(3)} PSNR ${psnr.padStart(9)}   worst error ${String(p.worst).padStart(3)}   mse ${p.mse.toFixed(4)}`,
     );
+  }
+
+  // Per frame, to tell a systematic error apart from drift accumulating down a
+  // chain of predicted pictures.
+  console.log("\nper frame:            Y                 Cb                Cr");
+  for (let f = 0; f < frames; f++) {
+    const cells: string[] = [];
+    for (const [offset, size] of [
+      [0, lumaSize],
+      [lumaSize, chromaSize],
+      [lumaSize + chromaSize, chromaSize],
+    ] as const) {
+      let sse = 0;
+      let worst = 0;
+      const base = f * frameSize + offset;
+      for (let i = 0; i < size; i++) {
+        const d = src[base + i]! - out[base + i]!;
+        sse += d * d;
+        if (Math.abs(d) > worst) worst = Math.abs(d);
+      }
+      const mse = sse / size;
+      const psnr = mse === 0 ? Infinity : 10 * Math.log10((255 * 255) / mse);
+      cells.push(
+        `${(psnr === Infinity ? "lossless" : psnr.toFixed(2)).padStart(8)} w${String(worst).padStart(3)}`,
+      );
+    }
+    console.log(`  ${String(f).padStart(3)}  ${cells.join("  ")}`);
   }
 } finally {
   rmSync(dir, { recursive: true, force: true });

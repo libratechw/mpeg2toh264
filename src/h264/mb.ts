@@ -13,8 +13,27 @@ import { writeResidualBlock } from "./cavlc.ts";
 import type { ChromaBlockLevels } from "./chroma.ts";
 import { ZIGZAG_8X8 } from "./params.ts";
 
-/** mb_type 0 in a P slice: one 16x16 partition predicted from list 0. */
-const MB_TYPE_P_L0_16X16 = 0;
+/**
+ * B slice macroblock types for a single 16x16 partition (Table 7-14).
+ *
+ * Everything this transcoder emits is a B slice, including the pictures that
+ * were I or P in the source, because bi-prediction is only available there and
+ * the half-sample mapping depends on it.
+ */
+export const BMbType = {
+  L0_16X16: 1,
+  L1_16X16: 2,
+  BI_16X16: 3,
+} as const;
+
+/**
+ * te(v): with exactly two choices the value is a single inverted bit, otherwise
+ * it is plain ue(v) (clause 9.1.1).
+ */
+function writeTe(w: BitWriter, value: number, range: number): void {
+  if (range === 1) w.u(1, value === 0 ? 1 : 0);
+  else w.ue(value);
+}
 
 /**
  * Position of each 4x4 luma block within a macroblock, in units of 4 samples
@@ -82,12 +101,25 @@ export interface GrayRefMacroblock {
   /** Macroblock position in the picture. */
   mbX: number;
   mbY: number;
+  /** One of BMbType. */
+  mbType: number;
+  /** Reference indices; -1 marks a list this macroblock does not use. */
+  refIdxL0: number;
+  refIdxL1: number;
+  /** Motion vector differences in quarter samples. */
+  mvdL0x: number;
+  mvdL0y: number;
+  mvdL1x: number;
+  mvdL1y: number;
+  /** Highest reference index available in each list, for te(v). */
+  numRefIdxL0Minus1: number;
+  numRefIdxL1Minus1: number;
   /**
    * Four 8x8 luma blocks of H.264 coefficient levels in 8x8 zig-zag scan order,
    * or null where the block has no coefficients at all.
    */
   luma: (Int32Array | null)[];
-  /** Cb and Cr, or null to leave chroma at the grey prediction. */
+  /** Cb and Cr, or null to leave chroma at the prediction. */
   chroma: [ChromaBlockLevels, ChromaBlockLevels] | null;
   /** QP this macroblock is coded at. */
   qp: number;
@@ -130,13 +162,26 @@ export function writeGrayRefMacroblock(
   chromaCounts: ChromaCounts,
   mb: GrayRefMacroblock,
 ): number {
-  w.ue(MB_TYPE_P_L0_16X16);
+  w.ue(mb.mbType);
 
-  // mb_pred: ref_idx_l0 is not sent because the grey frame is the only entry in
-  // list 0. Every macroblock uses a zero vector, so every neighbour predicts
-  // zero and the difference is zero too.
-  w.se(0); // mvd_l0[0][0][0]
-  w.se(0); // mvd_l0[0][0][1]
+  // mb_pred: reference indices for whichever lists this type uses, then their
+  // vector differences. ref_idx is omitted when the list holds one picture.
+  const usesL0 =
+    mb.mbType === BMbType.L0_16X16 || mb.mbType === BMbType.BI_16X16;
+  const usesL1 =
+    mb.mbType === BMbType.L1_16X16 || mb.mbType === BMbType.BI_16X16;
+  if (usesL0 && mb.numRefIdxL0Minus1 > 0)
+    writeTe(w, mb.refIdxL0, mb.numRefIdxL0Minus1);
+  if (usesL1 && mb.numRefIdxL1Minus1 > 0)
+    writeTe(w, mb.refIdxL1, mb.numRefIdxL1Minus1);
+  if (usesL0) {
+    w.se(mb.mvdL0x);
+    w.se(mb.mvdL0y);
+  }
+  if (usesL1) {
+    w.se(mb.mvdL1x);
+    w.se(mb.mvdL1y);
+  }
 
   let cbpLuma = 0;
   for (let i8x8 = 0; i8x8 < 4; i8x8++) {

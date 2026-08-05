@@ -34,9 +34,9 @@ const C8 = (() => {
   return m;
 })();
 
-/** Chroma QP for a given luma QP, via Table 8-15 (chroma_qp_index_offset is 0). */
-export function chromaQp(lumaQp: number): number {
-  return QPC_FROM_QPI[Math.max(0, Math.min(51, lumaQp))]!;
+/** Chroma QP for a given luma QP and PPS offset, via Table 8-15. */
+export function chromaQp(lumaQp: number, offset: number): number {
+  return QPC_FROM_QPI[Math.max(0, Math.min(51, lumaQp + offset))]!;
 }
 
 /** Inverse 8x8 DCT, orthonormal, into `out` in raster order. */
@@ -129,14 +129,33 @@ export function convertIntraChromaBlock(
   intraDcPrecision: number,
   qpC: number,
   out: ChromaBlockLevels,
+  intra: boolean,
 ): void {
-  // MPEG-2 dequantisation, clauses 7.4.1 and 7.4.2.1, less the grey prediction.
-  const intraDcMult = 8 >> intraDcPrecision;
-  dequant[0] = intraDcMult * levels[0]! - GRAY_DC;
-  for (let pos = 1; pos < 64; pos++) {
-    const level = levels[pos]!;
-    dequant[pos] =
-      level === 0 ? 0 : (2 * level * weightScale[pos]! * quantiserScale) / 32;
+  // MPEG-2 dequantisation, clause 7.4.2.1. An intra block is coded against the
+  // grey reference, so its flat 128 prediction comes off the DC; a non-intra
+  // block is coded against motion compensation the H.264 side reproduces, and
+  // its residual carries across untouched.
+  if (intra) {
+    dequant[0] = (8 >> intraDcPrecision) * levels[0]! - GRAY_DC;
+    for (let pos = 1; pos < 64; pos++) {
+      const level = levels[pos]!;
+      dequant[pos] =
+        level === 0
+          ? 0
+          : Math.trunc((2 * level * weightScale[pos]! * quantiserScale) / 32);
+    }
+  } else {
+    for (let pos = 0; pos < 64; pos++) {
+      const level = levels[pos]!;
+      if (level === 0) {
+        dequant[pos] = 0;
+        continue;
+      }
+      const sign = level < 0 ? -1 : 1;
+      dequant[pos] = Math.trunc(
+        ((2 * level + sign) * weightScale[pos]! * quantiserScale) / 32,
+      );
+    }
   }
 
   idct8(dequant, spatial);
@@ -174,6 +193,19 @@ export function convertIntraChromaBlock(
   out.dc[3] = Math.round((f0 - f1 - f2 + f3) / 4);
   out.anyDc =
     out.dc[0] !== 0 || out.dc[1] !== 0 || out.dc[2] !== 0 || out.dc[3] !== 0;
+}
+
+/**
+ * Reset a scratch record. Necessary because coded_block_pattern's chroma field
+ * is shared between Cb and Cr: if one component has AC coefficients then both
+ * components' AC blocks get written, so an uncoded component must present
+ * zeros rather than whatever the previous macroblock left behind.
+ */
+export function clearChromaBlockLevels(out: ChromaBlockLevels): void {
+  out.dc.fill(0);
+  for (const block of out.ac) block.fill(0);
+  out.anyDc = false;
+  out.anyAc = false;
 }
 
 export function makeChromaBlockLevels(): ChromaBlockLevels {

@@ -57,6 +57,14 @@ export interface PpsConfig {
    */
   scaling8x8Intra: readonly number[] | null;
   scaling8x8Inter: readonly number[] | null;
+  /**
+   * Shifts chroma QP relative to luma, -12..12. Chroma otherwise inherits the
+   * luma QP through Table 8-15 with no way to refine it, and its path carries
+   * more rounding than luma's -- notably the 2x2 DC Hadamard, which is
+   * orthogonal but not orthonormal, so a half-step rounding of a DC level can
+   * reach four times that in the reconstructed value.
+   */
+  chromaQpIndexOffset?: number;
 }
 
 /** Macroblock dimensions and the cropping needed to reach the coded size. */
@@ -180,7 +188,7 @@ export function writePps(cfg: PpsConfig): Uint8Array {
   w.u(2, 0); // weighted_bipred_idc
   w.se(cfg.initQp - 26); // pic_init_qp_minus26
   w.se(0); // pic_init_qs_minus26
-  w.se(0); // chroma_qp_index_offset
+  w.se(cfg.chromaQpIndexOffset ?? 0); // chroma_qp_index_offset
   w.flag(1); // deblocking_filter_control_present_flag: slices switch it off
   w.flag(0); // constrained_intra_pred_flag: no H.264 intra prediction is used
   w.flag(0); // redundant_pic_cnt_present_flag
@@ -205,7 +213,7 @@ export function writePps(cfg: PpsConfig): Uint8Array {
       if (list !== null) writeScalingList(w, list);
     }
   }
-  w.se(0); // second_chroma_qp_index_offset
+  w.se(cfg.chromaQpIndexOffset ?? 0); // second_chroma_qp_index_offset
 
   w.rbspTrailingBits();
   return toNalUnit(w.bytes(), 3, NalType.PPS);
