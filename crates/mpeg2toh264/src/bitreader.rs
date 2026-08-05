@@ -10,17 +10,28 @@ pub struct BitReader<'a> {
     pub data: &'a [u8],
     /// Absolute position in bits from the start of `data`.
     pos: usize,
+    /// Upcoming bits, most significant first. Sequential syntax reads consume
+    /// this reservoir and touch the input only when fewer than 32 bits remain.
+    reservoir: u64,
+    reservoir_bits: u32,
 }
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            data,
+            pos: 0,
+            reservoir: 0,
+            reservoir_bits: 0,
+        }
     }
 
     pub fn at_bit(data: &'a [u8], start_bit: usize) -> Self {
         Self {
             data,
             pos: start_bit,
+            reservoir: 0,
+            reservoir_bits: 0,
         }
     }
 
@@ -30,6 +41,8 @@ impl<'a> BitReader<'a> {
 
     pub fn set_bit_pos(&mut self, pos: usize) {
         self.pos = pos;
+        self.reservoir = 0;
+        self.reservoir_bits = 0;
     }
 
     pub fn byte_pos(&self) -> usize {
@@ -51,24 +64,33 @@ impl<'a> BitReader<'a> {
         self.data.get(index).copied().unwrap_or(0) as u32
     }
 
+    /// Refill from the current absolute position. MPEG-2 fields are at most 32
+    /// bits, while an eight-byte window leaves at least 57 usable bits after
+    /// alignment, so one refill always satisfies the next read.
     #[inline]
-    fn word_at(&self, byte: usize) -> u32 {
-        // Every peek goes through here, so the window is taken in one load
-        // wherever there is a whole one to take. Only the last three bytes of
-        // the stream fall back to reading past the end as zeroes.
-        if byte.saturating_add(4) <= self.data.len() {
-            u32::from_be_bytes([
+    fn refill(&mut self) {
+        let byte = self.pos >> 3;
+        let bit_offset = (self.pos & 7) as u32;
+        let word = if byte.saturating_add(8) <= self.data.len() {
+            u64::from_be_bytes([
                 self.data[byte],
                 self.data[byte + 1],
                 self.data[byte + 2],
                 self.data[byte + 3],
+                self.data[byte + 4],
+                self.data[byte + 5],
+                self.data[byte + 6],
+                self.data[byte + 7],
             ])
         } else {
-            (self.byte_at(byte) << 24)
-                | (self.byte_at(byte + 1) << 16)
-                | (self.byte_at(byte + 2) << 8)
-                | self.byte_at(byte + 3)
-        }
+            let mut word = 0u64;
+            for i in 0..8 {
+                word = (word << 8) | self.byte_at(byte + i) as u64;
+            }
+            word
+        };
+        self.reservoir = word << bit_offset;
+        self.reservoir_bits = 64 - bit_offset;
     }
 
     /// Read `n` bits (n <= 32) MSB-first as an unsigned integer.
@@ -77,52 +99,26 @@ impl<'a> BitReader<'a> {
         if n == 0 {
             return 0;
         }
-        // A four-byte window covers any request that starts at any bit offset
-        // and spans at most 25 bits, which is every field but the widest few.
-        if n <= 25 {
-            let value = (self.word_at(self.pos >> 3) << (self.pos & 7) as u32) >> (32 - n);
-            self.pos += n as usize;
-            return value;
+        debug_assert!(n <= 32);
+        if self.reservoir_bits < n {
+            self.refill();
         }
-        let mut value: u64 = 0;
-        let mut left = n;
-        let mut p = self.pos;
-        while left > 0 {
-            let bit_offset = (p & 7) as u32;
-            let avail = 8 - bit_offset;
-            let take = avail.min(left);
-            // Extract `take` bits starting at bit_offset within the byte.
-            let chunk = (self.byte_at(p >> 3) >> (avail - take)) & ((1 << take) - 1);
-            value = (value << take) | chunk as u64;
-            p += take as usize;
-            left -= take;
-        }
-        self.pos = p;
-        value as u32
+        let value = (self.reservoir >> (64 - n)) as u32;
+        self.skip(n);
+        value
     }
 
     /// Peek `n` bits without consuming them.
     #[inline]
-    pub fn peek(&self, n: u32) -> u32 {
+    pub fn peek(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
-        if n <= 25 {
-            return (self.word_at(self.pos >> 3) << (self.pos & 7) as u32) >> (32 - n);
+        debug_assert!(n <= 32);
+        if self.reservoir_bits < n {
+            self.refill();
         }
-        let mut value: u64 = 0;
-        let mut left = n;
-        let mut p = self.pos;
-        while left > 0 {
-            let bit_offset = (p & 7) as u32;
-            let avail = 8 - bit_offset;
-            let take = avail.min(left);
-            let chunk = (self.byte_at(p >> 3) >> (avail - take)) & ((1 << take) - 1);
-            value = (value << take) | chunk as u64;
-            p += take as usize;
-            left -= take;
-        }
-        value as u32
+        (self.reservoir >> (64 - n)) as u32
     }
 
     /// Read a single bit as a boolean.
@@ -134,6 +130,13 @@ impl<'a> BitReader<'a> {
     #[inline]
     pub fn skip(&mut self, n: u32) {
         self.pos += n as usize;
+        if n < self.reservoir_bits {
+            self.reservoir <<= n;
+            self.reservoir_bits -= n;
+        } else {
+            self.reservoir = 0;
+            self.reservoir_bits = 0;
+        }
     }
 
     /// MPEG-2 `marker_bit`: a bit that shall be 1, present purely to prevent
@@ -151,6 +154,8 @@ impl<'a> BitReader<'a> {
 
     pub fn align_to_byte(&mut self) {
         self.pos = (self.pos + 7) & !7;
+        self.reservoir = 0;
+        self.reservoir_bits = 0;
     }
 
     /// MPEG-2 `nextbits() == '0000 0000 0000 0000 0000 0001'`: true when the
@@ -194,4 +199,43 @@ pub fn find_start_codes(data: &[u8]) -> Vec<StartCode> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference(data: &[u8], pos: usize, width: u32) -> u32 {
+        let mut value = 0;
+        for bit in pos..pos + width as usize {
+            let byte = data.get(bit >> 3).copied().unwrap_or(0);
+            value = (value << 1) | u32::from((byte >> (7 - (bit & 7))) & 1);
+        }
+        value
+    }
+
+    #[test]
+    fn reservoir_matches_individual_bits_across_refills_and_seeks() {
+        let data: Vec<u8> = (0..20).map(|i| (i * 37 + 11) as u8).collect();
+        let mut reader = BitReader::at_bit(&data, 3);
+        let mut pos = 3;
+        for width in [3, 17, 5, 32, 7, 21, 1, 28] {
+            assert_eq!(reader.peek(width), reference(&data, pos, width));
+            assert_eq!(reader.bit_pos(), pos, "peek does not consume bits");
+            assert_eq!(reader.u(width), reference(&data, pos, width));
+            pos += width as usize;
+        }
+
+        reader.set_bit_pos(9);
+        assert_eq!(reader.u(32), reference(&data, 9, 32));
+        reader.skip(70);
+        assert_eq!(reader.u(13), reference(&data, 111, 13));
+    }
+
+    #[test]
+    fn reading_past_the_input_still_supplies_zero_bits() {
+        let mut reader = BitReader::at_bit(&[0b1010_0000], 4);
+        assert_eq!(reader.u(12), 0);
+        assert_eq!(reader.u(32), 0);
+    }
 }

@@ -103,7 +103,7 @@ impl VlcTable {
     }
 
     /// Peek at the symbol without consuming it; `None` if the code is invalid.
-    pub fn peek_symbol(&self, r: &BitReader<'_>) -> Option<i32> {
+    pub fn peek_symbol(&self, r: &mut BitReader<'_>) -> Option<i32> {
         let index = r.peek(self.max_len) as usize;
         let entry = self.entries[index];
         if entry & 31 == 0 {

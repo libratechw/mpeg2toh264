@@ -22,6 +22,7 @@ const chunkSize = Number(chunkSizeArg);
 
 let outputBytes = 0;
 let mediaFragments = 0;
+let videoSamples = 0;
 const samples = [];
 for (let iteration = 0; iteration < iterations; iteration += 1) {
   const session = new Session();
@@ -31,11 +32,13 @@ for (let iteration = 0; iteration < iterations; iteration += 1) {
     for (const fragment of fragments) {
       outputBytes += fragment.data.byteLength;
       mediaFragments += fragment.kind === "media" ? 1 : 0;
+      videoSamples += fragment.kind === "media" ? fragment.videoSamples : 0;
     }
   }
   for (const fragment of session.finish()) {
     outputBytes += fragment.data.byteLength;
     mediaFragments += fragment.kind === "media" ? 1 : 0;
+    videoSamples += fragment.kind === "media" ? fragment.videoSamples : 0;
   }
   session.free();
   samples.push(performance.now() - started);
@@ -51,6 +54,10 @@ console.log(
     chunkSize,
     samplesMs: samples.map((ms) => Number(ms.toFixed(2))),
     warmMeanMs: Number(meanMs.toFixed(2)),
+    videoSamplesPerIteration: videoSamples / iterations,
+    warmFramesPerSecond: Number(
+      (videoSamples / iterations / (meanMs / 1000)).toFixed(2),
+    ),
     warmMiBPerSecond: Number(
       (input.byteLength / 1048576 / (meanMs / 1000)).toFixed(2),
     ),
