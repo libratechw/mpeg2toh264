@@ -20,9 +20,9 @@ use crate::h264::params::ZIGZAG_8X8;
 
 /// H.264 Table 8-14: 8x8 field scan for field-coded macroblocks.
 pub static FIELD_SCAN_8X8: [usize; 64] = [
-    0, 8, 16, 1, 9, 24, 32, 17, 2, 10, 25, 40, 48, 33, 18, 3, 11, 26, 41, 56, 49, 34, 19, 4, 12,
-    27, 42, 57, 50, 35, 20, 5, 13, 28, 43, 58, 51, 36, 21, 6, 14, 29, 44, 59, 52, 37, 22, 7, 15,
-    30, 45, 60, 53, 38, 23, 31, 46, 61, 54, 39, 47, 62, 55, 63,
+    0, 8, 16, 1, 9, 24, 32, 17, 2, 25, 40, 48, 56, 33, 10, 3, 18, 41, 49, 57, 26, 11, 4, 19, 34,
+    42, 50, 58, 27, 12, 5, 20, 35, 43, 51, 59, 28, 13, 6, 21, 36, 44, 52, 60, 29, 14, 22, 37, 45,
+    53, 61, 30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
 ];
 
 /// B slice macroblock types for a single 16x16 partition (Table 7-14).
@@ -535,6 +535,32 @@ mod tests {
         assert!(to_zigzag_8x8(&raster, &mut out, true));
         let expected: Vec<i32> = FIELD_SCAN_8X8.iter().map(|&p| p as i32 + 1).collect();
         assert_eq!(out.to_vec(), expected);
+    }
+
+    /// Table 8-14 as the column and row it names, which is how the standard
+    /// prints it. Stating the table a second way is the point: comparing it with
+    /// itself, as the test above has to, says nothing about whether it is right.
+    #[test]
+    fn field_scan_visits_the_positions_table_8_14_names() {
+        #[rustfmt::skip]
+        let coordinates: [(usize, usize); 64] = [
+            (0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (0, 3), (0, 4), (1, 2),
+            (2, 0), (1, 3), (0, 5), (0, 6), (0, 7), (1, 4), (2, 1), (3, 0),
+            (2, 2), (1, 5), (1, 6), (1, 7), (2, 3), (3, 1), (4, 0), (3, 2),
+            (2, 4), (2, 5), (2, 6), (2, 7), (3, 3), (4, 1), (5, 0), (4, 2),
+            (3, 4), (3, 5), (3, 6), (3, 7), (4, 3), (5, 1), (6, 0), (5, 2),
+            (4, 4), (4, 5), (4, 6), (4, 7), (5, 3), (6, 1), (6, 2), (5, 4),
+            (5, 5), (5, 6), (5, 7), (6, 3), (7, 0), (7, 1), (6, 4), (6, 5),
+            (6, 6), (6, 7), (7, 2), (7, 3), (7, 4), (7, 5), (7, 6), (7, 7),
+        ];
+        let expected: Vec<usize> = coordinates.iter().map(|&(x, y)| y * 8 + x).collect();
+        assert_eq!(FIELD_SCAN_8X8.to_vec(), expected);
+
+        let mut seen = [false; 64];
+        for &p in &FIELD_SCAN_8X8 {
+            assert!(!seen[p], "position {p} is scanned twice");
+            seen[p] = true;
+        }
     }
 
     #[test]

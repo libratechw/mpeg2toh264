@@ -52,7 +52,7 @@ static CHROMA_RECIPROCAL_GAIN: LazyLock<([[f32; 16]; 40], [f32; 40])> = LazyLock
 });
 
 /// H.264 Table 8-14: 4x4 field scan for field-coded macroblocks.
-pub static FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 2, 6, 13, 10, 3, 7, 14, 11, 15];
+pub static FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
 
 /// Chroma QP for a given luma QP and PPS offset, via Table 8-15.
 pub fn chroma_qp(luma_qp: i32, offset: i32) -> i32 {
@@ -313,6 +313,7 @@ pub fn convert_chroma_block(
     qp_c: i32,
     out: &mut ChromaBlockLevels,
     intra: bool,
+    field_scan: bool,
 ) {
     let mut dequant = [0.0f32; 64];
     let mut spatial = [0.0f32; 64];
@@ -327,7 +328,7 @@ pub fn convert_chroma_block(
         &mut dequant,
     );
     idct8(&dequant, &mut spatial, &mut tmp);
-    spatial_to_chroma_levels(&spatial, qp_c, out, false);
+    spatial_to_chroma_levels(&spatial, qp_c, out, field_scan);
 }
 
 /// As [`convert_chroma_block`], but for a block predicted the way H.264 itself
@@ -345,6 +346,7 @@ pub fn convert_intra_chroma_block(
     qp_c: i32,
     prediction: &[i32; 4],
     out: &mut ChromaBlockLevels,
+    field_scan: bool,
 ) {
     let mut dequant = [0.0f32; 64];
     let mut spatial = [0.0f32; 64];
@@ -363,12 +365,32 @@ pub fn convert_intra_chroma_block(
         let blk = ((i / 8) / 4) * 2 + (i % 8) / 4;
         *sample += FLAT_PREDICTION_DC / 8.0 - prediction[blk] as f32;
     }
-    spatial_to_chroma_levels(&spatial, qp_c, out, false);
+    spatial_to_chroma_levels(&spatial, qp_c, out, field_scan);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Table 8-13, written as the column and row each entry names.
+    #[test]
+    fn field_scan_visits_the_positions_table_8_13_names() {
+        #[rustfmt::skip]
+        let coordinates: [(usize, usize); 16] = [
+            (0, 0), (0, 1), (1, 0), (0, 2),
+            (0, 3), (1, 1), (1, 2), (1, 3),
+            (2, 0), (2, 1), (2, 2), (2, 3),
+            (3, 0), (3, 1), (3, 2), (3, 3),
+        ];
+        let expected: Vec<usize> = coordinates.iter().map(|&(x, y)| y * 4 + x).collect();
+        assert_eq!(FIELD_SCAN_4X4.to_vec(), expected);
+
+        let mut seen = [false; 16];
+        for &p in &FIELD_SCAN_4X4 {
+            assert!(!seen[p], "position {p} is scanned twice");
+            seen[p] = true;
+        }
+    }
 
     #[test]
     fn chroma_qp_tracks_luma_until_thirty_then_flattens() {
@@ -399,7 +421,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = 8 * 60; // DC only, at intra_dc_precision 0 this is 60 per sample
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, false);
+        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, false, false);
         assert!(out.any_dc, "the flat level lands on the DC block");
         assert!(!out.any_ac, "a constant block has no AC content");
         assert_eq!(&out.dc[1..], &[0, 0, 0], "only the Hadamard DC is non-zero");
@@ -412,7 +434,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = (FLAT_PREDICTION_DC / 8.0) as i16;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, true);
+        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, true, false);
         assert!(
             out.is_empty(),
             "the residual against a flat prediction is zero"
@@ -424,7 +446,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[5] = 400;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 16, 0, 20, &mut out, false);
+        convert_chroma_block(&levels, &[16; 64], 16, 0, 20, &mut out, false, false);
         assert!(!out.is_empty(), "the fixture actually codes something");
         out.clear();
         assert!(out.is_empty());

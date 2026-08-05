@@ -1779,6 +1779,7 @@ fn write_picture(
                                 qp_c,
                                 prediction,
                                 &mut chroma_scratch[c],
+                                direct_field_pair,
                             ),
                             (Some(block), None) => convert_chroma_block(
                                 block,
@@ -1788,6 +1789,7 @@ fn write_picture(
                                 qp_c,
                                 &mut chroma_scratch[c],
                                 intra,
+                                direct_field_pair,
                             ),
                             (None, _) => chroma_scratch[c].clear(),
                         }
