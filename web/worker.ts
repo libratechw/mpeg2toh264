@@ -114,8 +114,8 @@ function flushPending(final = false) {
       hasReferences: initialized && !randomAccess,
     });
     const videoDuration =
-      (timeline.presentationIndices.length + (initialized ? 0 : 1)) *
-      timeline.sampleDuration;
+      timeline.presentationIndices.length * timeline.sampleDuration +
+      (initialized ? 0 : 1);
     const desiredAudioFrames = aacFrameCountThroughVideoTime(
       videoBaseDecodeTime + videoDuration,
       audioConfig.sampleRate,

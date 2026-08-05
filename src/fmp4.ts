@@ -587,7 +587,7 @@ export function h264ToFmp4(
 }
 
 export interface Fmp4FragmentOutput extends Fmp4Output {
-  /** Decode timeline consumed by content pictures; the zero-duration grey IDR is excluded. */
+  /** Decode timeline consumed by this fragment, including a one-tick grey IDR when present. */
   duration: number;
 }
 
@@ -620,14 +620,21 @@ export function h264GopToFmp4(
   if (samples.length !== expectedSamples) {
     throw new Error("H.264 GOP sample count does not match MPEG-2 timeline");
   }
-  const idrDuration = sps ? timeline.sampleDuration : 1;
+  // Keep the IDR as a fully compatible decoder reference, but expose it for
+  // only one 90 kHz tick so it cannot become a visible grey video frame.
+  const idrDuration = hasGreyIdr ? 1 : 0;
   const contentDurations = timeline.presentationIndices.map(
     () => timeline.sampleDuration,
   );
   const contentCompositions = timeline.presentationIndices.map(
     (presentationIndex, decodeIndex) => {
+      // MPEG-2 temporal_reference starts at 0, while the retained leading B
+      // pictures make the first emitted anchor land at index 1. Normalize each
+      // fragment locally so its first content presentation follows the IDR.
       const desired =
-        (presentationBase + presentationIndex) * timeline.sampleDuration;
+        baseDecodeTime +
+        idrDuration +
+        (presentationIndex - 1) * timeline.sampleDuration;
       const decoded =
         baseDecodeTime +
         (hasGreyIdr ? idrDuration : 0) +

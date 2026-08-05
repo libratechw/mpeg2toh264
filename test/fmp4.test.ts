@@ -83,6 +83,10 @@ describe("fragmented MP4 muxing", () => {
     expect(first.initSegment.length).toBeGreaterThan(0);
     expect(second.initSegment.length).toBe(0);
     expect(second.sampleCount).toBe(secondTimeline.presentationIndices.length);
+    expect(first.duration).toBe(
+      firstTimeline.presentationIndices.length * firstTimeline.sampleDuration +
+        1,
+    );
   });
 
   it("packages raw AAC-LC frames in an audio track without ADTS headers", () => {
