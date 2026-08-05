@@ -730,13 +730,15 @@ fn count_field_pair_vector(
 
 /// Prediction for one field of an MPEG-2 field-motion macroblock.
 fn prediction_for_field(
-    mb: &Macroblock,
+    mb: Option<&Macroblock>,
     field: usize,
     top_field_first: bool,
     layout: &RefLayout,
     intra: bool,
 ) -> Prediction {
-    if intra {
+    // Nothing to predict from, so the flat constant it is -- for a macroblock
+    // the source coded as intra, and for one it never coded at all.
+    let (Some(mb), false) = (mb, intra) else {
         return Prediction {
             mb_type: b_mb_type::L0_16X16,
             ref_idx_l0: layout.flat * 2,
@@ -744,7 +746,7 @@ fn prediction_for_field(
             mv_l0: [0, 0],
             mv_l1: [0, 0],
         };
-    }
+    };
     let has_backward = layout.bwd_l0 >= 0 && mb.flags & mb_flag::MOTION_BACKWARD != 0;
     let has_forward = mb.flags & mb_flag::MOTION_FORWARD != 0 || !has_backward;
     let field_motion = mb.motion_type == motion_type::FIELD;
@@ -1292,17 +1294,19 @@ struct FieldTargetSet {
 /// frame-DCT blocks into the field transform basis where needed.
 fn source_field_targets(
     pic: &Picture,
-    field_source: &Macroblock,
+    field_source: Option<&Macroblock>,
     raw: &mut [[f32; 64]; 4],
     converted: &mut [[f32; 64]; 4],
 ) -> FieldTargetSet {
     let mut active_mask = 0u32;
-    if field_source.skipped {
+    // A macroblock the source never coded carries nothing, which is the same
+    // as one it coded as skipped.
+    let Some(field_source) = field_source.filter(|mb| !mb.skipped) else {
         return FieldTargetSet {
             converted: false,
             active_mask,
         };
-    }
+    };
     let quantiser_scale =
         QUANTISER_SCALE[pic.coding.q_scale_type][field_source.quantiser_scale_code as usize];
     let source_intra = field_source.is_intra();
@@ -1367,19 +1371,19 @@ fn source_field_targets(
 /// converter needs to see it.
 fn field_chroma_source<'a>(
     pic: &'a Picture,
-    pair_source: &'a Macroblock,
+    pair_source: Option<&'a Macroblock>,
     component: usize,
 ) -> FieldChromaSource<'a> {
-    let source_intra = pair_source.is_intra();
+    let source_intra = pair_source.is_some_and(Macroblock::is_intra);
     FieldChromaSource {
-        levels: pair_source.block(4 + component),
+        levels: pair_source.and_then(|mb| mb.block(4 + component)),
         weight_scale: if source_intra {
             &pic.quant.chroma_intra
         } else {
             &pic.quant.chroma_non_intra
         },
         quantiser_scale: QUANTISER_SCALE[pic.coding.q_scale_type]
-            [pair_source.quantiser_scale_code as usize],
+            [pair_source.map_or(0, |mb| mb.quantiser_scale_code) as usize],
         intra_dc_precision: pic.coding.intra_dc_precision,
         intra: source_intra,
     }
@@ -1860,12 +1864,11 @@ fn write_picture(
         }
 
         if field_pair && !direct_field_pair {
-            let (Some(pair_top), Some(pair_bottom)) = (pair_top, pair_bottom) else {
-                bail!(
-                    "MBAFF macroblock pair at ({mb_x}, {}) is missing from the source",
-                    mb_y >> 1
-                );
-            };
+            // Either half of the pair may be missing, and at the head of a unit
+            // that starts part way through a picture -- which is what a seek
+            // hands the transcoder -- both often are. There is nothing to code
+            // them from, so they carry no coefficients and predict from the
+            // flat constant, the same concealment a field picture already uses.
             let pair_index = ((mb_y >> 1) * g.mb_width + mb_x) as isize;
             if cached_pair_address != pair_index {
                 cached_pair_address = pair_index;
@@ -1884,22 +1887,21 @@ fn write_picture(
                 }
                 // One H.264 field MB combines eight field lines from each of the
                 // two vertically adjacent MPEG-2 MBs. Use the finer source QP
-                // for both.
-                let top_qp = qp_for_scale(
-                    quant,
-                    &mut qp_by_scale,
-                    oversample,
-                    QUANTISER_SCALE[pic.coding.q_scale_type]
-                        [pair_top.quantiser_scale_code as usize],
-                );
-                let bottom_qp = qp_for_scale(
-                    quant,
-                    &mut qp_by_scale,
-                    oversample,
-                    QUANTISER_SCALE[pic.coding.q_scale_type]
-                        [pair_bottom.quantiser_scale_code as usize],
-                );
-                cached_pair_qp = top_qp.min(bottom_qp);
+                // for both, and where neither half is there, whatever the
+                // macroblock before was coded at -- nothing is being coded at
+                // it, and it saves a mb_qp_delta saying so.
+                let mut pair_qp: Option<i32> = None;
+                for half in [pair_top, pair_bottom].into_iter().flatten() {
+                    let half_qp = qp_for_scale(
+                        quant,
+                        &mut qp_by_scale,
+                        oversample,
+                        QUANTISER_SCALE[pic.coding.q_scale_type]
+                            [half.quantiser_scale_code as usize],
+                    );
+                    pair_qp = Some(pair_qp.map_or(half_qp, |current| current.min(half_qp)));
+                }
+                cached_pair_qp = pair_qp.unwrap_or(prev_qp);
                 let pair_qp_c = chroma_qp(cached_pair_qp, CHROMA_QP_OFFSET);
                 for c in 0..2 {
                     let upper_chroma = field_chroma_source(pic, pair_top, c);
@@ -2094,26 +2096,16 @@ fn write_picture(
             partitions = Some(built);
             field_modes = Some(modes);
         } else if field_pair && !direct_field_pair {
-            let (Some(pair_top), Some(pair_bottom)) = (pair_top, pair_bottom) else {
-                bail!("MBAFF macroblock pair is missing from the source");
-            };
             let field = mb_y & 1;
-            let field_preds = [
+            let field_preds = [pair_top, pair_bottom].map(|half| {
                 prediction_for_field(
-                    pair_top,
+                    half,
                     field,
                     pic.coding.top_field_first,
                     &ctx.layout,
-                    pair_top.is_intra(),
-                ),
-                prediction_for_field(
-                    pair_bottom,
-                    field,
-                    pic.coding.top_field_first,
-                    &ctx.layout,
-                    pair_bottom.is_intra(),
-                ),
-            ];
+                    half.is_some_and(Macroblock::is_intra),
+                )
+            });
             let mut built = [MotionPartition::default(); 2];
             for (part, slot) in built.iter_mut().enumerate() {
                 let field_pred = field_preds[part];
