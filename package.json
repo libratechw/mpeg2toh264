@@ -1,13 +1,16 @@
 {
-  "name": "mpeg2toh264-web",
+  "name": "mpeg2toh264-workspace",
   "version": "0.0.1",
-  "description": "Browser MSE player for the mpeg2toh264 transcoder",
+  "description": "Browser packages for the mpeg2toh264 transcoder",
   "type": "module",
   "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "web:dev": "vite web",
-    "web:build": "vite build web --outDir ../dist --emptyOutDir",
-    "typecheck": "tsc --noEmit -p web && tsc --noEmit -p web/tsconfig.worker.json"
+    "web:dev": "npm run dev --workspace @mpeg2toh264/demo",
+    "web:build": "npm run build --workspace @mpeg2toh264/demo",
+    "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",

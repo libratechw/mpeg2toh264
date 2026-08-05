@@ -14,8 +14,10 @@ crates/
   mpeg2toh264-wasm/   # Sessionのwasm-bindgenラッパー
 testdata/             # 合成MPEG-2テストストリーム
 tools/                # テーブル生成・解析スクリプト（Python）
-web/                  # ブラウザプレイヤー（src/がライブラリ、demo.tsが利用例）
-  src/yadif/          #   FFmpeg由来のyadifシェーダーだけLGPL-2.1-or-later
+packages/
+  player/             # ブラウザプレイヤー（MIT）
+  demo/               # プレイヤーのデモアプリ
+  yadif/              # FFmpeg由来のyadifシェーダー（LGPL-2.1-or-later）
 ```
 
 ## CLI
@@ -70,7 +72,7 @@ AAC-LC音声はスペクトルを再エンコードせず、通常のステレ�
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli
-./tools/build-wasm.sh            # web/wasm/ へ出力
+./tools/build-wasm.sh            # packages/player/wasm/ へ出力
 ```
 
 WASMビルドでは`.cargo/config.toml`により`nontrapping-fptoint`、`bulk-memory`、
@@ -103,10 +105,10 @@ cargo test --release
 
 ## ブラウザプレイヤー
 
-`web/src/`が、URLと`<video>`を渡すだけのライブラリです。ページ側に残るのはメディア要素だけで、取得・変換・（可能なら）MSEはすべてWorker内で完結します。
+`packages/player/`が、URLと`<video>`を渡すだけのライブラリです。ページ側に残るのはメディア要素だけで、取得・変換・（可能なら）MSEはすべてWorker内で完結します。
 
 ```ts
-import { Mpeg2TsPlayer } from './src/index.js';
+import { Mpeg2TsPlayer } from '@mpeg2toh264/player';
 
 const player = new Mpeg2TsPlayer(video);
 player.addEventListener('statechange', (e) => console.log(e.detail.state));
@@ -116,7 +118,7 @@ await player.load('https://example.com/video.ts');
 
 `load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`・`seekable`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
 
-オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds` / `deinterlace`。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`web/demo.ts`がそうしています）。ファイルはページの外へ出ません。
+オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds` / `deinterlace`。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`packages/demo/src/demo.ts`がそうしています）。ファイルはページの外へ出ません。
 
 ### デインタレース
 
@@ -156,7 +158,7 @@ Androidの実機など、**デコーダーが自前でデインタレースし�
 
 `decoderDeinterlaces()`（1回だけ実行して記憶）が、内蔵の検査用クリップを再生してピクセルを読み、**縦方向の交互パターンがどれだけ残っているか**を返します。想定より欠けていれば「この端末は自前でデインタレースしている」と判断します。既定のしきい値は50%で、`tolerance`で変えられます。
 
-- **検査用クリップ**は`web/src/probe-clip.ts`にdata URLで入っています。1440x1080インターレース（TFF）6フレーム、**3,636バイト**（base64で4.8 KB）。2つのフィールドが明暗まるごと反対で、しかも1フレームごとに入れ替わります。つまり「フレームが持ちうる最大の櫛」かつ「全画素が動いている」ので、どんな方式のデインタレーサーでも必ず何かをします。再生成用のffmpegコマンドはファイルの先頭に書いてあります。
+- **検査用クリップ**は`packages/player/src/probe-clip.ts`にdata URLで入っています。1440x1080インターレース（TFF）6フレーム、**3,636バイト**（base64で4.8 KB）。2つのフィールドが明暗まるごと反対で、しかも1フレームごとに入れ替わります。つまり「フレームが持ちうる最大の櫛」かつ「全画素が動いている」ので、どんな方式のデインタレーサーでも必ず何かをします。再生成用のffmpegコマンドはファイルの先頭に書いてあります。
 - **解像度が1440x1080なのは意図的**です。デコーダーは中身に応じて経路（HW/SW）を選ぶので、サムネイル大のクリップだと本番と違う経路に行きかねません。これだけ規則的な絵はエンコーダーにとって何でもないので、放送と同じ形のまま5 KBを切ります。
 - **読み出しはフィルターと同じ経路**（`<video>`からcanvasへ）です。端末がどこでデインタレースしていようと、これが見るのは「フィルターに渡される画素そのもの」なので、判定と実際にやるべきことが食い違いません。
 - 判定は`Mpeg2TsPlayer`の`deinterlace: 'auto'`が中でやります。失敗（デコードできない、canvasが汚染された、時間切れ）は全部`false`＝「フィルターをかける」に倒します。これまでと同じ動作になるほうが安全なので。
@@ -180,7 +182,7 @@ Androidの実機など、**デコーダーが自前でデインタレースし�
 
 8倍速で再生させて確かめたところ、`missed 58` / `dropped 173`（60 Hzのディスプレイに毎秒240枚提示させた場合）と、詰まっている場所がそのまま出ます。等速なら`30.0fps · 0.4ms/フレーム · missed 0`です。
 
-yadifそのもの（`web/src/yadif/shader.ts`）はFFmpegの`vf_yadif_cuda.cu`からの移植なので**LGPL-2.1-or-later**です。ディレクトリを分けてあるのはそのためで、混ぜないでください。WebGLの組み立て・テクスチャ・rVFCのループは`web/src/deinterlace.ts`で、こちらはMITです。
+yadifそのもの（`packages/yadif`）はFFmpegの`vf_yadif_cuda.cu`からの移植なので**LGPL-2.1-or-later**です。独立npmパッケージにしてライセンス境界を保っています。WebGLの組み立て・テクスチャ・rVFCのループは`packages/player/src/deinterlace.ts`で、こちらはMITです。
 
 ### シーク
 
@@ -202,7 +204,7 @@ yadifそのもの（`web/src/yadif/shader.ts`）はFFmpegの`vf_yadif_cuda.cu`�
 - **Worker（MSE in Workers）** — `MediaSource`をWorker内に作り、`handle`をtransferしてページが`video.srcObject`へ付けます。フラグメントがスレッドをまたがないので、ページ側は再生ヘッドを200 msごとに送り返すだけです。現状Chromium系のみ。
 - **メインスレッド** — フラグメントをtransferでページへ送り、ページの`MseSink`がappendします。FirefoxとSafariはこちらになります。
 
-バッファ管理は`web/src/mse.ts`の`MseSink`ひとつで、どちらの経路も同じコードを通ります。メディア要素に触る2箇所（再生ヘッドの読み書き）だけがコールバックです。溢れたときの破棄は、`Session`が24 GOPごとに置くIDRを境界に使います。
+バッファ管理は`packages/player/src/mse.ts`の`MseSink`ひとつで、どちらの経路も同じコードを通ります。メディア要素に触る2箇所（再生ヘッドの読み書き）だけがコールバックです。溢れたときの破棄は、`Session`が24 GOPごとに置くIDRを境界に使います。
 
 背圧はメッセージを持ちません。Workerの読み出しループが「sinkに置き場所ができるまで待ってから次のスライスを読む」ので、`ReadyGate`ひとつで表現できます。
 
@@ -216,9 +218,9 @@ npm run web:build        # dist/ へ出力
 npm run typecheck        # ページ側とWorker側の2プログラム
 ```
 
-`web/wasm/`はビルド生成物なのでgit管理外です。`build-wasm.sh`を通していないと`npm run typecheck`もvite buildもimportを解決できません。
+`packages/player/wasm/`はビルド生成物なのでgit管理外です。`build-wasm.sh`を通していないと`npm run typecheck`もvite buildもimportを解決できません。
 
-`web/src/mse.ts`は両方のプログラムに属します。ページ側は`lib.dom`のMSE宣言を使い、Worker側は`web/src/worker-mse.d.ts`を使います（`lib.webworker.d.ts`は`MediaSourceHandle`しか宣言していないため）。tsconfigの`include`を明示しているのはこの衝突を避けるためです。
+`packages/player/src/mse.ts`は両方のプログラムに属します。ページ側は`lib.dom`のMSE宣言を使い、Worker側は`packages/player/src/worker-mse.d.ts`を使います（`lib.webworker.d.ts`は`MediaSourceHandle`しか宣言していないため）。tsconfigの`include`を明示しているのはこの衝突を避けるためです。
 
 ## 残作業
 

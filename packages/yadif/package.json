@@ -1,0 +1,13 @@
+{
+  "name": "@mpeg2toh264/yadif",
+  "version": "0.0.1",
+  "description": "WebGL2 yadif shader derived from FFmpeg",
+  "type": "module",
+  "license": "LGPL-2.1-or-later",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

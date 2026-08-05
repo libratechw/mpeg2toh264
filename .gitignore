@@ -4,8 +4,8 @@ dist/
 # Cargo build output.
 target/
 
-# The WebAssembly package tools/build-wasm.sh generates for web/.
-web/wasm/
+# The WebAssembly package tools/build-wasm.sh generates for the player package.
+packages/player/wasm/
 
 # ITU-T specifications. Large third-party binaries, fetched separately from
 # itu.int. analysis/annexB.txt holds the extracted text that the VLC table

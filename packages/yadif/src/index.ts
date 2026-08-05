@@ -26,7 +26,7 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this file; if not, see <https://www.gnu.org/licenses/>.
  *
- * The rest of this player is MIT; only this file is derived from FFmpeg.
+ * The player package is MIT; this package is LGPL-2.1-or-later.
  */
 
 /**

@@ -8,7 +8,7 @@ import {
   supportsDeinterlace,
   supportsWorkerMediaSource,
   type PlayerState,
-} from "./src/index.js";
+} from "@mpeg2toh264/player";
 
 const video = document.querySelector<HTMLVideoElement>("#video")!;
 const urlForm = document.querySelector<HTMLFormElement>("#url-form")!;

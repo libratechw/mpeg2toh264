@@ -1,0 +1,16 @@
+{
+  "name": "@mpeg2toh264/player",
+  "version": "0.0.1",
+  "description": "Browser MSE player for the mpeg2toh264 transcoder",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json"
+  },
+  "dependencies": {
+    "@mpeg2toh264/yadif": "0.0.1"
+  }
+}

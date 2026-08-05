@@ -2,7 +2,7 @@
  * Play an MPEG-2 transport stream in a `<video>`.
  *
  * ```ts
- * import { Mpeg2TsPlayer } from './src/index.js';
+ * import { Mpeg2TsPlayer } from '@mpeg2toh264/player';
  *
  * const player = new Mpeg2TsPlayer(document.querySelector('video')!);
  * await player.load('https://example.com/video.ts');

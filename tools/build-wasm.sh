@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the WebAssembly package the browser sources import, into web/wasm.
+# Build the WebAssembly package the player imports, into packages/player/wasm.
 #
 # Needs the wasm32 target and a wasm-bindgen CLI matching the wasm-bindgen
 # crate version in Cargo.lock:
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-out="$root/web/wasm"
+out="$root/packages/player/wasm"
 
 # The generator and the crate have to agree, or the glue will not load.
 wanted="$(sed -n '/^name = "wasm-bindgen"$/,/^version/s/^version = "\(.*\)"/\1/p' "$root/Cargo.lock" | head -1)"

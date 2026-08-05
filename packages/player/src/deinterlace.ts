@@ -8,8 +8,8 @@
  * question, so this takes the frames the element presents and filters them in
  * WebGL, on a canvas laid over the element.
  *
- * The filter is yadif, which lives in yadif/shader.ts because it is derived
- * from FFmpeg and is licensed differently to the rest of this. Everything here
+ * The filter is supplied by the separate @mpeg2toh264/yadif package because it
+ * is derived from FFmpeg and licensed differently. Everything here
  * is the machinery around it: three frames' worth of textures, a program, and
  * `requestVideoFrameCallback` to say when a frame is worth uploading.
  *
@@ -19,7 +19,7 @@
  * audio. That is well inside what a viewer can tell, and the alternative is a
  * filter with half its motion measurements missing.
  */
-import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./yadif/shader.js";
+import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "@mpeg2toh264/yadif";
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
