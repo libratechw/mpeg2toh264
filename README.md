@@ -69,6 +69,19 @@ AAC-LC音声はスペクトルを再エンコードせず、通常のステレ�
 
 `crates/mpeg2toh264-wasm`は`Session`をそのまま包んだだけの層です。フラグメントはプレーンなJSオブジェクトで返るので`free()`は要らず、`data`は転送可能な`Uint8Array`です。
 
+ホストへRustや`wasm-bindgen`を入れずにデモを試す場合はDockerを使えます。WASM、player、yadif、デモを順にビルドし、nginxで配信します。
+
+```bash
+docker build -t mpeg2toh264-demo .
+docker run --rm -p 8080:80 mpeg2toh264-demo
+```
+
+ブラウザーで`http://localhost:8080`を開き、MPEG-2 TSファイルを選択してください。コンテナへ動画を渡す必要はなく、選択したファイルはブラウザー内で処理されます。
+
+`wasm-bindgen` CLIのバージョンは、Dockerビルド時に`Cargo.lock`から読み取ってcrateと一致させます。
+
+ローカル環境でWASMだけを生成する場合は次の手順を使います。
+
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli

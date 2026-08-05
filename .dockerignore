@@ -1,0 +1,8 @@
+.git
+.claude
+node_modules
+target
+dist
+packages/*/dist
+packages/player/wasm
+*.pdf
