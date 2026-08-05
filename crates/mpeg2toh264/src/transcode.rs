@@ -335,8 +335,18 @@ impl IncrementalTranscoder {
                 (prev_ref_frame_num + 1) % MAX_FRAME_NUM
             };
             let geo = picture_geometry(pic);
-            by_address.clear();
-            by_address.resize_with(geo.mb_width * geo.mb_height, || None);
+            // Emptying the slots one by one writes a discriminant each, where
+            // resizing from empty writes a whole macroblock -- five megabytes a
+            // picture, which the browser build pays for in memset.
+            let cells = geo.mb_width * geo.mb_height;
+            if by_address.len() == cells {
+                for slot in by_address.iter_mut() {
+                    *slot = None;
+                }
+            } else {
+                by_address.clear();
+                by_address.resize_with(cells, || None);
+            }
             for slice in &pic.slices {
                 decode_slice(&mut reader, pic, slice, geo.mb_width, &mut by_address)?;
             }

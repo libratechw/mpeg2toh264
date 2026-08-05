@@ -552,9 +552,10 @@ fn decode_macroblock(
     for i in 0..6 {
         let coded = intra || cbp & (1 << (5 - i)) != 0;
         if coded {
-            let mut block = [0i16; 64];
-            decode_block(r, pic, state, i, intra, &mut block)?;
-            mb.blocks[i] = block;
+            // Straight into the macroblock: a block built on the stack and
+            // assigned in is another hundred and twenty-eight bytes copied per
+            // coded block, which the browser build pays for in memcpy.
+            decode_block(r, pic, state, i, intra, &mut mb.blocks[i])?;
             mb.coded_blocks |= 1 << i;
         }
     }
