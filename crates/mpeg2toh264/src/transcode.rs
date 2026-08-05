@@ -63,6 +63,17 @@ const PPS_INIT_QP: i32 = 26;
 /// mapping and that error compounds along a chain of predicted pictures.
 const CHROMA_QP_OFFSET: i32 = -6;
 const MAX_FRAME_NUM: u32 = 1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4);
+/// Picture order counts advance by this much per source frame.
+///
+/// Four, not the two a pair of fields needs, because a random access point puts
+/// two pictures where the source had one: an IDR that may be a field pair and
+/// so takes counts 0 and 1, and the copy of it that carries the flat prediction
+/// at 2. Content has to start above all three, and stepping by four leaves each
+/// frame's own pair of counts adjacent.
+const POC_PER_FRAME: u32 = 4;
+/// The order count of the copy that follows the IDR, which displays between the
+/// IDR and the first content picture.
+const CLONE_POC: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TranscodeOptions {
@@ -89,7 +100,10 @@ pub struct Stats {
     pub single_axis_half_vectors: u64,
     /// Half sample on both axes, where luma is approximate as well.
     pub both_axis_half_vectors: u64,
-    /// Bidirectional macroblocks, where both prediction slots are already used.
+    /// Macroblocks with both prediction slots already spoken for, so H.264's
+    /// own sub-sample filter runs in place of MPEG-2's bilinear. Bidirectional
+    /// macroblocks are the usual case; the second field of a random access
+    /// point is the other, its list 1 carrying the flat prediction.
     pub bidirectional_vectors: u64,
     pub intra_macroblocks: u64,
     pub inter_macroblocks: u64,
@@ -119,8 +133,19 @@ struct RefLayout {
     /// those weights on -- its samples are never read.
     flat: i32,
     /// Set for I and P pictures, where both lists must reach the same picture
-    /// and list 1's default construction would swap its first two entries.
-    force_l1_short_term: bool,
+    /// and list 1's default construction would swap its first two entries. It
+    /// holds how far back in `frame_num` the newest short-term reference is.
+    l1_short_term_delta: Option<u32>,
+    /// Set on the second field of the picture that opens a random access point.
+    ///
+    /// That field is routinely a P field predicted from the first half of its
+    /// own pair, and that half is the only reference field in the buffer. One
+    /// picture cannot be named twice in one list, so the two roles are split
+    /// between the lists: list 0 holds the field at its ordinary weight for the
+    /// motion the source coded, list 1 holds it again carrying the flat weights
+    /// its intra macroblocks need. Both lists are one entry long, so every
+    /// index below is 0 whatever parity the source asked for.
+    anchor_second_field: bool,
 }
 
 /// The neighbour state a picture's coding reads back, kept between pictures.
@@ -180,6 +205,10 @@ pub struct IncrementalTranscoder {
     mbaff: bool,
     prev_ref_frame_num: u32,
     short_term_count: u32,
+    /// `frame_num` of the newest short-term reference, which is not the newest
+    /// reference outright: the copy behind an IDR is long-term and leaves the
+    /// IDR itself, one `frame_num` further back, as the newest short-term one.
+    newest_short_term: u32,
     gop_base: u32,
     seen_picture: bool,
     max_tr_in_gop: u32,
@@ -201,6 +230,7 @@ impl IncrementalTranscoder {
             mbaff: false,
             prev_ref_frame_num: 0,
             short_term_count: 0,
+            newest_short_term: 0,
             gop_base: 0,
             seen_picture: false,
             max_tr_in_gop: 0,
@@ -319,6 +349,11 @@ impl IncrementalTranscoder {
         } else {
             self.short_term_count
         };
+        let mut newest_short_term = if random_access {
+            0
+        } else {
+            self.newest_short_term
+        };
         // temporal_reference restarts at each group of pictures, so display
         // order is recovered by accumulating a base as the counter wraps.
         let mut gop_base = if random_access { 0 } else { self.gop_base };
@@ -380,13 +415,8 @@ impl IncrementalTranscoder {
                 continue;
             }
             // Nothing can be coded before the IDR that starts the decoded
-            // picture buffer, and only an I picture can become one -- an I
-            // picture sent as a frame, at that. The copy that starts the
-            // short-term chain behind an IDR is a frame, and a frame cannot
-            // follow a pair of fields and stand for them. A broadcast that
-            // sends some of its pictures as fields sends the rest as frames,
-            // so the wait is a group of pictures or two, not the whole stretch.
-            let real_idr = awaiting_idr && picture_type == PictureType::I && paired_pic.is_none();
+            // picture buffer, and only an I picture can become one.
+            let real_idr = awaiting_idr && picture_type == PictureType::I;
             if awaiting_idr && !real_idr {
                 pictures_skipped += 1;
                 continue;
@@ -398,6 +428,11 @@ impl IncrementalTranscoder {
             let is_reference =
                 real_idr || (!options.i_frames_only && picture_type != PictureType::B);
 
+            let frame_num = if real_idr {
+                0
+            } else {
+                (prev_ref_frame_num + 1) % MAX_FRAME_NUM
+            };
             let layout = if picture_type == PictureType::B {
                 // A B picture sits between its two references, so list 0
                 // defaults to [forward, backward, long-term] and list 1 to
@@ -409,7 +444,8 @@ impl IncrementalTranscoder {
                     bwd_l0: short_term_count as i32 - 1,
                     bwd_l1: 0,
                     flat: short_term_count as i32,
-                    force_l1_short_term: false,
+                    l1_short_term_delta: None,
+                    anchor_second_field: false,
                 }
             } else {
                 RefLayout {
@@ -421,14 +457,10 @@ impl IncrementalTranscoder {
                     // Long-term entries follow every short-term one in both
                     // default lists.
                     flat: short_term_count as i32,
-                    force_l1_short_term: short_term_count > 0,
+                    l1_short_term_delta: (short_term_count > 0)
+                        .then(|| (frame_num + MAX_FRAME_NUM - newest_short_term) % MAX_FRAME_NUM),
+                    anchor_second_field: false,
                 }
-            };
-
-            let frame_num = if real_idr {
-                0
-            } else {
-                (prev_ref_frame_num + 1) % MAX_FRAME_NUM
             };
             let geo = picture_geometry(pic);
             by_address.reset(geo.mb_width * geo.mb_height);
@@ -483,7 +515,11 @@ impl IncrementalTranscoder {
             let ctx = PictureContext {
                 frame_num,
                 // The IDR displays first, so it takes the lowest POC in the segment.
-                poc: if real_idr { 0 } else { 2 * (gop_base + tr) },
+                poc: if real_idr {
+                    0
+                } else {
+                    POC_PER_FRAME * (gop_base + tr)
+                },
                 is_reference,
                 layout,
                 options,
@@ -506,10 +542,10 @@ impl IncrementalTranscoder {
             )?);
 
             if real_idr {
-                // The IDR is held as the long-term flat-prediction picture, and
-                // nothing predicts from its samples, so I-only mode needs no
-                // short-term reference at all. Otherwise a skipped copy of it
-                // starts that chain.
+                // In I-only mode nothing predicts from anything but the
+                // flat-prediction picture, so the IDR needs no copy to hold and
+                // no short-term chain to start. Otherwise the copy follows and
+                // takes the long-term slot, leaving the IDR short-term.
                 if !options.i_frames_only {
                     if has_field_pairs {
                         parts.push(write_access_unit_delimiter());
@@ -517,10 +553,12 @@ impl IncrementalTranscoder {
                     parts.push(write_reference_clone(&g, mbaff));
                     prev_ref_frame_num = 1;
                     short_term_count = 1;
+                    newest_short_term = frame_num;
                 }
             } else if is_reference {
                 prev_ref_frame_num = frame_num;
                 short_term_count = (short_term_count + 1).min(3);
+                newest_short_term = frame_num;
             }
             pictures_converted += 1;
         }
@@ -538,6 +576,7 @@ impl IncrementalTranscoder {
         self.mbaff = mbaff;
         self.prev_ref_frame_num = prev_ref_frame_num;
         self.short_term_count = short_term_count;
+        self.newest_short_term = newest_short_term;
         self.gop_base = gop_base;
         self.seen_picture = seen_picture;
         self.max_tr_in_gop = max_tr_in_gop;
@@ -955,11 +994,22 @@ fn prediction_for_field_picture(
     second_reference_field: bool,
 ) -> Prediction {
     let (Some(mb), false) = (mb, intra) else {
+        // The index the slice header hung the flat weights on, which this has
+        // to name exactly or the macroblock predicts from a picture instead of
+        // from the constant its residual was taken against. On the second field
+        // of a random access point those weights are on list 1, since list 0
+        // has to keep the same field predictable.
+        if layout.anchor_second_field {
+            return Prediction {
+                mb_type: b_mb_type::L1_16X16,
+                ref_idx_l0: -1,
+                ref_idx_l1: 0,
+                mv_l0: [0, 0],
+                mv_l1: [0, 0],
+            };
+        }
         return Prediction {
             mb_type: b_mb_type::L0_16X16,
-            // The index the slice header hung the flat weights on, which this
-            // has to name exactly or the macroblock predicts from a picture
-            // instead of from the constant its residual was taken against.
             ref_idx_l0: layout.flat * 2 - i32::from(second_reference_field),
             ref_idx_l1: -1,
             mv_l0: [0, 0],
@@ -994,6 +1044,26 @@ fn prediction_for_field_picture(
             mb.mv[vector_base + direction * 2 + 1],
         )
     };
+
+    // The second field of a random access point has one reference field and a
+    // list 1 already spoken for by the flat prediction, so neither the dual
+    // prime average nor the bilinear pair below has anywhere to put its second
+    // prediction. H.264 interpolates the sub-sample position itself instead,
+    // which is the same trade a bidirectional macroblock already makes.
+    if layout.anchor_second_field {
+        stats.bidirectional_vectors += 1;
+        return Prediction {
+            mb_type: b_mb_type::L0_16X16,
+            // One entry, one index. The source may name a parity the pair does
+            // not hold, since MPEG-2 lets a P field reach back a frame further,
+            // but nothing before the random access point was coded, so there is
+            // nowhere else the prediction could have come from anyway.
+            ref_idx_l0: 0,
+            ref_idx_l1: -1,
+            mv_l0: native_position(mb.mv[vector_base], mb.mv[vector_base + 1]),
+            mv_l1: [0, 0],
+        };
+    }
 
     if mb.motion_type == motion_type::DUAL_PRIME {
         stats.bidirectional_vectors += 1;
@@ -1142,14 +1212,17 @@ fn field_picture_ref_index(
     frame_ref * 2 + i32::from(selected != current)
 }
 
-/// Copy the content IDR into a short-term reference without changing pixels.
+/// Copy the content IDR into the long-term reference without changing pixels.
 ///
-/// The IDR itself is kept as a long-term picture, purely to have a reference
-/// index whose weights can force the flat prediction that intra macroblocks
-/// need. That leaves nothing short-term for the pictures after it to predict
-/// from, so this all-skip P picture puts the same samples in the short-term
-/// chain. It carries the pair's display slot while the IDR is given a single
-/// tick, and the two hold identical samples, so the seam is invisible.
+/// Intra macroblocks need a reference index whose weights can force the flat
+/// prediction, and that index has to survive the sliding window for the rest of
+/// the stream, so some picture has to be long-term. It cannot be the IDR: a
+/// source field pair codes its IDR as a single field, and a long-term marking
+/// made by a field is one ffmpeg loses -- neither the `long_term_reference_flag`
+/// of clause 7.4.3.3 nor the command 3 it offers as the alternative reaches the
+/// other half of the pair. This all-skip P picture is always a frame, so it can
+/// say it plainly, and the IDR is left as an ordinary short-term reference for
+/// the content to predict from. Both hold the same samples either way.
 fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(64);
     write_slice_header(
@@ -1158,9 +1231,13 @@ fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
             slice_type: SliceType::P,
             frame_num: 1,
             log2_max_frame_num: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
-            pic_order_cnt_lsb: 1,
+            pic_order_cnt_lsb: CLONE_POC,
             log2_max_poc_lsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
             reference: true,
+            // The IDR is the only picture in the buffer, and a pair of coded
+            // fields sharing a `frame_num` is one frame to a frame picture, so
+            // index 0 finds it whichever way the source sent it.
+            long_term_current: Some(0),
             mbaff,
             slice_qp: PPS_INIT_QP,
             pps_init_qp: PPS_INIT_QP,
@@ -1169,7 +1246,7 @@ fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
             ..Default::default()
         },
     );
-    w.ue((g.mb_width * g.mb_height) as u32); // mb_skip_run: copy the long-term IDR
+    w.ue((g.mb_width * g.mb_height) as u32); // mb_skip_run: copy the IDR
     w.rbsp_trailing_bits();
     to_nal_unit(w.bytes(), 2, nal_type::SLICE_NON_IDR)
 }
@@ -1465,14 +1542,19 @@ fn write_picture(
             mbaff: ctx.mbaff && paired_field.is_none(),
         },
     });
-    let output_slice_type = if ctx.real_idr {
-        SliceType::I
-    } else if ctx.options.i_frames_only {
-        SliceType::P
-    } else {
-        SliceType::B
-    };
     let direct_field_pair = paired_field.is_some();
+    // What the second field of a random access point predicts from, which is
+    // the first half of its own pair and nothing else. See [`RefLayout`].
+    let anchor_layout = RefLayout {
+        count: 1,
+        fwd_l0: 0,
+        fwd_l1: 0,
+        bwd_l0: -1,
+        bwd_l1: -1,
+        flat: 0,
+        l1_short_term_delta: None,
+        anchor_second_field: true,
+    };
     let picture_field_pairs = direct_field_pair
         || (ctx.mbaff
             && !ctx.options.i_frames_only
@@ -1494,6 +1576,35 @@ fn write_picture(
         let field_size = position_count >> 1;
         let second_output_field = direct_field_pair && position >= field_size;
         let second_field_of_reference_pair = second_output_field && ctx.is_reference;
+        // Only one of a pair's two coded fields can carry IdrPicFlag: an IDR
+        // empties the decoded picture buffer, so a second one would throw out
+        // the field that came before it. Clause 3.30 says as much -- the second
+        // field of a complementary reference field pair is by definition not an
+        // IDR picture -- so the other field is an ordinary reference field, and
+        // the sliding window leaves the pair alone.
+        let idr_field = ctx.real_idr && !second_output_field;
+        // Nor is it coded like one. A frame sent as a pair of fields makes its
+        // second field a P field predicted from the first as a matter of
+        // course, and H.264 intra prediction has nothing to make those inter
+        // macroblocks from, so the second field goes through the same path
+        // every content picture does.
+        let anchor_second_field = ctx.real_idr && second_output_field;
+        if anchor_second_field {
+            intra_state = None;
+        }
+        let layout = if anchor_second_field {
+            &anchor_layout
+        } else {
+            &ctx.layout
+        };
+        let output_slice_type = if idr_field {
+            SliceType::I
+        } else if ctx.options.i_frames_only && !anchor_second_field {
+            SliceType::P
+        } else {
+            // A B slice is the only one with a list 1 to put the flat weights in.
+            SliceType::B
+        };
         let source_field = usize::from(second_output_field);
         let first_parity =
             usize::from(pic.coding.picture_structure == PictureStructure::BottomField);
@@ -1552,12 +1663,19 @@ fn write_picture(
                     slice_type: output_slice_type,
                     frame_num: ctx.frame_num,
                     log2_max_frame_num: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
-                    pic_order_cnt_lsb: ctx.poc + if direct_field_pair { field as u32 } else { 0 },
+                    // A field pair displays in the order it was coded, so the
+                    // second coded field takes the later slot whichever parity
+                    // it carries. A coded IDR field is also required to hold
+                    // order count 0, and the first coded field is the one that
+                    // is the IDR.
+                    pic_order_cnt_lsb: ctx.poc
+                        + if direct_field_pair {
+                            u32::from(second_output_field)
+                        } else {
+                            0
+                        },
                     log2_max_poc_lsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
-                    idr: ctx.real_idr,
-                    // The IDR is the flat-prediction reference for everything
-                    // that follows, so it has to survive the sliding window.
-                    long_term_reference: ctx.real_idr,
+                    idr: idr_field,
                     reference: ctx.is_reference,
                     mbaff: ctx.mbaff,
                     field_picture: direct_field_pair.then_some(field != 0),
@@ -1571,29 +1689,37 @@ fn write_picture(
                     // that frame into the buffer and pushed the oldest one out,
                     // so one whole frame has become a single field.
                     num_ref_idx_l0_active: Some(if direct_field_pair {
-                        ctx.layout.count * 2 - u32::from(second_field_of_reference_pair)
+                        layout.count * 2 - u32::from(second_field_of_reference_pair)
                     } else {
-                        ctx.layout.count
+                        layout.count
                     }),
                     num_ref_idx_l1_active: Some(if direct_field_pair {
-                        ctx.layout.count * 2 - u32::from(second_field_of_reference_pair)
+                        layout.count * 2 - u32::from(second_field_of_reference_pair)
                     } else {
-                        ctx.layout.count
+                        layout.count
                     }),
-                    l1_first_short_term_delta: (!direct_field_pair
-                        && ctx.layout.force_l1_short_term)
-                        .then_some(1),
-                    // Long-term fields follow every short-term one, and both
-                    // runs start with the parity of the field being coded, so
-                    // the anchor's own field leads them whichever parity that
-                    // is. One short-term field fewer stands in front of it in
-                    // the second field of a reference pair, for the reason
-                    // above.
-                    flat_pred_ref_idx: Some(if direct_field_pair {
-                        (ctx.layout.flat * 2) as u32 - u32::from(second_field_of_reference_pair)
+                    l1_first_short_term_delta: layout
+                        .l1_short_term_delta
+                        .filter(|_| !direct_field_pair),
+                    flat_pred_ref_idx: if anchor_second_field {
+                        // The one field this list holds is what the inter
+                        // macroblocks predict from, so list 0 keeps it at its
+                        // ordinary weight and only list 1 carries the constant.
+                        [None, Some(0)]
                     } else {
-                        ctx.layout.flat as u32
-                    }),
+                        // Long-term fields follow every short-term one, and
+                        // both runs start with the parity of the field being
+                        // coded, so the anchor's own field leads them whichever
+                        // parity that is. One short-term field fewer stands in
+                        // front of it in the second field of a reference pair,
+                        // for the reason above.
+                        let idx = if direct_field_pair {
+                            (layout.flat * 2) as u32 - u32::from(second_field_of_reference_pair)
+                        } else {
+                            layout.flat as u32
+                        };
+                        [Some(idx); 2]
+                    },
                     ..Default::default()
                 },
             );
@@ -1616,6 +1742,14 @@ fn write_picture(
             grid.get(field_row * g.mb_width + mb_x)
         } else {
             by_address.get(mb_y * g.mb_width + mb_x)
+        };
+        // The two halves of a pair are two coded pictures with headers of their
+        // own, and they need not agree: an I field and the P field beside it
+        // routinely differ in intra_dc_precision alone. Every macroblock has to
+        // be dequantised against the header of the field it came from.
+        let source_pic = match paired_field {
+            Some((mate, _)) if second_output_field => mate,
+            _ => pic,
         };
         let pair_top = if direct_field_pair {
             top_grid.get(field_row * g.mb_width + mb_x)
@@ -1671,18 +1805,18 @@ fn write_picture(
         if !field_pair || direct_field_pair {
             if let Some(source) = source {
                 if !source.skipped && (source.flags & mb_flag::PATTERN != 0 || intra) {
-                    let quantiser_scale = QUANTISER_SCALE[pic.coding.q_scale_type]
+                    let quantiser_scale = QUANTISER_SCALE[source_pic.coding.q_scale_type]
                         [source.quantiser_scale_code as usize];
                     qp = qp_for_scale(quant, &mut qp_by_scale, oversample, quantiser_scale);
                     let matrix = if intra {
-                        &pic.quant.intra
+                        &source_pic.quant.intra
                     } else {
-                        &pic.quant.non_intra
+                        &source_pic.quant.non_intra
                     };
                     let chroma_matrix = if intra {
-                        &pic.quant.chroma_intra
+                        &source_pic.quant.chroma_intra
                     } else {
-                        &pic.quant.chroma_non_intra
+                        &source_pic.quant.chroma_non_intra
                     };
 
                     for b in 0..4 {
@@ -1700,7 +1834,7 @@ fn write_picture(
                                 block,
                                 matrix,
                                 quantiser_scale,
-                                pic.coding.intra_dc_precision,
+                                source_pic.coding.intra_dc_precision,
                                 target,
                             );
                         } else {
@@ -1775,7 +1909,7 @@ fn write_picture(
                                 block,
                                 chroma_matrix,
                                 quantiser_scale,
-                                pic.coding.intra_dc_precision,
+                                source_pic.coding.intra_dc_precision,
                                 qp_c,
                                 prediction,
                                 &mut chroma_scratch[c],
@@ -1785,7 +1919,7 @@ fn write_picture(
                                 block,
                                 chroma_matrix,
                                 quantiser_scale,
-                                pic.coding.intra_dc_precision,
+                                source_pic.coding.intra_dc_precision,
                                 qp_c,
                                 &mut chroma_scratch[c],
                                 intra,
@@ -1864,6 +1998,9 @@ fn write_picture(
                 || (!direct_field_pair && mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1)
             {
                 writer.rbsp_trailing_bits();
+                // Only the IDR reaches here: the second field of a pair drops
+                // its `intra_state` and goes through the content path instead.
+                debug_assert!(idr_field, "H.264 intra prediction is for the IDR alone");
                 picture_nals.extend_from_slice(&to_nal_unit(
                     writer.bytes(),
                     3,
@@ -1964,7 +2101,7 @@ fn write_picture(
             stats.inter_macroblocks += 1;
         }
         if field_pair && !direct_field_pair {
-            count_field_pair_vector(source, intra, &ctx.layout, stats);
+            count_field_pair_vector(source, intra, layout, stats);
         }
         let pred = if direct_field_pair {
             prediction_for_field_picture(
@@ -1972,7 +2109,7 @@ fn write_picture(
                 mb_y & 1,
                 0,
                 intra,
-                &ctx.layout,
+                layout,
                 stats,
                 second_output_field && ctx.is_reference,
             )
@@ -1985,7 +2122,7 @@ fn write_picture(
                 mv_l1: [0, 0],
             }
         } else {
-            prediction_for(source, intra, &ctx.layout, stats)
+            prediction_for(source, intra, layout, stats)
         };
 
         let uses_l0 = pred.mb_type != b_mb_type::L1_16X16;
@@ -2057,7 +2194,7 @@ fn write_picture(
                     field,
                     part,
                     intra,
-                    &ctx.layout,
+                    layout,
                     stats,
                     second_output_field && ctx.is_reference,
                 );
@@ -2117,7 +2254,7 @@ fn write_picture(
                     half,
                     field,
                     pic.coding.top_field_first,
-                    &ctx.layout,
+                    layout,
                     half.is_some_and(Macroblock::is_intra),
                 )
             });
@@ -2216,11 +2353,11 @@ fn write_picture(
         } else {
             pred.mb_type
         };
-        let ref_count = ctx.layout.count as i32;
+        let ref_count = layout.count as i32;
         let mb = InterMacroblock {
             mb_x,
             mb_y: if field_pair { mb_y >> 1 } else { mb_y },
-            p_slice: ctx.options.i_frames_only,
+            p_slice: output_slice_type == SliceType::P,
             mb_type,
             ref_idx_l0: pred.ref_idx_l0,
             ref_idx_l1: pred.ref_idx_l1,
@@ -2247,7 +2384,13 @@ fn write_picture(
             partitions,
             num_ref_idx_l0_minus1: if field_pair {
                 if second_output_field && ctx.is_reference {
-                    5
+                    // One field fewer than the list a first field sees, the
+                    // same subtraction the slice header made. Anything above 1
+                    // codes the index the same way, so this only has to be
+                    // exact where the list is short enough to change it -- the
+                    // second field of a random access point, whose lists hold
+                    // one field each and so carry no index at all.
+                    ref_count * 2 - 2
                 } else {
                     ref_count * 2 - 1
                 }
@@ -2256,7 +2399,13 @@ fn write_picture(
             },
             num_ref_idx_l1_minus1: if field_pair {
                 if second_output_field && ctx.is_reference {
-                    5
+                    // One field fewer than the list a first field sees, the
+                    // same subtraction the slice header made. Anything above 1
+                    // codes the index the same way, so this only has to be
+                    // exact where the list is short enough to change it -- the
+                    // second field of a random access point, whose lists hold
+                    // one field each and so carry no index at all.
+                    ref_count * 2 - 2
                 } else {
                     ref_count * 2 - 1
                 }
@@ -2344,14 +2493,14 @@ fn write_picture(
             writer.rbsp_trailing_bits();
             picture_nals.extend_from_slice(&to_nal_unit(
                 writer.bytes(),
-                if ctx.real_idr {
+                if idr_field {
                     3
                 } else if ctx.is_reference {
                     2
                 } else {
                     0
                 },
-                if ctx.real_idr {
+                if idr_field {
                     nal_type::SLICE_IDR
                 } else {
                     nal_type::SLICE_NON_IDR

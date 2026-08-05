@@ -33,10 +33,11 @@ pub struct SliceHeaderConfig {
     /// True for an IDR picture, which changes which header fields appear.
     pub idr: bool,
     pub idr_pic_id: u32,
-    /// IDR only. Marks the picture as a long-term reference with
-    /// `LongTermFrameIdx` 0, which is how the flat-prediction reference is kept
-    /// in the decoded picture buffer for the rest of the stream.
-    pub long_term_reference: bool,
+    /// Non-IDR reference pictures only. Marks this picture as a long-term
+    /// reference with the given `LongTermFrameIdx`, which is how the
+    /// flat-prediction reference is kept in the decoded picture buffer for the
+    /// rest of the stream.
+    pub long_term_current: Option<u32>,
     /// Set when the source is interlaced, i.e. `frame_mbs_only_flag` is 0.
     pub mbaff: bool,
     /// `Some(false)` for a top field picture and `Some(true)` for a bottom
@@ -65,7 +66,14 @@ pub struct SliceHeaderConfig {
     /// which is exactly the case here, since the half-sample mapping wants the
     /// same picture reachable through both lists.
     pub l1_first_short_term_delta: Option<u32>,
-    /// The reference index intra macroblocks point at, in both lists.
+    /// The reference index intra macroblocks point at, given per list.
+    ///
+    /// It is normally the same index in both, since it names a picture nothing
+    /// else predicts from. The exception is the second field of a picture
+    /// opening a random access point: the one reference field it has is the
+    /// first half of its own pair, which its inter macroblocks really do
+    /// predict from, so the flat weights go on list 1 alone and list 0 keeps
+    /// the field at its ordinary weight.
     ///
     /// H.264 has no "no prediction" macroblock mode, so an MPEG-2 intra
     /// macroblock cannot be expressed directly: H.264 intra prediction would
@@ -82,7 +90,7 @@ pub struct SliceHeaderConfig {
     /// constant removed -- in the transform domain, a shift of the DC
     /// coefficient alone -- and no reference picture has to be manufactured to
     /// carry it.
-    pub flat_pred_ref_idx: Option<u32>,
+    pub flat_pred_ref_idx: [Option<u32>; 2],
 }
 
 impl Default for SliceHeaderConfig {
@@ -96,7 +104,7 @@ impl Default for SliceHeaderConfig {
             log2_max_poc_lsb: 16,
             idr: false,
             idr_pic_id: 0,
-            long_term_reference: false,
+            long_term_current: None,
             mbaff: false,
             field_picture: None,
             reference: false,
@@ -107,7 +115,7 @@ impl Default for SliceHeaderConfig {
             num_ref_idx_l1_active: None,
             l0_first_long_term: None,
             l1_first_short_term_delta: None,
-            flat_pred_ref_idx: None,
+            flat_pred_ref_idx: [None; 2],
         }
     }
 }
@@ -117,12 +125,12 @@ impl Default for SliceHeaderConfig {
 /// the denominators at 0 both single-list and bi-prediction reduce to the
 /// unweighted equations: in particular bi-prediction stays `(P0 + P1 + 1) >> 1`,
 /// which is what makes MPEG-2's half-sample filter reproducible bit for bit.
-fn write_pred_weight_table(w: &mut BitWriter, counts: &[u32], flat_pred_ref_idx: Option<u32>) {
+fn write_pred_weight_table(w: &mut BitWriter, counts: &[u32], flat_pred_ref_idx: &[Option<u32>]) {
     w.ue(0); // luma_log2_weight_denom
     w.ue(0); // chroma_log2_weight_denom
-    for &count in counts {
+    for (list, &count) in counts.iter().enumerate() {
         for i in 0..count {
-            let flat = Some(i) == flat_pred_ref_idx;
+            let flat = Some(i) == flat_pred_ref_idx[list];
             w.flag(flat); // luma_weight_lX_flag
             if flat {
                 w.se(0); // luma_weight_lX
@@ -209,19 +217,40 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
         } else {
             &[l0]
         };
-        write_pred_weight_table(w, counts, cfg.flat_pred_ref_idx);
+        write_pred_weight_table(w, counts, &cfg.flat_pred_ref_idx);
     }
 
     // dec_ref_pic_marking appears only for reference pictures.
     if cfg.reference {
         if cfg.idr {
             w.flag(false); // no_output_of_prior_pics_flag
-            w.flag(cfg.long_term_reference);
+                           // long_term_reference_flag. The picture the flat prediction hangs
+                           // on is the copy behind the IDR, not the IDR: a field pair codes
+                           // its IDR as one field, and ffmpeg loses a long-term marking made
+                           // by a field. The copy is always a frame and has no such trouble.
+            w.flag(false);
         } else {
-            w.flag(false); // adaptive_ref_pic_marking_mode_flag: sliding window
+            w.flag(cfg.long_term_current.is_some()); // adaptive_ref_pic_marking_mode_flag
+            if let Some(frame_idx) = cfg.long_term_current {
+                // 4: raise MaxLongTermFrameIdx to the index about to be used.
+                // The IDR left it at "no long-term frame indices", and clause
+                // 7.4.3.3 lets the command below name nothing above it.
+                w.ue(4); // memory_management_control_operation
+                w.ue(frame_idx + 1); // max_long_term_frame_idx_plus1
+                                     // 6: mark the current picture long-term. Step 3 of clause
+                                     // 8.2.5.1 then leaves it out of the short-term chain, which is
+                                     // what the sliding window would otherwise have put it in.
+                w.ue(6); // memory_management_control_operation
+                w.ue(frame_idx); // long_term_frame_idx
+                w.ue(0); // memory_management_control_operation: end of the list
+            }
         }
     } else {
         assert!(!cfg.idr, "an IDR picture must be a reference picture");
+        assert!(
+            cfg.long_term_current.is_none(),
+            "only a reference picture can be marked long-term"
+        );
     }
 
     // entropy_coding_mode_flag is 0, so no cabac_init_idc.
