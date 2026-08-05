@@ -116,6 +116,93 @@ const spatial = new Float64Array(64);
 const dequant = new Float64Array(64);
 const coeff4 = new Float64Array(16);
 
+function spatialToChromaLevels(
+  samples: Float64Array,
+  qpC: number,
+  out: ChromaBlockLevels,
+): void {
+  const acGain = CHROMA_AC_GAIN_4X4[qpC % 6]!;
+  const shift = 2 ** Math.floor(qpC / 6);
+  const dcGain = CHROMA_DC_GAIN[qpC % 6]! * shift;
+
+  const dcTarget = new Float64Array(4);
+  out.anyAc = false;
+  for (let b = 0; b < 4; b++) {
+    forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, coeff4);
+    dcTarget[b] = coeff4[0]!;
+    const acOut = out.ac[b]!;
+    for (let k = 1; k < 16; k++) {
+      const pos = ZIGZAG_4X4[k]!;
+      const gain = acGain[pos >> 2]![pos & 3]! * shift;
+      const level = Math.round(coeff4[pos]! / gain);
+      acOut[k - 1] = level;
+      if (level !== 0) out.anyAc = true;
+    }
+  }
+
+  const f0 = dcTarget[0]! / dcGain;
+  const f1 = dcTarget[1]! / dcGain;
+  const f2 = dcTarget[2]! / dcGain;
+  const f3 = dcTarget[3]! / dcGain;
+  out.dc[0] = Math.round((f0 + f1 + f2 + f3) / 4);
+  out.dc[1] = Math.round((f0 - f1 + f2 - f3) / 4);
+  out.dc[2] = Math.round((f0 + f1 - f2 - f3) / 4);
+  out.dc[3] = Math.round((f0 - f1 - f2 + f3) / 4);
+  out.anyDc =
+    out.dc[0] !== 0 || out.dc[1] !== 0 || out.dc[2] !== 0 || out.dc[3] !== 0;
+}
+
+function dequantInterChroma(
+  levels: Int16Array | null,
+  weightScale: readonly number[],
+  quantiserScale: number,
+  out: Float64Array,
+): void {
+  if (!levels) {
+    out.fill(0);
+    return;
+  }
+  for (let pos = 0; pos < 64; pos++) {
+    const level = levels[pos]!;
+    if (level === 0) out[pos] = 0;
+    else {
+      const sign = level < 0 ? -1 : 1;
+      out[pos] = Math.trunc(
+        ((2 * level + sign) * weightScale[pos]! * quantiserScale) / 32,
+      );
+    }
+  }
+}
+
+/** Combine two vertically adjacent MPEG-2 chroma residuals into one field MB. */
+export function convertInterFieldChromaBlocks(
+  upper: Int16Array | null,
+  lower: Int16Array | null,
+  weightScale: readonly number[],
+  upperQuantiserScale: number,
+  lowerQuantiserScale: number,
+  field: 0 | 1,
+  qpC: number,
+  out: ChromaBlockLevels,
+): void {
+  const upperCoeff = new Float64Array(64);
+  const lowerCoeff = new Float64Array(64);
+  const upperSpatial = new Float64Array(64);
+  const lowerSpatial = new Float64Array(64);
+  const fieldSpatial = new Float64Array(64);
+  dequantInterChroma(upper, weightScale, upperQuantiserScale, upperCoeff);
+  dequantInterChroma(lower, weightScale, lowerQuantiserScale, lowerCoeff);
+  idct8(upperCoeff, upperSpatial);
+  idct8(lowerCoeff, lowerSpatial);
+  for (let y = 0; y < 4; y++) {
+    for (let x = 0; x < 8; x++) {
+      fieldSpatial[y * 8 + x] = upperSpatial[(y * 2 + field) * 8 + x]!;
+      fieldSpatial[(y + 4) * 8 + x] = lowerSpatial[(y * 2 + field) * 8 + x]!;
+    }
+  }
+  spatialToChromaLevels(fieldSpatial, qpC, out);
+}
+
 /**
  * Convert one MPEG-2 intra chroma block into H.264 chroma levels.
  *
@@ -160,39 +247,7 @@ export function convertIntraChromaBlock(
 
   idct8(dequant, spatial);
 
-  const acGain = CHROMA_AC_GAIN_4X4[qpC % 6]!;
-  const shift = 2 ** Math.floor(qpC / 6);
-  const dcGain = CHROMA_DC_GAIN[qpC % 6]! * shift;
-
-  // Forward transform each quadrant; its DC feeds the 2x2 block, its AC is
-  // quantised in place.
-  const dcTarget = new Float64Array(4);
-  out.anyAc = false;
-  for (let b = 0; b < 4; b++) {
-    forward4x4(spatial, (b & 1) * 4, (b >> 1) * 4, coeff4);
-    dcTarget[b] = coeff4[0]!;
-    const acOut = out.ac[b]!;
-    for (let k = 1; k < 16; k++) {
-      const pos = ZIGZAG_4X4[k]!;
-      const gain = acGain[pos >> 2]![pos & 3]! * shift;
-      const level = Math.round(coeff4[pos]! / gain);
-      acOut[k - 1] = level;
-      if (level !== 0) out.anyAc = true;
-    }
-  }
-
-  // The decoder computes f = H * c * H then scales, so invert both: divide by
-  // the gain to get f, then apply H^-1 = H / 2 on each side.
-  const f0 = dcTarget[0]! / dcGain;
-  const f1 = dcTarget[1]! / dcGain;
-  const f2 = dcTarget[2]! / dcGain;
-  const f3 = dcTarget[3]! / dcGain;
-  out.dc[0] = Math.round((f0 + f1 + f2 + f3) / 4);
-  out.dc[1] = Math.round((f0 - f1 + f2 - f3) / 4);
-  out.dc[2] = Math.round((f0 + f1 - f2 - f3) / 4);
-  out.dc[3] = Math.round((f0 - f1 - f2 + f3) / 4);
-  out.anyDc =
-    out.dc[0] !== 0 || out.dc[1] !== 0 || out.dc[2] !== 0 || out.dc[3] !== 0;
+  spatialToChromaLevels(spatial, qpC, out);
 }
 
 /**

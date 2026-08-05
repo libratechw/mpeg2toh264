@@ -32,6 +32,7 @@ import { BitWriter, NalType, toNalUnit } from "./h264/bitwriter.ts";
 import {
   chromaQp,
   clearChromaBlockLevels,
+  convertInterFieldChromaBlocks,
   convertIntraChromaBlock,
   makeChromaBlockLevels,
   type ChromaBlockLevels,
@@ -572,17 +573,14 @@ function writePicture(
     const source = byAddress.get(mbY * g.mbWidth + mbX);
     const pairTop = byAddress.get((mbY & ~1) * g.mbWidth + mbX);
     const pairBottom = byAddress.get(((mbY & ~1) + 1) * g.mbWidth + mbX);
-    const hasNoChromaResidual = (mb: Macroblock | undefined) =>
-      !!mb &&
-      (mb.flags & MBFlag.INTRA) === 0 &&
-      mb.blocks[4] === null &&
-      mb.blocks[5] === null;
+    const isInter = (mb: Macroblock | undefined) =>
+      !!mb && (mb.flags & MBFlag.INTRA) === 0;
     const fieldPair =
       ctx.mbaff &&
       pairTop?.motionType === MotionType.FIELD &&
       pairBottom?.motionType === MotionType.FIELD &&
-      hasNoChromaResidual(pairTop) &&
-      hasNoChromaResidual(pairBottom);
+      isInter(pairTop) &&
+      isInter(pairBottom);
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
     const luma: (Int32Array | null)[] = [null, null, null, null];
@@ -720,7 +718,28 @@ function writePicture(
         const out = new Int32Array(64);
         if (toZigzag8x8(raster, out)) luma[b] = out;
       }
-      chroma = null;
+      for (let c = 0; c < 2; c++) {
+        clearChromaBlockLevels(chromaScratch[c]!);
+        convertInterFieldChromaBlocks(
+          pairTop!.blocks[4 + c] ?? null,
+          pairBottom!.blocks[4 + c] ?? null,
+          pic.quant.chromaNonIntra,
+          QUANTISER_SCALE[pic.coding.qScaleType]![pairTop!.quantiserScaleCode]!,
+          QUANTISER_SCALE[pic.coding.qScaleType]![
+            pairBottom!.quantiserScaleCode
+          ]!,
+          field,
+          chromaQp(qp, CHROMA_QP_OFFSET),
+          chromaScratch[c]!,
+        );
+      }
+      chroma =
+        chromaScratch[0]!.anyDc ||
+        chromaScratch[0]!.anyAc ||
+        chromaScratch[1]!.anyDc ||
+        chromaScratch[1]!.anyAc
+          ? chromaScratch
+          : null;
     }
 
     if (intra) ctx.stats.intraMacroblocks++;
