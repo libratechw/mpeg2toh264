@@ -9,7 +9,7 @@
  */
 import type { BitWriter } from "./bitwriter.ts";
 import { CBP_TO_CODE_NUM_INTER } from "./cavlc-tables.ts";
-import { writeResidualBlock } from "./cavlc.ts";
+import { writeResidualLevels } from "./cavlc.ts";
 import type { ChromaBlockLevels } from "./chroma.ts";
 import { ZIGZAG_8X8 } from "./params.ts";
 
@@ -36,17 +36,18 @@ export const BMbType = {
 
 export type PredictionMode = "L0" | "L1" | "BI";
 
+const B16X8_MB_TYPE: Record<PredictionMode, Record<PredictionMode, number>> = {
+  L0: { L0: 4, L1: 8, BI: 12 },
+  L1: { L0: 10, L1: 6, BI: 14 },
+  BI: { L0: 16, L1: 18, BI: 20 },
+};
+
 /** B-slice mb_type for two 16x8 partitions (Table 7-14). */
 export function b16x8MbType(
   top: PredictionMode,
   bottom: PredictionMode,
 ): number {
-  const types: Record<PredictionMode, Record<PredictionMode, number>> = {
-    L0: { L0: 4, L1: 8, BI: 12 },
-    L1: { L0: 10, L1: 6, BI: 14 },
-    BI: { L0: 16, L1: 18, BI: 20 },
-  };
-  return types[top][bottom];
+  return B16X8_MB_TYPE[top][bottom];
 }
 
 export interface MotionPartition {
@@ -203,29 +204,32 @@ export function writeGrayRefMacroblock(
 
   // mb_pred: reference indices for whichever lists this type uses, then their
   // vector differences. ref_idx is omitted when the list holds one picture.
-  const partitions: readonly MotionPartition[] = mb.partitions ?? [mb];
-  const usesL0 = partitions.map((p) => p.refIdxL0 >= 0);
-  const usesL1 = partitions.map((p) => !mb.pSlice && p.refIdxL1 >= 0);
-  for (let i = 0; i < partitions.length; i++) {
-    if (usesL0[i] && mb.numRefIdxL0Minus1 > 0) {
-      writeTe(w, partitions[i]!.refIdxL0, mb.numRefIdxL0Minus1);
+  const partitions = mb.partitions;
+  const partitionCount = partitions ? 2 : 1;
+  for (let i = 0; i < partitionCount; i++) {
+    const part = partitions ? partitions[i]! : mb;
+    if (part.refIdxL0 >= 0 && mb.numRefIdxL0Minus1 > 0) {
+      writeTe(w, part.refIdxL0, mb.numRefIdxL0Minus1);
     }
   }
-  for (let i = 0; i < partitions.length; i++) {
-    if (usesL1[i] && mb.numRefIdxL1Minus1 > 0) {
-      writeTe(w, partitions[i]!.refIdxL1, mb.numRefIdxL1Minus1);
+  for (let i = 0; i < partitionCount; i++) {
+    const part = partitions ? partitions[i]! : mb;
+    if (!mb.pSlice && part.refIdxL1 >= 0 && mb.numRefIdxL1Minus1 > 0) {
+      writeTe(w, part.refIdxL1, mb.numRefIdxL1Minus1);
     }
   }
-  for (let i = 0; i < partitions.length; i++) {
-    if (usesL0[i]) {
-      w.se(partitions[i]!.mvdL0x);
-      w.se(partitions[i]!.mvdL0y);
+  for (let i = 0; i < partitionCount; i++) {
+    const part = partitions ? partitions[i]! : mb;
+    if (part.refIdxL0 >= 0) {
+      w.se(part.mvdL0x);
+      w.se(part.mvdL0y);
     }
   }
-  for (let i = 0; i < partitions.length; i++) {
-    if (usesL1[i]) {
-      w.se(partitions[i]!.mvdL1x);
-      w.se(partitions[i]!.mvdL1y);
+  for (let i = 0; i < partitionCount; i++) {
+    const part = partitions ? partitions[i]! : mb;
+    if (!mb.pSlice && part.refIdxL1 >= 0) {
+      w.se(part.mvdL1x);
+      w.se(part.mvdL1y);
     }
   }
 
@@ -281,7 +285,7 @@ function writeChromaResidual(
   const maps = [counts.cb, counts.cr];
 
   for (let c = 0; c < 2; c++) {
-    writeResidualBlock(w, { levels: mb.chroma[c]!.dc, maxNumCoeff: 4, nC: -1 });
+    writeResidualLevels(w, mb.chroma[c]!.dc, 4, -1);
   }
 
   for (let c = 0; c < 2; c++) {
@@ -293,11 +297,12 @@ function writeChromaResidual(
         map.set(bx, by, 0);
         continue;
       }
-      const total = writeResidualBlock(w, {
-        levels: mb.chroma[c]!.ac[b]!,
-        maxNumCoeff: 15,
-        nC: map.nC(bx, by),
-      });
+      const total = writeResidualLevels(
+        w,
+        mb.chroma[c]!.ac[b]!,
+        15,
+        map.nC(bx, by),
+      );
       map.set(bx, by, total);
     }
   }
@@ -308,10 +313,11 @@ export function markNoChromaCoefficients(
   mbX: number,
   mbY: number,
 ): void {
-  for (const map of [counts.cb, counts.cr]) {
-    for (let b = 0; b < 4; b++) {
-      map.set(mbX * 2 + (b & 1), mbY * 2 + (b >> 1), 0);
-    }
+  for (let b = 0; b < 4; b++) {
+    const bx = mbX * 2 + (b & 1);
+    const by = mbY * 2 + (b >> 1);
+    counts.cb.set(bx, by, 0);
+    counts.cr.set(bx, by, 0);
   }
 }
 
@@ -325,9 +331,10 @@ export function markNoCoefficients(
   mbX: number,
   mbY: number,
 ): void {
-  for (let blk = 0; blk < 16; blk++) {
-    const [x, y] = LUMA_4X4_XY[blk]!;
-    counts.set(mbX * 4 + x, mbY * 4 + y, 0);
+  const bx = mbX * 4;
+  const by = mbY * 4;
+  for (let y = 0; y < 4; y++) {
+    for (let x = 0; x < 4; x++) counts.set(bx + x, by + y, 0);
   }
 }
 
@@ -346,13 +353,15 @@ export function wrapQpDelta(delta: number): number {
  * interleaved 4x4 blocks, where 4x4 block i4x4 carries the 8x8 scan positions
  * congruent to i4x4 modulo 4.
  */
+const lumaSubBlock = new Int32Array(16);
+
 function writeLumaResidual8x8(
   w: BitWriter,
   counts: CoeffCountMap,
   mb: GrayRefMacroblock,
   cbpLuma: number,
 ): void {
-  const sub = new Int32Array(16);
+  const sub = lumaSubBlock;
   for (let i8x8 = 0; i8x8 < 4; i8x8++) {
     const block = mb.luma[i8x8];
     for (let i4x4 = 0; i4x4 < 4; i4x4++) {
@@ -367,11 +376,7 @@ function writeLumaResidual8x8(
       }
 
       for (let i = 0; i < 16; i++) sub[i] = block[4 * i + i4x4]!;
-      const total = writeResidualBlock(w, {
-        levels: sub,
-        maxNumCoeff: 16,
-        nC: counts.nC(bx, by),
-      });
+      const total = writeResidualLevels(w, sub, 16, counts.nC(bx, by));
       counts.set(bx, by, total);
     }
   }

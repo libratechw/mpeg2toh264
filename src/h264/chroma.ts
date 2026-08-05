@@ -271,6 +271,59 @@ export function convertFieldChromaBlocks(
   spatialToChromaLevels(fieldSpatial, qpC, out, true);
 }
 
+/** Convert both field macroblocks while sharing the source dequantisation and IDCT. */
+export function convertFieldChromaPair(
+  upper: FieldChromaSource,
+  lower: FieldChromaSource,
+  qpC: number,
+  out: [ChromaBlockLevels, ChromaBlockLevels],
+  scratch = makeFieldChromaScratch(),
+): void {
+  const {
+    upperCoeff,
+    lowerCoeff,
+    upperSpatial,
+    lowerSpatial,
+    fieldSpatial,
+    idctTemp,
+  } = scratch;
+  if (upper.levels) {
+    dequantChroma(
+      upper.levels,
+      upper.weightScale,
+      upper.quantiserScale,
+      upper.intraDcPrecision,
+      upper.intra,
+      upperCoeff,
+    );
+    idct8(upperCoeff, upperSpatial, idctTemp);
+  } else {
+    upperSpatial.fill(0);
+  }
+  if (lower.levels) {
+    dequantChroma(
+      lower.levels,
+      lower.weightScale,
+      lower.quantiserScale,
+      lower.intraDcPrecision,
+      lower.intra,
+      lowerCoeff,
+    );
+    idct8(lowerCoeff, lowerSpatial, idctTemp);
+  } else {
+    lowerSpatial.fill(0);
+  }
+  for (let field = 0; field < 2; field++) {
+    for (let y = 0; y < 4; y++) {
+      for (let x = 0; x < 8; x++) {
+        fieldSpatial[y * 8 + x] = upperSpatial[(y * 2 + field) * 8 + x]!;
+        fieldSpatial[(y + 4) * 8 + x] = lowerSpatial[(y * 2 + field) * 8 + x]!;
+      }
+    }
+    spatialToChromaLevels(fieldSpatial, qpC, out[field as 0 | 1]!, true);
+  }
+}
+
 /**
  * Convert one MPEG-2 intra chroma block into H.264 chroma levels.
  *

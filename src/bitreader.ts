@@ -38,6 +38,24 @@ export class BitReader {
   /** Read `n` bits (n <= 32) MSB-first as an unsigned integer. */
   u(n: number): number {
     if (n === 0) return 0;
+    const bitOffset = this.pos & 7;
+    const bitsInByte = 8 - bitOffset;
+    if (n <= bitsInByte) {
+      const byte = this.data[this.pos >>> 3] ?? 0;
+      this.pos += n;
+      return (byte >>> (bitsInByte - n)) & ((1 << n) - 1);
+    }
+    if (n <= 32 - bitOffset) {
+      const byte = this.pos >>> 3;
+      const word =
+        (((this.data[byte] ?? 0) << 24) |
+          ((this.data[byte + 1] ?? 0) << 16) |
+          ((this.data[byte + 2] ?? 0) << 8) |
+          (this.data[byte + 3] ?? 0)) >>>
+        0;
+      this.pos += n;
+      return (word << bitOffset) >>> (32 - n);
+    }
     let v = 0;
     let left = n;
     let p = this.pos;
@@ -58,10 +76,27 @@ export class BitReader {
 
   /** Peek `n` bits without consuming them. */
   peek(n: number): number {
+    if (n === 0) return 0;
+    const bitOffset = this.pos & 7;
+    const bitsInByte = 8 - bitOffset;
+    if (n <= bitsInByte) {
+      const byte = this.data[this.pos >>> 3] ?? 0;
+      return (byte >>> (bitsInByte - n)) & ((1 << n) - 1);
+    }
+    if (n <= 32 - bitOffset) {
+      const byte = this.pos >>> 3;
+      const word =
+        (((this.data[byte] ?? 0) << 24) |
+          ((this.data[byte + 1] ?? 0) << 16) |
+          ((this.data[byte + 2] ?? 0) << 8) |
+          (this.data[byte + 3] ?? 0)) >>>
+        0;
+      return (word << bitOffset) >>> (32 - n);
+    }
     const save = this.pos;
-    const v = this.u(n);
+    const value = this.u(n);
     this.pos = save;
-    return v;
+    return value;
   }
 
   /** Read a single bit as a boolean. */

@@ -13,42 +13,57 @@ import {
   TOTAL_ZEROS_4X4,
   TOTAL_ZEROS_CHROMA_DC,
   coeffTokenTableIndex,
-  levelPrefixCode,
 } from "./cavlc-tables.ts";
 
-const codeValues = new Map<string, number>();
-
-function writeCode(w: BitWriter, code: string): void {
-  if (code.length <= 32) {
-    let value = codeValues.get(code);
-    if (value === undefined) {
-      value = parseInt(code, 2);
-      codeValues.set(code, value);
-    }
-    w.u(code.length, value);
-    return;
-  }
-  // Escape codewords can exceed the writer's 32-bit limit.
-  for (let i = 0; i < code.length; i += 24) {
-    const part = code.slice(i, i + 24);
-    w.u(part.length, parseInt(part, 2));
-  }
+interface VlcCode {
+  length: number;
+  value: number;
 }
 
-// Residual coding is synchronous, so one scan-position workspace can serve
-// every block without allocating a fresh JavaScript array for each call.
-const nonZeroPositions = new Int8Array(16);
+function vlc(code: string): VlcCode {
+  return { length: code.length, value: parseInt(code, 2) };
+}
+
+const COEFF_TOKEN_VLC = COEFF_TOKEN.map((table) => {
+  const out: (VlcCode | undefined)[] = new Array(4 * 17);
+  for (let trailingOnes = 0; trailingOnes <= 3; trailingOnes++) {
+    for (let totalCoeff = trailingOnes; totalCoeff <= 16; totalCoeff++) {
+      const code = table[`${trailingOnes},${totalCoeff}`];
+      if (code !== undefined) out[trailingOnes * 17 + totalCoeff] = vlc(code);
+    }
+  }
+  return out;
+});
+const TOTAL_ZEROS_4X4_VLC = TOTAL_ZEROS_4X4.map((table) =>
+  Object.fromEntries(
+    Object.entries(table).map(([key, code]) => [key, vlc(code)]),
+  ),
+);
+const TOTAL_ZEROS_CHROMA_DC_VLC = TOTAL_ZEROS_CHROMA_DC.map((table) =>
+  Object.fromEntries(
+    Object.entries(table).map(([key, code]) => [key, vlc(code)]),
+  ),
+);
+const RUN_BEFORE_VLC = RUN_BEFORE.map((table) =>
+  Object.fromEntries(
+    Object.entries(table).map(([key, code]) => [key, vlc(code)]),
+  ),
+);
+
+function writeCode(w: BitWriter, code: VlcCode): void {
+  w.u(code.length, code.value);
+}
 
 /** Which total_zeros table applies, given the block size being coded. */
 function totalZerosCode(
   totalCoeff: number,
   totalZeros: number,
   maxNumCoeff: number,
-): string {
+): VlcCode {
   const table =
     maxNumCoeff === 4
-      ? TOTAL_ZEROS_CHROMA_DC[totalCoeff - 1]
-      : TOTAL_ZEROS_4X4[totalCoeff - 1];
+      ? TOTAL_ZEROS_CHROMA_DC_VLC[totalCoeff - 1]
+      : TOTAL_ZEROS_4X4_VLC[totalCoeff - 1];
   const code = table?.[totalZeros];
   if (code === undefined) {
     throw new Error(
@@ -57,6 +72,10 @@ function totalZerosCode(
   }
   return code;
 }
+
+// Residual coding is synchronous, so one scan-position workspace can serve
+// every block without allocating a fresh JavaScript array for each call.
+const nonZeroPositions = new Int8Array(16);
 
 /**
  * Encode one level as level_prefix and level_suffix.
@@ -107,7 +126,7 @@ function writeLevel(
     suffix = levelCode - base;
   }
 
-  writeCode(w, levelPrefixCode(prefix));
+  w.u(prefix + 1, 1);
   if (suffixBits > 0) w.u(suffixBits, suffix);
 }
 
@@ -129,7 +148,16 @@ export interface ResidualBlock {
  */
 export function writeResidualBlock(w: BitWriter, block: ResidualBlock): number {
   const { levels, maxNumCoeff, nC } = block;
+  return writeResidualLevels(w, levels, maxNumCoeff, nC);
+}
 
+/** Allocation-free residual entry point for the macroblock writer hot path. */
+export function writeResidualLevels(
+  w: BitWriter,
+  levels: ResidualBlock["levels"],
+  maxNumCoeff: number,
+  nC: number,
+): number {
   // Positions of the non-zero levels, lowest frequency first.
   const positions = nonZeroPositions;
   let totalCoeff = 0;
@@ -144,8 +172,8 @@ export function writeResidualBlock(w: BitWriter, block: ResidualBlock): number {
     trailingOnes++;
   }
 
-  const table = COEFF_TOKEN[coeffTokenTableIndex(nC)];
-  const token = table?.[`${trailingOnes},${totalCoeff}`];
+  const table = COEFF_TOKEN_VLC[coeffTokenTableIndex(nC)];
+  const token = table?.[trailingOnes * 17 + totalCoeff];
   if (token === undefined) {
     throw new Error(
       `no coeff_token for trailingOnes=${trailingOnes} totalCoeff=${totalCoeff} nC=${nC}`,
@@ -189,7 +217,7 @@ export function writeResidualBlock(w: BitWriter, block: ResidualBlock): number {
       const lo = positions[totalCoeff - 2 - i]!;
       const runBefore = hi - lo - 1;
       const tableIdx = Math.min(zerosLeft, 7) - 1;
-      const code = RUN_BEFORE[tableIdx]?.[runBefore];
+      const code = RUN_BEFORE_VLC[tableIdx]?.[runBefore];
       if (code === undefined) {
         throw new Error(
           `no run_before code for run=${runBefore} zerosLeft=${zerosLeft}`,

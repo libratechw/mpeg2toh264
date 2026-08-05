@@ -62,9 +62,14 @@ export class BitWriter {
     if (value < 0) throw new Error(`ue(v) is unsigned, got ${value}`);
     // codeNum + 1 written as a 1 followed by (bits-1) zeros then the remainder.
     const v = value + 1;
-    let bits = 32 - Math.clz32(v);
-    this.u(bits - 1, 0);
-    this.u(bits, v);
+    const bits = 32 - Math.clz32(v);
+    if (bits <= 16) {
+      // The leading zeroes and v together are one 2*bits-1 bit codeword.
+      this.u(bits * 2 - 1, v);
+    } else {
+      this.u(bits - 1, 0);
+      this.u(bits, v);
+    }
   }
 
   /** se(v): signed Exp-Golomb (clause 9.1.1). */
@@ -99,23 +104,24 @@ export function toNalUnit(
   nalRefIdc: number,
   nalUnitType: number,
 ): Uint8Array {
-  const out: number[] = [
-    0x00,
-    0x00,
-    0x00,
-    0x01,
-    (nalRefIdc << 5) | nalUnitType,
-  ];
+  // At most one emulation-prevention byte can be inserted per three payload
+  // bytes. Reserve that upper bound and trim the view afterwards; this avoids
+  // growing and boxing a number[] for every picture.
+  const out = new Uint8Array(5 + rbsp.length + Math.ceil(rbsp.length / 3));
+  out[3] = 0x01;
+  out[4] = (nalRefIdc << 5) | nalUnitType;
+  let length = 5;
   let zeros = 0;
-  for (const b of rbsp) {
+  for (let i = 0; i < rbsp.length; i++) {
+    const b = rbsp[i]!;
     if (zeros >= 2 && b <= 0x03) {
-      out.push(0x03);
+      out[length++] = 0x03;
       zeros = 0;
     }
-    out.push(b);
+    out[length++] = b;
     zeros = b === 0x00 ? zeros + 1 : 0;
   }
-  return new Uint8Array(out);
+  return out.subarray(0, length);
 }
 
 /** NAL unit types used by this encoder (Table 7-1). */
