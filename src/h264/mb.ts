@@ -101,6 +101,8 @@ export interface GrayRefMacroblock {
   /** Macroblock position in the picture. */
   mbX: number;
   mbY: number;
+  /** P_L0_16x16 syntax instead of a B-slice macroblock type. */
+  pSlice: boolean;
   /** One of BMbType. */
   mbType: number;
   /** Reference indices; -1 marks a list this macroblock does not use. */
@@ -162,14 +164,18 @@ export function writeGrayRefMacroblock(
   chromaCounts: ChromaCounts,
   mb: GrayRefMacroblock,
 ): number {
-  w.ue(mb.mbType);
+  // P_L0_16x16 is mb_type 0 (Table 7-13). B slices use Table 7-14 below.
+  w.ue(mb.pSlice ? 0 : mb.mbType);
 
   // mb_pred: reference indices for whichever lists this type uses, then their
   // vector differences. ref_idx is omitted when the list holds one picture.
   const usesL0 =
-    mb.mbType === BMbType.L0_16X16 || mb.mbType === BMbType.BI_16X16;
+    mb.pSlice ||
+    mb.mbType === BMbType.L0_16X16 ||
+    mb.mbType === BMbType.BI_16X16;
   const usesL1 =
-    mb.mbType === BMbType.L1_16X16 || mb.mbType === BMbType.BI_16X16;
+    !mb.pSlice &&
+    (mb.mbType === BMbType.L1_16X16 || mb.mbType === BMbType.BI_16X16);
   if (usesL0 && mb.numRefIdxL0Minus1 > 0)
     writeTe(w, mb.refIdxL0, mb.numRefIdxL0Minus1);
   if (usesL1 && mb.numRefIdxL1Minus1 > 0)

@@ -183,6 +183,9 @@ export function transcode(
       log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
       ppsInitQp: PPS_INIT_QP,
       mbaff: false,
+      // I-only pictures are non-reference P slices, so this ordinary short-term
+      // IDR remains the sole DPB entry without long-term reference machinery.
+      longTermReference: !options.iFramesOnly,
     }),
   ];
 
@@ -252,7 +255,6 @@ export function transcode(
           bwdL1: -1,
           gray: 0,
           forceL1ShortTerm: false,
-          l0FirstLongTerm: 0,
         }
       : type === PictureType.B
         ? {
@@ -435,7 +437,10 @@ function writePicture(
 
   writeSliceHeader(w, {
     firstMbInSlice: 0,
-    sliceType: SliceType.B,
+    // I-only pictures need no bi-prediction. P slices are simpler and much
+    // more widely handled than a stream consisting solely of reference-less B
+    // pictures, while still predicting every source intra MB from grey.
+    sliceType: ctx.options.iFramesOnly ? SliceType.P : SliceType.B,
     frameNum: ctx.frameNum,
     log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
     picOrderCntLsb: ctx.poc,
@@ -576,6 +581,7 @@ function writePicture(
       const mb: GrayRefMacroblock = {
         mbX,
         mbY,
+        pSlice: ctx.options.iFramesOnly ?? false,
         mbType: pred.mbType,
         refIdxL0: pred.refIdxL0,
         refIdxL1: pred.refIdxL1,

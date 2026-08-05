@@ -39,6 +39,8 @@ export interface GrayFrameConfig {
   ppsInitQp: number;
   /** True when the SPS signals MBAFF, which adds mb_field_decoding_flag. */
   mbaff: boolean;
+  /** Keep grey as a long-term reference; unnecessary when all content is non-reference. */
+  longTermReference?: boolean;
 }
 
 export function writeGrayIdr(cfg: GrayFrameConfig): Uint8Array {
@@ -55,7 +57,7 @@ export function writeGrayIdr(cfg: GrayFrameConfig): Uint8Array {
     idrPicId: 0,
     reference: true,
     // This is the whole point: keep the frame in the DPB indefinitely.
-    longTermReference: true,
+    longTermReference: cfg.longTermReference ?? true,
     mbaff: cfg.mbaff,
     sliceQp: cfg.ppsInitQp,
     ppsInitQp: cfg.ppsInitQp,
