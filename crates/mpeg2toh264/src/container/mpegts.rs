@@ -10,7 +10,7 @@ const SYNC_BYTE: u8 = 0x47;
 const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
 
-/// The component tag carried by an ARIB stream_identifier_descriptor.
+/// The component tag carried by an ARIB stream identifier descriptor.
 fn component_tag(descriptors: &[u8]) -> Option<u8> {
     let mut at = 0;
     while at + 2 <= descriptors.len() {
@@ -27,14 +27,62 @@ fn component_tag(descriptors: &[u8]) -> Option<u8> {
     None
 }
 
-/// ARIB assigns 0x30..=0x37 to captions and 0x38..=0x3f to character
-/// superimpose. Their low three bits name the video component they accompany.
-fn private_stream_matches_video(private_tag: Option<u8>, video_tag: Option<u8>) -> bool {
-    match (private_tag, video_tag) {
-        (Some(private @ 0x30..=0x3f), Some(video @ 0x00..=0x0f)) => private & 0x07 == video & 0x07,
-        // Keep accepting streams without ARIB component metadata. This is
-        // common in remuxed files and was the demuxer's historical behaviour.
-        _ => true,
+fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
+    let caption = streams
+        .iter()
+        .find(|(_, tag)| matches!(tag, Some(0x30 | 0x87)))
+        .or_else(|| {
+            streams
+                .iter()
+                .find(|(_, tag)| matches!(tag, Some(0x30..=0x37 | 0x87)))
+        })
+        .map(|(pid, _)| *pid);
+    let superimpose = streams
+        .iter()
+        .find(|(_, tag)| matches!(tag, Some(0x38 | 0x88)))
+        .or_else(|| {
+            streams
+                .iter()
+                .find(|(_, tag)| matches!(tag, Some(0x38..=0x3f | 0x88)))
+        })
+        .map(|(pid, _)| *pid);
+
+    let mut selected = Vec::new();
+    selected.extend(caption);
+    selected.extend(superimpose);
+    selected
+}
+
+#[cfg(test)]
+mod private_stream_tests {
+    use super::select_private_streams;
+
+    #[test]
+    fn prefers_default_caption_and_superimpose_component_tags() {
+        let streams = vec![
+            (0x131, Some(0x31)),
+            (0x139, Some(0x39)),
+            (0x130, Some(0x30)),
+            (0x138, Some(0x38)),
+        ];
+        assert_eq!(select_private_streams(streams), [0x130, 0x138]);
+    }
+
+    #[test]
+    fn falls_back_to_the_first_component_of_each_kind() {
+        let streams = vec![
+            (0x132, Some(0x32)),
+            (0x131, Some(0x31)),
+            (0x13a, Some(0x3a)),
+            (0x139, Some(0x39)),
+        ];
+        assert_eq!(select_private_streams(streams), [0x132, 0x13a]);
+    }
+
+    #[test]
+    fn ignores_private_data_without_a_caption_or_superimpose_tag() {
+        let streams = vec![(0x120, None), (0x121, Some(0x40))];
+        assert!(select_private_streams(streams).is_empty());
     }
 }
 
@@ -326,7 +374,6 @@ impl ProgramMap {
             let end = section.len() - 4;
             let mut i = 12 + program_info_length;
             let mut video = None;
-            let mut video_tag = None;
             let mut audio = None;
             let mut private = Vec::new();
             let mut all_pids = Vec::new();
@@ -344,7 +391,6 @@ impl ProgramMap {
                 let tag = component_tag(&section[info_start..info_end]);
                 if video.is_none() && stream_type == STREAM_TYPE_MPEG2_VIDEO {
                     video = Some(stream_pid);
-                    video_tag = tag;
                 }
                 if audio.is_none() && stream_type == STREAM_TYPE_AAC_ADTS {
                     audio = Some(stream_pid);
@@ -354,12 +400,7 @@ impl ProgramMap {
                 }
                 i += 5 + info_length;
             }
-            let private: Vec<u16> = private
-                .into_iter()
-                .filter_map(|(pid, tag)| {
-                    private_stream_matches_video(tag, video_tag).then_some(pid)
-                })
-                .collect();
+            let private = select_private_streams(private);
             all_pids.sort_unstable();
             all_pids.dedup();
             let old = self

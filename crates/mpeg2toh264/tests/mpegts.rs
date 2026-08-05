@@ -223,18 +223,23 @@ fn waits_for_the_first_announced_services_pmt_before_emitting() {
 fn emits_private_stream_pes_from_the_selected_service() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{
-        mux_transport_stream, PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO,
-        STREAM_TYPE_PRIVATE_DATA,
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
+        STREAM_TYPE_MPEG2_VIDEO, STREAM_TYPE_PRIVATE_DATA,
     };
 
     let caption = vec![0x80; 300];
     let superimpose = vec![0x81; 40];
+    let caption_component = [0x52, 0x01, 0x30];
     let streams = &[
-        (0x100, STREAM_TYPE_MPEG2_VIDEO),
-        (0x110, STREAM_TYPE_AAC_ADTS),
-        (0x120, STREAM_TYPE_PRIVATE_DATA),
+        (0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (0x110, STREAM_TYPE_AAC_ADTS, &[][..]),
+        (
+            0x120,
+            STREAM_TYPE_PRIVATE_DATA,
+            caption_component.as_slice(),
+        ),
     ];
-    let ts = mux_transport_stream(
+    let ts = mux_transport_stream_with_descriptors(
         streams,
         &[
             PesUnit {
@@ -306,7 +311,7 @@ fn emits_private_stream_pes_from_the_selected_service() {
 }
 
 #[test]
-fn emits_only_private_streams_for_the_selected_video_component() {
+fn emits_only_the_default_caption_and_superimpose_streams() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{
         mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
@@ -324,18 +329,18 @@ fn emits_only_private_streams_for_the_selected_video_component() {
         (0x100, STREAM_TYPE_MPEG2_VIDEO, main_video.as_slice()),
         (0x101, STREAM_TYPE_MPEG2_VIDEO, secondary_video.as_slice()),
         (0x110, STREAM_TYPE_AAC_ADTS, &[][..]),
-        (0x130, STREAM_TYPE_PRIVATE_DATA, main_caption.as_slice()),
         (
             0x131,
             STREAM_TYPE_PRIVATE_DATA,
             secondary_caption.as_slice(),
         ),
-        (0x138, STREAM_TYPE_PRIVATE_DATA, main_superimpose.as_slice()),
+        (0x130, STREAM_TYPE_PRIVATE_DATA, main_caption.as_slice()),
         (
             0x139,
             STREAM_TYPE_PRIVATE_DATA,
             secondary_superimpose.as_slice(),
         ),
+        (0x138, STREAM_TYPE_PRIVATE_DATA, main_superimpose.as_slice()),
     ];
     let units = [
         PesUnit {
