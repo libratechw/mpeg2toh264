@@ -230,6 +230,7 @@ function play(
   deinterlaceStats.textContent = IDLE_DEINTERLACE;
   setDetails();
   setPlayhead();
+  syncPlayPause();
   // Failures already arrive as an error event, which is what writes the
   // message; the rejection here is the same one and needs no second report.
   void createPlayer()
@@ -295,16 +296,37 @@ function setVolume(level: number) {
   video.muted = false;
 }
 
+/**
+ * Say what pressing the button will do, and whether it can be pressed at all.
+ *
+ * Read from the element rather than set by whichever event last arrived. Media
+ * element events are queued rather than delivered on the spot, so tearing one
+ * load down and starting another -- which is what changing the service does --
+ * leaves the two loads' events interleaved: a stale `emptied` arriving after
+ * the new load's `loadeddata` would otherwise disable the button over a
+ * playing video, and a stale `pause` would have it offering to play what is
+ * already playing.
+ */
+function syncPlayPause() {
+  playPause.textContent = video.paused ? "再生" : "一時停止";
+  playPause.disabled = video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA;
+}
+
 playPause.addEventListener("click", togglePlay);
 back.addEventListener("click", () => skip(-SKIP_SECONDS));
 forward.addEventListener("click", () => skip(SKIP_SECONDS));
-video.addEventListener("play", () => (playPause.textContent = "一時停止"));
-video.addEventListener("pause", () => (playPause.textContent = "再生"));
-video.addEventListener("loadeddata", () => (playPause.disabled = false));
-video.addEventListener("emptied", () => {
-  playPause.disabled = true;
-  setPlayhead();
-});
+for (const name of [
+  "play",
+  "pause",
+  "loadstart",
+  "loadeddata",
+  "canplay",
+  "emptied",
+  "ended",
+]) {
+  video.addEventListener(name, syncPlayPause);
+}
+video.addEventListener("emptied", setPlayhead);
 video.addEventListener("timeupdate", setPlayhead);
 video.addEventListener("seeked", setPlayhead);
 video.addEventListener("durationchange", setPlayhead);
