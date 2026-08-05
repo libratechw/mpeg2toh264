@@ -19,7 +19,7 @@
  * audio. That is well inside what a viewer can tell, and the alternative is a
  * filter with half its motion measurements missing.
  */
-import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "@mpeg2toh264/yadif";
+import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
@@ -125,6 +125,12 @@ export interface DeinterlacerOptions {
   onStats?(stats: DeinterlaceStats): void;
 }
 
+/** Field information supplied by a player or another video source. */
+export interface Scan {
+  interlaced: boolean;
+  topFieldFirst: boolean;
+}
+
 /** Whether this browser has the two things the deinterlacer is built on. */
 export function supportsDeinterlace(): boolean {
   return (
@@ -180,6 +186,8 @@ export class Deinterlacer {
   #lastMediaTime = 0;
   #handle: number | null = null;
   #running = false;
+  #enabled = false;
+  #scan: Scan | null = null;
   #lost = false;
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
   /** Everything the next report is counted from. See DeinterlaceStats. */
@@ -243,6 +251,27 @@ export class Deinterlacer {
     return this.#running;
   }
 
+  /** Whether the caller wants filtering, independently of the current source. */
+  get enabled(): boolean {
+    return this.#enabled;
+  }
+
+  set enabled(enabled: boolean) {
+    this.#enabled = enabled;
+    this.#apply();
+  }
+
+  /** Update whether the source needs filtering and which field comes first. */
+  set scan(scan: Scan | null) {
+    this.#scan = scan;
+    if (scan) this.#topFieldFirst = scan.topFieldFirst;
+    this.#apply();
+  }
+
+  get scan(): Scan | null {
+    return this.#scan;
+  }
+
   /**
    * What to put on the screen for fullscreen: the `<div>` holding both the
    * element and the canvas once there is one, and the element itself before
@@ -273,6 +302,11 @@ export class Deinterlacer {
     // Turning it off leaves a second field on its way to a canvas that is
     // about to stop expecting one.
     if (!doubleRate) this.#cancelSecond();
+  }
+
+  #apply(): void {
+    if (this.#enabled && (this.#scan?.interlaced ?? true)) this.start();
+    else this.stop();
   }
 
   start(): void {

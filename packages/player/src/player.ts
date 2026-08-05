@@ -6,14 +6,7 @@
  * attaching the source to the element, moving the playhead, and telling the
  * worker where playback has got to.
  */
-import {
-  Deinterlacer,
-  supportsDeinterlace,
-  type DeinterlacerOptions,
-  type DeinterlaceStats,
-} from "./deinterlace.js";
 import { MseSink } from "./mse.js";
-import { decoderDeinterlaces } from "./probe.js";
 import {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_MAX_AHEAD_SECONDS,
@@ -47,6 +40,18 @@ const TIMED_EVENTS: TimingMark[] = [
   "waiting",
 ];
 
+/** A replaceable deinterlacer controlled by the player's scan notifications. */
+export interface PlayerDeinterlacer {
+  readonly running: boolean;
+  enabled: boolean;
+  scan: Scan | null;
+  destroy(): void;
+}
+
+export type PlayerDeinterlacerFactory = (
+  video: HTMLVideoElement,
+) => PlayerDeinterlacer;
+
 export interface Mpeg2TsPlayerOptions {
   /** Where the `.wasm` is. Defaults to the copy sitting beside the worker. */
   wasmUrl?: string | URL;
@@ -74,27 +79,18 @@ export interface Mpeg2TsPlayerOptions {
    * off the air is interlaced and stays that way through the conversion, so
    * without this the picture is combed wherever anything moved.
    *
-   * `'auto'` asks the machine first, and leaves the filter off where the
-   * frames come back deinterlaced already -- which they do on plenty of
-   * Android hardware. See `decoderDeinterlaces`. The asking takes a decode, so
-   * it is not instant, and the filter starts once it has an answer.
-   *
-   * The deinterlacer covers the element with a canvas of its own, which means
-   * covering the element's own controls; see `Deinterlacer`. Off by default
-   * for that reason. It can be turned on and off while playing.
+   * The implementation is supplied separately through `deinterlacer`, so yadif,
+   * bob, or another implementation can be selected without changing player.
    */
-  deinterlace?: boolean | "auto" | DeinterlacerOptions;
+  deinterlace?: boolean;
+  /** Construct the deinterlacer attached to this player's video element. */
+  deinterlacer?: PlayerDeinterlacerFactory;
 }
 
 export interface Mpeg2TsPlayerEventMap {
   statechange: CustomEvent<{ state: PlayerState }>;
   progress: CustomEvent<Progress>;
   stats: CustomEvent<Stats>;
-  /**
-   * How the deinterlacer is getting on, about once a second while frames are
-   * arriving. Only while it is on, and only on a browser that can run it.
-   */
-  deinterlace: CustomEvent<DeinterlaceStats>;
   /**
    * What the source said about its fields: whether the pictures are
    * interlaced, and which field came first. Arrives with the first fragment
@@ -193,7 +189,7 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** When the last mark was, so each one can say what it cost on its own. */
   #markedAt = 0;
   /** Built the first time deinterlacing is turned on, and kept after that. */
-  #deinterlacer: Deinterlacer | null = null;
+  #deinterlacer: PlayerDeinterlacer | null = null;
   /** Whether deinterlacing was asked for; whether it runs also needs `#scan`. */
   #wanted = false;
   #destroyed = false;
@@ -212,14 +208,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.video.addEventListener("seeking", this.#onSeeking);
     for (const name of TIMED_EVENTS)
       this.video.addEventListener(name, this.#onTimedEvent);
-    if (options.deinterlace === "auto") void this.#deinterlaceUnlessDone();
-    else if (options.deinterlace) this.deinterlace = true;
-  }
-
-  /** Turn the filter on, unless the machine has already done its work. */
-  async #deinterlaceUnlessDone(): Promise<void> {
-    if (await decoderDeinterlaces()) return;
-    if (!this.#destroyed) this.deinterlace = true;
+    if (options.deinterlace) this.deinterlace = true;
   }
 
   get state(): PlayerState {
@@ -268,7 +257,7 @@ export class Mpeg2TsPlayer extends EventTarget {
    * are its own -- the field order, and whether a picture goes up per field
    * or per frame. Null until `deinterlace` has been turned on.
    */
-  get deinterlacer(): Deinterlacer | null {
+  get deinterlacer(): PlayerDeinterlacer | null {
     return this.#deinterlacer;
   }
 
@@ -287,25 +276,15 @@ export class Mpeg2TsPlayer extends EventTarget {
    * the two.
    */
   #applyDeinterlace(): void {
-    const called = this.#scan?.interlaced ?? true;
-    if (!this.#wanted || !called) {
-      this.#deinterlacer?.stop();
-      return;
-    }
-    if (this.#destroyed || !supportsDeinterlace()) return;
-    const options =
-      typeof this.#options.deinterlace === "object"
-        ? this.#options.deinterlace
-        : {};
+    if (this.#destroyed) return;
     try {
-      this.#deinterlacer ??= new Deinterlacer(this.video, {
-        ...options,
-        onStats: (stats) => {
-          options.onStats?.(stats);
-          this.#emit("deinterlace", stats);
-        },
-      });
-      this.#deinterlacer.start();
+      if (this.#wanted && !this.#deinterlacer && this.#options.deinterlacer) {
+        this.#deinterlacer = this.#options.deinterlacer(this.video);
+      }
+      if (this.#deinterlacer) {
+        this.#deinterlacer.scan = this.#scan;
+        this.#deinterlacer.enabled = this.#wanted;
+      }
     } catch (error) {
       // Without it the element shows its own picture, which is worth saying
       // and is not worth failing a load over.
@@ -468,11 +447,6 @@ export class Mpeg2TsPlayer extends EventTarget {
         // The one setting the filter cannot guess at. Everything else about it
         // is a preference; this is a fact about the picture, and getting it
         // wrong moves every other line half a field the wrong way.
-        if (this.#deinterlacer)
-          this.#deinterlacer.topFieldFirst = notification.scan.topFieldFirst;
-        // And where the source turns out to have nothing to deinterlace, stop
-        // deinterlacing it, from this fragment rather than from some later
-        // point that would need deciding on.
         this.#applyDeinterlace();
         this.#emit("scan", notification.scan);
         break;

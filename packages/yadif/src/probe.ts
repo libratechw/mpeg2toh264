@@ -66,8 +66,7 @@ let asked: Promise<DecoderProbe> | null = null;
  *
  * Asked once and remembered: the answer is a property of the machine, and the
  * decode behind it is not worth repeating. A page should ask before turning
- * the deinterlacer on -- see `Mpeg2TsPlayer`'s `deinterlace: 'auto'`, which is
- * this and nothing more.
+ * the deinterlacer on. Applications can use this before enabling a filter.
  *
  * Anything that goes wrong comes back as `deinterlaces` false with the reason
  * in `error`, which is the safe way round: the picture then gets filtered,

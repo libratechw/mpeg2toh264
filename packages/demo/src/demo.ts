@@ -4,11 +4,14 @@
  */
 import {
   Mpeg2TsPlayer,
-  probeDecoder,
-  supportsDeinterlace,
   supportsWorkerMediaSource,
   type PlayerState,
 } from "@mpeg2toh264/player";
+import {
+  Deinterlacer,
+  probeDecoder,
+  supportsDeinterlace,
+} from "@mpeg2toh264/yadif";
 
 const video = document.querySelector<HTMLVideoElement>("#video")!;
 const urlForm = document.querySelector<HTMLFormElement>("#url-form")!;
@@ -73,6 +76,7 @@ function formatDuration(seconds: number): string {
 }
 
 let player: Mpeg2TsPlayer | null = null;
+let yadif: Deinterlacer | null = null;
 /** The blob URL for a picked file, revoked when the next source replaces it. */
 let fileUrl: string | null = null;
 let label = "";
@@ -102,11 +106,19 @@ function setDetails() {
  */
 function createPlayer(): Mpeg2TsPlayer {
   player?.destroy();
+  yadif = null;
   const mediaSource = placement.value as "auto" | "worker" | "main";
   const created = new Mpeg2TsPlayer(video, {
     mediaSource,
     serviceId: wantedService ?? undefined,
-    deinterlace: deinterlace.checked && { doubleRate: doubleRate.checked },
+    deinterlace: deinterlace.checked,
+    deinterlacer: (element) => {
+      yadif = new Deinterlacer(element, {
+        doubleRate: doubleRate.checked,
+        onStats: showDeinterlaceStats,
+      });
+      return yadif;
+    },
   });
   created.addEventListener("statechange", (event) => {
     const { state } = event.detail;
@@ -185,24 +197,23 @@ function createPlayer(): Mpeg2TsPlayer {
     if (audioFrames > 0) counts += ` · ${audioFrames} AAC frames`;
     setDetails();
   });
-  // The counts that are not `filtered` are the filter working on frames whose
-  // neighbours are not what it takes them for, which is what combing that
-  // comes and goes looks like from here.
-  created.addEventListener("deinterlace", (event) => {
-    const { filtered, missed, dropped, degraded, discontinuities } =
-      event.detail;
-    const { fps: presentedFps, frameMs } = event.detail;
-    deinterlaceStats.textContent =
-      `${presentedFps.toFixed(1)}fps · ${frameMs.toFixed(1)}ms/フレーム` +
-      ` · 適用 ${filtered} · 取りこぼし ${missed} · 端 ${degraded}` +
-      ` · 不連続 ${discontinuities} · デコーダー落ち ${dropped}`;
-  });
   created.addEventListener("error", (event) =>
     setStatus(event.detail.error.message, true),
   );
   player = created;
   syncControls();
   return created;
+}
+
+function showDeinterlaceStats(
+  stats: import("@mpeg2toh264/yadif").DeinterlaceStats,
+): void {
+  const { filtered, missed, dropped, degraded, discontinuities } = stats;
+  const { fps: presentedFps, frameMs } = stats;
+  deinterlaceStats.textContent =
+    `${presentedFps.toFixed(1)}fps · ${frameMs.toFixed(1)}ms/フレーム` +
+    ` · 適用 ${filtered} · 取りこぼし ${missed} · 端 ${degraded}` +
+    ` · 不連続 ${discontinuities} · デコーダー落ち ${dropped}`;
 }
 
 /** The service a viewer picked, which only a fresh load can act on. */
@@ -425,7 +436,7 @@ document.addEventListener("keydown", (event) => {
 function applyDeinterlace() {
   if (!player) return;
   player.deinterlace = deinterlace.checked;
-  if (player.deinterlacer) player.deinterlacer.doubleRate = doubleRate.checked;
+  if (yadif) yadif.doubleRate = doubleRate.checked;
   syncControls();
 }
 

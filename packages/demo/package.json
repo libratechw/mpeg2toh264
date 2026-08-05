@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@mpeg2toh264/player": "0.0.1"
+    "@mpeg2toh264/player": "0.0.1",
+    "@mpeg2toh264/yadif": "0.0.1"
   }
 }

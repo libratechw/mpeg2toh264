@@ -1,11 +1,4 @@
 {
   "extends": "../../tsconfig.base.json",
-  "include": [
-    "src/index.ts",
-    "src/player.ts",
-    "src/mse.ts",
-    "src/protocol.ts",
-    "src/deinterlace.ts",
-    "src/probe.ts"
-  ]
+  "include": ["src/index.ts", "src/player.ts", "src/mse.ts", "src/protocol.ts"]
 }
