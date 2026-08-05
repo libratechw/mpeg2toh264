@@ -130,6 +130,7 @@ export function transcode(
 
   const width = first.sequence.horizontalSize;
   const height = first.sequence.verticalSize;
+  const mbaff = !first.sequenceExt.progressiveSequence;
 
   // Interlaced coding is not handled. A field-DCT macroblock builds its 8x8
   // blocks from alternate lines and field motion predicts each field
@@ -151,7 +152,7 @@ export function transcode(
     );
   }
 
-  const g = frameGeometry(width, height, true);
+  const g = frameGeometry(width, height, !mbaff);
   const scaling = first.quant.nonIntra;
 
   const parts: Uint8Array[] = [
@@ -159,7 +160,7 @@ export function transcode(
       width,
       height,
       levelIdc: width * height > 720 * 576 ? 40 : 30,
-      frameMbsOnly: true,
+      frameMbsOnly: !mbaff,
       // The grey frame plus the two most recent I or P pictures, which are what
       // a B picture predicts from.
       maxNumRefFrames: 3,
@@ -182,7 +183,7 @@ export function transcode(
       log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
       log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
       ppsInitQp: PPS_INIT_QP,
-      mbaff: false,
+      mbaff,
       // I-only pictures are non-reference P slices, so this ordinary short-term
       // IDR remains the sole DPB entry without long-term reference machinery.
       longTermReference: !options.iFramesOnly,
@@ -287,6 +288,7 @@ export function transcode(
         isReference,
         layout,
         options,
+        mbaff,
         stats,
       }),
     );
@@ -314,6 +316,7 @@ interface PictureContext {
   isReference: boolean;
   layout: RefLayout;
   options: TranscodeOptions;
+  mbaff: boolean;
   stats: Stats;
 }
 
@@ -447,7 +450,7 @@ function writePicture(
     log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
     idr: false,
     reference: ctx.isReference,
-    mbaff: false,
+    mbaff: ctx.mbaff,
     sliceQp: PPS_INIT_QP,
     ppsInitQp: PPS_INIT_QP,
     disableDeblockingFilterIdc: 1,
@@ -473,148 +476,168 @@ function writePicture(
   ];
   let prevQp = PPS_INIT_QP;
 
-  for (let mbY = 0; mbY < g.mbHeight; mbY++) {
-    for (let mbX = 0; mbX < g.mbWidth; mbX++) {
-      const source = byAddress.get(mbY * g.mbWidth + mbX);
-      const intra =
-        !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
-      const luma: (Int32Array | null)[] = [null, null, null, null];
-      let chroma: [ChromaBlockLevels, ChromaBlockLevels] | null = null;
-      let qp = prevQp;
+  // MBAFF addresses macroblocks pair-by-pair: top then bottom at one X,
+  // followed by the next pair horizontally. Frame-only pictures use raster
+  // order. Coordinates remain spatial so coefficient and MV neighbour lookup
+  // does not otherwise change for frame-coded pairs.
+  const positions: [number, number][] = [];
+  if (ctx.mbaff) {
+    for (let pairY = 0; pairY < g.mbHeight; pairY += 2) {
+      for (let mbX = 0; mbX < g.mbWidth; mbX++) {
+        positions.push([mbX, pairY], [mbX, pairY + 1]);
+      }
+    }
+  } else {
+    for (let mbY = 0; mbY < g.mbHeight; mbY++) {
+      for (let mbX = 0; mbX < g.mbWidth; mbX++) positions.push([mbX, mbY]);
+    }
+  }
 
-      if (
-        source &&
-        !source.skipped &&
-        ((source.flags & MBFlag.PATTERN) !== 0 || intra)
-      ) {
-        const quantiserScale =
-          QUANTISER_SCALE[pic.coding.qScaleType]![source.quantiserScaleCode]!;
-        qp = quant.chooseQp(
-          quantiserScale,
-          ctx.options.oversample ?? DEFAULT_QUANTISER_OPTIONS.oversample,
-        );
-        const matrix = intra ? pic.quant.intra : pic.quant.nonIntra;
-        const chromaMatrix = intra
-          ? pic.quant.chromaIntra
-          : pic.quant.chromaNonIntra;
+  for (const [mbX, mbY] of positions) {
+    const source = byAddress.get(mbY * g.mbWidth + mbX);
+    const intra =
+      !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
+    const luma: (Int32Array | null)[] = [null, null, null, null];
+    let chroma: [ChromaBlockLevels, ChromaBlockLevels] | null = null;
+    let qp = prevQp;
 
-        for (let b = 0; b < 4; b++) {
-          const block = source.blocks[b];
-          const target = source.dctType === 1 ? fieldTargets[b]! : targets[b]!;
-          target.fill(0);
-          if (!block) continue;
-          if (intra) {
-            intraTargets(
-              block,
-              matrix,
-              quantiserScale,
-              pic.coding.intraDcPrecision,
-              target,
-            );
-          } else {
-            interTargets(block, matrix, quantiserScale, target);
-          }
-        }
-        if (source.dctType === 1) {
-          fieldDctToFrameTargets(
-            fieldTargets[0]!,
-            fieldTargets[2]!,
-            targets[0]!,
-            targets[2]!,
-          );
-          fieldDctToFrameTargets(
-            fieldTargets[1]!,
-            fieldTargets[3]!,
-            targets[1]!,
-            targets[3]!,
-          );
-        }
-        for (let b = 0; b < 4; b++) {
-          const target = targets[b]!;
-          for (let pos = 0; pos < 64; pos++) {
-            raster[pos] = quant.levelFor(target[pos]!, qp, pos);
-          }
-          const out = new Int32Array(64);
-          if (toZigzag8x8(raster, out)) luma[b] = out;
-        }
+    if (
+      source &&
+      !source.skipped &&
+      ((source.flags & MBFlag.PATTERN) !== 0 || intra)
+    ) {
+      const quantiserScale =
+        QUANTISER_SCALE[pic.coding.qScaleType]![source.quantiserScaleCode]!;
+      qp = quant.chooseQp(
+        quantiserScale,
+        ctx.options.oversample ?? DEFAULT_QUANTISER_OPTIONS.oversample,
+      );
+      const matrix = intra ? pic.quant.intra : pic.quant.nonIntra;
+      const chromaMatrix = intra
+        ? pic.quant.chromaIntra
+        : pic.quant.chromaNonIntra;
 
-        const qpC = chromaQp(qp, CHROMA_QP_OFFSET);
-        for (let c = 0; c < 2; c++) {
-          const block = source.blocks[4 + c];
-          if (!block) {
-            clearChromaBlockLevels(chromaScratch[c]!);
-            continue;
-          }
-          convertIntraChromaBlock(
+      for (let b = 0; b < 4; b++) {
+        const block = source.blocks[b];
+        const target = source.dctType === 1 ? fieldTargets[b]! : targets[b]!;
+        target.fill(0);
+        if (!block) continue;
+        if (intra) {
+          intraTargets(
             block,
-            chromaMatrix,
+            matrix,
             quantiserScale,
             pic.coding.intraDcPrecision,
-            qpC,
-            chromaScratch[c]!,
-            intra,
+            target,
           );
-        }
-        if (
-          chromaScratch[0]!.anyDc ||
-          chromaScratch[0]!.anyAc ||
-          chromaScratch[1]!.anyDc ||
-          chromaScratch[1]!.anyAc
-        ) {
-          chroma = chromaScratch;
+        } else {
+          interTargets(block, matrix, quantiserScale, target);
         }
       }
-
-      if (intra) ctx.stats.intraMacroblocks++;
-      else ctx.stats.interMacroblocks++;
-      const pred = predictionFor(source, intra, ctx.layout, ctx.stats);
-
-      const usesL0 = pred.mbType !== BMbType.L1_16X16;
-      const usesL1 = pred.mbType !== BMbType.L0_16X16;
-      const predL0 = usesL0
-        ? motion.predict(mbX, mbY, 0, pred.refIdxL0)
-        : ([0, 0] as [number, number]);
-      const predL1 = usesL1
-        ? motion.predict(mbX, mbY, 1, pred.refIdxL1)
-        : ([0, 0] as [number, number]);
-
-      const mb: GrayRefMacroblock = {
-        mbX,
-        mbY,
-        pSlice: ctx.options.iFramesOnly ?? false,
-        mbType: pred.mbType,
-        refIdxL0: pred.refIdxL0,
-        refIdxL1: pred.refIdxL1,
-        mvdL0x: usesL0 ? pred.mvL0[0] - predL0[0] : 0,
-        mvdL0y: usesL0 ? pred.mvL0[1] - predL0[1] : 0,
-        mvdL1x: usesL1 ? pred.mvL1[0] - predL1[0] : 0,
-        mvdL1y: usesL1 ? pred.mvL1[1] - predL1[1] : 0,
-        numRefIdxL0Minus1: ctx.layout.count - 1,
-        numRefIdxL1Minus1: ctx.layout.count - 1,
-        luma,
-        chroma,
-        qp,
-        prevQp,
-      };
-
-      motion.set(mbX, mbY, {
-        refIdxL0: usesL0 ? pred.refIdxL0 : -1,
-        refIdxL1: usesL1 ? pred.refIdxL1 : -1,
-        mvL0x: usesL0 ? pred.mvL0[0] : 0,
-        mvL0y: usesL0 ? pred.mvL0[1] : 0,
-        mvL1x: usesL1 ? pred.mvL1[0] : 0,
-        mvL1y: usesL1 ? pred.mvL1[1] : 0,
-      });
-
-      // Every macroblock is coded explicitly. A B_Skip would mean direct mode,
-      // whose derived vectors are not the ones the source used.
-      w.ue(0); // mb_skip_run
-      prevQp = writeGrayRefMacroblock(w, counts, chromaCounts, mb);
-      if (!luma[0] && !luma[1] && !luma[2] && !luma[3]) {
-        markNoCoefficients(counts, mbX, mbY);
+      if (source.dctType === 1) {
+        fieldDctToFrameTargets(
+          fieldTargets[0]!,
+          fieldTargets[2]!,
+          targets[0]!,
+          targets[2]!,
+        );
+        fieldDctToFrameTargets(
+          fieldTargets[1]!,
+          fieldTargets[3]!,
+          targets[1]!,
+          targets[3]!,
+        );
       }
-      if (!chroma) markNoChromaCoefficients(chromaCounts, mbX, mbY);
+      for (let b = 0; b < 4; b++) {
+        const target = targets[b]!;
+        for (let pos = 0; pos < 64; pos++) {
+          raster[pos] = quant.levelFor(target[pos]!, qp, pos);
+        }
+        const out = new Int32Array(64);
+        if (toZigzag8x8(raster, out)) luma[b] = out;
+      }
+
+      const qpC = chromaQp(qp, CHROMA_QP_OFFSET);
+      for (let c = 0; c < 2; c++) {
+        const block = source.blocks[4 + c];
+        if (!block) {
+          clearChromaBlockLevels(chromaScratch[c]!);
+          continue;
+        }
+        convertIntraChromaBlock(
+          block,
+          chromaMatrix,
+          quantiserScale,
+          pic.coding.intraDcPrecision,
+          qpC,
+          chromaScratch[c]!,
+          intra,
+        );
+      }
+      if (
+        chromaScratch[0]!.anyDc ||
+        chromaScratch[0]!.anyAc ||
+        chromaScratch[1]!.anyDc ||
+        chromaScratch[1]!.anyAc
+      ) {
+        chroma = chromaScratch;
+      }
     }
+
+    if (intra) ctx.stats.intraMacroblocks++;
+    else ctx.stats.interMacroblocks++;
+    const pred = predictionFor(source, intra, ctx.layout, ctx.stats);
+
+    const usesL0 = pred.mbType !== BMbType.L1_16X16;
+    const usesL1 = pred.mbType !== BMbType.L0_16X16;
+    const predL0 = usesL0
+      ? motion.predict(mbX, mbY, 0, pred.refIdxL0)
+      : ([0, 0] as [number, number]);
+    const predL1 = usesL1
+      ? motion.predict(mbX, mbY, 1, pred.refIdxL1)
+      : ([0, 0] as [number, number]);
+
+    const mb: GrayRefMacroblock = {
+      mbX,
+      mbY,
+      pSlice: ctx.options.iFramesOnly ?? false,
+      mbType: pred.mbType,
+      refIdxL0: pred.refIdxL0,
+      refIdxL1: pred.refIdxL1,
+      mvdL0x: usesL0 ? pred.mvL0[0] - predL0[0] : 0,
+      mvdL0y: usesL0 ? pred.mvL0[1] - predL0[1] : 0,
+      mvdL1x: usesL1 ? pred.mvL1[0] - predL1[0] : 0,
+      mvdL1y: usesL1 ? pred.mvL1[1] - predL1[1] : 0,
+      numRefIdxL0Minus1: ctx.layout.count - 1,
+      numRefIdxL1Minus1: ctx.layout.count - 1,
+      luma,
+      chroma,
+      qp,
+      prevQp,
+    };
+
+    motion.set(mbX, mbY, {
+      refIdxL0: usesL0 ? pred.refIdxL0 : -1,
+      refIdxL1: usesL1 ? pred.refIdxL1 : -1,
+      mvL0x: usesL0 ? pred.mvL0[0] : 0,
+      mvL0y: usesL0 ? pred.mvL0[1] : 0,
+      mvL1x: usesL1 ? pred.mvL1[0] : 0,
+      mvL1y: usesL1 ? pred.mvL1[1] : 0,
+    });
+
+    // Every macroblock is coded explicitly. A B_Skip would mean direct mode,
+    // whose derived vectors are not the ones the source used.
+    w.ue(0); // mb_skip_run
+    if (ctx.mbaff && mbY % 2 === 0) {
+      // In P/B slices mb_field_decoding_flag follows mb_skip_run, unlike the
+      // I-slice grey frame where it immediately precedes mb_type.
+      w.flag(0); // frame-coded pair for now
+    }
+    prevQp = writeGrayRefMacroblock(w, counts, chromaCounts, mb);
+    if (!luma[0] && !luma[1] && !luma[2] && !luma[3]) {
+      markNoCoefficients(counts, mbX, mbY);
+    }
+    if (!chroma) markNoChromaCoefficients(chromaCounts, mbX, mbY);
   }
 
   w.rbspTrailingBits();
