@@ -10,7 +10,6 @@ import {
 import { MBFlag, PictureType } from "../src/mpeg2/constants.ts";
 import { parseElementaryStream } from "../src/mpeg2/headers.ts";
 import { transcode } from "../src/transcode.ts";
-import { annexBNalUnits, frameMbsOnlyFlag } from "./h264-reader.ts";
 
 describe("interlaced frame-picture transcoding", () => {
   it("converts field-DCT and field-motion macroblocks in one slice per picture", () => {
@@ -38,24 +37,6 @@ describe("interlaced frame-picture transcoding", () => {
     );
     expect(nalTypes.filter((type) => type === 5)).toHaveLength(1);
   }, 15_000);
-
-  it("can code an interlaced source without macroblock-adaptive frame/field", () => {
-    // Apple's VideoToolbox will not create a decoder for frame_mbs_only_flag
-    // equal to 0 at all, whoever produced the stream, so a source that uses
-    // field coding has to be expressible as ordinary frames too.
-    const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));
-    resetDecodeStats();
-    const result = transcode(source, { progressive: true });
-    expect(decodeStats.dctTypeField).toBeGreaterThan(0);
-    expect(decodeStats.motionField).toBeGreaterThan(0);
-    expect(result.picturesConverted).toBeGreaterThan(0);
-
-    const spsOf = (bitstream: Uint8Array) =>
-      annexBNalUnits(bitstream).find((nal) => (nal[4]! & 0x1f) === 7)!;
-    expect(frameMbsOnlyFlag(spsOf(result.bitstream))).toBe(true);
-    // The same source without the option still asks for frame/field coding.
-    expect(frameMbsOnlyFlag(spsOf(transcode(source).bitstream))).toBe(false);
-  }, 20_000);
 
   it("can emit only source I pictures", () => {
     const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));

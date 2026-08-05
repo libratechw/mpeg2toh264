@@ -10,7 +10,47 @@ import {
   DEFAULT_INTRA_QUANT,
   DEFAULT_NON_INTRA_QUANT,
 } from "../src/mpeg2/constants.ts";
-import { Reader, rbspOf } from "./h264-reader.ts";
+
+/** Strip the Annex B start code, NAL header and emulation prevention bytes. */
+function rbspOf(nal: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  let zeros = 0;
+  for (let i = 5; i < nal.length; i++) {
+    const b = nal[i]!;
+    if (zeros >= 2 && b === 0x03) {
+      zeros = 0;
+      continue;
+    }
+    out.push(b);
+    zeros = b === 0x00 ? zeros + 1 : 0;
+  }
+  return new Uint8Array(out);
+}
+
+/** Minimal RBSP reader, written against the spec rather than reusing the writer. */
+class Reader {
+  private pos = 0;
+  constructor(private readonly d: Uint8Array) {}
+  u1(): number {
+    const b = (this.d[this.pos >> 3]! >> (7 - (this.pos & 7))) & 1;
+    this.pos++;
+    return b;
+  }
+  u(n: number): number {
+    let v = 0;
+    for (let i = 0; i < n; i++) v = (v << 1) | this.u1();
+    return v;
+  }
+  ue(): number {
+    let zeros = 0;
+    while (this.u1() === 0) zeros++;
+    return (1 << zeros) - 1 + (zeros === 0 ? 0 : this.u(zeros));
+  }
+  se(): number {
+    const k = this.ue();
+    return k % 2 === 1 ? (k + 1) / 2 : -(k / 2);
+  }
+}
 
 /** Reconstruct a scaling list exactly as clause 7.3.2.1.1.1 specifies. */
 function readScalingList(r: Reader, size: 16 | 64 = 64): number[] {

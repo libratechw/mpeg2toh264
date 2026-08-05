@@ -3,7 +3,6 @@ const QUEUE_HIGH_WATER = 32 * 1024 * 1024;
 const KEEP_BEHIND_SECONDS = 10;
 
 const input = document.querySelector<HTMLInputElement>("#file")!;
-const progressive = document.querySelector<HTMLInputElement>("#progressive")!;
 const video = document.querySelector<HTMLVideoElement>("#video")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const details = document.querySelector<HTMLElement>("#details")!;
@@ -224,5 +223,5 @@ input.addEventListener("change", () => {
     } else if (message.type === "error") setStatus(message.message, true);
   };
   setStatus("ストリーミング変換を開始します…");
-  worker.postMessage({ type: "start", progressive: progressive.checked });
+  worker.postMessage({ type: "start" });
 });
