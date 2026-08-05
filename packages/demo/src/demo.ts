@@ -418,11 +418,18 @@ function toggleFullscreen() {
   else void stage.requestFullscreen().catch(() => {});
 }
 
-fullscreen.addEventListener("click", toggleFullscreen);
+fullscreen.addEventListener("click", (event) => {
+  toggleFullscreen();
+  // Pointer clicks leave focus on the button and would keep the fullscreen
+  // controls visible through :focus-within. Keyboard activation keeps focus
+  // so the controls remain operable without a pointer.
+  if (event.detail > 0) fullscreen.blur();
+});
 document.addEventListener("fullscreenchange", () => {
   fullscreen.textContent = document.fullscreenElement
     ? "全画面を解除"
     : "全画面";
+  syncControls();
 });
 
 // The page's keys, not a control's: a focused button already takes the space
@@ -488,7 +495,8 @@ function applyDeinterlace() {
  * cannot run it keeps them, which is the fallback that matters.
  */
 function syncControls() {
-  video.controls = !(player?.deinterlace ?? false);
+  video.controls =
+    document.fullscreenElement !== stage && !(player?.deinterlace ?? false);
 }
 /**
  * Put the service picker away and stop asking for what was picked.

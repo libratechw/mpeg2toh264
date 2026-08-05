@@ -39,21 +39,37 @@
       #url {
         flex: 1 1 30em;
       }
-      /* On the screen, the controls keep their row at the bottom and the
-         picture takes everything they leave. The first child is the element
-         itself, or the <div> the deinterlacer puts around it and its canvas. */
       #stage:fullscreen {
-        display: flex;
-        flex-direction: column;
+        position: relative;
+        background: black;
       }
       #stage:fullscreen > #picture {
-        flex: 1 1 auto;
-        min-height: 0;
         width: 100%;
+        height: 100%;
       }
       #stage:fullscreen #video {
         width: 100%;
         height: 100%;
+      }
+      #stage:fullscreen #playback {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        padding: 2em 1em 1em;
+        color: white;
+        background: linear-gradient(transparent, rgb(0 0 0 / 80%));
+        opacity: 0;
+        transition: opacity 150ms ease;
+      }
+      #stage:fullscreen #playback:hover,
+      #stage:fullscreen #playback:focus-within {
+        opacity: 1;
+      }
+      @media (hover: none) {
+        #stage:fullscreen #playback {
+          opacity: 1;
+        }
       }
     </style>
   </head>
