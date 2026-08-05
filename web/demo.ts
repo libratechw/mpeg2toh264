@@ -4,6 +4,7 @@
  */
 import {
   Mpeg2TsPlayer,
+  probeDecoder,
   supportsDeinterlace,
   supportsWorkerMediaSource,
   type PlayerState,
@@ -32,6 +33,7 @@ const details = document.querySelector<HTMLElement>("#details")!;
 const fps = document.querySelector<HTMLElement>("#fps")!;
 const deinterlaceStats =
   document.querySelector<HTMLElement>("#deinterlace-stats")!;
+const probe = document.querySelector<HTMLElement>("#probe")!;
 
 /** How many steps the seek bar divides the video into. */
 const SEEK_STEPS = 1000;
@@ -384,12 +386,38 @@ fileInput.addEventListener("change", () => {
   play(url, selected.name, url);
 });
 
-if (!supportsDeinterlace()) {
+function disableDeinterlace(reason: string) {
   deinterlace.checked = false;
   deinterlace.disabled = true;
   doubleRate.checked = false;
   doubleRate.disabled = true;
-  deinterlace.labels?.[0]?.append("（このブラウザーでは使えません）");
+  deinterlace.labels?.[0]?.append(reason);
+  if (player) applyDeinterlace();
+}
+
+if (!supportsDeinterlace()) {
+  probe.textContent = "判定せず（このブラウザーではデインタレースできません）";
+  disableDeinterlace("（このブラウザーでは使えません）");
+} else {
+  // Ask the machine before offering to do what it may already be doing. Some
+  // hardware decoders -- Android's especially -- hand back frames that have
+  // been deinterlaced for us, and filtering those again only softens them.
+  // The measurement goes on the page whichever way it comes out: it is the
+  // only sign of what was decided, and on a device nobody can attach a
+  // debugger to it is the only way to see why.
+  void probeDecoder().then(({ deinterlaces, survives, tookMs, error }) => {
+    const left =
+      survives === null ? "測定不能" : `残存率 ${survives.toFixed(2)}`;
+    const detail = `（${left} · ${tookMs.toFixed(0)}ms）`;
+    if (error) {
+      probe.textContent = `判定できず: ${error}${detail} — yadifは有効のまま`;
+    } else if (deinterlaces) {
+      probe.textContent = `デコーダーが自動でデインタレース${detail} — yadifは無効`;
+      disableDeinterlace("（デコーダーが自動でデインタレースします）");
+    } else {
+      probe.textContent = `自動デインタレースなし${detail} — yadifを使います`;
+    }
+  });
 }
 
 if (!supportsWorkerMediaSource()) {

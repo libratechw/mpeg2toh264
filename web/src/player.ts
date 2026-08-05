@@ -13,6 +13,7 @@ import {
   type DeinterlaceStats,
 } from "./deinterlace.js";
 import { MseSink } from "./mse.js";
+import { decoderDeinterlaces } from "./probe.js";
 import {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
@@ -62,11 +63,16 @@ export interface Mpeg2TsPlayerOptions {
    * off the air is interlaced and stays that way through the conversion, so
    * without this the picture is combed wherever anything moved.
    *
+   * `'auto'` asks the machine first, and leaves the filter off where the
+   * frames come back deinterlaced already -- which they do on plenty of
+   * Android hardware. See `decoderDeinterlaces`. The asking takes a decode, so
+   * it is not instant, and the filter starts once it has an answer.
+   *
    * The deinterlacer covers the element with a canvas of its own, which means
    * covering the element's own controls; see `Deinterlacer`. Off by default
    * for that reason. It can be turned on and off while playing.
    */
-  deinterlace?: boolean | DeinterlacerOptions;
+  deinterlace?: boolean | "auto" | DeinterlacerOptions;
 }
 
 export interface Mpeg2TsPlayerEventMap {
@@ -178,7 +184,14 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.video.addEventListener("seeking", this.#onSeeking);
     for (const name of TIMED_EVENTS)
       this.video.addEventListener(name, this.#onTimedEvent);
-    if (options.deinterlace) this.deinterlace = true;
+    if (options.deinterlace === "auto") void this.#deinterlaceUnlessDone();
+    else if (options.deinterlace) this.deinterlace = true;
+  }
+
+  /** Turn the filter on, unless the machine has already done its work. */
+  async #deinterlaceUnlessDone(): Promise<void> {
+    if (await decoderDeinterlaces()) return;
+    if (!this.#destroyed) this.deinterlace = true;
   }
 
   get state(): PlayerState {

@@ -25,6 +25,7 @@
     "src/mse.ts",
     "src/protocol.ts",
     "src/deinterlace.ts",
+    "src/probe.ts",
     "src/yadif/shader.ts"
   ]
 }
