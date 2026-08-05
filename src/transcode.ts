@@ -433,33 +433,7 @@ function writePicture(
   ctx: PictureContext,
 ): Uint8Array {
   const geo = pictureGeometry(pic);
-  const w = new BitWriter(1 << 18);
-  counts.reset();
-  chromaCounts.cb.reset();
-  chromaCounts.cr.reset();
-  motion.reset();
-
-  writeSliceHeader(w, {
-    firstMbInSlice: 0,
-    // I-only pictures need no bi-prediction. P slices are simpler and much
-    // more widely handled than a stream consisting solely of reference-less B
-    // pictures, while still predicting every source intra MB from grey.
-    sliceType: ctx.options.iFramesOnly ? SliceType.P : SliceType.B,
-    frameNum: ctx.frameNum,
-    log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
-    picOrderCntLsb: ctx.poc,
-    log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
-    idr: false,
-    reference: ctx.isReference,
-    mbaff: ctx.mbaff,
-    sliceQp: PPS_INIT_QP,
-    ppsInitQp: PPS_INIT_QP,
-    disableDeblockingFilterIdc: 1,
-    numRefIdxL0Active: ctx.layout.count,
-    numRefIdxL1Active: ctx.layout.count,
-    l1FirstShortTermDelta: ctx.layout.forceL1ShortTerm ? 1 : undefined,
-    l0FirstLongTerm: ctx.layout.l0FirstLongTerm,
-  });
+  const nalParts: Uint8Array[] = [];
 
   const byAddress = new Map<number, Macroblock>();
   for (const slice of pic.slices) {
@@ -476,6 +450,7 @@ function writePicture(
     makeChromaBlockLevels(),
   ];
   let prevQp = PPS_INIT_QP;
+  let w: BitWriter | null = null;
 
   // MBAFF addresses macroblocks pair-by-pair: top then bottom at one X,
   // followed by the next pair horizontally. Frame-only pictures use raster
@@ -495,6 +470,37 @@ function writePicture(
   }
 
   for (const [mbX, mbY] of positions) {
+    const startsSlice = !ctx.mbaff ? w === null : mbY % 2 === 0;
+    if (startsSlice) {
+      counts.reset();
+      chromaCounts.cb.reset();
+      chromaCounts.cr.reset();
+      motion.reset();
+      prevQp = PPS_INIT_QP;
+      w = new BitWriter(ctx.mbaff ? 4096 : 1 << 18);
+      writeSliceHeader(w, {
+        firstMbInSlice: ctx.mbaff ? (mbY >> 1) * g.mbWidth + mbX : 0,
+        // I-only pictures need no bi-prediction. P slices are simpler and much
+        // more widely handled than a stream consisting solely of reference-less B
+        // pictures, while still predicting every source intra MB from grey.
+        sliceType: ctx.options.iFramesOnly ? SliceType.P : SliceType.B,
+        frameNum: ctx.frameNum,
+        log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
+        picOrderCntLsb: ctx.poc,
+        log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
+        idr: false,
+        reference: ctx.isReference,
+        mbaff: ctx.mbaff,
+        sliceQp: PPS_INIT_QP,
+        ppsInitQp: PPS_INIT_QP,
+        disableDeblockingFilterIdc: 1,
+        numRefIdxL0Active: ctx.layout.count,
+        numRefIdxL1Active: ctx.layout.count,
+        l1FirstShortTermDelta: ctx.layout.forceL1ShortTerm ? 1 : undefined,
+        l0FirstLongTerm: ctx.layout.l0FirstLongTerm,
+      });
+    }
+    const writer = w!;
     const source = byAddress.get(mbY * g.mbWidth + mbX);
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
@@ -667,19 +673,39 @@ function writePicture(
 
     // Every macroblock is coded explicitly. A B_Skip would mean direct mode,
     // whose derived vectors are not the ones the source used.
-    w.ue(0); // mb_skip_run
+    writer.ue(0); // mb_skip_run
     if (ctx.mbaff && mbY % 2 === 0) {
       // In P/B slices mb_field_decoding_flag follows mb_skip_run, unlike the
       // I-slice grey frame where it immediately precedes mb_type.
-      w.flag(0); // frame-coded pair for now
+      writer.flag(0); // frame-coded pair for now
     }
-    prevQp = writeGrayRefMacroblock(w, counts, chromaCounts, mb);
+    prevQp = writeGrayRefMacroblock(writer, counts, chromaCounts, mb);
     if (!luma[0] && !luma[1] && !luma[2] && !luma[3]) {
       markNoCoefficients(counts, mbX, mbY);
     }
     if (!chroma) markNoChromaCoefficients(chromaCounts, mbX, mbY);
+    const endsSlice = !ctx.mbaff
+      ? mbX === g.mbWidth - 1 && mbY === g.mbHeight - 1
+      : mbY % 2 === 1;
+    if (endsSlice) {
+      writer.rbspTrailingBits();
+      nalParts.push(
+        toNalUnit(
+          writer.bytes(),
+          ctx.isReference ? 2 : 0,
+          NalType.SLICE_NON_IDR,
+        ),
+      );
+      w = null;
+    }
   }
 
-  w.rbspTrailingBits();
-  return toNalUnit(w.bytes(), ctx.isReference ? 2 : 0, NalType.SLICE_NON_IDR);
+  const total = nalParts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of nalParts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
 }
