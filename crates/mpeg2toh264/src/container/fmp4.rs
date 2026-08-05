@@ -185,7 +185,22 @@ pub fn complementary_field<'a>(
         mate.coding.picture_structure != PictureStructure::Frame
             && mate.coding.picture_structure != picture.coding.picture_structure
             && mate.header.temporal_reference == picture.header.temporal_reference
-            && mate.header.picture_coding_type == picture.header.picture_coding_type
+            // The two fields of a frame need not be coded the same way. The
+            // second field of an intra frame is routinely predicted from the
+            // first, which puts a P field beside an I one, and refusing the
+            // pair over that leaves the frame with neither of its halves --
+            // and every picture that predicts from it wrong until the next
+            // intra picture puts them right.
+            && matches!(
+                (
+                    picture.header.picture_coding_type,
+                    mate.header.picture_coding_type
+                ),
+                (PictureType::I, PictureType::I)
+                    | (PictureType::I, PictureType::P)
+                    | (PictureType::P, PictureType::P)
+                    | (PictureType::B, PictureType::B)
+            )
     })
 }
 
