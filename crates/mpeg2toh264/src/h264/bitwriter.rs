@@ -8,6 +8,7 @@ pub mod nal_type {
     pub const SEI: u8 = 6;
     pub const SPS: u8 = 7;
     pub const PPS: u8 = 8;
+    pub const AUD: u8 = 9;
 }
 
 /// Writes an RBSP (raw byte sequence payload) bit by bit.

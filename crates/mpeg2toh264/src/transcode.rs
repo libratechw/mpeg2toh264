@@ -240,7 +240,7 @@ impl IncrementalTranscoder {
                 // count also fixes how many short-term pictures the sliding
                 // window keeps, so the reference indices in RefLayout depend on
                 // it.
-                max_num_ref_frames: 3,
+                max_num_ref_frames: 4,
                 log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM_MINUS4,
                 log2_max_poc_lsb_minus4: LOG2_MAX_POC_LSB_MINUS4,
                 // An MPEG-2 stream codes its anchor picture before the B
@@ -319,6 +319,7 @@ impl IncrementalTranscoder {
             logical_pictures.push((pic, Some(mate)));
             source_index += 2;
         }
+        let has_field_pairs = logical_pictures.iter().any(|(_, mate)| mate.is_some());
 
         'pictures: for &(pic, paired_pic) in &logical_pictures {
             let picture_type = pic.header.picture_coding_type;
@@ -363,12 +364,12 @@ impl IncrementalTranscoder {
                 // defaults to [forward, backward, long-term] and list 1 to
                 // [backward, forward, long-term].
                 RefLayout {
-                    count: 3,
+                    count: short_term_count + 1,
                     fwd_l0: 0,
                     fwd_l1: 1,
-                    bwd_l0: 1,
+                    bwd_l0: short_term_count as i32 - 1,
                     bwd_l1: 0,
-                    flat: 2,
+                    flat: short_term_count as i32,
                     force_l1_short_term: false,
                 }
             } else {
@@ -461,6 +462,9 @@ impl IncrementalTranscoder {
                 mbaff,
                 real_idr,
             };
+            if has_field_pairs {
+                parts.push(write_access_unit_delimiter());
+            }
             parts.push(write_picture(
                 pic,
                 &by_address,
@@ -479,13 +483,16 @@ impl IncrementalTranscoder {
                 // short-term reference at all. Otherwise a skipped copy of it
                 // starts that chain.
                 if !options.i_frames_only {
+                    if has_field_pairs {
+                        parts.push(write_access_unit_delimiter());
+                    }
                     parts.push(write_reference_clone(&g, mbaff));
                     prev_ref_frame_num = 1;
                     short_term_count = 1;
                 }
             } else if is_reference {
                 prev_ref_frame_num = frame_num;
-                short_term_count = (short_term_count + 1).min(2);
+                short_term_count = (short_term_count + 1).min(3);
             }
             pictures_converted += 1;
         }
@@ -796,11 +803,16 @@ fn prediction_for_field_picture(
     intra: bool,
     layout: &RefLayout,
     stats: &mut Stats,
+    second_reference_field: bool,
 ) -> Prediction {
     let (Some(mb), false) = (mb, intra) else {
         return Prediction {
             mb_type: b_mb_type::L0_16X16,
-            ref_idx_l0: layout.flat * 2,
+            ref_idx_l0: if second_reference_field {
+                4
+            } else {
+                layout.flat * 2 + field as i32
+            },
             ref_idx_l1: -1,
             mv_l0: [0, 0],
             mv_l1: [0, 0],
@@ -809,7 +821,23 @@ fn prediction_for_field_picture(
     let has_backward = layout.bwd_l0 >= 0 && mb.flags & mb_flag::MOTION_BACKWARD != 0;
     let has_forward = mb.flags & mb_flag::MOTION_FORWARD != 0 || !has_backward;
     let field_ref = |frame_ref: i32, direction: usize| {
-        frame_ref * 2 + i32::from(mb.field_select[direction] as usize != field)
+        // Skipped MPEG-2 field macroblocks infer zero-vector, same-parity
+        // prediction; no motion_vertical_field_select bit is present for the
+        // parser to store.
+        let selected = if mb.skipped {
+            field
+        } else {
+            mb.field_select[direction] as usize
+        };
+        if second_reference_field && direction == 0 && frame_ref == layout.fwd_l0 {
+            if selected != field {
+                1
+            } else {
+                0
+            }
+        } else {
+            frame_ref * 2 + selected as i32 + i32::from(second_reference_field)
+        }
     };
     let mapped = |direction: usize| map_vector(mb.mv[direction * 2], mb.mv[direction * 2 + 1]);
 
@@ -821,6 +849,19 @@ fn prediction_for_field_picture(
             ref_idx_l1: field_ref(layout.bwd_l1, 1),
             mv_l0: native_position(mb.mv[0], mb.mv[1]),
             mv_l1: native_position(mb.mv[2], mb.mv[3]),
+        };
+    }
+
+    // A reference field picture has no decoded future picture for list 1.
+    // Keep its forward prediction wholly on list 0. H.264's half-sample filter
+    // differs slightly, but this avoids naming a non-existent list-1 field.
+    if layout.bwd_l0 < 0 {
+        return Prediction {
+            mb_type: b_mb_type::L0_16X16,
+            ref_idx_l0: field_ref(layout.fwd_l0, 0),
+            ref_idx_l1: -1,
+            mv_l0: native_position(mb.mv[0], mb.mv[1]),
+            mv_l1: [0, 0],
         };
     }
 
@@ -900,6 +941,15 @@ fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
     w.ue((g.mb_width * g.mb_height) as u32); // mb_skip_run: copy the long-term IDR
     w.rbsp_trailing_bits();
     to_nal_unit(w.bytes(), 2, nal_type::SLICE_NON_IDR)
+}
+
+/// Access-unit delimiter used by the MP4 wrapper to keep the two NAL units of
+/// a PAFF complementary field pair in one video sample.
+fn write_access_unit_delimiter() -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.u(3, 7); // primary_pic_type: I, P, or B
+    w.rbsp_trailing_bits();
+    to_nal_unit(w.bytes(), 0, nal_type::AUD)
 }
 
 /// Which of the two per-slot buffers a field macroblock's targets landed in, and
@@ -1053,6 +1103,7 @@ fn write_picture(
         std::array::from_fn(|_| std::array::from_fn(|_| ChromaBlockLevels::default()));
     let mut prev_qp = PPS_INIT_QP;
     let mut slice_open = false;
+    let mut picture_nals = Vec::new();
     let output_slice_type = if ctx.real_idr {
         SliceType::I
     } else if ctx.options.i_frames_only {
@@ -1080,13 +1131,32 @@ fn write_picture(
     // does not otherwise change for frame-coded pairs.
     let position_count = g.mb_width * g.mb_height;
     for position in 0..position_count {
-        let pair_address = position >> 1;
-        let mb_x = if ctx.mbaff {
+        let field_size = position_count >> 1;
+        let second_output_field = direct_field_pair && position >= field_size;
+        let source_field = usize::from(second_output_field);
+        let first_parity =
+            usize::from(pic.coding.picture_structure == PictureStructure::BottomField);
+        let field = if direct_field_pair {
+            first_parity ^ source_field
+        } else {
+            position & 1
+        };
+        let field_position = if direct_field_pair {
+            position % field_size
+        } else {
+            position
+        };
+        let pair_address = field_position >> 1;
+        let mb_x = if direct_field_pair {
+            field_position % g.mb_width
+        } else if ctx.mbaff {
             pair_address % g.mb_width
         } else {
             position % g.mb_width
         };
-        let mb_y = if ctx.mbaff {
+        let mb_y = if direct_field_pair {
+            (field_position / g.mb_width) * 2 + field
+        } else if ctx.mbaff {
             (pair_address / g.mb_width) * 2 + (position & 1)
         } else {
             position / g.mb_width
@@ -1118,7 +1188,7 @@ fn write_picture(
                     slice_type: output_slice_type,
                     frame_num: ctx.frame_num,
                     log2_max_frame_num: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
-                    pic_order_cnt_lsb: ctx.poc,
+                    pic_order_cnt_lsb: ctx.poc + if direct_field_pair { field as u32 } else { 0 },
                     log2_max_poc_lsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
                     idr: ctx.real_idr,
                     // The IDR is the flat-prediction reference for everything
@@ -1126,13 +1196,40 @@ fn write_picture(
                     long_term_reference: ctx.real_idr,
                     reference: ctx.is_reference,
                     mbaff: ctx.mbaff,
+                    field_picture: direct_field_pair.then_some(field != 0),
                     slice_qp: PPS_INIT_QP,
                     pps_init_qp: PPS_INIT_QP,
                     disable_deblocking_filter_idc: 1,
-                    num_ref_idx_l0_active: Some(ctx.layout.count),
-                    num_ref_idx_l1_active: Some(ctx.layout.count),
-                    l1_first_short_term_delta: ctx.layout.force_l1_short_term.then_some(1),
-                    flat_pred_ref_idx: Some(ctx.layout.flat as u32),
+                    num_ref_idx_l0_active: Some(if direct_field_pair {
+                        if second_output_field && ctx.is_reference {
+                            6
+                        } else {
+                            ctx.layout.count * 2
+                        }
+                    } else {
+                        ctx.layout.count
+                    }),
+                    num_ref_idx_l1_active: Some(if direct_field_pair {
+                        if second_output_field && ctx.is_reference {
+                            6
+                        } else {
+                            ctx.layout.count * 2
+                        }
+                    } else {
+                        ctx.layout.count
+                    }),
+                    l1_first_short_term_delta: (!direct_field_pair
+                        && ctx.layout.force_l1_short_term)
+                        .then_some(1),
+                    flat_pred_ref_idx: Some(if direct_field_pair {
+                        if second_output_field && ctx.is_reference {
+                            4
+                        } else {
+                            (ctx.layout.flat * 2 + field as i32) as u32
+                        }
+                    } else {
+                        ctx.layout.flat as u32
+                    }),
                     ..Default::default()
                 },
             );
@@ -1181,7 +1278,7 @@ fn write_picture(
         // vectors or QP for anything to read back.
         if ctx.real_idr {
             stats.intra_macroblocks += 1;
-            if ctx.mbaff && mb_y % 2 == 0 {
+            if ctx.mbaff && !direct_field_pair && mb_y % 2 == 0 {
                 writer.flag(direct_field_pair); // field-coded for paired field pictures
             }
             let samples = match source {
@@ -1189,9 +1286,22 @@ fn write_picture(
                 _ => concealment.clone(),
             };
             write_pcm_macroblock(writer, PcmSliceType::I, &samples);
-            if mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1 {
+            let end_of_field =
+                direct_field_pair && mb_x == g.mb_width - 1 && field_position == field_size - 1;
+            if end_of_field
+                || (!direct_field_pair && mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1)
+            {
                 writer.rbsp_trailing_bits();
-                return Ok(to_nal_unit(writer.bytes(), 3, nal_type::SLICE_IDR));
+                picture_nals.extend_from_slice(&to_nal_unit(
+                    writer.bytes(),
+                    3,
+                    nal_type::SLICE_IDR,
+                ));
+                if direct_field_pair && !second_output_field {
+                    slice_open = false;
+                    continue;
+                }
+                return Ok(picture_nals);
             }
             continue;
         }
@@ -1379,7 +1489,14 @@ fn write_picture(
             count_field_pair_vector(source, intra, &ctx.layout, stats);
         }
         let pred = if direct_field_pair {
-            prediction_for_field_picture(source, mb_y & 1, intra, &ctx.layout, stats)
+            prediction_for_field_picture(
+                source,
+                mb_y & 1,
+                intra,
+                &ctx.layout,
+                stats,
+                second_output_field && ctx.is_reference,
+            )
         } else if field_pair {
             Prediction {
                 mb_type: b_mb_type::L0_16X16,
@@ -1581,12 +1698,20 @@ fn write_picture(
             },
             partitions,
             num_ref_idx_l0_minus1: if field_pair {
-                ref_count * 2 - 1
+                if second_output_field && ctx.is_reference {
+                    5
+                } else {
+                    ref_count * 2 - 1
+                }
             } else {
                 ref_count - 1
             },
             num_ref_idx_l1_minus1: if field_pair {
-                ref_count * 2 - 1
+                if second_output_field && ctx.is_reference {
+                    5
+                } else {
+                    ref_count * 2 - 1
+                }
             } else {
                 ref_count - 1
             },
@@ -1625,7 +1750,7 @@ fn write_picture(
         // Every macroblock is coded explicitly. A B_Skip would mean direct mode,
         // whose derived vectors are not the ones the source used.
         writer.ue(0); // mb_skip_run
-        if ctx.mbaff && mb_y % 2 == 0 {
+        if ctx.mbaff && !direct_field_pair && mb_y % 2 == 0 {
             // In P/B slices mb_field_decoding_flag follows mb_skip_run, unlike
             // the I_PCM IDR slice where it immediately precedes mb_type.
             writer.flag(field_pair);
@@ -1664,9 +1789,12 @@ fn write_picture(
         if chroma.is_none() {
             mark_no_chroma_coefficients(active_chroma_counts, mb.mb_x, mb.mb_y);
         }
-        if mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1 {
+        let end_of_field =
+            direct_field_pair && mb_x == g.mb_width - 1 && field_position == field_size - 1;
+        if end_of_field || (!direct_field_pair && mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1)
+        {
             writer.rbsp_trailing_bits();
-            return Ok(to_nal_unit(
+            picture_nals.extend_from_slice(&to_nal_unit(
                 writer.bytes(),
                 if ctx.real_idr {
                     3
@@ -1681,6 +1809,11 @@ fn write_picture(
                     nal_type::SLICE_NON_IDR
                 },
             ));
+            if direct_field_pair && !second_output_field {
+                slice_open = false;
+                continue;
+            }
+            return Ok(picture_nals);
         }
     }
 

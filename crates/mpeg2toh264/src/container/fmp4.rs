@@ -116,6 +116,39 @@ fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
     nals
 }
 
+type VideoSample<'a> = Vec<&'a [u8]>;
+
+/// Group VCL NAL units into access units. New streams carry AUDs so a PAFF
+/// field pair becomes one MP4 sample; accepting streams without AUDs preserves
+/// compatibility with callers that provide one VCL NAL per picture.
+fn video_samples<'a>(nals: &[&'a [u8]]) -> Vec<VideoSample<'a>> {
+    let has_aud = nals.iter().any(|nal| nal[0] & 0x1f == 9);
+    if !has_aud {
+        return nals
+            .iter()
+            .filter(|nal| matches!(nal[0] & 0x1f, 1 | 5))
+            .map(|&nal| vec![nal])
+            .collect();
+    }
+    let mut samples = Vec::new();
+    let mut current = Vec::new();
+    for &nal in nals {
+        match nal[0] & 0x1f {
+            9 => {
+                if !current.is_empty() {
+                    samples.push(std::mem::take(&mut current));
+                }
+            }
+            1 | 5 => current.push(nal),
+            _ => {}
+        }
+    }
+    if !current.is_empty() {
+        samples.push(current);
+    }
+    samples
+}
+
 #[derive(Clone, Debug)]
 pub struct Mpeg2VideoTimeline {
     pub width: u32,
@@ -534,7 +567,10 @@ fn length_prefixed(nal: &[u8]) -> Vec<u8> {
 
 /// Each sample as the `mdat` carries it: length-prefixed NAL units, with any
 /// parameter-set-adjacent SEI prepended to the first sample.
-fn make_video_payloads(samples: &[&[u8]], first_sample_prefixes: &[&[u8]]) -> Vec<Vec<u8>> {
+fn make_video_payloads(
+    samples: &[VideoSample<'_>],
+    first_sample_prefixes: &[&[u8]],
+) -> Vec<Vec<u8>> {
     samples
         .iter()
         .enumerate()
@@ -544,10 +580,12 @@ fn make_video_payloads(samples: &[&[u8]], first_sample_prefixes: &[&[u8]]) -> Ve
                 for prefix in first_sample_prefixes {
                     out.extend_from_slice(&length_prefixed(prefix));
                 }
-                out.extend_from_slice(&length_prefixed(sample));
+                for nal in sample {
+                    out.extend_from_slice(&length_prefixed(nal));
+                }
                 out
             } else {
-                length_prefixed(sample)
+                sample.iter().flat_map(|nal| length_prefixed(nal)).collect()
             }
         })
         .collect()
@@ -555,7 +593,7 @@ fn make_video_payloads(samples: &[&[u8]], first_sample_prefixes: &[&[u8]]) -> Ve
 
 #[allow(clippy::too_many_arguments)]
 fn make_media_segment(
-    samples: &[&[u8]],
+    samples: &[VideoSample<'_>],
     durations: &[u32],
     compositions: &[u32],
     sync_samples: &[bool],
@@ -616,7 +654,7 @@ fn make_media_segment(
 /// for each in the same `moof` rather than two interleaved fragment streams.
 #[allow(clippy::too_many_arguments)]
 fn make_av_media_segment(
-    video_samples: &[&[u8]],
+    video_samples: &[VideoSample<'_>],
     durations: &[u32],
     compositions: &[u32],
     sync_samples: &[bool],
@@ -627,11 +665,19 @@ fn make_av_media_segment(
     first_sample_prefixes: &[&[u8]],
 ) -> Vec<u8> {
     let prefix_bytes: usize = first_sample_prefixes.iter().map(|nal| 4 + nal.len()).sum();
-    let video_bytes: usize =
-        video_samples.iter().map(|nal| 4 + nal.len()).sum::<usize>() + prefix_bytes;
+    let video_bytes: usize = video_samples
+        .iter()
+        .flatten()
+        .map(|nal| 4 + nal.len())
+        .sum::<usize>()
+        + prefix_bytes;
     let mut video_entries = Buf::new();
     for i in 0..video_samples.len() {
-        let sample_bytes = 4 + video_samples[i].len() + if i == 0 { prefix_bytes } else { 0 };
+        let sample_bytes: usize = video_samples[i]
+            .iter()
+            .map(|nal| 4 + nal.len())
+            .sum::<usize>()
+            + if i == 0 { prefix_bytes } else { 0 };
         video_entries.u32(durations[i]);
         video_entries.u32(sample_bytes as u32);
         video_entries.u32(if sync_samples[i] {
@@ -712,8 +758,10 @@ fn make_av_media_segment(
                 out.extend_from_slice(prefix);
             }
         }
-        out.extend_from_slice(&(sample.len() as u32).to_be_bytes());
-        out.extend_from_slice(sample);
+        for nal in sample {
+            out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            out.extend_from_slice(nal);
+        }
     }
     for sample in audio_samples {
         out.extend_from_slice(sample);
@@ -736,11 +784,7 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
     let sps = nals.iter().find(|nal| nal_type(nal) == 7).copied();
     let pps = nals.iter().find(|nal| nal_type(nal) == 8).copied();
     let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
-    let samples: Vec<&[u8]> = nals
-        .iter()
-        .filter(|nal| matches!(nal_type(nal), 1 | 5))
-        .copied()
-        .collect();
+    let samples = video_samples(&nals);
     let (Some(sps), Some(pps)) = (sps, pps) else {
         bail!("H.264 stream lacks SPS or PPS");
     };
@@ -753,7 +797,10 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
         );
     }
     let timing = mpeg2_sample_timing(timeline, has_idr_clone);
-    let sync_samples: Vec<bool> = samples.iter().map(|nal| nal[0] & 0x1f == 5).collect();
+    let sync_samples: Vec<bool> = samples
+        .iter()
+        .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
+        .collect();
     let codec = format!("{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3]);
     let prefixes: Vec<&[u8]> = sei.into_iter().collect();
 
@@ -830,11 +877,7 @@ pub fn h264_gop_to_fmp4(
     let sps = nals.iter().find(|nal| nal_type(nal) == 7).copied();
     let pps = nals.iter().find(|nal| nal_type(nal) == 8).copied();
     let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
-    let samples: Vec<&[u8]> = nals
-        .iter()
-        .filter(|nal| matches!(nal_type(nal), 1 | 5))
-        .copied()
-        .collect();
+    let samples = video_samples(&nals);
 
     let has_idr_clone = samples.len() == timeline.presentation_indices.len() + 1;
     let expected = timeline.presentation_indices.len() + usize::from(has_idr_clone);
@@ -849,7 +892,10 @@ pub fn h264_gop_to_fmp4(
     // very start of the timeline has nowhere to put it and simply displays that
     // much later.
     let base_decode_time = presentation_start.saturating_sub(timing.reorder_delay as u64);
-    let sync_samples: Vec<bool> = samples.iter().map(|nal| nal[0] & 0x1f == 5).collect();
+    let sync_samples: Vec<bool> = samples
+        .iter()
+        .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
+        .collect();
     let prefixes: Vec<&[u8]> = sei.into_iter().collect();
 
     let media_segment = match audio_track {

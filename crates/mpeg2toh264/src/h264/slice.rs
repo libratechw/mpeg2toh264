@@ -39,6 +39,9 @@ pub struct SliceHeaderConfig {
     pub long_term_reference: bool,
     /// Set when the source is interlaced, i.e. `frame_mbs_only_flag` is 0.
     pub mbaff: bool,
+    /// `Some(false)` for a top field picture and `Some(true)` for a bottom
+    /// field picture. `None` emits a frame picture (MBAFF when enabled).
+    pub field_picture: Option<bool>,
     /// Whether the picture is a reference, i.e. `nal_ref_idc` is non-zero. It
     /// governs whether `dec_ref_pic_marking` appears at all, so it has to match
     /// the NAL header exactly.
@@ -93,6 +96,7 @@ impl Default for SliceHeaderConfig {
             idr_pic_id: 0,
             long_term_reference: false,
             mbaff: false,
+            field_picture: None,
             reference: false,
             slice_qp: 26,
             pps_init_qp: 26,
@@ -140,10 +144,10 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
     w.u(cfg.log2_max_frame_num, cfg.frame_num);
 
     if cfg.mbaff {
-        // field_pic_flag: always a frame picture. MPEG-2 frame pictures mix
-        // frame-DCT and field-DCT macroblocks, which is macroblock-adaptive
-        // frame/field coding rather than field pictures.
-        w.flag(false);
+        w.flag(cfg.field_picture.is_some());
+        if let Some(bottom_field) = cfg.field_picture {
+            w.flag(bottom_field);
+        }
     }
 
     if cfg.idr {
