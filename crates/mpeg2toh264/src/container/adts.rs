@@ -362,6 +362,18 @@ impl AdtsStream {
                 Some(chain) if self.chain.as_ref().is_none_or(|last| *last == chain) => {
                     self.chain = Some(chain);
                 }
+                // ARIB dual mono can switch from an ordinary stereo CPE whose
+                // ADTS header says two channels to two SCEs with channel
+                // configuration zero. The current two-channel ASC still
+                // describes the CPE rebuilt below; the SCE element chain is
+                // intentionally allowed to vary between mono and dual mono.
+                Some(chain)
+                    if channel_count == 0
+                        && self
+                            .current_config
+                            .as_ref()
+                            .is_some_and(|c| c.channel_count <= 2)
+                        && chain.first().is_some_and(|&(id, _)| id == 0) => {}
                 // A mono or dual-mono service is rebuilt from its primary
                 // element alone and switches between the two as the broadcast
                 // does, so its chain is not fixed and is not judged by this.

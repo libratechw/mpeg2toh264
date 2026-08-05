@@ -333,6 +333,26 @@ fn accepts_mono_to_dual_mono_changes_when_the_primary_sce_is_stable() {
 }
 
 #[test]
+fn accepts_stereo_to_zero_config_dual_mono_changes() {
+    let mut stereo = adts_frame(3, 2, 16);
+    stereo[7] = 0x20; // ID_CPE
+                      // Two empty SCEs while channel_configuration is zero, as ARIB dual mono
+                      // signals itself after an ordinary stereo programme.
+    let dual = adts_frame_with_payload(3, 0, &[0, 0, 0, 0, 0x10, 0, 0, 0x38]);
+    let mut adts = AdtsStream::new();
+    assert_eq!(adts.push(&stereo).expect("stereo frame").len(), 1);
+    let frames = adts.push(&dual).expect("dual-mono frame");
+
+    assert_eq!(
+        frames.len(),
+        1,
+        "the configuration change is not packet damage"
+    );
+    assert_eq!(frames[0].config.channel_count, 2);
+    assert_eq!(frames[0].data.len(), 7, "the primary SCE is duplicated");
+}
+
+#[test]
 fn reads_an_in_band_pce_when_adts_channel_configuration_is_zero() {
     let payload = packed_bits(concat!(
         "101", // ID_PCE
@@ -665,6 +685,46 @@ fn carries_aac_audio_through_untouched() {
         total_audio, audio_frames,
         "every access unit fed in comes out again"
     );
+}
+
+#[test]
+fn conceals_a_missing_aac_frame_instead_of_stalling_video() {
+    let video = repeat_fixture("ibbp.m2v", 4);
+    let audio = adts_stream(1, 3, 2);
+    let mut units = vec![PesUnit {
+        pid: VIDEO_PID,
+        stream_id: 0xe0,
+        payload: &video,
+        pts: Some(900_000),
+    }];
+    for index in 0..120u64 {
+        units.push(PesUnit {
+            pid: AUDIO_PID,
+            stream_id: 0xc0,
+            payload: &audio,
+            // One 48 kHz AAC access unit is absent halfway through.
+            pts: Some(900_000 + index * 1_920 + u64::from(index >= 60) * 1_920),
+        });
+    }
+    let stream = mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+    );
+    let fragments = run_session(&stream, 64 * 1024);
+    let (_, media) = split_fragments(&fragments);
+    let audio_samples: usize = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { audio_samples, .. } => *audio_samples,
+            _ => 0,
+        })
+        .sum();
+
+    assert_eq!(audio_samples, 121, "the missing timeline slot is concealed");
+    assert_eq!(media.len(), 4, "every video GOP is emitted");
 }
 
 /// The audio of a recording can run out before its video does, and a `trun`

@@ -31,6 +31,11 @@ const RANDOM_ACCESS_GOP_INTERVAL: usize = 24;
 
 const TIMESCALE: u64 = 90_000;
 
+/// Short AAC holes are packet loss, not the end of the audio track. Repeating
+/// the following access unit keeps MSE's joint audio/video buffered range
+/// continuous. Larger jumps are discontinuities and are not concealed here.
+const MAX_CONCEALED_AUDIO_FRAMES: u64 = 8;
+
 /// The PES timestamp field is 33 bits and wraps every 26.5 hours (clause
 /// 2.4.3.7), so the distance between two of them is modular.
 const PTS_MODULUS: i64 = 1 << 33;
@@ -97,6 +102,10 @@ pub struct Session {
 
     /// PES timestamp of the first audio packet, in 90 kHz units.
     audio_start_pts: Option<u64>,
+    /// PTS and frame count used to notice missing AAC access units.
+    audio_clock_start_pts: Option<u64>,
+    audio_clock_frames: u64,
+    audio_clock_sample_rate: Option<u32>,
     /// Where the audio track begins on the shared timeline, once it is fixed.
     audio_origin_ticks: u64,
     /// The PES timestamp presentation time zero stands for. Supplied by a
@@ -160,6 +169,9 @@ impl Session {
             pending_audio: Vec::new(),
             audio_config: None,
             audio_start_pts: None,
+            audio_clock_start_pts: None,
+            audio_clock_frames: 0,
+            audio_clock_sample_rate: None,
             audio_origin_ticks: 0,
             timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
@@ -215,10 +227,11 @@ impl Session {
                     if self.audio_start_pts.is_none() {
                         self.audio_start_pts = packet.pts;
                     }
-                    let frames = self.adts.push(&packet.data)?;
+                    let mut frames = self.adts.push(&packet.data)?;
                     if self.audio_config.is_none() {
                         self.audio_config = frames.first().map(|frame| frame.config.clone());
                     }
+                    self.conceal_audio_gap(packet.pts, &mut frames);
                     self.pending_audio.extend(frames);
                 }
                 ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2 => {
@@ -237,6 +250,32 @@ impl Session {
             self.flush_pending(false, out)?;
         }
         Ok(())
+    }
+
+    /// Fill a small PTS hole with copies of the next decodable access unit.
+    /// Without this, one lost AAC frame leaves every later GOP one frame short
+    /// of `wanted`, so conversion waits forever even though audio resumed.
+    fn conceal_audio_gap(&mut self, pts: Option<u64>, frames: &mut Vec<AacFrame>) {
+        let Some(first) = frames.first().cloned() else {
+            return;
+        };
+        let rate = first.config.sample_rate;
+        let Some(pts) = pts else {
+            self.audio_clock_frames += frames.len() as u64;
+            return;
+        };
+        if self.audio_clock_sample_rate != Some(rate) || self.audio_clock_start_pts.is_none() {
+            self.audio_clock_start_pts = Some(pts);
+            self.audio_clock_frames = 0;
+            self.audio_clock_sample_rate = Some(rate);
+        }
+        let elapsed = ticks_since(self.audio_clock_start_pts.unwrap() as i64, pts as i64) as i64;
+        let expected = aac_frame_count_through_video_time(elapsed, rate).max(0) as u64;
+        let missing = expected.saturating_sub(self.audio_clock_frames);
+        if missing <= MAX_CONCEALED_AUDIO_FRAMES {
+            frames.splice(0..0, std::iter::repeat(first).take(missing as usize));
+        }
+        self.audio_clock_frames += frames.len() as u64;
     }
 
     /// Whether the fragment about to be emitted opens at an IDR, which is both
