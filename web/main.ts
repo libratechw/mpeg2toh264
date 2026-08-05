@@ -6,6 +6,7 @@ const input = document.querySelector<HTMLInputElement>("#file")!;
 const video = document.querySelector<HTMLVideoElement>("#video")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const details = document.querySelector<HTMLElement>("#details")!;
+const fps = document.querySelector<HTMLElement>("#fps")!;
 
 let worker: Worker | null = null;
 let file: File | null = null;
@@ -49,6 +50,7 @@ function resetState() {
   quotaBlocked = false;
   sampleCount = 0;
   audioSampleCount = 0;
+  fps.textContent = "変換FPS: 瞬間 — · トータル —";
   randomAccessPoints = [];
   playheadPlaced = false;
   if (objectUrl) URL.revokeObjectURL(objectUrl);
@@ -241,6 +243,8 @@ input.addEventListener("change", () => {
         audioSampleCount > 0 ? ` · ${audioSampleCount} AAC frames` : "";
       details.textContent = `${file!.name} · ${sampleCount} video frames${audio} · queue ${(queuedBytes / 1024 / 1024).toFixed(1)} MiB`;
       pump();
+    } else if (message.type === "performance") {
+      fps.textContent = `変換FPS: 瞬間 ${message.instantFps.toFixed(1)} · トータル ${message.totalFps.toFixed(1)}`;
     } else if (message.type === "done") {
       workerDone = true;
       maybeFinish();

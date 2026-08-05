@@ -22,6 +22,10 @@ let pending: Promise<unknown> = init({
 });
 
 let session: Session | null = null;
+let totalProcessingMs = 0;
+let totalVideoSamples = 0;
+let intervalProcessingMs = 0;
+let intervalVideoSamples = 0;
 
 /**
  * The fragment's bytes are a copy wasm-bindgen made for us, so no one else
@@ -52,22 +56,53 @@ function send(fragment: Fragment) {
   }
 }
 
+function reportPerformance(fragments: Fragment[], processingMs: number) {
+  const videoSamples = fragments.reduce(
+    (count, fragment) =>
+      count + (fragment.kind === "media" ? fragment.videoSamples : 0),
+    0,
+  );
+  totalProcessingMs += processingMs;
+  totalVideoSamples += videoSamples;
+  intervalProcessingMs += processingMs;
+  intervalVideoSamples += videoSamples;
+  if (intervalVideoSamples === 0) return;
+  self.postMessage({
+    type: "performance",
+    instantFps: (intervalVideoSamples * 1000) / intervalProcessingMs,
+    totalFps: (totalVideoSamples * 1000) / totalProcessingMs,
+  });
+  intervalProcessingMs = 0;
+  intervalVideoSamples = 0;
+}
+
 function handle(request: Request) {
   if (request.type === "start") {
     // Rust memory, so dropping the reference would not be enough.
     session?.free();
     session = new Session();
+    totalProcessingMs = 0;
+    totalVideoSamples = 0;
+    intervalProcessingMs = 0;
+    intervalVideoSamples = 0;
     self.postMessage({ type: "pull" });
     return;
   }
   // Only reachable when the module failed to load, which was reported already.
   if (!session) return;
   if (request.type === "chunk") {
-    for (const fragment of session.push(new Uint8Array(request.data)))
-      send(fragment);
+    const started = performance.now();
+    const fragments = session.push(new Uint8Array(request.data));
+    const processingMs = performance.now() - started;
+    for (const fragment of fragments) send(fragment);
+    reportPerformance(fragments, processingMs);
     self.postMessage({ type: "pull" });
   } else {
-    for (const fragment of session.finish()) send(fragment);
+    const started = performance.now();
+    const fragments = session.finish();
+    const processingMs = performance.now() - started;
+    for (const fragment of fragments) send(fragment);
+    reportPerformance(fragments, processingMs);
     session.free();
     session = null;
     self.postMessage({ type: "done" });
