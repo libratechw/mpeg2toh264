@@ -233,6 +233,7 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): {
     controller.attachFeeder(feeder);
     controller.attachRenderer(renderer);
     controller.attachMedia(video, picture);
+    picture.lastElementChild?.setAttribute("preserveAspectRatio", "none");
     return { type, controller, feeder, renderer };
   });
 
