@@ -566,6 +566,39 @@ fn frame_vector(mb: &Macroblock, backward: bool) -> [i32; 2] {
     ]
 }
 
+/// H.262 `// 2`: nearest integer, with a half-integer rounded away from zero.
+fn rounded_half(value: i32) -> i32 {
+    if value < 0 {
+        (value - 1) / 2
+    } else {
+        (value + 1) / 2
+    }
+}
+
+/// Derive the opposite-parity vector of dual-prime prediction (H.262
+/// 7.6.3.6). The coded vector addresses the same-parity field.
+fn dual_prime_opposite(
+    coded: [i32; 2],
+    differential: [i32; 2],
+    predicted_field: usize,
+    frame_picture: bool,
+    top_field_first: bool,
+) -> [i32; 2] {
+    let multiplier = if frame_picture {
+        match (predicted_field, top_field_first) {
+            (0, true) | (1, false) => 1,
+            _ => 3,
+        }
+    } else {
+        1
+    };
+    let parity_offset = if predicted_field == 0 { -1 } else { 1 };
+    [
+        rounded_half(coded[0] * multiplier) + differential[0],
+        rounded_half(coded[1] * multiplier) + parity_offset + differential[1],
+    ]
+}
+
 fn prediction_for(
     mb: Option<&Macroblock>,
     intra: bool,
@@ -683,6 +716,7 @@ fn count_field_pair_vector(
 fn prediction_for_field(
     mb: &Macroblock,
     field: usize,
+    top_field_first: bool,
     layout: &RefLayout,
     intra: bool,
 ) -> Prediction {
@@ -698,19 +732,43 @@ fn prediction_for_field(
     let has_backward = layout.bwd_l0 >= 0 && mb.flags & mb_flag::MOTION_BACKWARD != 0;
     let has_forward = mb.flags & mb_flag::MOTION_FORWARD != 0 || !has_backward;
     let field_motion = mb.motion_type == motion_type::FIELD;
-    let field_ref = |frame_ref: i32, direction: usize| -> i32 {
-        if !field_motion {
-            return frame_ref * 2;
-        }
-        let ref_parity = mb.field_select[field * 2 + direction] as usize;
-        // MBAFF field lists expand each frame entry into same-parity then
-        // opposite-parity fields for the current macroblock.
-        frame_ref * 2 + i32::from(ref_parity != field)
-    };
     let vector = |direction: usize| -> [i32; 2] {
         let base = if field_motion { field * 4 } else { 0 } + direction * 2;
         [mb.mv[base], mb.mv[base + 1]]
     };
+    let ref_parity = |direction: usize| -> usize {
+        if field_motion {
+            mb.field_select[field * 2 + direction] as usize
+        } else {
+            // A frame vertical vector counts half frame-lines.  When its
+            // integer part crosses an odd number of frame lines, the exact
+            // sample belongs to the opposite reference field.
+            (field as i32 + vector(direction)[1].div_euclid(2)).rem_euclid(2) as usize
+        }
+    };
+    let field_ref = |frame_ref: i32, direction: usize| -> i32 {
+        let ref_parity = ref_parity(direction);
+        // MBAFF field lists expand each frame entry into same-parity then
+        // opposite-parity fields for the current macroblock.
+        frame_ref * 2 + i32::from(ref_parity != field)
+    };
+
+    if mb.motion_type == motion_type::DUAL_PRIME {
+        let opposite = dual_prime_opposite(
+            [mb.mv[0], mb.mv[1]],
+            mb.dmvector,
+            field,
+            true,
+            top_field_first,
+        );
+        return Prediction {
+            mb_type: b_mb_type::BI_16X16,
+            ref_idx_l0: layout.fwd_l0 * 2,
+            ref_idx_l1: layout.fwd_l1 * 2 + 1,
+            mv_l0: native_position(mb.mv[0], mb.mv[1]),
+            mv_l1: native_position(opposite[0], opposite[1]),
+        };
+    }
     let native = |direction: usize| -> [i32; 2] {
         let [x, y] = vector(direction);
         // A frame vector's vertical half-sample unit is one quarter sample on
@@ -719,7 +777,11 @@ fn prediction_for_field(
         if field_motion {
             native_position(x, y)
         } else {
-            [x * 2, y]
+            // Convert the frame-grid position to quarter samples of the
+            // selected reference field.  The parity term is what turns an odd
+            // whole-frame-line displacement into an integer position in the
+            // opposite field instead of filtering between same-parity lines.
+            [x * 2, y + 2 * (field as i32 - ref_parity(direction) as i32)]
         }
     };
 
@@ -736,6 +798,61 @@ fn prediction_for_field(
     let use_backward = has_backward;
     let direction = usize::from(use_backward);
     if !field_motion {
+        let [x, y] = vector(direction);
+        let primary_frame = if use_backward {
+            layout.bwd_l0
+        } else {
+            layout.fwd_l0
+        };
+        let secondary_frame = if use_backward {
+            layout.bwd_l1
+        } else {
+            layout.fwd_l1
+        };
+        let field_index =
+            |frame_ref: i32, parity: usize| frame_ref * 2 + i32::from(parity != field);
+        let vector_to_line = |horizontal: i32, displacement: i32, parity: usize| {
+            [
+                horizontal,
+                2 * (field as i32 - parity as i32) + 2 * displacement,
+            ]
+        };
+
+        // With a half-sample on one axis MPEG-2's bilinear prediction is the
+        // rounded average of two integer samples.  Name the same source field
+        // through both H.264 lists and reproduce that average, avoiding the
+        // H.264 six-tap filter.  Two-axis halves retain H.264 horizontal
+        // interpolation but still average the correct adjacent frame lines.
+        if x & 1 != 0 || y & 1 != 0 {
+            let dy0 = y.div_euclid(2);
+            let (p0, p1, mv0, mv1) = if y & 1 != 0 {
+                let p0 = (field as i32 + dy0).rem_euclid(2) as usize;
+                let p1 = (field as i32 + dy0 + 1).rem_euclid(2) as usize;
+                (
+                    p0,
+                    p1,
+                    vector_to_line(x * 2, dy0, p0),
+                    vector_to_line(x * 2, dy0 + 1, p1),
+                )
+            } else {
+                let parity = (field as i32 + dy0).rem_euclid(2) as usize;
+                let x0 = x.div_euclid(2) * 4;
+                (
+                    parity,
+                    parity,
+                    vector_to_line(x0, dy0, parity),
+                    vector_to_line(x0 + 4, dy0, parity),
+                )
+            };
+            return Prediction {
+                mb_type: b_mb_type::BI_16X16,
+                ref_idx_l0: field_index(primary_frame, p0),
+                ref_idx_l1: field_index(secondary_frame, p1),
+                mv_l0: mv0,
+                mv_l1: mv1,
+            };
+        }
+
         let mv = native(direction);
         return if use_backward {
             Prediction {
@@ -800,6 +917,7 @@ fn prediction_for_field(
 fn prediction_for_field_picture(
     mb: Option<&Macroblock>,
     field: usize,
+    partition: usize,
     intra: bool,
     layout: &RefLayout,
     stats: &mut Stats,
@@ -824,22 +942,42 @@ fn prediction_for_field_picture(
         // Skipped MPEG-2 field macroblocks infer zero-vector, same-parity
         // prediction; no motion_vertical_field_select bit is present for the
         // parser to store.
-        let selected = if mb.skipped {
-            field
-        } else {
-            mb.field_select[direction] as usize
-        };
-        if second_reference_field && direction == 0 && frame_ref == layout.fwd_l0 {
-            if selected != field {
-                1
-            } else {
-                0
-            }
-        } else {
-            frame_ref * 2 + selected as i32 + i32::from(second_reference_field)
-        }
+        let selected = field_picture_selected_parity(
+            mb.skipped,
+            mb.flags,
+            mb.field_select[partition * 2 + direction] as usize,
+            field,
+            direction,
+        );
+        field_picture_ref_index(
+            frame_ref,
+            selected,
+            field,
+            second_reference_field,
+            direction == 0 && frame_ref == layout.fwd_l0,
+        )
     };
-    let mapped = |direction: usize| map_vector(mb.mv[direction * 2], mb.mv[direction * 2 + 1]);
+    let vector_base = partition * 4;
+    let mapped = |direction: usize| {
+        map_vector(
+            mb.mv[vector_base + direction * 2],
+            mb.mv[vector_base + direction * 2 + 1],
+        )
+    };
+
+    if mb.motion_type == motion_type::DUAL_PRIME {
+        stats.bidirectional_vectors += 1;
+        let opposite = dual_prime_opposite([mb.mv[0], mb.mv[1]], mb.dmvector, field, false, false);
+        return Prediction {
+            mb_type: b_mb_type::BI_16X16,
+            ref_idx_l0: field_ref(layout.fwd_l0, 0),
+            // In a P-field B slice list 1 has the first two fields swapped, so
+            // its entry 0 is the opposite-parity field of the same reference.
+            ref_idx_l1: 0,
+            mv_l0: native_position(mb.mv[0], mb.mv[1]),
+            mv_l1: native_position(opposite[0], opposite[1]),
+        };
+    }
 
     if has_forward && has_backward {
         stats.bidirectional_vectors += 1;
@@ -847,21 +985,47 @@ fn prediction_for_field_picture(
             mb_type: b_mb_type::BI_16X16,
             ref_idx_l0: field_ref(layout.fwd_l0, 0),
             ref_idx_l1: field_ref(layout.bwd_l1, 1),
-            mv_l0: native_position(mb.mv[0], mb.mv[1]),
-            mv_l1: native_position(mb.mv[2], mb.mv[3]),
+            mv_l0: native_position(mb.mv[vector_base], mb.mv[vector_base + 1]),
+            mv_l1: native_position(mb.mv[vector_base + 2], mb.mv[vector_base + 3]),
         };
     }
 
-    // A reference field picture has no decoded future picture for list 1.
-    // Keep its forward prediction wholly on list 0. H.264's half-sample filter
-    // differs slightly, but this avoids naming a non-existent list-1 field.
+    // A P field picture has no future reference, so the initial B-slice lists
+    // contain the same past fields and H.264 8.2.4.2.3 swaps the first two
+    // entries of list 1.  Use those two views of the same MPEG-2 reference to
+    // reproduce a one-axis half sample as an integer-sample average, just as
+    // the frame-picture path does.
     if layout.bwd_l0 < 0 {
+        let motion = mapped(0);
+        match motion.kind {
+            VectorKind::Integer => stats.integer_vectors += 1,
+            VectorKind::HalfOneAxis => stats.single_axis_half_vectors += 1,
+            VectorKind::HalfBothAxes => stats.both_axis_half_vectors += 1,
+        }
+        let Some(second) = motion.b else {
+            return Prediction {
+                mb_type: b_mb_type::L0_16X16,
+                ref_idx_l0: field_ref(layout.fwd_l0, 0),
+                ref_idx_l1: -1,
+                mv_l0: motion.a,
+                mv_l1: [0, 0],
+            };
+        };
+        let selected = field_picture_selected_parity(
+            mb.skipped,
+            mb.flags,
+            mb.field_select[partition * 2] as usize,
+            field,
+            0,
+        );
         return Prediction {
-            mb_type: b_mb_type::L0_16X16,
+            mb_type: b_mb_type::BI_16X16,
             ref_idx_l0: field_ref(layout.fwd_l0, 0),
-            ref_idx_l1: -1,
-            mv_l0: native_position(mb.mv[0], mb.mv[1]),
-            mv_l1: [0, 0],
+            // List 1 has the first two field entries exchanged: same parity is
+            // entry 1 and opposite parity is entry 0.
+            ref_idx_l1: i32::from(selected == field),
+            mv_l0: motion.a,
+            mv_l1: second,
         };
     }
 
@@ -909,6 +1073,43 @@ fn prediction_for_field_picture(
         mv_l0: motion.a,
         mv_l1: second,
     }
+}
+
+fn field_picture_selected_parity(
+    skipped: bool,
+    flags: i32,
+    signalled: usize,
+    field: usize,
+    direction: usize,
+) -> usize {
+    let inferred_forward = direction == 0 && flags & mb_flag::MOTION_FORWARD == 0;
+    if skipped || inferred_forward {
+        field
+    } else {
+        signalled
+    }
+}
+
+/// Index an MPEG-2 top/bottom field in the H.264 field reference list.
+///
+/// Non-reference B pairs use the ordinary parity-relative alternation.  A
+/// reference P pair is different after its first field has been decoded: that
+/// field is inserted separately ahead of the older complementary pairs.
+fn field_picture_ref_index(
+    frame_ref: i32,
+    selected: usize,
+    current: usize,
+    second_reference_field: bool,
+    forward_reference: bool,
+) -> i32 {
+    if second_reference_field && forward_reference {
+        return i32::from(selected != current);
+    }
+    // H.264 8.2.4.2.5 alternates fields starting with the parity of the
+    // current field.  The index is therefore parity-relative for P fields as
+    // well as B fields; using the MPEG top/bottom bit as an absolute offset
+    // makes both selections address index 1 for a bottom P field.
+    frame_ref * 2 + i32::from(selected != current)
 }
 
 /// Copy the content IDR into a short-term reference without changing pixels.
@@ -1492,6 +1693,7 @@ fn write_picture(
             prediction_for_field_picture(
                 source,
                 mb_y & 1,
+                0,
                 intra,
                 &ctx.layout,
                 stats,
@@ -1564,14 +1766,93 @@ fn write_picture(
                 };
             }
             partitions = Some(built);
+        } else if direct_field_pair
+            && source
+                .is_some_and(|mb| mb.motion_type == motion_type::FRAME_OR_16X8 && mb.mv_count >= 2)
+        {
+            let source = source.expect("checked above");
+            let field = mb_y & 1;
+            let mut built = [MotionPartition::default(); 2];
+            let mut modes = [PredictionMode::L0; 2];
+            for (part, slot) in built.iter_mut().enumerate() {
+                let part_pred = prediction_for_field_picture(
+                    Some(source),
+                    field,
+                    part,
+                    intra,
+                    &ctx.layout,
+                    stats,
+                    second_output_field && ctx.is_reference,
+                );
+                let uses_part_l0 = part_pred.ref_idx_l0 >= 0;
+                let uses_part_l1 = part_pred.ref_idx_l1 >= 0;
+                let p_l0 = if uses_part_l0 {
+                    field_motion[field].predict_16x8(mb_x, mb_y >> 1, part, 0, part_pred.ref_idx_l0)
+                } else {
+                    [0, 0]
+                };
+                let p_l1 = if uses_part_l1 {
+                    field_motion[field].predict_16x8(mb_x, mb_y >> 1, part, 1, part_pred.ref_idx_l1)
+                } else {
+                    [0, 0]
+                };
+                let state = MbMotion {
+                    ref_idx_l0: part_pred.ref_idx_l0,
+                    ref_idx_l1: part_pred.ref_idx_l1,
+                    mv_l0x: if uses_part_l0 { part_pred.mv_l0[0] } else { 0 },
+                    mv_l0y: if uses_part_l0 { part_pred.mv_l0[1] } else { 0 },
+                    mv_l1x: if uses_part_l1 { part_pred.mv_l1[0] } else { 0 },
+                    mv_l1y: if uses_part_l1 { part_pred.mv_l1[1] } else { 0 },
+                };
+                field_motion[field].set_16x8(mb_x, mb_y >> 1, part, &state);
+                *slot = MotionPartition {
+                    ref_idx_l0: state.ref_idx_l0,
+                    ref_idx_l1: state.ref_idx_l1,
+                    mvd_l0x: if uses_part_l0 {
+                        state.mv_l0x - p_l0[0]
+                    } else {
+                        0
+                    },
+                    mvd_l0y: if uses_part_l0 {
+                        state.mv_l0y - p_l0[1]
+                    } else {
+                        0
+                    },
+                    mvd_l1x: if uses_part_l1 {
+                        state.mv_l1x - p_l1[0]
+                    } else {
+                        0
+                    },
+                    mvd_l1y: if uses_part_l1 {
+                        state.mv_l1y - p_l1[1]
+                    } else {
+                        0
+                    },
+                };
+                modes[part] = PredictionMode::from_mb_type(part_pred.mb_type);
+            }
+            partitions = Some(built);
+            field_modes = Some(modes);
         } else if field_pair && !direct_field_pair {
             let (Some(pair_top), Some(pair_bottom)) = (pair_top, pair_bottom) else {
                 bail!("MBAFF macroblock pair is missing from the source");
             };
             let field = mb_y & 1;
             let field_preds = [
-                prediction_for_field(pair_top, field, &ctx.layout, pair_top.is_intra()),
-                prediction_for_field(pair_bottom, field, &ctx.layout, pair_bottom.is_intra()),
+                prediction_for_field(
+                    pair_top,
+                    field,
+                    pic.coding.top_field_first,
+                    &ctx.layout,
+                    pair_top.is_intra(),
+                ),
+                prediction_for_field(
+                    pair_bottom,
+                    field,
+                    pic.coding.top_field_first,
+                    &ctx.layout,
+                    pair_bottom.is_intra(),
+                ),
             ];
             let mut built = [MotionPartition::default(); 2];
             for (part, slot) in built.iter_mut().enumerate() {
@@ -1719,7 +2000,7 @@ fn write_picture(
             prev_qp,
         };
 
-        if direct_field_pair {
+        if direct_field_pair && partitions.is_none() {
             field_motion[mb_y & 1].set(
                 mb_x,
                 mb_y >> 1,
@@ -1818,4 +2099,70 @@ fn write_picture(
     }
 
     unreachable!("a picture geometry always contains a final macroblock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        dual_prime_opposite, field_picture_ref_index, field_picture_selected_parity, rounded_half,
+    };
+    use crate::mpeg2::constants::mb_flag;
+
+    #[test]
+    fn an_uncoded_p_field_vector_infers_same_parity() {
+        assert_eq!(field_picture_selected_parity(false, 0, 0, 1, 0), 1);
+        assert_eq!(
+            field_picture_selected_parity(false, mb_flag::MOTION_FORWARD, 0, 1, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn h262_half_rounds_ties_away_from_zero() {
+        assert_eq!(rounded_half(3), 2);
+        assert_eq!(rounded_half(-3), -2);
+        assert_eq!(rounded_half(2), 1);
+        assert_eq!(rounded_half(-2), -1);
+    }
+
+    #[test]
+    fn dual_prime_uses_the_field_distance_and_parity_offset() {
+        let coded = [3, -3];
+        let differential = [1, -1];
+        assert_eq!(
+            dual_prime_opposite(coded, differential, 0, true, true),
+            [3, -4],
+            "top field is one field interval from the opposite reference"
+        );
+        assert_eq!(
+            dual_prime_opposite(coded, differential, 1, true, true),
+            [6, -5],
+            "bottom field is three field intervals from the opposite reference"
+        );
+    }
+
+    #[test]
+    fn b_field_lists_start_with_the_current_parity() {
+        assert_eq!(field_picture_ref_index(0, 0, 0, false, true), 0);
+        assert_eq!(field_picture_ref_index(0, 1, 0, false, true), 1);
+        assert_eq!(field_picture_ref_index(0, 1, 1, false, true), 0);
+        assert_eq!(field_picture_ref_index(0, 0, 1, false, true), 1);
+    }
+
+    #[test]
+    fn p_field_lists_also_start_with_the_current_parity() {
+        assert_eq!(field_picture_ref_index(0, 0, 0, false, true), 0);
+        assert_eq!(field_picture_ref_index(0, 1, 0, false, true), 1);
+        assert_eq!(field_picture_ref_index(0, 1, 1, false, true), 0);
+        assert_eq!(field_picture_ref_index(0, 0, 1, false, true), 1);
+    }
+
+    #[test]
+    fn a_second_reference_field_keeps_the_first_field_at_index_one() {
+        // The older same-parity field remains first. The already decoded first
+        // field of the current pair is the opposite-parity entry immediately
+        // after it.
+        assert_eq!(field_picture_ref_index(0, 1, 1, true, true), 0);
+        assert_eq!(field_picture_ref_index(0, 0, 1, true, true), 1);
+    }
 }

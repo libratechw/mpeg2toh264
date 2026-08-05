@@ -71,13 +71,13 @@ pub fn map_vector(mvx_half: i32, mvy_half: i32) -> MappedPosition {
             b: Some([ix * 4, (iy + 1) * 4]),
         };
     }
-    // Both predictions sit at H.264's vertical half sample, so the bi-prediction
-    // average runs horizontally and stays exactly bilinear there; the six-tap
-    // filter absorbs the vertical axis.
+    // Both predictions sit at H.264's horizontal half sample, so the
+    // bi-prediction average runs vertically and stays exactly bilinear there;
+    // the six-tap filter absorbs the horizontal axis.
     MappedPosition {
         kind: VectorKind::HalfBothAxes,
-        a: [ix * 4, iy * 4 + 2],
-        b: Some([(ix + 1) * 4, iy * 4 + 2]),
+        a: [ix * 4 + 2, iy * 4],
+        b: Some([ix * 4 + 2, (iy + 1) * 4]),
     }
 }
 
@@ -127,13 +127,13 @@ mod tests {
     }
 
     #[test]
-    fn a_half_sample_on_both_axes_keeps_the_horizontal_exact() {
+    fn a_half_sample_on_both_axes_keeps_the_vertical_exact() {
         // Two predictions cannot average four samples, so the pair stays
-        // bilinear horizontally and the six-tap filter absorbs the vertical.
+        // bilinear vertically and the six-tap filter absorbs the horizontal.
         let mapped = map_vector(3, 5);
         assert_eq!(mapped.kind, VectorKind::HalfBothAxes);
-        assert_eq!(mapped.a, [4, 10], "vertically at the half sample");
-        assert_eq!(mapped.b, Some([8, 10]));
+        assert_eq!(mapped.a, [6, 8], "horizontally at the half sample");
+        assert_eq!(mapped.b, Some([6, 12]));
     }
 
     #[test]

@@ -69,6 +69,9 @@ pub struct Macroblock {
     /// `[r * 4 + s * 2 + t]` with r the vector index, s = 0 forward / 1
     /// backward, t = 0 horizontal / 1 vertical.
     pub mv: [i32; 8],
+    /// Dual-prime differential vector, whose two components are each -1, 0,
+    /// or +1 (H.262 7.6.3.6).
+    pub dmvector: [i32; 2],
     /// `motion_vertical_field_select`, indexed `[r * 2 + s]`.
     pub field_select: [u8; 4],
     /// How many of the two vector slots are in use.
@@ -105,6 +108,7 @@ impl Macroblock {
             dct_type: 0,
             cbp: 0,
             mv: [0; 8],
+            dmvector: [0; 2],
             field_select: [0; 4],
             mv_count: 1,
             blocks: [[0; 64]; 6],
@@ -126,6 +130,7 @@ impl Macroblock {
         self.dct_type = 0;
         self.cbp = 0;
         self.mv = [0; 8];
+        self.dmvector = [0; 2];
         self.field_select = [0; 4];
         self.mv_count = 1;
         self.coded_blocks = 0;
@@ -553,6 +558,7 @@ fn decode_macroblock(
     }
 
     let mut mv = [0i32; 8];
+    let mut dmvector = [0i32; 2];
     let mut field_select = [0u8; 4];
     let mut mv_count = 1usize;
 
@@ -585,7 +591,7 @@ fn decode_macroblock(
             let field_vertical_in_frame = spec.field_format && frame;
             mv[base] = decode_motion_component(r, f_code_h, &mut state.pmv, base, false)?;
             if spec.dmv {
-                V_DMV.decode(r)?; // dmvector[0]
+                dmvector[0] = V_DMV.decode(r)?;
             }
             mv[base + 1] = decode_motion_component(
                 r,
@@ -595,7 +601,7 @@ fn decode_macroblock(
                 field_vertical_in_frame,
             )?;
             if spec.dmv {
-                V_DMV.decode(r)?; // dmvector[1]
+                dmvector[1] = V_DMV.decode(r)?;
             }
         }
     }
@@ -629,6 +635,7 @@ fn decode_macroblock(
     mb.dct_type = dct_type;
     mb.cbp = if intra { 0x3f } else { cbp };
     mb.mv = mv;
+    mb.dmvector = dmvector;
     mb.field_select = field_select;
     mb.mv_count = mv_count;
 
