@@ -1,7 +1,20 @@
 {
-  "extends": "../tsconfig.json",
+  // The options the TypeScript implementation kept in a root tsconfig, which
+  // went away with it. web/ is the only TypeScript left, so they live here.
   "compilerOptions": {
-    "lib": ["ES2022", "DOM"]
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    // Only what the sources import: an ambient @types package would otherwise
+    // put Node's globals into a program that has none of them.
+    "types": []
   },
   "include": ["main.ts"]
 }

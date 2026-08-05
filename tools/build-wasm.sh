@@ -20,7 +20,10 @@ if [ "$wanted" != "$have" ]; then
 fi
 
 cargo build --release --package mpeg2toh264-wasm --target wasm32-unknown-unknown
-wasm-bindgen --target bundler --out-dir "$out" \
+# The web target loads the module itself, from a URL the caller passes in. The
+# bundler target would instead `import` the .wasm, which Vite only understands
+# with a plugin.
+wasm-bindgen --target web --out-dir "$out" \
   "$root/target/wasm32-unknown-unknown/release/mpeg2toh264_wasm.wasm"
 
 echo "wrote $out"

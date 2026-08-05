@@ -2,7 +2,7 @@
   // The worker needs lib.webworker, which redeclares self, postMessage and
   // much else that lib.dom also declares, so it cannot share a program with
   // main.ts.
-  "extends": "../tsconfig.json",
+  "extends": "./tsconfig.json",
   "compilerOptions": {
     "lib": ["ES2022", "WebWorker"]
   },

@@ -211,7 +211,7 @@ input.addEventListener("change", () => {
       if (message.randomAccess) randomAccessPoints.push(message.start);
       fragments.push(message.data);
       queuedBytes += message.data.byteLength;
-      sampleCount += message.samples ?? 0;
+      sampleCount += message.videoSamples ?? 0;
       audioSampleCount += message.audioSamples ?? 0;
       const audio =
         audioSampleCount > 0 ? ` · ${audioSampleCount} AAC frames` : "";

@@ -12,7 +12,7 @@ crates/
   mpeg2toh264-wasm/   # Sessionのwasm-bindgenラッパー
 testdata/             # 合成MPEG-2テストストリーム
 tools/                # テーブル生成・解析スクリプト（Python）
-web/                  # ブラウザMSEプレイヤー（後述、現状ビルド不可）
+web/                  # ブラウザMSEプレイヤー（後述）
 ```
 
 ## CLI
@@ -71,12 +71,16 @@ cargo install wasm-bindgen-cli
 ```ts
 import init, { Session } from './wasm/mpeg2toh264_wasm.js';
 
+await init({ module_or_path: new URL('./wasm/mpeg2toh264_wasm_bg.wasm', import.meta.url) });
+
 const session = new Session();
 for (const fragment of session.push(chunk)) {
   if (fragment.kind === 'init') openSourceBuffer(fragment.mimeCodec, fragment.data);
   else append(fragment.data, fragment.start, fragment.randomAccess);
 }
 ```
+
+`--target web`で生成しているので、`.wasm`の場所は上のように呼び出し側が渡します。bundlerターゲットは`.wasm`を`import`するため、Viteにプラグインが要ります。
 
 wasm-bindgen CLIのバージョンは`Cargo.lock`のcrateと一致している必要があります（ビルドスクリプトが確認します）。
 
@@ -90,10 +94,21 @@ cargo test --release
 
 ## ブラウザMSEプレイヤー
 
-`web/`はTypeScript実装（`src/`）を直接importしていたため、**現在はビルドできません**。WASMクレート（`crates/mpeg2toh264-wasm`）を追加して`web/`をそこへつなぎ替えるまでの一時的な状態です。
+TSファイルを選ぶと、Web Worker内のWASM `Session`が変換し、返ってきたフラグメントをそのままMSEへappendします。ファイルはページの外へ出ません。
+
+```bash
+./tools/build-wasm.sh    # 先にWASMを生成しておく
+npm install
+npm run web:dev          # 開発サーバー
+npm run web:build        # dist/ へ出力
+npm run typecheck
+```
+
+`web/wasm/`はビルド生成物なのでgit管理外です。`build-wasm.sh`を通していないと`npm run typecheck`もvite buildもimportを解決できません。
+
+`web/worker.ts`はメッセージの受け渡しだけで、変換の中身は持ちません。フラグメントの`data`はwasm-bindgenが作ったコピーなので、ページへはtransferで渡していて再コピーは起きません。バッファが溢れたときの破棄（`main.ts`の`relieveQuota`）は、`Session`が24 GOPごとに置くIDRを境界に使います。
 
 ## 残作業
 
-- `crates/mpeg2toh264-wasm`（`Session`をwasm-bindgenで包むだけ）と、`web/worker.ts`のつなぎ替え
 - CLIの`.mp4`出力はvideo-onlyのままです。音声が要るなら`Session`を通す必要があります
 - `tools/gen-*.py`はまだTypeScriptを出力するので、テーブルを再生成するにはエミッタ側の移植が必要です

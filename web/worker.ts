@@ -1,236 +1,86 @@
-import {
-  h264GopToFmp4,
-  mpeg2FragmentDuration,
-  mpeg2VideoTimeline,
-  type Mpeg2VideoTimeline,
-} from "../src/fmp4.ts";
-import {
-  aacFrameCountThroughVideoTime,
-  AdtsStream,
-  type AacConfig,
-  type AacFrame,
-} from "../src/aac/adts.ts";
-import { Mpeg2GopStream, type Mpeg2Gop } from "../src/mpeg2/gop-stream.ts";
-import { MpegTsAvDemuxer, type MpegTsElementaryPacket } from "../src/mpegts.ts";
-import { IncrementalTranscoder } from "../src/transcode.ts";
+/**
+ * Runs the transcoder off the page's main thread.
+ *
+ * There is no pipeline here any more: demux, GOP splitting, transcoding,
+ * muxing and the two-track timeline all live inside the WebAssembly `Session`.
+ * What is left is the message protocol -- pull a slice, hand back whatever
+ * fragments it completed -- and moving buffers to the page without copying.
+ */
+import init, { Session, type Fragment } from "./wasm/mpeg2toh264_wasm.js";
 
-let demuxer: MpegTsAvDemuxer;
-let gops: Mpeg2GopStream;
-let adts: AdtsStream;
-let sequenceNumber: number;
-let videoPresentationStart: number;
-let audioFramesEmitted: number;
-let initialized: boolean;
-let transcoder: IncrementalTranscoder;
-let pendingGops: Mpeg2Gop[];
-let pendingAudio: AacFrame[];
-let audioConfig: AacConfig | null;
-let gopsEmitted: number;
-/** PES timestamp of the first audio packet, in 90 kHz units. */
-let audioStartPts: number | null;
-/** Where the audio track begins on the shared timeline, once it is fixed. */
-let audioOriginTicks: number;
-let timelinesAligned: boolean;
-
-const RANDOM_ACCESS_GOP_INTERVAL = 24;
-const TIMESCALE = 90_000;
-
-function reset() {
-  demuxer = new MpegTsAvDemuxer();
-  gops = new Mpeg2GopStream();
-  adts = new AdtsStream();
-  sequenceNumber = 1;
-  videoPresentationStart = 0;
-  audioFramesEmitted = 0;
-  initialized = false;
-  transcoder = new IncrementalTranscoder();
-  pendingGops = [];
-  pendingAudio = [];
-  audioConfig = null;
-  gopsEmitted = 0;
-  audioStartPts = null;
-  audioOriginTicks = 0;
-  timelinesAligned = false;
-}
+type Request =
+  { type: "start" } | { type: "chunk"; data: ArrayBuffer } | { type: "end" };
 
 /**
- * Put the two tracks on one timeline, using the timestamps the transport
- * stream gives them.
+ * Message handling, queued behind loading the module.
  *
- * Video and audio in a broadcast stream do not start at the same PTS -- a few
- * hundred milliseconds apart is normal -- so starting both tracks at zero
- * shifts the audio by exactly that difference. Both are instead placed at
- * their real distance from whichever starts first, which keeps either base
- * time from going negative.
+ * Messages can arrive before the WebAssembly is instantiated, and they have to
+ * be answered in the order they came in, so each one waits on the last.
  */
-function alignTimelines(gop: Mpeg2Gop, timeline: Mpeg2VideoTimeline) {
-  if (timelinesAligned) return;
-  // Once a fragment has gone out the origin is fixed, whether or not the
-  // timestamps to choose it ever arrived; moving it later would tear the
-  // timeline in two.
-  if (initialized) {
-    timelinesAligned = true;
-    return;
-  }
-  if (gop.pts === null || audioStartPts === null) return;
-  timelinesAligned = true;
-  // A GOP's timestamp belongs to its I picture, which is coded first but
-  // displayed after the B pictures that lead the group. This only ever runs on
-  // the opening fragment, where those pictures are missing and the IDR covers
-  // their display slots, so the presentation still starts where they would.
-  const leadingSlots = (timeline.presentationIndices[0] ?? 1) - 1;
-  const videoStart = gop.pts - leadingSlots * timeline.sampleDuration;
-  // Decoding leads display by up to one frame, and the muxer needs somewhere
-  // to put that, so the timeline starts a frame before the earlier track.
-  const origin = Math.min(videoStart - timeline.sampleDuration, audioStartPts);
-  videoPresentationStart = videoStart - origin;
-  audioOriginTicks = audioStartPts - origin;
-}
+let pending: Promise<unknown> = init({
+  module_or_path: new URL("./wasm/mpeg2toh264_wasm_bg.wasm", import.meta.url),
+});
 
-/** Decode time of the next audio sample, in the audio track's own timescale. */
-function audioBaseDecodeTime(rate: number): number {
-  return (
-    Math.round((audioOriginTicks * rate) / TIMESCALE) +
-    audioFramesEmitted * 1024
-  );
-}
+let session: Session | null = null;
 
-function emitGop(gop: Mpeg2Gop, audioFrames: AacFrame[]) {
-  const randomAccess =
-    gopsEmitted > 0 && gopsEmitted % RANDOM_ACCESS_GOP_INTERVAL === 0;
-  if (randomAccess) {
-    transcoder.requestRandomAccessPoint();
-  }
-  const startsAtIdr = !initialized || randomAccess;
-  const timeline = mpeg2VideoTimeline(gop.data, {
-    hasReferences: !startsAtIdr,
-  });
-  // Aligning can still move the origin, so read the start after it.
-  alignTimelines(gop, timeline);
-  const start = videoPresentationStart / TIMESCALE;
-  const h264 = transcoder.push(gop.data);
-  const config = audioFrames[0]?.config ?? audioConfig ?? undefined;
-  const fragment = h264GopToFmp4(
-    h264.bitstream,
-    timeline,
-    sequenceNumber++,
-    videoPresentationStart,
-    config,
-    config
-      ? {
-          config,
-          samples: audioFrames.map((frame) => frame.data),
-          baseDecodeTime: audioBaseDecodeTime(config.sampleRate),
-        }
-      : undefined,
-  );
-  videoPresentationStart += fragment.duration;
-  audioFramesEmitted += audioFrames.length;
-  gopsEmitted++;
-  if (!initialized) {
-    initialized = true;
+/**
+ * The fragment's bytes are a copy wasm-bindgen made for us, so no one else
+ * holds the buffer and it can be transferred to the page rather than copied a
+ * second time.
+ */
+function send(fragment: Fragment) {
+  const data = fragment.data.buffer as ArrayBuffer;
+  if (fragment.kind === "init") {
+    self.postMessage({ type: "init", data, mimeCodec: fragment.mimeCodec }, [
+      data,
+    ]);
+  } else {
     self.postMessage(
       {
-        type: "init",
-        data: fragment.initSegment.buffer,
-        mimeCodec: fragment.mimeCodec,
+        type: "fragment",
+        data,
+        videoSamples: fragment.videoSamples,
+        audioSamples: fragment.audioSamples,
+        // Where this fragment starts, and whether it can be decoded from. The
+        // page needs both to evict buffered media without cutting into what is
+        // about to be played; see relieveQuota in main.ts.
+        start: fragment.start,
+        randomAccess: fragment.randomAccess,
       },
-      [fragment.initSegment.buffer],
+      [data],
     );
   }
-  self.postMessage(
-    {
-      type: "fragment",
-      data: fragment.mediaSegment.buffer,
-      samples: fragment.sampleCount,
-      audioSamples: audioFrames.length,
-      // Where this fragment starts, and whether it can be decoded from. The
-      // page needs both to evict buffered media without cutting into what is
-      // about to be played; see relieveQuota in main.ts.
-      start,
-      randomAccess: startsAtIdr,
-    },
-    [fragment.mediaSegment.buffer],
-  );
 }
 
-function flushPending(final = false) {
-  if (!demuxer.hasAacAudio) {
-    for (const gop of pendingGops) emitGop(gop, []);
-    pendingGops = [];
+function handle(request: Request) {
+  if (request.type === "start") {
+    // Rust memory, so dropping the reference would not be enough.
+    session?.free();
+    session = new Session();
+    self.postMessage({ type: "pull" });
     return;
   }
-  // Keep one GOP pending so all AAC packets up to the next GOP boundary can
-  // share the same moof. MSE implementations then see both trafs per fragment.
-  while (
-    pendingGops.length > (final ? 0 : 1) &&
-    audioConfig &&
-    (final || pendingAudio.length > 0)
-  ) {
-    const gop = pendingGops[0]!;
-    const randomAccess =
-      gopsEmitted > 0 && gopsEmitted % RANDOM_ACCESS_GOP_INTERVAL === 0;
-    const startsAtIdr = !initialized || randomAccess;
-    const timeline = mpeg2VideoTimeline(gop.data, {
-      hasReferences: !startsAtIdr,
-    });
-    alignTimelines(gop, timeline);
-    const videoDuration = mpeg2FragmentDuration(timeline, startsAtIdr);
-    // Audio is measured from where the audio track itself starts, not from
-    // where the video does.
-    const desiredAudioFrames = aacFrameCountThroughVideoTime(
-      videoPresentationStart + videoDuration - audioOriginTicks,
-      audioConfig.sampleRate,
-    );
-    const wanted = Math.max(0, desiredAudioFrames - audioFramesEmitted);
-    if (!final && pendingAudio.length < wanted) break;
-    pendingGops.shift();
-    const take =
-      final && pendingGops.length === 0
-        ? pendingAudio.length
-        : Math.min(wanted, pendingAudio.length);
-    emitGop(gop, pendingAudio.splice(0, take));
+  // Only reachable when the module failed to load, which was reported already.
+  if (!session) return;
+  if (request.type === "chunk") {
+    for (const fragment of session.push(new Uint8Array(request.data)))
+      send(fragment);
+    self.postMessage({ type: "pull" });
+  } else {
+    for (const fragment of session.finish()) send(fragment);
+    session.free();
+    session = null;
+    self.postMessage({ type: "done" });
   }
 }
 
-function consumeElementary(parts: MpegTsElementaryPacket[]) {
-  for (const part of parts) {
-    if (part.kind === "video") {
-      pendingGops.push(...gops.push(part.data, part.pts));
-    } else {
-      if (part.pts !== null) audioStartPts ??= part.pts;
-      const frames = adts.push(part.data);
-      audioConfig ??= frames[0]?.config ?? null;
-      pendingAudio.push(...frames);
-    }
-    flushPending();
-  }
-}
-
-reset();
-self.onmessage = (
-  event: MessageEvent<{ type: string; data?: ArrayBuffer }>,
-) => {
-  try {
-    if (event.data.type === "start") {
-      reset();
-      self.postMessage({ type: "pull" });
-    } else if (event.data.type === "chunk") {
-      consumeElementary(demuxer.push(new Uint8Array(event.data.data!)));
-      self.postMessage({ type: "pull" });
-    } else if (event.data.type === "end") {
-      consumeElementary(demuxer.finish());
-      pendingGops.push(...gops.finish());
-      const finalAudio = adts.finish();
-      audioConfig ??= finalAudio[0]?.config ?? null;
-      pendingAudio.push(...finalAudio);
-      flushPending(true);
-      self.postMessage({ type: "done" });
-    }
-  } catch (error) {
-    self.postMessage({
-      type: "error",
-      message: error instanceof Error ? error.message : String(error),
+self.onmessage = (event: MessageEvent<Request>) => {
+  pending = pending
+    .then(() => handle(event.data))
+    .catch((error: unknown) => {
+      self.postMessage({
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
     });
-  }
 };
