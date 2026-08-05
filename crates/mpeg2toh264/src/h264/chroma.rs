@@ -17,7 +17,9 @@ use std::sync::LazyLock;
 
 use crate::h264::cos_table::COS_PI_OVER_16;
 use crate::h264::params::ZIGZAG_4X4;
+#[cfg(test)]
 use crate::h264::quant::FLAT_PREDICTION_DC;
+use crate::h264::quant::{inter_targets, intra_targets};
 use crate::h264::quant_tables::{CHROMA_AC_GAIN_4X4, CHROMA_DC_GAIN, QPC_FROM_QPI};
 use crate::round_half_up_i32;
 
@@ -196,18 +198,16 @@ fn dequant_chroma(
         out.fill(0.0);
         return;
     };
-    for pos in 0..64 {
-        let level = levels[pos] as i64;
-        if intra && pos == 0 {
-            out[pos] = ((8 >> intra_dc_precision) as i64 * level) as f32 - FLAT_PREDICTION_DC;
-        } else if level == 0 {
-            out[pos] = 0.0;
-        } else {
-            let sign: i64 = if level < 0 { -1 } else { 1 };
-            let numerator = if intra { 2 * level } else { 2 * level + sign };
-            let scaled = numerator * weight_scale[pos] as i64 * quantiser_scale as i64;
-            out[pos] = (scaled / 32) as f32;
-        }
+    if intra {
+        intra_targets(
+            levels,
+            weight_scale,
+            quantiser_scale,
+            intra_dc_precision,
+            out,
+        );
+    } else {
+        inter_targets(levels, weight_scale, quantiser_scale, out);
     }
 }
 

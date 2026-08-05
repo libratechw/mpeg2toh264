@@ -15,12 +15,12 @@ use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
 
 /// fixture, converted pictures, output bytes, FNV-1a of the Annex B stream.
 const GOLDEN: [(&str, usize, usize, u64); 6] = [
-    ("altscan.m2v", 8, 330541, 0x50a9_4b00_8c36_efbb),
-    ("escape.m2v", 6, 244079, 0x399a_0ec0_f91b_100f),
-    ("hd1080i.m2v", 15, 4352299, 0x270c_5e65_8d27_dc0b),
-    ("i_only.m2v", 3, 211550, 0xaf0a_dec8_134b_2a78),
-    ("ibbp.m2v", 15, 296445, 0xeb87_3c8f_4ff4_e08f),
-    ("ip.m2v", 10, 264195, 0xd1f9_96e7_0178_7ad1),
+    ("altscan.m2v", 8, 340517, 0xd34c_096a_0562_5939),
+    ("escape.m2v", 6, 246744, 0x37ff_b946_fac4_ea2d),
+    ("hd1080i.m2v", 15, 4352883, 0x4eda_3674_3533_63e0),
+    ("i_only.m2v", 3, 211551, 0xd293_3c91_4fae_0330),
+    ("ibbp.m2v", 15, 296437, 0x100b_ae36_9f75_e5a3),
+    ("ip.m2v", 10, 264230, 0x7555_9dff_5663_d092),
 ];
 
 #[test]

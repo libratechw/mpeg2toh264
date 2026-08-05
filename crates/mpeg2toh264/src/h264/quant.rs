@@ -147,7 +147,17 @@ pub const FLAT_PREDICTION: i32 = 127;
 /// touches no AC term.
 pub const FLAT_PREDICTION_DC: f32 = 8.0 * FLAT_PREDICTION as f32;
 
-/// MPEG-2 dequantisation of an intra block, clause 7.4.1 and 7.4.2.1, minus the
+#[inline]
+fn finish_mismatch_control(out: &mut [f32; 64], parity: i32) {
+    // Since Rust uses two's-complement integers, XOR with one is exactly the
+    // clause 7.4.4 adjustment of F'[7][7]: subtract one when odd and add one
+    // when even. Saturation has already happened while filling the block.
+    if parity & 1 == 0 {
+        out[63] = ((out[63] as i32) ^ 1) as f32;
+    }
+}
+
+/// MPEG-2 dequantisation of an intra block, clauses 7.4.1 and 7.4.2.3, minus the
 /// flat prediction. The result is what the H.264 residual has to reconstruct.
 ///
 /// DC uses `intra_dc_mult` rather than the quantiser matrix, so it is handled
@@ -160,18 +170,26 @@ pub fn intra_targets(
     out: &mut [f32; 64],
 ) {
     let intra_dc_mult: i32 = 8 >> intra_dc_precision;
-    out[0] = (intra_dc_mult * levels[0] as i32) as f32 - FLAT_PREDICTION_DC;
-    // A level of zero gives zero through the same arithmetic, so there is no
-    // branch to keep the compiler from taking these four at a time. The
-    // products stay well inside 32 bits: the widest is 2 * 2048 * 255 * 112.
+    let dc = (intra_dc_mult * levels[0] as i32).clamp(-2048, 2047);
+    out[0] = dc as f32;
+    let mut parity = dc;
+    // The products stay well inside 32 bits: the widest is
+    // 2 * 2048 * 255 * 112.
     for pos in 1..64 {
         let level = levels[pos] as i32;
         // The division truncates toward zero, matching what a decoder computes.
-        out[pos] = ((2 * level * weight_scale[pos] * quantiser_scale) / 32) as f32;
+        let coefficient =
+            ((2 * level * weight_scale[pos] * quantiser_scale) / 32).clamp(-2048, 2047);
+        out[pos] = coefficient as f32;
+        parity ^= coefficient;
     }
+    finish_mismatch_control(out, parity);
+    // Mismatch control applies to the reconstructed MPEG-2 block, before the
+    // H.264-only flat prediction is removed from its DC coefficient.
+    out[0] -= FLAT_PREDICTION_DC;
 }
 
-/// MPEG-2 dequantisation of a non-intra block, clause 7.4.2.1. The prediction is
+/// MPEG-2 dequantisation of a non-intra block, clause 7.4.2.3. The prediction is
 /// the source's motion-compensated block, which the H.264 side reproduces, so
 /// nothing is subtracted here -- the residual carries across as it stands.
 pub fn inter_targets(
@@ -180,13 +198,17 @@ pub fn inter_targets(
     quantiser_scale: i32,
     out: &mut [f32; 64],
 ) {
-    // signum is zero at zero, which is exactly what a zero level has to
-    // dequantise to, so this needs no branch and can go four at a time.
+    // signum is zero at zero, exactly what a zero level has to dequantise to.
+    let mut parity = 0i32;
     for pos in 0..64 {
         let level = levels[pos] as i32;
-        out[pos] =
-            (((2 * level + level.signum()) * weight_scale[pos] * quantiser_scale) / 32) as f32;
+        let coefficient = (((2 * level + level.signum()) * weight_scale[pos] * quantiser_scale)
+            / 32)
+            .clamp(-2048, 2047);
+        out[pos] = coefficient as f32;
+        parity ^= coefficient;
     }
+    finish_mismatch_control(out, parity);
 }
 
 /// Orthonormal 8-point DCT basis, indexed by sample then frequency.
@@ -425,6 +447,7 @@ mod tests {
         // is subtracted: a constant prediction touches no AC term.
         assert_eq!(out[1], 32.0);
         assert_eq!(out[2], 0.0, "an uncoded position stays zero");
+        assert_eq!(out[63], 1.0, "an even coefficient sum is made odd");
     }
 
     #[test]
@@ -438,6 +461,34 @@ mod tests {
         assert_eq!(out[0], 3.0);
         // (2 * -3 - 1) * 16 * 1 / 32 = -3.5, truncated toward zero to -3.
         assert_eq!(out[1], -3.0);
+        assert_eq!(out[63], 1.0, "an even coefficient sum is made odd");
+    }
+
+    #[test]
+    fn inverse_quantisation_saturates_before_mismatch_control() {
+        let mut levels = [0i16; 64];
+        levels[0] = 2047;
+        levels[1] = -2048;
+        levels[63] = 2047;
+        let weights = [255; 64];
+        let mut out = [0.0f32; 64];
+        inter_targets(&levels, &weights, 112, &mut out);
+
+        assert_eq!(out[0], 2047.0);
+        assert_eq!(out[1], -2048.0);
+        // The saturated sum is even, so the odd value at [7][7] is reduced.
+        assert_eq!(out[63], 2046.0);
+    }
+
+    #[test]
+    fn mismatch_control_leaves_an_odd_sum_unchanged() {
+        let mut levels = [0i16; 64];
+        levels[0] = 1;
+        let mut out = [0.0f32; 64];
+        inter_targets(&levels, &DEFAULT_NON_INTRA_QUANT, 2, &mut out);
+
+        assert_eq!(out[0], 3.0);
+        assert_eq!(out[63], 0.0);
     }
 
     /// What a round trip through two eight-point transforms is allowed to
