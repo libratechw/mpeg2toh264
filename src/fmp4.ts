@@ -555,7 +555,7 @@ export function h264ToFmp4(
     return type === 1 || type === 5;
   });
   if (!sps || !pps) throw new Error("H.264 stream lacks SPS or PPS");
-  const presentation = [0, ...timeline.presentationIndices];
+  const presentation = timeline.presentationIndices;
   if (samples.length !== presentation.length) {
     throw new Error(
       `H.264 sample count ${samples.length} does not match MPEG-2 timeline ${presentation.length}`,
@@ -579,7 +579,7 @@ export function h264ToFmp4(
       presentation.map(
         (value, index) => (value - index) * timeline.sampleDuration,
       ),
-      samples.map((sample) => (sample[0]! & 0x1f) === 5),
+      samples.map((sample, index) => (sample[0]! & 0x1f) === 5 || index === 0),
     ),
     mimeCodec: `video/mp4; codecs="avc1.${codec}"`,
     sampleCount: samples.length,
@@ -648,7 +648,9 @@ export function h264GopToFmp4(
   const compositions = hasGreyIdr
     ? [0, ...contentCompositions]
     : contentCompositions;
-  const syncSamples = samples.map((sample) => (sample[0]! & 0x1f) === 5);
+  const syncSamples = samples.map(
+    (sample, index) => (sample[0]! & 0x1f) === 5 || Boolean(sps && index === 0),
+  );
   const codec = sps
     ? [sps[1]!, sps[2]!, sps[3]!]
         .map((v) => v.toString(16).padStart(2, "0"))

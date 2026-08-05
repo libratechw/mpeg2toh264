@@ -62,6 +62,8 @@ export interface SliceHeaderConfig {
    * same picture reachable through both lists.
    */
   l1FirstShortTermDelta?: number;
+  /** Promote the immediately previous short-term picture to long-term index 0. */
+  markPreviousLongTerm?: boolean;
 }
 
 export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
@@ -131,7 +133,15 @@ export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
       w.flag(0); // no_output_of_prior_pics_flag
       w.flag(cfg.longTermReference ?? false);
     } else {
-      w.flag(0); // adaptive_ref_pic_marking_mode_flag: sliding window
+      w.flag(cfg.markPreviousLongTerm ?? false);
+      if (cfg.markPreviousLongTerm) {
+        w.ue(4); // set MaxLongTermFrameIdx to 0
+        w.ue(1); // max_long_term_frame_idx_plus1
+        w.ue(3); // assign the immediately previous short-term picture
+        w.ue(0); // difference_of_pic_nums_minus1
+        w.ue(0); // long_term_frame_idx
+        w.ue(0); // end memory_management_control_operation list
+      }
     }
   } else if (cfg.idr) {
     throw new Error("an IDR picture must be a reference picture");

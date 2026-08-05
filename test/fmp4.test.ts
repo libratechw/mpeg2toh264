@@ -36,7 +36,7 @@ describe("fragmented MP4 muxing", () => {
     const mpeg2 = fixture("ibbp.m2v");
     const result = transcode(mpeg2);
     const mp4 = h264ToFmp4(result.bitstream, mpeg2VideoTimeline(mpeg2));
-    expect(mp4.sampleCount).toBe(result.picturesConverted + 1);
+    expect(mp4.sampleCount).toBe(result.picturesConverted);
     expect(mp4.mimeCodec).toMatch(/^video\/mp4; codecs="avc1\.[0-9a-f]{6}"$/);
     expect(text(mp4.initSegment)).toContain("ftyp");
     expect(text(mp4.initSegment)).toContain("moov");
@@ -84,8 +84,7 @@ describe("fragmented MP4 muxing", () => {
     expect(second.initSegment.length).toBe(0);
     expect(second.sampleCount).toBe(secondTimeline.presentationIndices.length);
     expect(first.duration).toBe(
-      firstTimeline.presentationIndices.length * firstTimeline.sampleDuration +
-        1,
+      firstTimeline.presentationIndices.length * firstTimeline.sampleDuration,
     );
   });
 
