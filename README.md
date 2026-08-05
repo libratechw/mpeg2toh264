@@ -1,246 +1,172 @@
 # mpeg2toh264
 
-MPEG-2の係数・動きベクトル構造を保ちながらH.264へ変換するビットストリームトランスコーダーです。動き補償も参照フレームバッファも持たず、MPEG-2の量子化レベルを直交DCT値へ逆量子化してH.264のレベルへ再量子化します。
+MPEG-2 Videoを完全にデコードせずH.264/AVCへトランスコードする実装
 
-例外はランダムアクセス点を開くピクチャで、ここだけはIスライスに参照リストがないため、フラット予測に代わってH.264自身のイントラ予測（DCモード）で符号化します。予測値をデコーダが再構成する画素から読む必要があるので、この1枚だけは逆変換と再構成も行います。
+一般的なトランスコードはMPEG-2をデコード→H.264エンコーダーで動き補償からやり直す、という処理を行う一方で、この実装はMPEG-2がすでに持つ量子化係数、マクロブロック種別、動きベクトル、ピクチャ参照関係を読み取り、対応するH.264のビットストリームへ直接変換します。輝度の通常の変換処理には逆DCT、動き補償、参照フレームバッファの処理はありません。
 
-実装はRustです。将来ブラウザ向けにWASMを載せる前提で、次の構成になっています。
+汎用H.264エンコーダーではなく、元の圧縮の構造を再利用しMPEG-2放送映像をブラウザーなどH.264デコーダーを前提とする環境で低い処理負荷で再生するための実装です。
 
-```
-Cargo.toml            # Cargoワークスペース
-crates/
-  mpeg2toh264/        # コアライブラリ（mpeg2 / h264 / container / session）
-  mpeg2toh264-cli/    # CLI
-  mpeg2toh264-wasm/   # Sessionのwasm-bindgenラッパー
-testdata/             # 合成MPEG-2テストストリーム
-tools/                # テーブル生成・解析スクリプト（Python）
-packages/
-  player/             # ブラウザプレイヤー（MIT）
-  demo/               # プレイヤーのデモアプリ
-  yadif/              # FFmpeg由来のyadifシェーダー（LGPL-2.1-or-later）
-```
+## 変換の仕組み
 
-## CLI
+### 1. 係数を画素にデコードせず変換
+
+MPEG-2の8×8量子化レベルを規格どおり逆量子化し、mismatch controlまで適用すると各値は直交正規化DCT空間上の係数になります。H.264 High Profileの8×8変換も同じ空間に再構成値を持つため、各係数について次を行えば輝度残差を直接変換できます。
+
+1. MPEG-2のレベル、量子化スケール、量子化行列から目標DCT値を求める
+2. MPEG-2の非イントラ量子化行列をH.264の8×8スケーリングリストとしてSPS/PPSへ渡す
+3. 各位置のH.264逆スケーリング利得で目標値を割り、最も近いH.264レベルへ丸める
+4. 係数をCAVLCで符号化する
+
+`--oversample`はH.264側の量子化刻みをMPEG-2より何倍細かくするかを指定します。既定値は2です。1では追加の丸め誤差がMPEG-2自身の誤差と同程度になり、約1.5 dBの損失、2では約0.5 dB、4では約0.13 dBが目安です。値を上げるほど出力は大きくなります。
+
+色差だけは例外で、MPEG-2 4:2:0の色差は1個の8×8 DCTなもののH.264は4個の4×4整数変換と2×2 DC Hadamard変換を使います。係数同士を一対一に対応させられないため、色差ブロックは8×8 IDCTで一度空間領域へ戻し、H.264の4×4基底へ投影します。これによる丸め誤差の蓄積を抑えるため、色差のQPには-6のオフセットを使います。
+
+### 2. MPEG-2の予測をH.264で再現する
+
+MPEG-2の動きベクトルは半画素単位で、半画素は隣接2画素のバイリニア補間です。一方、H.264の通常の半画素補間は6-tapフィルターなので、ベクトルを単純に2倍して1/4画素単位へ直すだけでは同じ予測になりません。
+
+この実装では、整数位置を1画素隔てた2本の予測として参照リスト0と1へ置き、H.264の双方向予測で平均します。これにより、片軸だけが半画素のMPEG-2輝度予測は厳密に再現できます。そのため、元がI/Pピクチャであっても通常の出力にはBスライスを使います。
+
+変換の精度は次のとおりです。
+
+| MPEG-2の位置・予測 | H.264での表現 | 精度 |
+| --- | --- | --- |
+| 両軸とも整数画素 | 1本の予測 | 輝度・色差とも厳密 |
+| 片軸だけ半画素 | 同じ参照画像上の2点を双方向予測 | 輝度は厳密。色差は1/4色差画素ずれる |
+| 両軸とも半画素 | 一方をバイリニア補間、他方をH.264補間 | 輝度も近似 |
+| MPEG-2の双方向予測 | 前方・後方予測で両方の参照リストを使用 | 平均構造は同じだが小数画素フィルターはH.264側 |
+
+色差のずれは、MPEG-2が輝度ベクトルを0方向へ丸めて半分にする一方、H.264は輝度ベクトルから1/8色差画素精度で導出し、色差だけのベクトルを指定する機能がないためです。
+
+H.264の動きベクトル差分は周囲のブロックから予測されるため、出力済みの4×4ブロック単位の参照インデックスとベクトルを保持し、H.264デコーダーと同じ中央値予測を行って差分を記録します。保持するのは参照画素のフレームバッファではなく、予測状態だけです。
+
+### 3. MPEG-2のイントラマクロブロックを一定値予測にする
+
+MPEG-2のイントラマクロブロックをH.264のイントラ予測へそのまま置き換えると、隣接画素から作られる予測を差し引く必要があり、画素の再構成が必要になります。
+
+そこで通常のピクチャでは、イントラマクロブロックも動きベクトル0のインターマクロブロックとして記録します。専用の長期参照インデックスに明示的重み付き予測の重み0、オフセット127を設定すると、参照画像の内容にかかわらず予測値は常に127になります。残差側はDC係数から `8 × 127` を引くだけなので、係数領域のまま処理できます。長期参照ピクチャはインデックスを置くためだけに存在し、画素は参照されません。
+
+### 4. ランダムアクセス点だけは再構成する
+
+デコードを開始するIDRはIスライスであり、一定値予測を置く参照リストがありません。この1枚だけはH.264のDCイントラ予測を使い、デコーダーが次のマクロブロックで参照する画素を得るために逆変換と再構成も行います。
+
+IDRの直後には同じ画像の長期参照用コピーを置き、以後の一定値予測用インデックスを確保します。ストリーミングでは24 GOPごとにこのランダムアクセス点を作ります。open GOP先頭のBピクチャなど、新しいデコード済みピクチャバッファに必要な参照がないピクチャは破棄し、IDRの表示時間を伸ばして元のGOP長と音声同期を保ちます。
+
+### 5. フレーム、フィールド、タイムライン
+
+プログレッシブシーケンスはフレーム符号化で出力します。インターレースシーケンスはMBAFFとして表し、フィールドピクチャは相補的なトップ・ボトムの組を1フレームにまとめます。
+
+元の符号化順と表示順は`temporal_reference`から復元し、H.264のPOCとMP4のcomposition offsetへ反映します。インターレースの有無とフィールド順はデコード後の画素から判別できないため、ストリーミングAPIではMPEG-2ヘッダーから読んだ値を各フラグメントのメタデータとして渡します。
+
+ループフィルターは無効です。MPEG-2にはループ内デブロッキングがなく、有効にすると後続ピクチャが参照する画像まで元映像と変わるためです。出力はHigh Profile、CAVLC、Level 5.1です。
+
+## 入出力
+
+入力はMPEG-2 Video ES、または188バイトパケットのMPEG-TSです。TSではPAT/PMTから同一サービスのMPEG-2 Video（stream type `0x02`）とAAC-LCを選びます。
+
+出力は拡張子で決まります。
+
+- `.h264`: Annex B H.264。TS入力でも映像のみ
+- その他（通常は`.mp4`）: fragmented MP4。TS入力ではAAC音声も多重化し、エレメンタリーストリーム入力では映像のみ
 
 ```bash
 cargo build --release
 ./target/release/mpeg2toh264 input.ts output.mp4
+./target/release/mpeg2toh264 input.m2v output.h264
 ```
 
-MPEG-TSとMPEG-2 video elementary streamを自動判別します。出力はfragmented MP4が既定で、`.h264`を指定したときだけ生のAnnex B H.264になります。TSからMP4へ変換するときは`Session`と同じ経路を通り、AAC音声もmuxします。video elementary streamには音声がないため、MP4もvideo-onlyです。
-
-```
-  -o, --oversample <n>      量子化探索のオーバーサンプル係数（既定: 2）
-  -q, --quiet               変換の進捗とサマリを表示しない
-  -h, --help                ヘルプを表示
+```text
+-o, --oversample <n>   H.264量子化刻みの細かさ（既定: 2、正の数）
+-q, --quiet            進捗と概要を表示しない
+-h, --help             ヘルプを表示
 ```
 
-## ストリーミングAPI
+AACのスペクトルデータは再符号化しません。通常のステレオと5.1chは保持し、モノラルは同じICSを左右へ複製、デュアルモノは主音声を左右へ複製して、放送途中で構成が変わっても2chトラックを維持します。映像と音声はそれぞれのPESタイムスタンプが示す間隔で配置します。
 
-`Session`がWASM/ブラウザ向けの入口です。TSのチャンクを渡すと、そのまま`SourceBuffer`へappendできるfMP4フラグメントが返ります。demux・GOP分割・変換・mux・2トラックのタイムライン調整はこの中で完結し、呼び出し側はファイルの読み出しとMSEへの追加を担当します。
+主な制約は次のとおりです。
+
+- 映像はMPEG-2のI/P/Bピクチャと4:2:0を対象とする
+- 逐次変換中の解像度またはプログレッシブ／インターレースシーケンスの変更は不可
+- TSの音声はAAC-LC、チャンネルエレメントの組み替えは44.1 kHzまたは48 kHzを対象とする
+- 破損スライス、参照が揃わない先頭Bピクチャ、片方だけのフィールドピクチャは読み飛ばす
+- 出力は再量子化による非可逆変換であり、小数画素予測には上表の近似がある
+
+## Rust API
+
+一括変換には`transcode`、GOP単位の処理には`IncrementalTranscoder`を使います。
+
+```rust
+use mpeg2toh264::{transcode, TranscodeOptions};
+
+let result = transcode(&mpeg2_es, TranscodeOptions::default())?;
+std::fs::write("output.h264", result.bitstream)?;
+println!("converted: {}, skipped: {}",
+         result.pictures_converted, result.pictures_skipped);
+```
+
+`Session`はブラウザーとストリーミング処理向けのインターフェースです。TSのチャンクを渡すと、MSEの`SourceBuffer`へ追加できるinitセグメントとGOP単位のfMP4フラグメント、字幕などのprivate PESイベントを返します。demux、GOP分割、変換、AAC処理、mux、PTSのラップアラウンドを含むタイムライン調整は内部で行います。
 
 ```rust
 let mut session = Session::default();
-for chunk in stream.chunks(1 << 20) {
+for chunk in input.chunks(1 << 20) {
     for fragment in session.push(chunk)? {
         match fragment {
-            Fragment::Init { data, mime_codec } => open_source_buffer(&mime_codec, &data),
-            Fragment::Media { data, start, random_access, .. } => append(&data, start, random_access),
-            Fragment::PrivateStream { .. } => { /* subtitle/data event */ }
+            Fragment::Init { data, mime_codec } => open(&mime_codec, data),
+            Fragment::Media { data, start, random_access, interlacing, .. } =>
+                append(data, start, random_access, interlacing),
+            Fragment::PrivateStream { stream_id, pid, data, pts } =>
+                dispatch(stream_id, pid, data, pts),
         }
     }
 }
-for fragment in session.finish()? { /* 同上 */ }
+for fragment in session.finish()? { /* 同様に処理 */ }
 ```
 
-`Media`が持つ`start`（秒）と`random_access`は、再生済み範囲を破棄するときにどこまで消してよいかを決めるためのものです。24 GOPごとにIDRを置いて復帰点にしています。
+ファイルの途中から再開する場合は、最初のセッションの`origin_ticks()`を`Session::anchored`へ渡します。フラグメントの`start`がファイル全体の時刻を維持するため、バイト範囲から読み直したデータを同じMSEタイムラインへ追加できます。`first_pts()`と`last_pts()`は、TSの小さなバイト範囲からシーク位置と再生時間を見積もるためのヘルパーです。
 
-ファイルの途中から読み直すときは`Session::anchored(options, Some(origin))`を使います。`origin`には最初のセッションの`origin_ticks()`（時刻0が指すPES timestamp、90 kHz）を渡します。こうすると、GOPヘッダーの手前で切れたバイト列から始めても、フラグメントの`start`はファイル全体で見た本当の時刻になります。末尾だけを読んで`last_pts()`にかければ、`origin`との差がそのまま動画長です。同じく`first_pts()`は「そのスライスの先頭バイトは何秒地点か」を返すので、索引のないTSでシーク位置を探すのに使えます。
+## WebAssemblyとMSEプレイヤー
 
-CLIでTSをMP4へ変換すると、このストリーミング経路が使われます。出力はそのまま再生可能なfMP4です。
+`crates/mpeg2toh264-wasm`は`Session`の`wasm-bindgen`ラッパーです。`packages/player`は取得、Worker内変換、MSEバッファー管理、範囲指定シークをまとめたMSEプレイヤー、`packages/yadif`はインターレース映像用の差し替え可能なWebGLデインターレーサーです。
 
-```bash
-./target/release/mpeg2toh264 input.ts output.mp4
-```
-
-AAC-LC音声はスペクトルを再エンコードせず、通常のステレオCPEはそのまま、モノラルSCEは同じICSを左右へ複製したCPE、デュアルモノは主音声SCEだけを左右へ複製したCPEへ組み替えてからmuxします。このため放送中にモノラルとデュアルモノが切り替わっても、出力トラックは一貫して2chステレオです。5.1chは暗黙のチャンネル構成とPCEによる明示構成のどちらも6chのまま保持します。映像と音声はPESのタイムスタンプが示す実際の間隔で配置されるので、放送でよくある数百ミリ秒のずれがそのまま保たれます。
-
-## WebAssembly
-
-`crates/mpeg2toh264-wasm`は`Session`をそのまま包んだだけの層です。フラグメントはプレーンなJSオブジェクトで返るので`free()`は要らず、`data`は転送可能な`Uint8Array`です。
-
-ホストへRustや`wasm-bindgen`を入れずにデモを試す場合はDockerを使えます。WASM、player、yadif、デモを順にビルドし、nginxで配信します。
+Dockerでは動画をサーバーへ送らず、選択したローカルファイルをブラウザー内で変換するデモを起動できます。
 
 ```bash
 docker build -t mpeg2toh264-demo .
 docker run --rm -p 8080:80 mpeg2toh264-demo
+# http://localhost:8080
 ```
 
-ブラウザーで`http://localhost:8080`を開き、MPEG-2 TSファイルを選択してください。コンテナへ動画を渡す必要はなく、選択したファイルはブラウザー内で処理されます。
-
-`wasm-bindgen` CLIのバージョンは、Dockerビルド時に`Cargo.lock`から読み取ってcrateと一致させます。
-
-ローカル環境でWASMだけを生成する場合は次の手順を使います。
+ローカルビルド:
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli
-./tools/build-wasm.sh            # packages/player/wasm/ へ出力
+cargo install wasm-bindgen-cli  # Cargo.lock内のwasm-bindgenと同じバージョン
+./tools/build-wasm.sh
+npm install
+npm run packages:build
+npm run web:dev
 ```
 
-WASMビルドでは`.cargo/config.toml`により`nontrapping-fptoint`、`bulk-memory`、
-`simd128`を有効にしています。これらのWebAssembly機能に対応したブラウザーが必要です。
-この設定は`wasm32-unknown-unknown`だけに適用され、CLIなどのネイティブビルドには影響しません。
+プレイヤーは特定のデインターレーサーへ依存しません。デモは`@mpeg2toh264/yadif`を注入し、MPEG-2由来のインターレース情報に従って処理します。private PESはMP4へ入れずイベントとして公開し、デモでは`aribb24.js`へ渡して字幕・文字スーパーを重ねます。
 
-```ts
-import init, { Session } from './wasm/mpeg2toh264_wasm.js';
+## 構成と検証
 
-await init({ module_or_path: new URL('./wasm/mpeg2toh264_wasm_bg.wasm', import.meta.url) });
-
-const session = new Session();
-for (const fragment of session.push(chunk)) {
-  if (fragment.kind === 'init') openSourceBuffer(fragment.mimeCodec, fragment.data);
-  else if (fragment.kind === 'media') append(fragment.data, fragment.start, fragment.randomAccess);
-  else handlePrivateStream(fragment.streamId, fragment.pid, fragment.data, fragment.pts);
-}
+```text
+crates/mpeg2toh264/       MPEG-2解析、H.264出力、コンテナー、Session
+crates/mpeg2toh264-cli/   CLI
+crates/mpeg2toh264-wasm/  Sessionのwasm-bindgenラッパー
+packages/player/          ブラウザープレイヤー（MIT）
+packages/yadif/           WebGL yadif（LGPL-2.1-or-later）
+packages/demo/            ブラウザーデモ
+testdata/                 テストデータ
+tools/                    テーブル生成、WASMビルド、テストデータ作成
 ```
-
-`--target web`で生成しているので、`.wasm`の場所は上のように呼び出し側が渡します。bundlerターゲットは`.wasm`を`import`するため、Viteにプラグインが要ります。
-
-wasm-bindgen CLIのバージョンは`Cargo.lock`のcrateと一致している必要があります（ビルドスクリプトが確認します）。
-
-## テスト
 
 ```bash
 cargo test --release
+npm run typecheck
 ```
 
-`crates/mpeg2toh264/tests/fixtures.rs`は各フィクスチャの出力バイト列をハッシュで固定しています。係数が1つでも変わればここで落ちるので、変わった理由を説明できないなら意図しない変更です。
+E2Eは全テストデータのAnnex B出力をハッシュで固定し、SPS/PPSは出力側とは独立したパーサーで読み戻します。フィールド順、TS分離、AACチャンネル構成、フラグメントのタイムライン、途中から再開するセッションも個別に検証しています。
 
-## ブラウザプレイヤー
-
-`packages/player/`が、URLと`<video>`を渡すだけのライブラリです。ページ側に残るのはメディア要素だけで、取得・変換・（可能なら）MSEはすべてWorker内で完結します。
-
-```ts
-import { Mpeg2TsPlayer } from '@mpeg2toh264/player';
-
-const player = new Mpeg2TsPlayer(video);
-player.addEventListener('statechange', (e) => console.log(e.detail.state));
-player.addEventListener('stats', (e) => console.log(e.detail.instantFps));
-await player.load('https://example.com/video.ts');
-```
-
-`load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`・`seekable`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
-
-選択サービスのprivate PESはfMP4へ入れず、`private_stream_1`（stream_id `0xbd`）または`private_stream_2`（`0xbf`）イベントで通知します。`event.detail`は`{ pid, data, pts }`で、`data`はPESヘッダーを除いた`ArrayBuffer`、`pts`は動画の時刻原点に合わせた秒です。文字スーパー自身にPTSがない場合は、同じサービスの直前の音声PTS（音声がなければ映像PTS）で補います。利用できる時刻がなければ`null`になります。デモは`aribb24.js`の`MPEGTSFeeder`へこのpayloadを渡し、`SVGDOMRenderer`で字幕（data_identifier `0x80`）と文字スーパー（`0x81`）を映像上へ重ねます。
-
-オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds` / `deinterlace` / `deinterlacer`。`deinterlacer`には`PlayerDeinterlacer`を返すfactoryを渡します。player自身は特定の方式に依存せず、`enabled`とストリームの`scan`情報を実装へ渡します。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`packages/demo/src/demo.ts`がそうしています）。ファイルはページの外へ出ません。
-
-### デインタレース
-
-放送のTSはインターレースで、変換後のH.264もそのままなので、`<video>`が出す絵は動いた場所が櫛状になります。デモは`@mpeg2toh264/yadif`の`Deinterlacer`をplayerへ注入し、要素の上に重ねた`<canvas>`へフィルター結果を表示します。`player.deinterlace = true/false`で再生中に切り替えられ、別方式も`PlayerDeinterlacer`インターフェースで差し替えられます。
-
-- フレームの取得には`requestVideoFrameCallback`を使います。yadifは前後1枚ずつを参照するため、映像は次のフレームが届くまでの約33 ms遅れて表示されます。この遅延により、動き検出に必要な3つの尺度を利用できます。シークやストリームの切り替わりは`mediaTime`の不連続として検出し、保持しているフレームを破棄します。
-- 既定は1フレームあたり1枚出力（`send_frame`＝mode 0相当）です。先に来たフィールドの行を残し、もう一方を補間します。フィールド順はストリームから取得し、`topFieldFirst`で上書きできます。
-- `doubleRate`でフィールドごとに1枚出力（`send_field`＝mode 1相当）になります。`spatialCheck`と組み合わせてyadifの4つのモードすべてに対応します（`send_frame` / `send_field` / それぞれの`nospatial`）。
-
-#### 倍レート（mode 1相当）
-
-インターレースの1フレームには2つの瞬間が入っています。1フレーム1枚だと後から来たほうを捨てることになり、毎秒59.94の動きが29.97になります。`doubleRate`を有効にすると、同じ3枚組へパリティを入れ替えてもう一度フィルターをかけ、残すフィールドをsecondのものにしたうえで、半フレーム後に表示します。
-
-- シェーダーの変更は不要です。補間する行を挟む2枚（`prev2` / `next2`）はパリティから決まるため、`uParity`を反転すると後続フィールドの時刻を表せます。参照実装の`is_second_field`と同じ分岐です。
-- 表示のタイミングは`requestVideoFrameCallback`の`expectedDisplayTime`（要素のフレームが画面に出る時刻）を基準に、そこから半フレーム後を狙って`requestAnimationFrame`で出します。実際に描くのは「目標の1/4フレーム手前」を過ぎた最初のtickです。60 Hzのディスプレイで29.97fpsなら、これがちょうど1リフレッシュずつ交互になります。
-- フレーム長は`mediaTime`の差を`playbackRate`で割って求めます。これにより、再生速度を変更した場合も表示時刻を補正できます。
-- 次のフレームが来たら未実行の2枚目はキャンセルします。一時停止・シーク・末尾では1枚だけ出します（静止画が表すのは1つの瞬間なので）。
-- 統計の`fps`は要素が提示したフレームのレート（＝入力側）のままです。`filtered`は2枚とも数え、`frameMs`は2回分の描画を含んだ「映像1フレームあたりの費用」です。
-- テクスチャはコード化サイズ（例: 1440x1080）で確保し、canvasのCSS上の領域は表示サイズ（例: 16:9）に合わせて`#layout`が配置します。この引き伸ばしによってSARを反映します。`videoWidth`はSAR適用後の幅なので、テクスチャの確保に使うと右端が埋まりません。アップロードされるサイズには`VideoFrameCallbackMetadata.width/height`を使います。
-- canvasは要素の絵を覆うので、要素自身のコントロールも隠れます。デモページが再生ボタンとシークバーを自前で持っているのはそのためです。
-- 一時停止、終端、デコード遅延などで同じフレームが再提示された場合は、`mediaTime`が変化していないことを確認して破棄します。同じフレームを履歴へ重複して追加すると、不要な処理が発生し、yadifが重複を動きとして扱う可能性があります。
-
-#### インターレースかどうか・TFFかBFFか
-
-変換後のH.264からは判別できません。デコード後は「2つの瞬間を持つフレーム」も「1つの瞬間のフレーム」も同じフレームとして見え、残すべき行を示す情報もありません。そのため、MPEG-2ヘッダーから読み取った情報をフラグメントに載せて渡します。
-
-- Rust側は`pictures_interlacing()`が`Interlacing { interlaced, top_field_first }`を返します。フィールドピクチャ（`picture_structure`が`TopField`/`BottomField`）なら構造的にインターレースで、先に符号化されたほうが先のフィールド。フレームピクチャなら`progressive_frame`が2つの瞬間かどうかを、`top_field_first`が順序を言います。1つのGOPに両方が混ざる（局が映画と生カメラを切り替えると起きます）場合は、どれか一つでもインターレースならインターレース扱いです
-- `Fragment::Media`に`interlacing`が付き、WASMでは`interlaced` / `topFieldFirst`として出ます。Workerは値が変わったときだけ`scan`通知を送り、プレイヤーが`scan`イベントとして中継しながらデインタレーサーへ渡します。フィールド順を誤ると、1行おきに半フィールドぶん逆方向へ動きます。
-- 放送の途中で変わりうるので、1回きりではなく変化のたびに流れます
-- プログレッシブと判明した時点でフィルターを停止し、インターレースに戻った時点で再開します。ソースの走査方式が判明するまでは、指定された有効状態に従います。
-
-検証は`crates/mpeg2toh264/tests/fixtures.rs`の`reads_the_field_order_of_every_fixture`が6フィクスチャすべてでffprobeの`field_order`と一致することを確認しています（`hd1080i`＝tt、`altscan`＝bb、残り4つはprogressive）。ブラウザでも同じ3ケースを確認済みで、BFFのストリームでは`deinterlacer.topFieldFirst`が`false`に切り替わります。
-
-#### デコーダーがデインタレースする場合
-
-Android端末など、デコーダーがデインタレース済みのフレームを返す環境があります。そのフレームへさらにyadifをかけると、不要なフィルター処理によって画質が低下します。この動作を判定するAPIはないため、検査用クリップをデコードして確認します。
-
-`decoderDeinterlaces()`は一度だけ検査用クリップを再生してピクセルを読み、縦方向の交互パターンが残っている割合を返します。結果は記憶され、2回目以降の呼び出しで再検査は行いません。残存率がしきい値を下回る場合は、デコーダーがデインタレースしていると判断します。既定のしきい値は50%で、`tolerance`で変更できます。
-
-- 検査用クリップは`packages/yadif/src/probe-clip.ts`にdata URLとして格納しています。1440x1080インターレース（TFF）の6フレームで、サイズは3,221バイト（base64で4.3 KB）です。2つのフィールドは明暗が反転し、フレームごとに入れ替わります。AVC Level 4.1のDPB制限内に収めたfragmented MP4で、本編と同じMSE経路からデコーダーへ渡します。再生成用のffmpegコマンドはファイルの先頭に記載しています。
-- 解像度を1440x1080にしているのは、実際の放送映像と同じデコード経路を使わせるためです。小さいクリップでは、デコーダーが異なるHW/SW経路を選ぶ可能性があります。
-- ピクセルはフィルターと同じく`<video>`からcanvasへ描画して読み出します。判定対象とフィルターへ渡される画素が同じ経路を通るため、デインタレース処理が行われる位置に左右されません。
-- デモは`probeDecoder()`の結果に応じてplayerの`deinterlace`を切り替えます。デコード失敗、canvasの読み出し失敗、タイムアウトの場合は、未処理のインターレース映像を避けるためフィルターを有効のままにします。
-
-デスクトップChrome（自動デインタレースなし）では残存率1.00・判定`false`・所要146 ms、Android端末（自動デインタレースあり）では残存率0.00・判定`true`・所要238 msでした。同じ指標をフィールド混合（blend）または片フィールド倍化（bob）へ適用した場合も0.00です。測定値がしきい値から十分離れているため、既定値の50%で判別できます。
-
-判定結果はデモページの「状態」欄に必ず出ます（残存率・所要時間つき、測定できなかった場合はその理由）。実機にデバッガを繋げなくても、`false`が「櫛が残っていた」のか「測れなかった」のか画面で区別できるようにするためです。
-
-#### フレーム落ちの統計
-
-デインタレースは渡されるフレーム次第で、前後が1枚飛ぶだけで動き判定が狂います。`deinterlace`イベント（フレームが来ている間、約1秒ごと）でそこが見えます。
-
-| 項目 | 意味 |
-| --- | --- |
-| `filtered` | 前後が揃った状態で処理できたフレーム。多いほど良い |
-| `missed` | 要素は提示したのにコールバックが呼ばれなかったフレーム（`presentedFrames`の飛びから算出）。前後が実際には2フレーム離れているので、動き判定が誤ります |
-| `dropped` | デコード後に提示されなかったフレーム（要素の`getVideoPlaybackQuality()`）。デインタレースを無効にした場合も発生するため、デコード処理の遅延を示します |
-| `degraded` | 片側の隣接フレームを自分自身で代用したフレーム。ストリームの先頭・シーク直後・停止直前。数個なら正常で、出続けるなら履歴が壊れ続けています |
-| `discontinuities` | `mediaTime`の不連続によって履歴を破棄した回数。シークとストリーム切り替えを含みます |
-| `fps` / `frameMs` | 直近1秒の提示レートと、アップロード＋描画がページのスレッドを使った時間 |
-
-8倍速で再生させて確かめたところ、`missed 58` / `dropped 173`（60 Hzのディスプレイに毎秒240枚提示させた場合）と、詰まっている場所がそのまま出ます。等速なら`30.0fps · 0.4ms/フレーム · missed 0`です。
-
-`packages/yadif`はFFmpegの`vf_yadif_cuda.cu`から移植したシェーダーと、WebGLの組み立て・テクスチャ・rVFCのループをまとめたLGPL-2.1-or-laterの独立パッケージです。MITのplayerはこれをimportせず、デモが実装を選んで注入します。
-
-### シーク
-
-サーバーがコンテンツ長と任意位置のバイト列を返せる場合は、シークを利用できます。ライブ配信やRangeリクエストに対応しないサーバーでは、変換済みの範囲だけが再生対象です。
-
-1. `Content-Length`がない場合は生配信として扱い、ファイル長の取得とシーク位置の探索を行いません。
-2. 末尾1 MiBをRangeリクエストで取り、失敗（206以外／取れた範囲が末尾でない）なら生配信のまま。Viteの開発サーバーのように`bytes=-N`を取り違える実装があるので、返ってきた`Content-Range`を見て絶対位置で取り直します。
-3. 成功したら、その中の最後のPTSと`Session`が報告する原点との差が動画長です。`MediaSource.duration`に入り、`seekable`が全長になって`seekable`イベントで通知されます。
-4. バッファ外へシークされたら、バッファを全消去し、開始位置を探索してからRangeリクエストを出し直します。TSに索引はないため、平均ビットレートから位置を推定し、そこから128 KiBを読んで`first_pts()`に渡します。得られた時刻で位置を再計算し、誤差0.5秒以内になるか4回に達するまで繰り返します。実際の録画（552 MB / 369秒）では、平均誤差が推定のみの1.53秒から探索後の0.18秒へ減少しました（最大誤差は2.4秒から0.36秒）。読み出す量は128〜256 KiBです。
-
-探索で得た点（バイト, 秒）はロード中に保持します。2回目以降のシークでは過去の探索結果を使って内挿するため、推定精度が向上します。探索の目標は要求時刻の1秒前です。GOP境界によって開始位置が最大0.5秒後方へ移動しても要求時刻を超えないようにしています。
-
-肝は`Session::anchored`です。ふつうのセッションは自分が読み始めた場所を時刻0にしますが、シーク後のセッションには最初のセッションが報告した原点（`origin_ticks`）を渡します。フラグメントはファイル全体の中での本当の時刻を持って出てくるので、appendした先がそのまま`currentTime`と一致します。33ビットで一周するPTSの折り返しも原点からの差で吸収します。
-
-### MediaSourceの置き場所
-
-`MediaSource`はWorker側とページ側のどちらでも動きます。既定の`mediaSource: 'auto'`は`MediaSource.canConstructInDedicatedWorker`を見て決めます。
-
-- Worker（MSE in Workers）— `MediaSource`をWorker内に作り、`handle`をtransferしてページが`video.srcObject`へ設定します。フラグメントはWorker内で処理され、ページ側は再生位置を200 msごとに通知します。現状ではChromium系ブラウザーのみ対応しています。
-- メインスレッド — フラグメントをtransferでページへ送り、ページの`MseSink`がappendします。FirefoxとSafariではこの方式を使います。
-
-バッファ管理は`packages/player/src/mse.ts`の`MseSink`ひとつで、どちらの経路も同じコードを通ります。メディア要素に触る2箇所（再生ヘッドの読み書き）だけがコールバックです。溢れたときの破棄は、`Session`が24 GOPごとに置くIDRを境界に使います。
-
-背圧はメッセージを持ちません。Workerの読み出しループが「sinkに置き場所ができるまで待ってから次のスライスを読む」ので、`ReadyGate`ひとつで表現できます。
-
-### ビルド
-
-```bash
-./tools/build-wasm.sh    # 先にWASMを生成しておく
-npm install
-npm run packages:build    # playerとyadifの配布用ファイルを生成
-npm run web:dev          # 開発サーバー
-npm run web:build        # dist/ へ出力
-npm run typecheck        # ページ側とWorker側の2プログラム
-```
-
-`packages/player/wasm/`はビルド生成物なのでgit管理外です。`build-wasm.sh`を通していないと`npm run typecheck`もvite buildもimportを解決できません。
-
-`@mpeg2toh264/player`と`@mpeg2toh264/yadif`の`exports`は、それぞれの`dist/`に生成したJavaScriptと型定義を参照します。playerのdistにはworkerとWASMも含まれ、workerのURLは`import.meta.url`を基準に解決されます。このため、利用側でViteによるTypeScriptやWorkerの変換は必要ありません。`npm pack`と`npm publish`では`prepack`が配布用ビルドを実行します。
-
-`packages/player/src/mse.ts`は両方のプログラムに属します。ページ側は`lib.dom`のMSE宣言を使い、Worker側は`packages/player/src/worker-mse.d.ts`を使います（`lib.webworker.d.ts`は`MediaSourceHandle`しか宣言していないため）。tsconfigの`include`を明示しているのはこの衝突を避けるためです。
-
-## 残作業
-
-- `tools/gen-*.py`はまだTypeScriptを出力するので、テーブルを再生成するにはエミッタ側の移植が必要です
+Rustクレート、CLI、プレイヤーはMITライセンスです。`packages/yadif`はFFmpeg由来部分を含むためLGPL-2.1-or-laterです。
