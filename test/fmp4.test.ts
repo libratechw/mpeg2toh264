@@ -6,7 +6,10 @@ import {
   aacToFmp4Fragment,
   h264GopToFmp4,
   h264ToFmp4,
+  mpeg2FragmentDuration,
+  mpeg2SampleTiming,
   mpeg2VideoTimeline,
+  type Mpeg2VideoTimeline,
 } from "../src/fmp4.ts";
 import { IncrementalTranscoder, transcode } from "../src/transcode.ts";
 import { sequenceSampleAspectRatio } from "../src/mpeg2/headers.ts";
@@ -70,7 +73,6 @@ describe("fragmented MP4 muxing", () => {
       firstTimeline,
       1,
       0,
-      0,
     );
     const secondTimeline = mpeg2VideoTimeline(gop, { hasReferences: true });
     const second = h264GopToFmp4(
@@ -78,7 +80,6 @@ describe("fragmented MP4 muxing", () => {
       secondTimeline,
       2,
       first.duration,
-      Math.max(...firstTimeline.presentationIndices),
     );
     expect(first.initSegment.length).toBeGreaterThan(0);
     expect(second.initSegment.length).toBe(0);
@@ -87,6 +88,49 @@ describe("fragmented MP4 muxing", () => {
       firstTimeline.presentationIndices.length * firstTimeline.sampleDuration +
         1,
     );
+  });
+
+  it("spans the source frames a random access point could not code", () => {
+    // An open GOP's two leading B pictures reference the previous anchor, which
+    // an IDR flushes, so a fragment restarting there starts at display slot 3.
+    // Its duration still has to cover all fifteen source frames or the video
+    // creeps ahead of the audio by two frames at every random access point.
+    const timeline: Mpeg2VideoTimeline = {
+      width: 720,
+      height: 480,
+      sampleDuration: 3003,
+      presentationIndices: [3, 6, 4, 5, 9, 7, 8, 12, 10, 11, 15, 13, 14],
+      syncSamples: [],
+    };
+    expect(mpeg2FragmentDuration(timeline, true)).toBe(15 * 3003);
+    // A closed GOP leaves no slot for the IDR, so it takes a single tick.
+    const closed = { ...timeline, presentationIndices: [1, 2, 3] };
+    expect(mpeg2FragmentDuration(closed, true)).toBe(3 * 3003 + 1);
+    expect(mpeg2FragmentDuration(closed, false)).toBe(3 * 3003);
+  });
+
+  it("never asks for a picture to be displayed before it is decoded", () => {
+    const gop = fixture("ibbp.m2v");
+    const timeline = mpeg2VideoTimeline(gop);
+    for (const startsAtIdr of [false, true]) {
+      const { durations, compositions, reorderDelay } = mpeg2SampleTiming(
+        timeline,
+        startsAtIdr,
+      );
+      expect(Math.min(...compositions)).toBeGreaterThanOrEqual(0);
+      // The delay is real time the decoder gets, not padding: display order
+      // still runs one slot per frame with no repeats or gaps.
+      let decodeTime = 0;
+      const displayed = durations
+        .map((duration, index) => {
+          const at = decodeTime + compositions[index]!;
+          decodeTime += duration;
+          return at;
+        })
+        .sort((a, b) => a - b);
+      expect(displayed[0]).toBe(reorderDelay);
+      expect(new Set(displayed).size).toBe(displayed.length);
+    }
   });
 
   it("packages raw AAC-LC frames in an audio track without ADTS headers", () => {
@@ -115,7 +159,6 @@ describe("fragmented MP4 muxing", () => {
       h264.bitstream,
       mpeg2VideoTimeline(mpeg2),
       1,
-      0,
       0,
       config,
       { config, samples, baseDecodeTime: 0 },

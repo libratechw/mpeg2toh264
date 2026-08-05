@@ -7,7 +7,18 @@ function psiPacket(pid: number, section: readonly number[]): Uint8Array {
   return packet;
 }
 
-export function wrapMpeg2EsInTs(es: Uint8Array): Uint8Array {
+/** The five-byte PTS field of a PES header, clause 2.4.3.7. */
+function ptsField(pts: number): number[] {
+  return [
+    0x21 | ((Math.floor(pts / 0x4000_0000) & 0x07) << 1),
+    Math.floor(pts / 0x40_0000) & 0xff,
+    0x01 | ((Math.floor(pts / 0x8000) & 0x7f) << 1),
+    Math.floor(pts / 0x80) & 0xff,
+    0x01 | ((pts & 0x7f) << 1),
+  ];
+}
+
+export function wrapMpeg2EsInTs(es: Uint8Array, pts?: number): Uint8Array {
   const pat = psiPacket(
     0,
     [
@@ -22,9 +33,13 @@ export function wrapMpeg2EsInTs(es: Uint8Array): Uint8Array {
       0x02, 0xe1, 0x01, 0xf0, 0x00, 0, 0, 0, 0,
     ],
   );
-  const pes = new Uint8Array(9 + es.length);
-  pes.set([0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0]);
-  pes.set(es, 9);
+  const header =
+    pts === undefined
+      ? [0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0]
+      : [0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, ...ptsField(pts)];
+  const pes = new Uint8Array(header.length + es.length);
+  pes.set(header);
+  pes.set(es, header.length);
 
   const packets: Uint8Array[] = [pat, pmt];
   let at = 0;

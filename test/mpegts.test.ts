@@ -19,6 +19,26 @@ describe("MPEG-TS demuxing", () => {
     expect(extractMpeg2VideoEs(ts)).toEqual(es);
   });
 
+  it("reads the PES presentation timestamp back exactly", () => {
+    const es = new Uint8Array(
+      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+    );
+    // A timestamp is 33 bits spread over five bytes around marker bits, so a
+    // misplaced shift stays invisible for small values. These exercise the top
+    // bits, the 90 kHz range a broadcast day reaches, and the wrap point.
+    const demux = (ts: Uint8Array) => {
+      const demuxer = new MpegTsAvDemuxer();
+      demuxer.push(ts);
+      return demuxer.finish();
+    };
+    for (const pts of [0, 1, 5_226_554_117, 0x1_ffff_ffff]) {
+      expect(demux(wrapMpeg2EsInTs(es, pts)).map((part) => part.pts)).toEqual([
+        pts,
+      ]);
+    }
+    expect(demux(wrapMpeg2EsInTs(es))[0]!.pts).toBeNull();
+  });
+
   it("does not mistake an elementary stream for transport packets", () => {
     const es = new Uint8Array(
       readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),

@@ -39,15 +39,35 @@ describe("incremental transcoding", () => {
     const stream = new Mpeg2GopStream();
     const units: Uint8Array[] = [];
     for (let at = 0; at < combined.length; at += 97) {
-      units.push(...stream.push(combined.subarray(at, at + 97)));
+      units.push(
+        ...stream.push(combined.subarray(at, at + 97)).map((gop) => gop.data),
+      );
     }
-    units.push(...stream.finish());
+    units.push(...stream.finish().map((gop) => gop.data));
     expect(units).toHaveLength(2);
     const picturesPerGop = parseElementaryStream(gop).length;
     expect(units.map((unit) => parseElementaryStream(unit).length)).toEqual([
       picturesPerGop,
       picturesPerGop,
     ]);
+  });
+
+  it("gives each GOP the timestamp of the packet that opens it", () => {
+    // The splitter drops everything before the first sequence header and
+    // re-injects sequence headers ahead of later units, so the byte a unit
+    // starts at is not the byte it was handed. Getting that mapping wrong
+    // anchors the whole presentation on the wrong picture.
+    const gop = new Uint8Array(
+      readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
+    );
+    const stream = new Mpeg2GopStream();
+    const units = [
+      ...stream.push(new Uint8Array(64), 1000),
+      ...stream.push(gop, 2000),
+      ...stream.push(gop, 3000),
+      ...stream.finish(),
+    ];
+    expect(units.map((unit) => unit.pts)).toEqual([2000, 3000]);
   });
 
   it("can insert a real IDR restart point between incremental GOPs", () => {
@@ -60,7 +80,7 @@ describe("incremental transcoding", () => {
     const restarted = session.push(gop).bitstream;
     expect([...restarted.subarray(0, 5)]).toEqual([0, 0, 0, 1, 0x65]);
     const timeline = mpeg2VideoTimeline(gop, { hasReferences: false });
-    const fragment = h264GopToFmp4(restarted, timeline, 2, 0, 0);
+    const fragment = h264GopToFmp4(restarted, timeline, 2, 0);
     expect(fragment.sampleCount).toBe(timeline.presentationIndices.length + 1);
     expect(fragment.duration).toBe(
       timeline.presentationIndices.length * timeline.sampleDuration + 1,
@@ -77,7 +97,7 @@ describe("incremental transcoding", () => {
     const restarted = session.push(gop).bitstream;
     expect([...restarted.subarray(0, 5)]).toEqual([0, 0, 0, 1, 0x65]);
     const timeline = mpeg2VideoTimeline(gop, { hasReferences: false });
-    const fragment = h264GopToFmp4(restarted, timeline, 2, 0, 0);
+    const fragment = h264GopToFmp4(restarted, timeline, 2, 0);
     expect(fragment.sampleCount).toBe(timeline.presentationIndices.length + 1);
     expect(fragment.duration).toBe(
       timeline.presentationIndices.length * timeline.sampleDuration + 1,

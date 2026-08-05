@@ -1,11 +1,16 @@
-import { h264GopToFmp4, mpeg2VideoTimeline } from "../src/fmp4.ts";
+import {
+  h264GopToFmp4,
+  mpeg2FragmentDuration,
+  mpeg2VideoTimeline,
+  type Mpeg2VideoTimeline,
+} from "../src/fmp4.ts";
 import {
   aacFrameCountThroughVideoTime,
   AdtsStream,
   type AacConfig,
   type AacFrame,
 } from "../src/aac/adts.ts";
-import { Mpeg2GopStream } from "../src/mpeg2/gop-stream.ts";
+import { Mpeg2GopStream, type Mpeg2Gop } from "../src/mpeg2/gop-stream.ts";
 import { MpegTsAvDemuxer, type MpegTsElementaryPacket } from "../src/mpegts.ts";
 import { IncrementalTranscoder } from "../src/transcode.ts";
 
@@ -13,63 +18,111 @@ let demuxer: MpegTsAvDemuxer;
 let gops: Mpeg2GopStream;
 let adts: AdtsStream;
 let sequenceNumber: number;
-let videoBaseDecodeTime: number;
-let audioBaseDecodeTime: number;
-let presentationBase: number;
+let videoPresentationStart: number;
+let audioFramesEmitted: number;
 let initialized: boolean;
 let transcoder: IncrementalTranscoder;
-let pendingGops: Uint8Array[];
+let pendingGops: Mpeg2Gop[];
 let pendingAudio: AacFrame[];
 let audioConfig: AacConfig | null;
 let gopsEmitted: number;
+/** PES timestamp of the first audio packet, in 90 kHz units. */
+let audioStartPts: number | null;
+/** Where the audio track begins on the shared timeline, once it is fixed. */
+let audioOriginTicks: number;
+let timelinesAligned: boolean;
 
 const RANDOM_ACCESS_GOP_INTERVAL = 24;
+const TIMESCALE = 90_000;
 
 function reset() {
   demuxer = new MpegTsAvDemuxer();
   gops = new Mpeg2GopStream();
   adts = new AdtsStream();
   sequenceNumber = 1;
-  videoBaseDecodeTime = 0;
-  audioBaseDecodeTime = 0;
-  presentationBase = 0;
+  videoPresentationStart = 0;
+  audioFramesEmitted = 0;
   initialized = false;
   transcoder = new IncrementalTranscoder();
   pendingGops = [];
   pendingAudio = [];
   audioConfig = null;
   gopsEmitted = 0;
+  audioStartPts = null;
+  audioOriginTicks = 0;
+  timelinesAligned = false;
 }
 
-function emitGop(mpeg2: Uint8Array, audioFrames: AacFrame[]) {
+/**
+ * Put the two tracks on one timeline, using the timestamps the transport
+ * stream gives them.
+ *
+ * Video and audio in a broadcast stream do not start at the same PTS -- a few
+ * hundred milliseconds apart is normal -- so starting both tracks at zero
+ * shifts the audio by exactly that difference. Both are instead placed at
+ * their real distance from whichever starts first, which keeps either base
+ * time from going negative.
+ */
+function alignTimelines(gop: Mpeg2Gop, timeline: Mpeg2VideoTimeline) {
+  if (timelinesAligned) return;
+  // Once a fragment has gone out the origin is fixed, whether or not the
+  // timestamps to choose it ever arrived; moving it later would tear the
+  // timeline in two.
+  if (initialized) {
+    timelinesAligned = true;
+    return;
+  }
+  if (gop.pts === null || audioStartPts === null) return;
+  timelinesAligned = true;
+  // A GOP's timestamp belongs to its I picture, which is coded first but
+  // displayed after the B pictures that lead the group. This only ever runs on
+  // the opening fragment, where those pictures are missing and the IDR covers
+  // their display slots, so the presentation still starts where they would.
+  const leadingSlots = (timeline.presentationIndices[0] ?? 1) - 1;
+  const videoStart = gop.pts - leadingSlots * timeline.sampleDuration;
+  // Decoding leads display by up to one frame, and the muxer needs somewhere
+  // to put that, so the timeline starts a frame before the earlier track.
+  const origin = Math.min(videoStart - timeline.sampleDuration, audioStartPts);
+  videoPresentationStart = videoStart - origin;
+  audioOriginTicks = audioStartPts - origin;
+}
+
+/** Decode time of the next audio sample, in the audio track's own timescale. */
+function audioBaseDecodeTime(rate: number): number {
+  return (
+    Math.round((audioOriginTicks * rate) / TIMESCALE) +
+    audioFramesEmitted * 1024
+  );
+}
+
+function emitGop(gop: Mpeg2Gop, audioFrames: AacFrame[]) {
   const randomAccess =
     gopsEmitted > 0 && gopsEmitted % RANDOM_ACCESS_GOP_INTERVAL === 0;
   if (randomAccess) {
     transcoder.requestRandomAccessPoint();
   }
-  const timeline = mpeg2VideoTimeline(mpeg2, {
+  const timeline = mpeg2VideoTimeline(gop.data, {
     hasReferences: initialized && !randomAccess,
   });
-  const h264 = transcoder.push(mpeg2);
+  alignTimelines(gop, timeline);
+  const h264 = transcoder.push(gop.data);
   const config = audioFrames[0]?.config ?? audioConfig ?? undefined;
   const fragment = h264GopToFmp4(
     h264.bitstream,
     timeline,
     sequenceNumber++,
-    videoBaseDecodeTime,
-    presentationBase,
+    videoPresentationStart,
     config,
     config
       ? {
           config,
           samples: audioFrames.map((frame) => frame.data),
-          baseDecodeTime: audioBaseDecodeTime,
+          baseDecodeTime: audioBaseDecodeTime(config.sampleRate),
         }
       : undefined,
   );
-  videoBaseDecodeTime += fragment.duration;
-  audioBaseDecodeTime += audioFrames.length * 1024;
-  presentationBase += Math.max(...timeline.presentationIndices);
+  videoPresentationStart += fragment.duration;
+  audioFramesEmitted += audioFrames.length;
   gopsEmitted++;
   if (!initialized) {
     initialized = true;
@@ -109,17 +162,19 @@ function flushPending(final = false) {
     const gop = pendingGops[0]!;
     const randomAccess =
       gopsEmitted > 0 && gopsEmitted % RANDOM_ACCESS_GOP_INTERVAL === 0;
-    const timeline = mpeg2VideoTimeline(gop, {
-      hasReferences: initialized && !randomAccess,
+    const startsAtIdr = !initialized || randomAccess;
+    const timeline = mpeg2VideoTimeline(gop.data, {
+      hasReferences: !startsAtIdr,
     });
-    const videoDuration =
-      timeline.presentationIndices.length * timeline.sampleDuration +
-      (initialized ? 0 : 1);
+    alignTimelines(gop, timeline);
+    const videoDuration = mpeg2FragmentDuration(timeline, startsAtIdr);
+    // Audio is measured from where the audio track itself starts, not from
+    // where the video does.
     const desiredAudioFrames = aacFrameCountThroughVideoTime(
-      videoBaseDecodeTime + videoDuration,
+      videoPresentationStart + videoDuration - audioOriginTicks,
       audioConfig.sampleRate,
     );
-    const wanted = Math.max(0, desiredAudioFrames - audioBaseDecodeTime / 1024);
+    const wanted = Math.max(0, desiredAudioFrames - audioFramesEmitted);
     if (!final && pendingAudio.length < wanted) break;
     pendingGops.shift();
     const take =
@@ -132,8 +187,10 @@ function flushPending(final = false) {
 
 function consumeElementary(parts: MpegTsElementaryPacket[]) {
   for (const part of parts) {
-    if (part.kind === "video") pendingGops.push(...gops.push(part.data));
-    else {
+    if (part.kind === "video") {
+      pendingGops.push(...gops.push(part.data, part.pts));
+    } else {
+      if (part.pts !== null) audioStartPts ??= part.pts;
       const frames = adts.push(part.data);
       audioConfig ??= frames[0]?.config ?? null;
       pendingAudio.push(...frames);

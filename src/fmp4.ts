@@ -558,6 +558,68 @@ export interface Fmp4Output {
   sampleCount: number;
 }
 
+/**
+ * Sample durations and composition offsets for one unit of coded pictures.
+ *
+ * Durations are in decode order and composition offsets carry each sample to
+ * its display slot.
+ *
+ * A unit that starts at a random access point carries an IDR plus the skipped
+ * copy of it that starts the short-term reference chain, so it holds one more
+ * sample than the timeline has pictures. It is also short of pictures at the
+ * front: an open GOP's leading B pictures reference an anchor the IDR flushes,
+ * so the transcoder cannot code them and the first retained picture sits that
+ * many display slots in.
+ *
+ * Those empty slots go to the IDR, which holds the same picture as the copy
+ * that follows it. That leaves no gap to stall on, and -- the reason this
+ * matters -- it makes every unit span exactly as many frames as the source did,
+ * so units appended end to end cannot creep away from the audio.
+ */
+export function mpeg2SampleTiming(
+  timeline: Mpeg2VideoTimeline,
+  startsAtIdr: boolean,
+) {
+  const indices = timeline.presentationIndices;
+  // The slot the unit starts on, which is not the first picture in decode
+  // order: an I picture is coded ahead of the B pictures that display before
+  // it, and at a random access point those B pictures are missing entirely.
+  const firstIndex = indices.length > 0 ? Math.min(...indices) : 1;
+  const offsets = indices.map(
+    (presentationIndex, decodeIndex) =>
+      (presentationIndex - firstIndex - decodeIndex) * timeline.sampleDuration,
+  );
+  // An anchor picture is coded before the B pictures that display ahead of it,
+  // so it reaches its display slot before its decode slot -- a negative
+  // composition offset, which asks a decoder to show a picture it has not
+  // decoded yet. Holding the whole decode timeline back by the largest such
+  // lead keeps every offset at or above zero without moving a single picture
+  // relative to the audio.
+  const reorderDelay = -Math.min(0, ...offsets);
+  const durations = indices.map(() => timeline.sampleDuration);
+  const compositions = offsets.map((offset) => offset + reorderDelay);
+  if (!startsAtIdr) return { durations, compositions, reorderDelay };
+  return {
+    durations: [
+      Math.max(1, (firstIndex - 1) * timeline.sampleDuration),
+      ...durations,
+    ],
+    compositions: [reorderDelay, ...compositions],
+    reorderDelay,
+  };
+}
+
+/** How much of the presentation one fragment covers, needed before its audio is chosen. */
+export function mpeg2FragmentDuration(
+  timeline: Mpeg2VideoTimeline,
+  startsAtIdr: boolean,
+): number {
+  return mpeg2SampleTiming(timeline, startsAtIdr).durations.reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+}
+
 /** Package this transcoder's Annex B output as one video-only MSE presentation. */
 export function h264ToFmp4(
   h264: Uint8Array,
@@ -574,14 +636,13 @@ export function h264ToFmp4(
   if (!sps || !pps) throw new Error("H.264 stream lacks SPS or PPS");
   const hasIdrClone =
     samples.length === timeline.presentationIndices.length + 1;
-  const presentation = hasIdrClone
-    ? [0, ...timeline.presentationIndices]
-    : timeline.presentationIndices;
-  if (samples.length !== presentation.length) {
+  const expected = timeline.presentationIndices.length + (hasIdrClone ? 1 : 0);
+  if (samples.length !== expected) {
     throw new Error(
-      `H.264 sample count ${samples.length} does not match MPEG-2 timeline ${presentation.length}`,
+      `H.264 sample count ${samples.length} does not match MPEG-2 timeline ${expected}`,
     );
   }
+  const { durations, compositions } = mpeg2SampleTiming(timeline, hasIdrClone);
   const codec = [sps[1]!, sps[2]!, sps[3]!]
     .map((v) => v.toString(16).padStart(2, "0"))
     .join("");
@@ -596,11 +657,8 @@ export function h264ToFmp4(
     ),
     mediaSegment: makeMediaSegment(
       samples,
-      samples.map(() => timeline.sampleDuration),
-      presentation.map(
-        (value, index) =>
-          (value - index - (hasIdrClone ? 0 : 1)) * timeline.sampleDuration,
-      ),
+      durations,
+      compositions,
       samples.map((sample) => (sample[0]! & 0x1f) === 5),
       1,
       0,
@@ -612,7 +670,7 @@ export function h264ToFmp4(
 }
 
 export interface Fmp4FragmentOutput extends Fmp4Output {
-  /** Decode timeline consumed by this fragment, including a one-tick IDR when present. */
+  /** Presentation time this fragment covers; see mpeg2SampleTiming. */
   duration: number;
 }
 
@@ -627,8 +685,8 @@ export function h264GopToFmp4(
   h264: Uint8Array,
   timeline: Mpeg2VideoTimeline,
   sequenceNumber: number,
-  baseDecodeTime: number,
-  presentationBase = 0,
+  /** Media time of the fragment's first displayed picture. */
+  presentationStart: number,
   audio?: AacConfig,
   audioTrack?: Fmp4AudioSamples,
 ): Fmp4FragmentOutput {
@@ -647,35 +705,14 @@ export function h264GopToFmp4(
   if (samples.length !== expectedSamples) {
     throw new Error("H.264 GOP sample count does not match MPEG-2 timeline");
   }
-  // An IDR and the skipped copy that follows it hold the same picture, so the
-  // IDR is exposed for a single 90 kHz tick and the copy takes its display
-  // slot. Both carry real content, so the seam is invisible either way.
-  const idrDuration = hasIdrClone ? 1 : 0;
-  const contentDurations = timeline.presentationIndices.map(
-    () => timeline.sampleDuration,
+  const { durations, compositions, reorderDelay } = mpeg2SampleTiming(
+    timeline,
+    hasIdrClone,
   );
-  const contentCompositions = timeline.presentationIndices.map(
-    (presentationIndex, decodeIndex) => {
-      // MPEG-2 temporal_reference starts at 0, while the retained leading B
-      // pictures make the first emitted anchor land at index 1. Normalize each
-      // fragment locally so its first content presentation follows the IDR.
-      const desired =
-        baseDecodeTime +
-        idrDuration +
-        (presentationIndex - 1) * timeline.sampleDuration;
-      const decoded =
-        baseDecodeTime +
-        (hasIdrClone ? idrDuration : 0) +
-        decodeIndex * timeline.sampleDuration;
-      return desired - decoded;
-    },
-  );
-  const durations = hasIdrClone
-    ? [idrDuration, ...contentDurations]
-    : contentDurations;
-  const compositions = hasIdrClone
-    ? [0, ...contentCompositions]
-    : contentCompositions;
+  // Decoding runs ahead of display by the reorder delay; a fragment at the very
+  // start of the timeline has nowhere to put it and simply displays that much
+  // later.
+  const baseDecodeTime = Math.max(0, presentationStart - reorderDelay);
   const syncSamples = samples.map((sample) => (sample[0]! & 0x1f) === 5);
   const codec = sps
     ? [sps[1]!, sps[2]!, sps[3]!]

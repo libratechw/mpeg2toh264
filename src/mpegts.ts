@@ -109,6 +109,26 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
+/**
+ * The 33-bit presentation timestamp, in 90 kHz units, or null when the PES
+ * packet carries none. It is spread over five bytes with a marker bit after
+ * every group (clause 2.4.3.7).
+ */
+function pesPts(packet: Uint8Array): number | null {
+  if ((packet[6]! & 0xc0) !== 0x80) return null;
+  if ((packet[7]! & 0x80) === 0) return null;
+  // PTS[32..30] then a marker, PTS[29..15] then a marker, PTS[14..0] then a
+  // marker. Multiplication rather than shifting, because the value exceeds
+  // what JavaScript's 32-bit bitwise operators hold.
+  return (
+    ((packet[9]! >> 1) & 0x07) * 0x40000000 +
+    packet[10]! * 0x400000 +
+    ((packet[11]! >> 1) & 0x7f) * 0x8000 +
+    packet[12]! * 0x80 +
+    (packet[13]! >> 1)
+  );
+}
+
 function pesPayload(
   packet: Uint8Array,
   kind: "video" | "audio" = "video",
@@ -240,6 +260,12 @@ export function extractMpeg2VideoEs(data: Uint8Array): Uint8Array {
 export interface MpegTsElementaryPacket {
   kind: "video" | "audio";
   data: Uint8Array;
+  /**
+   * The PES presentation timestamp in 90 kHz units, when one is present.
+   * Video and audio rarely start at the same timestamp in a broadcast stream,
+   * so this is what puts the two tracks on a common timeline.
+   */
+  pts: number | null;
 }
 
 interface PesState {
@@ -349,7 +375,8 @@ export class MpegTsAvDemuxer {
     output: MpegTsElementaryPacket[],
   ) {
     if (state.parts.length === 0) return;
-    output.push({ kind, data: pesPayload(concat(state.parts), kind) });
+    const packet = concat(state.parts);
+    output.push({ kind, data: pesPayload(packet, kind), pts: pesPts(packet) });
     state.parts = [];
     state.collecting = false;
   }
