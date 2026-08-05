@@ -1,4 +1,4 @@
-//! Minimal MPEG-TS demuxing for an MPEG-2 video elementary stream.
+//! Minimal MPEG-TS demuxing for MPEG-2 video and AAC-LC audio.
 
 use std::collections::{HashMap, HashSet};
 
@@ -7,6 +7,41 @@ use crate::error::{bail, Result};
 const TS_PACKET_SIZE: usize = 188;
 const SYNC_BYTE: u8 = 0x47;
 const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
+const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
+
+/// Which elementary stream a packet belongs to. The two differ in the
+/// `stream_id` range their PES headers may use (Table 2-22).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElementaryKind {
+    Video,
+    Audio,
+}
+
+impl ElementaryKind {
+    fn accepts_stream_id(self, stream_id: u8) -> bool {
+        match self {
+            Self::Video => (0xe0..=0xef).contains(&stream_id),
+            Self::Audio => (0xc0..=0xdf).contains(&stream_id),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::Audio => "audio",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ElementaryPacket {
+    pub kind: ElementaryKind,
+    pub data: Vec<u8>,
+    /// The PES presentation timestamp in 90 kHz units, when one is present.
+    /// Video and audio rarely start at the same timestamp in a broadcast
+    /// stream, so this is what puts the two tracks on a common timeline.
+    pub pts: Option<u64>,
+}
 
 struct TsPayload<'a> {
     pid: u16,
@@ -117,10 +152,73 @@ impl SectionAssembler {
     }
 }
 
+/// The elementary stream PIDs a program advertises.
+#[derive(Default)]
+struct ProgramMap {
+    pmt_pids: HashSet<u16>,
+    video_pid: Option<u16>,
+    audio_pid: Option<u16>,
+    assemblers: HashMap<u16, SectionAssembler>,
+}
+
+impl ProgramMap {
+    fn wants(&self, pid: u16) -> bool {
+        pid == 0 || self.pmt_pids.contains(&pid)
+    }
+
+    fn push(&mut self, packet: &TsPayload<'_>, sections: &mut Vec<Vec<u8>>) {
+        sections.clear();
+        self.assemblers.entry(packet.pid).or_default().push(
+            packet.data,
+            packet.payload_unit_start,
+            sections,
+        );
+        for section in sections.iter() {
+            self.scan(section, packet.pid);
+        }
+    }
+
+    /// Scan a PAT or PMT section, recording the PMT PIDs and the first MPEG-2
+    /// video and AAC elementary streams they advertise.
+    fn scan(&mut self, section: &[u8], pid: u16) {
+        if section.len() < 12 {
+            return;
+        }
+        if pid == 0 && section[0] == 0x00 {
+            let end = section.len() - 4;
+            let mut i = 8;
+            while i + 3 < end {
+                let program = ((section[i] as u16) << 8) | section[i + 1] as u16;
+                if program != 0 {
+                    self.pmt_pids
+                        .insert((((section[i + 2] & 0x1f) as u16) << 8) | section[i + 3] as u16);
+                }
+                i += 4;
+            }
+        } else if section[0] == 0x02 {
+            let program_info_length = (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
+            let end = section.len() - 4;
+            let mut i = 12 + program_info_length;
+            while i + 4 < end {
+                let stream_type = section[i];
+                let stream_pid = (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
+                let info_length =
+                    (((section[i + 3] & 0x0f) as usize) << 8) | section[i + 4] as usize;
+                if self.video_pid.is_none() && stream_type == STREAM_TYPE_MPEG2_VIDEO {
+                    self.video_pid = Some(stream_pid);
+                }
+                if self.audio_pid.is_none() && stream_type == STREAM_TYPE_AAC_ADTS {
+                    self.audio_pid = Some(stream_pid);
+                }
+                i += 5 + info_length;
+            }
+        }
+    }
+}
+
 /// The 33-bit presentation timestamp, in 90 kHz units, or `None` when the PES
 /// packet carries none. It is spread over five bytes with a marker bit after
 /// every group (clause 2.4.3.7).
-#[allow(dead_code)]
 fn pes_pts(packet: &[u8]) -> Option<u64> {
     if packet.len() < 14 || packet[6] & 0xc0 != 0x80 || packet[7] & 0x80 == 0 {
         return None;
@@ -134,13 +232,13 @@ fn pes_pts(packet: &[u8]) -> Option<u64> {
     )
 }
 
-fn pes_payload(packet: &[u8]) -> Result<&[u8]> {
+fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
     if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 || packet[2] != 1 {
-        bail!("invalid MPEG-TS video PES start code");
+        bail!("invalid MPEG-TS {} PES start code", kind.name());
     }
     let stream_id = packet[3];
-    if !(0xe0..=0xef).contains(&stream_id) {
-        bail!("unexpected video stream_id 0x{stream_id:02x}");
+    if !kind.accepts_stream_id(stream_id) {
+        bail!("unexpected {} stream_id 0x{stream_id:02x}", kind.name());
     }
     let pes_length = ((packet[4] as usize) << 8) | packet[5] as usize;
     let start = if packet[6] & 0xc0 == 0x80 {
@@ -174,102 +272,160 @@ fn pes_payload(packet: &[u8]) -> Result<&[u8]> {
         packet.len().min(6 + pes_length)
     };
     if start > end {
-        bail!("truncated MPEG-TS video PES header");
+        bail!("truncated MPEG-TS {} PES header", kind.name());
     }
     Ok(&packet[start..end])
 }
 
-/// Scan PAT and PMT sections, recording the PMT PIDs and the first MPEG-2 video
-/// elementary stream PID they advertise.
-fn scan_psi_section(section: &[u8], pid: u16, pmt_pids: &mut HashSet<u16>, video_pid: &mut i32) {
-    if section.len() < 12 {
-        return;
-    }
-    if pid == 0 && section[0] == 0x00 {
-        let end = section.len() - 4;
-        let mut i = 8;
-        while i + 3 < end {
-            let program = ((section[i] as u16) << 8) | section[i + 1] as u16;
-            if program != 0 {
-                pmt_pids.insert((((section[i + 2] & 0x1f) as u16) << 8) | section[i + 3] as u16);
-            }
-            i += 4;
+/// Whether a packet payload opens a PES packet of the given kind. A payload
+/// unit start on the right PID is not enough: broadcast streams interleave
+/// other PES types on PIDs a PMT has already claimed.
+fn is_pes_start(packet: &[u8], kind: ElementaryKind) -> bool {
+    packet.len() >= 4
+        && packet[0] == 0
+        && packet[1] == 0
+        && packet[2] == 1
+        && kind.accepts_stream_id(packet[3])
+}
+
+/// One elementary stream's PES packet as it accumulates across TS packets.
+#[derive(Default)]
+struct PesState {
+    parts: Vec<u8>,
+    collecting: bool,
+}
+
+impl PesState {
+    fn flush(&mut self, kind: ElementaryKind, output: &mut Vec<ElementaryPacket>) -> Result<()> {
+        if self.parts.is_empty() {
+            return Ok(());
         }
-    } else if section[0] == 0x02 {
-        let program_info_length = (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
-        let end = section.len() - 4;
-        let mut i = 12 + program_info_length;
-        while i + 4 < end {
-            let stream_type = section[i];
-            let stream_pid = (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
-            let info_length = (((section[i + 3] & 0x0f) as usize) << 8) | section[i + 4] as usize;
-            if *video_pid < 0 && stream_type == STREAM_TYPE_MPEG2_VIDEO {
-                *video_pid = stream_pid as i32;
-            }
-            i += 5 + info_length;
-        }
+        let packet = std::mem::take(&mut self.parts);
+        output.push(ElementaryPacket {
+            kind,
+            data: pes_payload(&packet, kind)?.to_vec(),
+            pts: pes_pts(&packet),
+        });
+        self.collecting = false;
+        Ok(())
     }
 }
 
-/// Extract the first ISO/IEC 13818-2 video stream advertised by PAT/PMT.
-pub fn extract_mpeg2_video_es(data: &[u8]) -> Result<Vec<u8>> {
-    let Some(first_packet) = sync_offset(data) else {
-        bail!("input is not a 188-byte MPEG transport stream");
-    };
+/// Stateful MPEG-2-video/AAC demuxer, for streaming a file through in bounded
+/// memory rather than holding all of it.
+#[derive(Default)]
+pub struct MpegTsAvDemuxer {
+    pending: Vec<u8>,
+    synced: bool,
+    program: ProgramMap,
+    video: PesState,
+    audio: PesState,
+}
 
-    let mut pmt_pids: HashSet<u16> = HashSet::new();
-    let mut video_pid: i32 = -1;
-    let mut assemblers: HashMap<u16, SectionAssembler> = HashMap::new();
-    let mut sections: Vec<Vec<u8>> = Vec::new();
+impl MpegTsAvDemuxer {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    let mut at = first_packet;
-    while at + TS_PACKET_SIZE <= data.len() {
-        if let Some(packet) = payload_at(data, at)? {
-            if packet.pid == 0 || pmt_pids.contains(&packet.pid) {
-                let pid = packet.pid;
-                sections.clear();
-                assemblers.entry(pid).or_default().push(
-                    packet.data,
-                    packet.payload_unit_start,
-                    &mut sections,
-                );
-                for section in &sections {
-                    scan_psi_section(section, pid, &mut pmt_pids, &mut video_pid);
+    /// Whether the program map has named an AAC-LC audio stream yet. The
+    /// caller needs this to decide whether to hold video back waiting for
+    /// audio that may never come.
+    pub fn has_aac_audio(&self) -> bool {
+        self.program.audio_pid.is_some()
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ElementaryPacket>> {
+        self.pending.extend_from_slice(chunk);
+        let input = std::mem::take(&mut self.pending);
+
+        let mut at = 0;
+        if !self.synced {
+            match sync_offset(&input) {
+                Some(offset) => {
+                    at = offset;
+                    self.synced = true;
+                }
+                None => {
+                    self.pending = input;
+                    return Ok(Vec::new());
                 }
             }
         }
-        at += TS_PACKET_SIZE;
+
+        let mut output = Vec::new();
+        let mut sections = Vec::new();
+        while at + TS_PACKET_SIZE <= input.len() {
+            if let Some(packet) = payload_at(&input, at)? {
+                if self.program.wants(packet.pid) {
+                    self.program.push(&packet, &mut sections);
+                }
+                let kind = if Some(packet.pid) == self.program.video_pid {
+                    Some(ElementaryKind::Video)
+                } else if Some(packet.pid) == self.program.audio_pid {
+                    Some(ElementaryKind::Audio)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    let state = match kind {
+                        ElementaryKind::Video => &mut self.video,
+                        ElementaryKind::Audio => &mut self.audio,
+                    };
+                    if packet.payload_unit_start {
+                        state.flush(kind, &mut output)?;
+                        state.collecting = is_pes_start(packet.data, kind);
+                    }
+                    if state.collecting {
+                        state.parts.extend_from_slice(packet.data);
+                    }
+                }
+            }
+            at += TS_PACKET_SIZE;
+        }
+        self.pending = input[at..].to_vec();
+        Ok(output)
     }
-    if pmt_pids.is_empty() {
+
+    /// Flush whatever PES packets were still accumulating at end of input.
+    pub fn finish(&mut self) -> Result<Vec<ElementaryPacket>> {
+        if !self.synced {
+            bail!("input is not a 188-byte MPEG transport stream");
+        }
+        if self.program.video_pid.is_none() {
+            bail!("MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)");
+        }
+        let mut output = Vec::new();
+        self.video.flush(ElementaryKind::Video, &mut output)?;
+        self.audio.flush(ElementaryKind::Audio, &mut output)?;
+        Ok(output)
+    }
+}
+
+/// Extract the first ISO/IEC 13818-2 video stream advertised by PAT/PMT, from a
+/// transport stream held whole in memory.
+pub fn extract_mpeg2_video_es(data: &[u8]) -> Result<Vec<u8>> {
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut elementary = Vec::new();
+    let mut saw_video = false;
+    for packet in demuxer.push(data)? {
+        if packet.kind == ElementaryKind::Video {
+            elementary.extend_from_slice(&packet.data);
+            saw_video = true;
+        }
+    }
+    if !demuxer.synced {
+        bail!("input is not a 188-byte MPEG transport stream");
+    }
+    if demuxer.program.pmt_pids.is_empty() {
         bail!("MPEG-TS PAT contains no program");
     }
-    if video_pid < 0 {
-        bail!("MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)");
-    }
-    let video_pid = video_pid as u16;
-
-    let mut elementary = Vec::new();
-    let mut pes_parts: Vec<u8> = Vec::new();
-    let mut saw_pes = false;
-    let mut at = first_packet;
-    while at + TS_PACKET_SIZE <= data.len() {
-        if let Some(packet) = payload_at(data, at)? {
-            if packet.pid == video_pid {
-                if packet.payload_unit_start && !pes_parts.is_empty() {
-                    elementary.extend_from_slice(pes_payload(&pes_parts)?);
-                    saw_pes = true;
-                    pes_parts.clear();
-                }
-                pes_parts.extend_from_slice(packet.data);
-            }
+    for packet in demuxer.finish()? {
+        if packet.kind == ElementaryKind::Video {
+            elementary.extend_from_slice(&packet.data);
+            saw_video = true;
         }
-        at += TS_PACKET_SIZE;
     }
-    if !pes_parts.is_empty() {
-        elementary.extend_from_slice(pes_payload(&pes_parts)?);
-        saw_pes = true;
-    }
-    if !saw_pes {
+    if !saw_video {
         bail!("MPEG-TS MPEG-2 video PID has no PES packets");
     }
     Ok(elementary)

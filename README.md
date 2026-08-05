@@ -7,7 +7,7 @@ MPEG-2の係数・動きベクトル構造を保ちながらH.264へ変換する
 ```
 Cargo.toml            # Cargoワークスペース
 crates/
-  mpeg2toh264/        # コアライブラリ（mpeg2 / h264 / container）
+  mpeg2toh264/        # コアライブラリ（mpeg2 / h264 / container / session）
   mpeg2toh264-cli/    # CLI
 testdata/             # 合成MPEG-2テストストリーム
 tools/                # テーブル生成・解析スクリプト（Python）
@@ -30,6 +30,33 @@ MPEG-TSとMPEG-2 video elementary streamを自動判別します。出力は拡�
   -h, --help                ヘルプを表示
 ```
 
+## ストリーミングAPI
+
+`Session`がWASM/ブラウザ向けの入口です。TSのチャンクを渡すと、そのまま`SourceBuffer`へappendできるfMP4フラグメントが返ります。demux・GOP分割・変換・mux・**2トラックのタイムライン合わせ**はすべてこの中で完結するので、呼び出し側はファイル読み出しとMSEの面倒だけを見ます。
+
+```rust
+let mut session = Session::default();
+for chunk in stream.chunks(1 << 20) {
+    for fragment in session.push(chunk)? {
+        match fragment {
+            Fragment::Init { data, mime_codec } => open_source_buffer(&mime_codec, &data),
+            Fragment::Media { data, start, random_access, .. } => append(&data, start, random_access),
+        }
+    }
+}
+for fragment in session.finish()? { /* 同上 */ }
+```
+
+`Media`が持つ`start`（秒）と`random_access`は、再生済み範囲を破棄するときにどこまで消してよいかを決めるためのものです。24 GOPごとにIDRを置いて復帰点にしています。
+
+ブラウザなしで動作を見るには次を使います。出力はそのまま再生可能なfMP4です。
+
+```bash
+cargo run --release --example dump_session -- input.ts output.mp4
+```
+
+AAC-LC音声は再エンコードせず、ADTSヘッダーだけを外して音声トラックへmuxします。映像と音声はPESのタイムスタンプが示す実際の間隔で配置されるので、放送でよくある数百ミリ秒のずれがそのまま保たれます。
+
 ## テスト
 
 ```bash
@@ -44,6 +71,6 @@ cargo test --release
 
 ## 残作業
 
-- `crates/mpeg2toh264-wasm`と`web/`のつなぎ替え（MSE再生、GOP単位のインクリメンタル変換）
-- AAC-LCの無変換mux。TypeScript版にはあったがRust移植では未対応で、CLIのMP4出力はvideo-onlyです
+- `crates/mpeg2toh264-wasm`（`Session`をwasm-bindgenで包むだけ）と、`web/worker.ts`のつなぎ替え
+- CLIの`.mp4`出力はvideo-onlyのままです。音声が要るなら`Session`を通す必要があります
 - `tools/gen-*.py`はまだTypeScriptを出力するので、テーブルを再生成するにはエミッタ側の移植が必要です

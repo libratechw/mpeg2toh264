@@ -19,12 +19,19 @@ pub mod bitreader;
 pub mod container;
 pub mod h264;
 pub mod mpeg2;
+pub mod session;
 pub mod transcode;
 
 pub use error::{Error, Result};
 
-pub use container::fmp4::{h264_to_fmp4, mpeg2_video_timeline, Fmp4Output, Mpeg2VideoTimeline};
-pub use container::mpegts::{extract_mpeg2_video_es, is_mpeg_transport_stream};
+pub use container::fmp4::{
+    h264_gop_to_fmp4, h264_to_fmp4, mpeg2_video_timeline, Fmp4Fragment, Fmp4Output,
+    Mpeg2VideoTimeline,
+};
+pub use container::mpegts::{
+    extract_mpeg2_video_es, is_mpeg_transport_stream, ElementaryKind, MpegTsAvDemuxer,
+};
+pub use session::{Fragment, Session};
 pub use transcode::{transcode, IncrementalTranscoder, TranscodeOptions, TranscodeResult};
 
 /// JavaScript's `Math.round`, which the reference implementation used

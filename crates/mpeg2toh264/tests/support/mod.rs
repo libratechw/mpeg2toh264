@@ -4,6 +4,7 @@
 //! every one of them.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const PACKET_SIZE: usize = 188;
@@ -142,3 +143,139 @@ pub fn split_annex_b(data: &[u8]) -> Vec<(u8, &[u8])> {
     }
     out
 }
+
+/// One PES packet to place in a synthetic transport stream.
+pub struct PesUnit<'a> {
+    pub pid: u16,
+    pub stream_id: u8,
+    pub payload: &'a [u8],
+    pub pts: Option<u64>,
+}
+
+/// Build a single-program transport stream from PES packets already in the
+/// order they should appear. The caller decides how the tracks interleave,
+/// which is what makes the audio arrive alongside the video rather than all at
+/// the end.
+///
+/// `streams` names the elementary streams the PMT advertises, as
+/// `(pid, stream_type)`.
+pub fn mux_transport_stream(streams: &[(u16, u8)], units: &[PesUnit<'_>]) -> Vec<u8> {
+    let mut pat_section = vec![
+        0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00, 0, 0, 0, 0,
+    ];
+    pat_section[2] = (13 + 4) as u8; // one program, plus the CRC
+    let mut out = psi_packet(0, &pat_section);
+
+    let pcr_pid = streams.first().map_or(0x100, |&(pid, _)| pid);
+    let mut pmt_section = vec![
+        0x02,
+        0xb0,
+        (13 + 5 * streams.len()) as u8,
+        0x00,
+        0x01,
+        0xc1,
+        0x00,
+        0x00,
+        0xe0 | (pcr_pid >> 8) as u8,
+        (pcr_pid & 0xff) as u8,
+        0xf0,
+        0x00,
+    ];
+    for &(pid, stream_type) in streams {
+        pmt_section.extend_from_slice(&[
+            stream_type,
+            0xe0 | (pid >> 8) as u8,
+            (pid & 0xff) as u8,
+            0xf0,
+            0x00,
+        ]);
+    }
+    pmt_section.extend_from_slice(&[0, 0, 0, 0]); // CRC32, which nothing here checks
+    out.extend_from_slice(&psi_packet(0x100, &pmt_section));
+
+    let mut continuity: HashMap<u16, u8> = HashMap::new();
+    for unit in units {
+        let mut pes: Vec<u8> = match unit.pts {
+            None => vec![0, 0, 1, unit.stream_id, 0, 0, 0x80, 0, 0],
+            Some(pts) => {
+                let mut header = vec![0, 0, 1, unit.stream_id, 0, 0, 0x80, 0x80, 5];
+                header.extend_from_slice(&pts_field(pts));
+                header
+            }
+        };
+        pes.extend_from_slice(unit.payload);
+
+        let mut at = 0;
+        while at < pes.len() {
+            let size = 184.min(pes.len() - at);
+            let mut packet = vec![0xff; PACKET_SIZE];
+            let start = if at == 0 { 0x40 } else { 0x00 };
+            let counter = continuity.entry(unit.pid).or_insert(0);
+            if size == 184 {
+                packet[..4].copy_from_slice(&[
+                    0x47,
+                    start | (unit.pid >> 8) as u8,
+                    (unit.pid & 0xff) as u8,
+                    0x10 | *counter,
+                ]);
+                packet[4..4 + size].copy_from_slice(&pes[at..at + size]);
+            } else {
+                let adaptation_length = 183 - size;
+                packet[..5].copy_from_slice(&[
+                    0x47,
+                    start | (unit.pid >> 8) as u8,
+                    (unit.pid & 0xff) as u8,
+                    0x30 | *counter,
+                    adaptation_length as u8,
+                ]);
+                if adaptation_length > 0 {
+                    packet[5] = 0;
+                }
+                let payload = 5 + adaptation_length;
+                packet[payload..payload + size].copy_from_slice(&pes[at..at + size]);
+            }
+            *counter = (*counter + 1) & 15;
+            out.extend_from_slice(&packet);
+            at += size;
+        }
+    }
+    out
+}
+
+/// Synthesise one AAC-LC ADTS frame with a payload of `payload_len` bytes.
+///
+/// The payload is not valid AAC, which does not matter: nothing here decodes
+/// it, and the point of the transcoder's audio path is that it never looks
+/// inside.
+pub fn adts_frame(sampling_frequency_index: u8, channel_count: u8, payload_len: usize) -> Vec<u8> {
+    let frame_length = 7 + payload_len;
+    let mut frame = vec![
+        0xff,
+        0xf1, // MPEG-4, layer 0, protection absent
+        (1 << 6) | (sampling_frequency_index << 2) | ((channel_count >> 2) & 1),
+        ((channel_count & 3) << 6) | ((frame_length >> 11) & 3) as u8,
+        ((frame_length >> 3) & 0xff) as u8,
+        (((frame_length & 7) << 5) | 0x1f) as u8,
+        0xfc,
+    ];
+    frame.extend((0..payload_len).map(|i| (i % 251) as u8));
+    frame
+}
+
+/// A run of identical ADTS frames, as one contiguous elementary stream.
+pub fn adts_stream(frames: usize, sampling_frequency_index: u8, channel_count: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..frames {
+        out.extend_from_slice(&adts_frame(
+            sampling_frequency_index,
+            channel_count,
+            32 + i % 17,
+        ));
+    }
+    out
+}
+
+pub const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
+pub const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
+pub const VIDEO_PID: u16 = 0x101;
+pub const AUDIO_PID: u16 = 0x102;

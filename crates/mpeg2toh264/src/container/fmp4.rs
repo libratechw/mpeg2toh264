@@ -1,5 +1,6 @@
 //! Packaging this transcoder's Annex B output as a fragmented MP4.
 
+use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
 use crate::mpeg2::constants::{PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
@@ -252,6 +253,52 @@ fn make_avc_c(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>> {
     Ok(boxed("avcC", &body.into_vec()))
 }
 
+/// An MPEG-4 descriptor: a tag, a length in the four-byte expanded form every
+/// muxer emits, then the payload.
+fn descriptor(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let length = payload.len() as u32;
+    let mut out = Buf::new();
+    out.u8(tag)
+        .u8(0x80 | ((length >> 21) & 0x7f) as u8)
+        .u8(0x80 | ((length >> 14) & 0x7f) as u8)
+        .u8(0x80 | ((length >> 7) & 0x7f) as u8)
+        .u8((length & 0x7f) as u8)
+        .bytes(payload);
+    out.into_vec()
+}
+
+/// The `esds` box, which is where an MP4 keeps the AudioSpecificConfig that
+/// ADTS carried in every frame header.
+fn make_esds(config: &AacConfig) -> Vec<u8> {
+    let decoder_specific = descriptor(0x05, &config.audio_specific_config);
+    let decoder_config = {
+        let mut body = Buf::new();
+        // objectTypeIndication 0x40 (MPEG-4 audio), streamType 0x15 (audio,
+        // upstream off), then buffer size, max and average bitrate as zero.
+        body.bytes(&[0x40, 0x15, 0, 0, 0])
+            .u32(0)
+            .u32(0)
+            .bytes(&decoder_specific);
+        descriptor(0x04, &body.into_vec())
+    };
+    let sl_config = descriptor(0x06, &[0x02]);
+    let es_descriptor = {
+        let mut body = Buf::new();
+        body.u16(2) // ES_ID
+            .u8(0) // no stream priority, no dependency, no URL
+            .bytes(&decoder_config)
+            .bytes(&sl_config);
+        descriptor(0x03, &body.into_vec())
+    };
+    full_box("esds", 0, 0, &es_descriptor)
+}
+
+/// 16.16 fixed point, wrapping exactly as the reference implementation's 32-bit
+/// shift did. A 96 kHz rate is the only value that reaches the wrap.
+fn fixed16_16(value: u32) -> u32 {
+    ((value as u64) << 16) as u32
+}
+
 /// The unity 3x3 display matrix every track here uses, in 16.16 fixed point.
 fn identity_matrix(buf: &mut Buf) {
     buf.u32(0x0001_0000).u32(0).u32(0);
@@ -265,6 +312,7 @@ fn make_init_segment(
     sps: &[u8],
     pps: &[u8],
     sample_aspect_ratio: Option<SampleAspectRatio>,
+    audio: Option<&AacConfig>,
 ) -> Result<Vec<u8>> {
     let ftyp = {
         let mut body = Buf::new();
@@ -276,7 +324,8 @@ fn make_init_segment(
         body.u32(0).u32(0).u32(TIMESCALE).u32(0);
         body.u32(0x0001_0000).u16(0x0100).u16(0).zeros(8);
         identity_matrix(&mut body);
-        body.zeros(24).u32(2);
+        // next_track_ID, past every track this movie declares.
+        body.zeros(24).u32(if audio.is_some() { 3 } else { 2 });
         full_box("mvhd", 0, 0, &body.into_vec())
     };
     let tkhd = {
@@ -284,7 +333,7 @@ fn make_init_segment(
         body.u32(0).u32(0).u32(1).u32(0).u32(0).zeros(8);
         body.u16(0).u16(0).u16(0).u16(0);
         identity_matrix(&mut body);
-        body.u32(width << 16).u32(height << 16);
+        body.u32(fixed16_16(width)).u32(fixed16_16(height));
         full_box("tkhd", 0, 7, &body.into_vec())
     };
     let mdhd = {
@@ -313,7 +362,11 @@ fn make_init_segment(
         let mut body = Buf::new();
         body.zeros(6).u16(1).zeros(16);
         body.u16(width as u16).u16(height as u16);
-        body.u32(72 << 16).u32(72 << 16).u32(0).u16(1).zeros(32);
+        body.u32(fixed16_16(72))
+            .u32(fixed16_16(72))
+            .u32(0)
+            .u16(1)
+            .zeros(32);
         body.u16(0x18).u16(0xffff).bytes(&make_avc_c(sps, pps)?);
         if let Some(sar) = sample_aspect_ratio {
             let mut pasp = Buf::new();
@@ -349,8 +402,77 @@ fn make_init_segment(
         body.u32(1).u32(1).u32(0).u32(0).u32(0);
         full_box("trex", 0, 0, &body.into_vec())
     };
-    let mvex = boxed("mvex", &trex);
-    let moov = boxed("moov", &concat(&[&mvhd, &trak, &mvex]));
+
+    let (audio_trak, audio_trex) = match audio {
+        None => (Vec::new(), Vec::new()),
+        Some(audio) => {
+            let audio_tkhd = {
+                let mut body = Buf::new();
+                body.u32(0).u32(0).u32(2).u32(0).u32(0).zeros(8);
+                // Full volume, and no width or height: this track has no picture.
+                body.u16(0).u16(0).u16(0x0100).u16(0);
+                identity_matrix(&mut body);
+                body.u32(0).u32(0);
+                full_box("tkhd", 0, 7, &body.into_vec())
+            };
+            let audio_mdhd = {
+                let mut body = Buf::new();
+                body.u32(0)
+                    .u32(0)
+                    .u32(audio.sample_rate)
+                    .u32(0)
+                    .u16(0x55c4)
+                    .u16(0);
+                full_box("mdhd", 0, 0, &body.into_vec())
+            };
+            let audio_hdlr = {
+                let mut body = Buf::new();
+                body.u32(0).ascii("soun").zeros(12).ascii("SoundHandler\0");
+                full_box("hdlr", 0, 0, &body.into_vec())
+            };
+            let smhd = {
+                let mut body = Buf::new();
+                body.u16(0).u16(0);
+                full_box("smhd", 0, 0, &body.into_vec())
+            };
+            let mp4a = {
+                let mut body = Buf::new();
+                body.zeros(6).u16(1).zeros(8);
+                body.u16(audio.channel_count as u16).u16(16);
+                body.u16(0)
+                    .u16(0)
+                    .u32(fixed16_16(audio.sample_rate))
+                    .bytes(&make_esds(audio));
+                boxed("mp4a", &body.into_vec())
+            };
+            let audio_stsd = {
+                let mut body = Buf::new();
+                body.u32(1).bytes(&mp4a);
+                full_box("stsd", 0, 0, &body.into_vec())
+            };
+            let audio_stbl = boxed(
+                "stbl",
+                &concat(&[
+                    &audio_stsd,
+                    &full_box("stts", 0, 0, &empty_count.0),
+                    &full_box("stsc", 0, 0, &empty_count.0),
+                    &full_box("stsz", 0, 0, &empty_pair.0),
+                    &full_box("stco", 0, 0, &empty_count.0),
+                ]),
+            );
+            let audio_minf = boxed("minf", &concat(&[&smhd, &dinf, &audio_stbl]));
+            let audio_mdia = boxed("mdia", &concat(&[&audio_mdhd, &audio_hdlr, &audio_minf]));
+            let mut trex_body = Buf::new();
+            trex_body.u32(2).u32(1).u32(0).u32(0).u32(0);
+            (
+                boxed("trak", &concat(&[&audio_tkhd, &audio_mdia])),
+                full_box("trex", 0, 0, &trex_body.into_vec()),
+            )
+        }
+    };
+
+    let mvex = boxed("mvex", &concat(&[&trex, &audio_trex]));
+    let moov = boxed("moov", &concat(&[&mvhd, &trak, &audio_trak, &mvex]));
     Ok(concat(&[&ftyp, &moov]))
 }
 
@@ -440,6 +562,100 @@ fn make_media_segment(
     concat(&[&moof, &boxed("mdat", &mdat_payload)])
 }
 
+/// One fragment carrying both tracks, so an MSE implementation sees a `traf`
+/// for each in the same `moof` rather than two interleaved fragment streams.
+#[allow(clippy::too_many_arguments)]
+fn make_av_media_segment(
+    video_samples: &[&[u8]],
+    durations: &[u32],
+    compositions: &[u32],
+    sync_samples: &[bool],
+    audio_samples: &[Vec<u8>],
+    sequence_number: u32,
+    video_base_decode_time: u64,
+    audio_base_decode_time: u64,
+    first_sample_prefixes: &[&[u8]],
+) -> Vec<u8> {
+    let video_payloads = make_video_payloads(video_samples, first_sample_prefixes);
+    let mut video_entries = Buf::new();
+    for i in 0..video_samples.len() {
+        video_entries.u32(durations[i]);
+        video_entries.u32(video_payloads[i].len() as u32);
+        video_entries.u32(if sync_samples[i] {
+            0x0200_0000
+        } else {
+            0x0101_0000
+        });
+        video_entries.u32(compositions[i]);
+    }
+    let video_entries = video_entries.into_vec();
+    let mut audio_entries = Buf::new();
+    for sample in audio_samples {
+        audio_entries.u32(AAC_FRAME_SAMPLES as u32);
+        audio_entries.u32(sample.len() as u32);
+    }
+    let audio_entries = audio_entries.into_vec();
+    let video_bytes: usize = video_payloads.iter().map(Vec::len).sum();
+
+    let make_moof = |video_offset: u32, audio_offset: u32| {
+        let mfhd = {
+            let mut body = Buf::new();
+            body.u32(sequence_number);
+            full_box("mfhd", 0, 0, &body.into_vec())
+        };
+        let traf = |track: u32,
+                    base_decode_time: u64,
+                    offset: u32,
+                    entries: &[u8],
+                    count: usize,
+                    version: u8,
+                    flags: u32| {
+            let mut tfhd_body = Buf::new();
+            tfhd_body.u32(track);
+            let mut tfdt_body = Buf::new();
+            tfdt_body.u32(base_decode_time as u32);
+            let mut trun_body = Buf::new();
+            trun_body.u32(count as u32).u32(offset).bytes(entries);
+            boxed(
+                "traf",
+                &concat(&[
+                    &full_box("tfhd", 0, 0x020000, &tfhd_body.into_vec()),
+                    &full_box("tfdt", 0, 0, &tfdt_body.into_vec()),
+                    &full_box("trun", version, flags, &trun_body.into_vec()),
+                ]),
+            )
+        };
+        let video_traf = traf(
+            1,
+            video_base_decode_time,
+            video_offset,
+            &video_entries,
+            video_samples.len(),
+            1,
+            0x000f01,
+        );
+        let audio_traf = traf(
+            2,
+            audio_base_decode_time,
+            audio_offset,
+            &audio_entries,
+            audio_samples.len(),
+            0,
+            0x000301,
+        );
+        boxed("moof", &concat(&[&mfhd, &video_traf, &audio_traf]))
+    };
+    let moof = make_moof(0, 0);
+    let payload_start = moof.len() as u32 + 8;
+    let moof = make_moof(payload_start, payload_start + video_bytes as u32);
+
+    let mut mdat_payload: Vec<u8> = video_payloads.concat();
+    for sample in audio_samples {
+        mdat_payload.extend_from_slice(sample);
+    }
+    concat(&[&moof, &boxed("mdat", &mdat_payload)])
+}
+
 #[derive(Clone, Debug)]
 pub struct Fmp4Output {
     pub init_segment: Vec<u8>,
@@ -483,6 +699,7 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
             sps,
             pps,
             timeline.sample_aspect_ratio,
+            None,
         )?,
         media_segment: make_media_segment(
             &samples,
@@ -495,5 +712,128 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
         ),
         mime_codec: format!("video/mp4; codecs=\"avc1.{codec}\""),
         sample_count: samples.len(),
+    })
+}
+
+/// How much of the presentation one fragment covers. The caller needs this
+/// before it can decide how much audio belongs in the same fragment, which is
+/// why it is separate from the muxing.
+pub fn mpeg2_fragment_duration(timeline: &Mpeg2VideoTimeline, starts_at_idr: bool) -> u64 {
+    mpeg2_sample_timing(timeline, starts_at_idr)
+        .durations
+        .iter()
+        .map(|&d| d as u64)
+        .sum()
+}
+
+/// The AAC access units that share a fragment with the video, and where the
+/// audio track's own timeline has reached.
+#[derive(Clone, Debug)]
+pub struct Fmp4AudioSamples {
+    pub config: AacConfig,
+    pub samples: Vec<Vec<u8>>,
+    pub base_decode_time: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Fmp4Fragment {
+    /// Empty for every fragment after the first: the transcoder emits the
+    /// parameter sets once, and MSE needs the initialization segment once.
+    pub init_segment: Vec<u8>,
+    pub media_segment: Vec<u8>,
+    /// Empty when this fragment carries no parameter sets to describe.
+    pub mime_codec: String,
+    pub sample_count: usize,
+    /// Presentation time this fragment covers; see [`mpeg2_sample_timing`].
+    pub duration: u64,
+}
+
+/// Package one independently transcoded GOP for incremental appending.
+///
+/// `presentation_start` is the media time of the fragment's first displayed
+/// picture, in the 90 kHz movie timescale.
+pub fn h264_gop_to_fmp4(
+    h264: &[u8],
+    timeline: &Mpeg2VideoTimeline,
+    sequence_number: u32,
+    presentation_start: u64,
+    audio: Option<&AacConfig>,
+    audio_track: Option<&Fmp4AudioSamples>,
+) -> Result<Fmp4Fragment> {
+    let nals = split_annex_b(h264);
+    let nal_type = |nal: &&[u8]| nal[0] & 0x1f;
+    let sps = nals.iter().find(|nal| nal_type(nal) == 7).copied();
+    let pps = nals.iter().find(|nal| nal_type(nal) == 8).copied();
+    let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
+    let samples: Vec<&[u8]> = nals
+        .iter()
+        .filter(|nal| matches!(nal_type(nal), 1 | 5))
+        .copied()
+        .collect();
+
+    let has_idr_clone = samples.len() == timeline.presentation_indices.len() + 1;
+    let expected = timeline.presentation_indices.len() + usize::from(has_idr_clone);
+    if samples.len() != expected {
+        bail!(
+            "H.264 GOP sample count {} does not match MPEG-2 timeline {expected}",
+            samples.len()
+        );
+    }
+    let timing = mpeg2_sample_timing(timeline, has_idr_clone);
+    // Decoding runs ahead of display by the reorder delay; a fragment at the
+    // very start of the timeline has nowhere to put it and simply displays that
+    // much later.
+    let base_decode_time = presentation_start.saturating_sub(timing.reorder_delay as u64);
+    let sync_samples: Vec<bool> = samples.iter().map(|nal| nal[0] & 0x1f == 5).collect();
+    let prefixes: Vec<&[u8]> = sei.into_iter().collect();
+
+    let media_segment = match audio_track {
+        Some(track) => make_av_media_segment(
+            &samples,
+            &timing.durations,
+            &timing.compositions,
+            &sync_samples,
+            &track.samples,
+            sequence_number,
+            base_decode_time,
+            track.base_decode_time,
+            &prefixes,
+        ),
+        None => make_media_segment(
+            &samples,
+            &timing.durations,
+            &timing.compositions,
+            &sync_samples,
+            sequence_number,
+            base_decode_time as u32,
+            &prefixes,
+        ),
+    };
+
+    let (init_segment, mime_codec) = match (sps, pps) {
+        (Some(sps), Some(pps)) => {
+            let codec = format!("{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3]);
+            let audio_codec = if audio.is_some() { ",mp4a.40.2" } else { "" };
+            (
+                make_init_segment(
+                    timeline.width,
+                    timeline.height,
+                    sps,
+                    pps,
+                    timeline.sample_aspect_ratio,
+                    audio,
+                )?,
+                format!("video/mp4; codecs=\"avc1.{codec}{audio_codec}\""),
+            )
+        }
+        _ => (Vec::new(), String::new()),
+    };
+
+    Ok(Fmp4Fragment {
+        init_segment,
+        media_segment,
+        mime_codec,
+        sample_count: samples.len(),
+        duration: timing.durations.iter().map(|&d| d as u64).sum(),
     })
 }

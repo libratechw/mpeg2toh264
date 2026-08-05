@@ -1,6 +1,7 @@
 //! MPEG-2 (ITU-T H.262) parsing: sequence, picture, slice and macroblock layers.
 
 pub mod constants;
+pub mod gop_stream;
 pub mod headers;
 pub mod macroblock;
 pub mod vlc;
