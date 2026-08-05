@@ -92,6 +92,8 @@ export interface Mpeg2VideoTimeline {
   sampleDuration: number;
   /** Presentation index for each coded picture, after the leading grey IDR. */
   presentationIndices: number[];
+  /** Content sync flags; restart points are supplied by actual IDR samples. */
+  syncSamples: boolean[];
   sampleAspectRatio?: SampleAspectRatio;
 }
 
@@ -117,6 +119,7 @@ export function mpeg2VideoTimeline(
   let seenPicture = false;
   let maxTrInGop = 0;
   const presentationIndices: number[] = [];
+  const syncSamples: boolean[] = [];
   for (const picture of pictures) {
     const type = picture.header.pictureCodingType;
     if (
@@ -134,6 +137,7 @@ export function mpeg2VideoTimeline(
     maxTrInGop = Math.max(maxTrInGop, tr);
     if (type === PictureType.B && references < 2) continue;
     presentationIndices.push(gopBase + tr + 1);
+    syncSamples.push(false);
     if (type !== PictureType.B) references = Math.min(2, references + 1);
   }
   return {
@@ -141,6 +145,7 @@ export function mpeg2VideoTimeline(
     height: first.sequence.verticalSize,
     sampleDuration,
     presentationIndices,
+    syncSamples,
     sampleAspectRatio: sequenceSampleAspectRatio(first.sequence),
   };
 }
@@ -406,13 +411,14 @@ function makeMediaSegment(
   samples: Uint8Array[],
   durations: number[],
   compositions: number[],
+  syncSamples: boolean[],
   sequenceNumber = 1,
   baseDecodeTime = 0,
 ) {
   const payloads = samples.map(lengthPrefixed);
   const entries: Uint8Array[] = [];
   for (let i = 0; i < samples.length; i++) {
-    const sync = (samples[i]![0]! & 0x1f) === 5;
+    const sync = syncSamples[i]!;
     entries.push(
       u32(durations[i]!),
       u32(payloads[i]!.length),
@@ -468,6 +474,7 @@ function makeAvMediaSegment(
   videoSamples: Uint8Array[],
   videoDurations: number[],
   videoCompositions: number[],
+  videoSyncSamples: boolean[],
   audioSamples: Uint8Array[],
   sequenceNumber: number,
   videoBaseDecodeTime: number,
@@ -476,7 +483,7 @@ function makeAvMediaSegment(
   const videoPayloads = videoSamples.map(lengthPrefixed);
   const videoEntries: Uint8Array[] = [];
   for (let index = 0; index < videoSamples.length; index++) {
-    const sync = (videoSamples[index]![0]! & 0x1f) === 5;
+    const sync = videoSyncSamples[index]!;
     videoEntries.push(
       u32(videoDurations[index]!),
       u32(videoPayloads[index]!.length),
@@ -572,6 +579,7 @@ export function h264ToFmp4(
       presentation.map(
         (value, index) => (value - index) * timeline.sampleDuration,
       ),
+      samples.map((sample) => (sample[0]! & 0x1f) === 5),
     ),
     mimeCodec: `video/mp4; codecs="avc1.${codec}"`,
     sampleCount: samples.length,
@@ -606,12 +614,13 @@ export function h264GopToFmp4(
     const type = nal[0]! & 0x1f;
     return type === 1 || type === 5;
   });
-  const hasGreyIdr = Boolean(sps && pps);
+  const hasGreyIdr = (samples[0]?.[0]! & 0x1f) === 5;
   const expectedSamples =
     timeline.presentationIndices.length + (hasGreyIdr ? 1 : 0);
   if (samples.length !== expectedSamples) {
     throw new Error("H.264 GOP sample count does not match MPEG-2 timeline");
   }
+  const idrDuration = sps ? timeline.sampleDuration : 1;
   const contentDurations = timeline.presentationIndices.map(
     () => timeline.sampleDuration,
   );
@@ -621,17 +630,18 @@ export function h264GopToFmp4(
         (presentationBase + presentationIndex) * timeline.sampleDuration;
       const decoded =
         baseDecodeTime +
-        (hasGreyIdr ? timeline.sampleDuration : 0) +
+        (hasGreyIdr ? idrDuration : 0) +
         decodeIndex * timeline.sampleDuration;
       return desired - decoded;
     },
   );
   const durations = hasGreyIdr
-    ? [timeline.sampleDuration, ...contentDurations]
+    ? [idrDuration, ...contentDurations]
     : contentDurations;
   const compositions = hasGreyIdr
     ? [0, ...contentCompositions]
     : contentCompositions;
+  const syncSamples = samples.map((sample) => (sample[0]! & 0x1f) === 5);
   const codec = sps
     ? [sps[1]!, sps[2]!, sps[3]!]
         .map((v) => v.toString(16).padStart(2, "0"))
@@ -654,6 +664,7 @@ export function h264GopToFmp4(
           samples,
           durations,
           compositions,
+          syncSamples,
           audioTrack.samples,
           sequenceNumber,
           baseDecodeTime,
@@ -663,6 +674,7 @@ export function h264GopToFmp4(
           samples,
           durations,
           compositions,
+          syncSamples,
           sequenceNumber,
           baseDecodeTime,
         ),

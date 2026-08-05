@@ -136,6 +136,7 @@ export class IncrementalTranscoder {
   private gopBase = 0;
   private seenPicture = false;
   private maxTrInGop = 0;
+  private randomAccessPending = false;
   private picturesConverted = 0;
   private picturesSkipped = 0;
   private readonly stats: Stats = {
@@ -149,6 +150,11 @@ export class IncrementalTranscoder {
 
   constructor(options: TranscodeOptions = DEFAULT_QUANTISER_OPTIONS) {
     this.options = options;
+  }
+
+  /** Reset the H.264 DPB with a grey IDR before the next incremental unit. */
+  requestRandomAccessPoint(): void {
+    if (this.initialized) this.randomAccessPending = true;
   }
 
   push(data: Uint8Array): TranscodeResult {
@@ -192,6 +198,7 @@ export class IncrementalTranscoder {
     const g = frameGeometry(width, height, !mbaff);
     const scaling = first.quant.nonIntra;
 
+    const randomAccess = this.initialized && this.randomAccessPending;
     const parts: Uint8Array[] = this.initialized
       ? []
       : [
@@ -217,18 +224,21 @@ export class IncrementalTranscoder {
             scaling8x8Inter: scaling,
             chromaQpIndexOffset: CHROMA_QP_OFFSET,
           }),
-          writeGrayIdr({
-            mbWidth: g.mbWidth,
-            mbHeight: g.mbHeight,
-            log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
-            log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
-            ppsInitQp: PPS_INIT_QP,
-            mbaff,
-            // I-only pictures are non-reference P slices, so this ordinary short-term
-            // IDR remains the sole DPB entry without long-term reference machinery.
-            longTermReference: !options.iFramesOnly,
-          }),
         ];
+    if (!this.initialized || randomAccess)
+      parts.push(
+        writeGrayIdr({
+          mbWidth: g.mbWidth,
+          mbHeight: g.mbHeight,
+          log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
+          log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
+          ppsInitQp: PPS_INIT_QP,
+          mbaff,
+          // I-only pictures are non-reference P slices, so this ordinary short-term
+          // IDR remains the sole DPB entry without long-term reference machinery.
+          longTermReference: !options.iFramesOnly,
+        }),
+      );
 
     const quant = new Quantiser8x8(scaling);
     const counts = makeLumaCounts(g.mbWidth, g.mbHeight);
@@ -240,8 +250,8 @@ export class IncrementalTranscoder {
     let picturesConverted = 0;
     let picturesSkipped = 0;
 
-    let prevRefFrameNum = this.prevRefFrameNum;
-    let shortTermCount = this.shortTermCount;
+    let prevRefFrameNum = randomAccess ? 0 : this.prevRefFrameNum;
+    let shortTermCount = randomAccess ? 0 : this.shortTermCount;
     // temporal_reference restarts at each group of pictures, so display order is
     // recovered by accumulating a base as the counter wraps.
     let gopBase = this.gopBase;
@@ -349,6 +359,7 @@ export class IncrementalTranscoder {
     this.gopBase = gopBase;
     this.seenPicture = seenPicture;
     this.maxTrInGop = maxTrInGop;
+    this.randomAccessPending = false;
     this.picturesConverted += picturesConverted;
     this.picturesSkipped += picturesSkipped;
     return {

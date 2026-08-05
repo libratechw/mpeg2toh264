@@ -21,6 +21,9 @@ let transcoder: IncrementalTranscoder;
 let pendingGops: Uint8Array[];
 let pendingAudio: AacFrame[];
 let audioConfig: AacConfig | null;
+let gopsEmitted: number;
+
+const RANDOM_ACCESS_GOP_INTERVAL = 24;
 
 function reset() {
   demuxer = new MpegTsAvDemuxer();
@@ -35,11 +38,19 @@ function reset() {
   pendingGops = [];
   pendingAudio = [];
   audioConfig = null;
+  gopsEmitted = 0;
 }
 
 function emitGop(mpeg2: Uint8Array, audioFrames: AacFrame[]) {
+  const randomAccess =
+    gopsEmitted > 0 && gopsEmitted % RANDOM_ACCESS_GOP_INTERVAL === 0;
+  if (randomAccess) {
+    transcoder.requestRandomAccessPoint();
+  }
   const firstFragment = !initialized;
-  const timeline = mpeg2VideoTimeline(mpeg2, { hasReferences: initialized });
+  const timeline = mpeg2VideoTimeline(mpeg2, {
+    hasReferences: initialized && !randomAccess,
+  });
   const h264 = transcoder.push(mpeg2);
   const config = audioFrames[0]?.config ?? audioConfig ?? undefined;
   const fragment = h264GopToFmp4(
@@ -60,6 +71,7 @@ function emitGop(mpeg2: Uint8Array, audioFrames: AacFrame[]) {
   videoBaseDecodeTime += fragment.duration;
   audioBaseDecodeTime += audioFrames.length * 1024;
   presentationBase += Math.max(...timeline.presentationIndices);
+  gopsEmitted++;
   if (!initialized) {
     initialized = true;
     self.postMessage(
@@ -96,7 +108,11 @@ function flushPending(final = false) {
     (final || pendingAudio.length > 0)
   ) {
     const gop = pendingGops[0]!;
-    const timeline = mpeg2VideoTimeline(gop, { hasReferences: initialized });
+    const randomAccess =
+      gopsEmitted > 0 && gopsEmitted % RANDOM_ACCESS_GOP_INTERVAL === 0;
+    const timeline = mpeg2VideoTimeline(gop, {
+      hasReferences: initialized && !randomAccess,
+    });
     const videoDuration =
       (timeline.presentationIndices.length + (initialized ? 0 : 1)) *
       timeline.sampleDuration;
