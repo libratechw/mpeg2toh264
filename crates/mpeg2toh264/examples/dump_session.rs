@@ -8,6 +8,8 @@
 //! cargo run --release --example dump_session -- input.ts output.mp4
 //! ```
 
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
 use std::process::ExitCode;
 
 use mpeg2toh264::{Fragment, Session};
@@ -17,6 +19,7 @@ struct Totals {
     media: usize,
     video_samples: usize,
     audio_samples: usize,
+    bytes: u64,
 }
 
 fn main() -> ExitCode {
@@ -36,37 +39,46 @@ fn main() -> ExitCode {
 }
 
 fn run(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = std::fs::read(input)?;
+    // The point of a Session is that neither side ever has to be held whole:
+    // the input arrives in slices and each fragment is written as it is
+    // finished, so a recording of any length costs the same memory.
+    let mut source = File::open(input)?;
+    let mut sink = BufWriter::new(File::create(output)?);
     let mut session = Session::default();
-    let mut out = Vec::new();
     let mut totals = Totals::default();
 
     // A megabyte at a time, matching what the browser player reads per slice.
-    for chunk in stream.chunks(1 << 20) {
-        for fragment in session.push(chunk)? {
-            report(&fragment, &mut out, &mut totals);
+    let mut slice = vec![0u8; 1 << 20];
+    loop {
+        let read = source.read(&mut slice)?;
+        if read == 0 {
+            break;
+        }
+        for fragment in session.push(&slice[..read])? {
+            report(&fragment, &mut sink, &mut totals)?;
         }
     }
     for fragment in session.finish()? {
-        report(&fragment, &mut out, &mut totals);
+        report(&fragment, &mut sink, &mut totals)?;
     }
+    sink.flush()?;
 
-    std::fs::write(output, &out)?;
     println!(
         "{} media fragments, {} video samples, {} audio samples, {} bytes",
-        totals.media,
-        totals.video_samples,
-        totals.audio_samples,
-        out.len()
+        totals.media, totals.video_samples, totals.audio_samples, totals.bytes
     );
     Ok(())
 }
 
-fn report(fragment: &Fragment, out: &mut Vec<u8>, totals: &mut Totals) {
+fn report(
+    fragment: &Fragment,
+    out: &mut impl Write,
+    totals: &mut Totals,
+) -> Result<(), std::io::Error> {
     match fragment {
         Fragment::Init { data, mime_codec } => {
             println!("init: {mime_codec} ({} bytes)", data.len());
-            out.extend_from_slice(data);
+            write(out, data, totals)?;
         }
         Fragment::Media {
             data,
@@ -86,7 +98,14 @@ fn report(fragment: &Fragment, out: &mut Vec<u8>, totals: &mut Totals) {
                     totals.media
                 );
             }
-            out.extend_from_slice(data);
+            write(out, data, totals)?;
         }
     }
+    Ok(())
+}
+
+fn write(out: &mut impl Write, data: &[u8], totals: &mut Totals) -> Result<(), std::io::Error> {
+    out.write_all(data)?;
+    totals.bytes += data.len() as u64;
+    Ok(())
 }
