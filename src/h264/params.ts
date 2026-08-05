@@ -6,9 +6,11 @@
  *
  * - High profile, because only it has the 8x8 transform and scaling lists that
  *   let MPEG-2 coefficients pass through.
- * - weighted_bipred_idc = 0, so B-slice bi-prediction is the plain
- *   (P0 + P1 + 1) >> 1 average. That is exactly MPEG-2's half-sample filter,
- *   and it is what makes half-pel motion reproducible bit-for-bit.
+ * - weighted_pred_flag = 1 and weighted_bipred_idc = 1, which is how intra
+ *   macroblocks reach a flat prediction without a manufactured reference
+ *   picture. See h264/slice.ts; the weights every other reference index gets
+ *   leave bi-prediction at the plain (P0 + P1 + 1) >> 1 average, which is
+ *   exactly MPEG-2's half-sample filter.
  * - deblocking_filter_control_present_flag = 1, so slices can switch the loop
  *   filter off. MPEG-2 has no in-loop filter, so leaving it on would alter
  *   every reconstructed picture.
@@ -220,10 +222,12 @@ export function writePps(cfg: PpsConfig): Uint8Array {
   w.ue(0); // num_slice_groups_minus1
   w.ue(0); // num_ref_idx_l0_default_active_minus1
   w.ue(0); // num_ref_idx_l1_default_active_minus1
-  w.flag(0); // weighted_pred_flag
-  // Default bi-prediction, i.e. (P0 + P1 + 1) >> 1. The half-pel mapping
-  // depends on this exact rounding, so it must not become weighted.
-  w.u(2, 0); // weighted_bipred_idc
+  // Explicit weighted prediction, which is what gives intra macroblocks their
+  // flat prediction; see h264/slice.ts. Every other reference index is given
+  // the default weight, so bi-prediction remains (P0 + P1 + 1) >> 1 and the
+  // half-pel mapping keeps its exact rounding.
+  w.flag(1); // weighted_pred_flag
+  w.u(2, 1); // weighted_bipred_idc: explicit
   w.se(cfg.initQp - 26); // pic_init_qp_minus26
   w.se(0); // pic_init_qs_minus26
   w.se(cfg.chromaQpIndexOffset ?? 0); // chroma_qp_index_offset

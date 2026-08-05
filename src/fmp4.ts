@@ -90,7 +90,7 @@ export interface Mpeg2VideoTimeline {
   width: number;
   height: number;
   sampleDuration: number;
-  /** Presentation index for each coded picture, after the leading grey IDR. */
+  /** Presentation index for each coded picture, excluding the IDR clone. */
   presentationIndices: number[];
   /** Content sync flags; restart points are supplied by actual IDR samples. */
   syncSamples: boolean[];
@@ -572,9 +572,9 @@ export function h264ToFmp4(
     return type === 1 || type === 5;
   });
   if (!sps || !pps) throw new Error("H.264 stream lacks SPS or PPS");
-  const hasLeadingGrey =
+  const hasIdrClone =
     samples.length === timeline.presentationIndices.length + 1;
-  const presentation = hasLeadingGrey
+  const presentation = hasIdrClone
     ? [0, ...timeline.presentationIndices]
     : timeline.presentationIndices;
   if (samples.length !== presentation.length) {
@@ -599,7 +599,7 @@ export function h264ToFmp4(
       samples.map(() => timeline.sampleDuration),
       presentation.map(
         (value, index) =>
-          (value - index - (hasLeadingGrey ? 0 : 1)) * timeline.sampleDuration,
+          (value - index - (hasIdrClone ? 0 : 1)) * timeline.sampleDuration,
       ),
       samples.map((sample) => (sample[0]! & 0x1f) === 5),
       1,
@@ -612,7 +612,7 @@ export function h264ToFmp4(
 }
 
 export interface Fmp4FragmentOutput extends Fmp4Output {
-  /** Decode timeline consumed by this fragment, including a one-tick grey IDR when present. */
+  /** Decode timeline consumed by this fragment, including a one-tick IDR when present. */
   duration: number;
 }
 
@@ -640,15 +640,17 @@ export function h264GopToFmp4(
     const type = nal[0]! & 0x1f;
     return type === 1 || type === 5;
   });
-  const hasGreyIdr = samples.length === timeline.presentationIndices.length + 1;
+  const hasIdrClone =
+    samples.length === timeline.presentationIndices.length + 1;
   const expectedSamples =
-    timeline.presentationIndices.length + (hasGreyIdr ? 1 : 0);
+    timeline.presentationIndices.length + (hasIdrClone ? 1 : 0);
   if (samples.length !== expectedSamples) {
     throw new Error("H.264 GOP sample count does not match MPEG-2 timeline");
   }
-  // Keep the IDR as a fully compatible decoder reference, but expose it for
-  // only one 90 kHz tick so it cannot become a visible grey video frame.
-  const idrDuration = hasGreyIdr ? 1 : 0;
+  // An IDR and the skipped copy that follows it hold the same picture, so the
+  // IDR is exposed for a single 90 kHz tick and the copy takes its display
+  // slot. Both carry real content, so the seam is invisible either way.
+  const idrDuration = hasIdrClone ? 1 : 0;
   const contentDurations = timeline.presentationIndices.map(
     () => timeline.sampleDuration,
   );
@@ -663,15 +665,15 @@ export function h264GopToFmp4(
         (presentationIndex - 1) * timeline.sampleDuration;
       const decoded =
         baseDecodeTime +
-        (hasGreyIdr ? idrDuration : 0) +
+        (hasIdrClone ? idrDuration : 0) +
         decodeIndex * timeline.sampleDuration;
       return desired - decoded;
     },
   );
-  const durations = hasGreyIdr
+  const durations = hasIdrClone
     ? [idrDuration, ...contentDurations]
     : contentDurations;
-  const compositions = hasGreyIdr
+  const compositions = hasIdrClone
     ? [0, ...contentCompositions]
     : contentCompositions;
   const syncSamples = samples.map((sample) => (sample[0]! & 0x1f) === 5);

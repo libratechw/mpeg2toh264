@@ -63,19 +63,6 @@ describe("mpeg2toh264 CLI", () => {
     expect(text).toContain("mdat");
   });
 
-  it("can write real I_PCM content IDRs without a grey reference frame", () => {
-    const output = join(temp, "pcm-intra.mp4");
-    const result = run([
-      "--pcm-intra",
-      join(root, "test/fixtures/ibbp.m2v"),
-      output,
-    ]);
-    expect(result.status).toBe(0);
-    const text = new TextDecoder("latin1").decode(readFileSync(output));
-    expect(text).toContain("ftyp");
-    expect(text).toContain("mdat");
-  });
-
   it("demuxes an MPEG transport stream before transcoding", () => {
     const es = new Uint8Array(
       readFileSync(join(root, "test/fixtures/i_only.m2v")),

@@ -34,7 +34,7 @@ function reset() {
   audioBaseDecodeTime = 0;
   presentationBase = 0;
   initialized = false;
-  transcoder = new IncrementalTranscoder({ pcmIntra: true });
+  transcoder = new IncrementalTranscoder();
   pendingGops = [];
   pendingAudio = [];
   audioConfig = null;

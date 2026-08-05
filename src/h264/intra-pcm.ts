@@ -4,7 +4,11 @@ import type { Picture } from "../mpeg2/headers.ts";
 import type { Macroblock } from "../mpeg2/macroblock.ts";
 import { idct8 } from "./chroma.ts";
 import type { PcmMacroblockSamples } from "./mb.ts";
-import { fieldDctToFrameTargets, GRAY_DC, intraTargets } from "./quant.ts";
+import {
+  fieldDctToFrameTargets,
+  FLAT_PREDICTION_DC,
+  intraTargets,
+} from "./quant.ts";
 
 function sample(value: number): number {
   return Math.max(0, Math.min(255, Math.round(value)));
@@ -45,7 +49,7 @@ export function reconstructIntraPcm(
       pic.coding.intraDcPrecision,
       target,
     );
-    target[0] = target[0]! + GRAY_DC;
+    target[0] = target[0]! + FLAT_PREDICTION_DC;
     mismatchControl(target);
   }
 

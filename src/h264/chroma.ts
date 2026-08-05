@@ -20,7 +20,7 @@ import {
   CHROMA_DC_GAIN,
   QPC_FROM_QPI,
 } from "./quant-tables.ts";
-import { GRAY_DC } from "./quant.ts";
+import { FLAT_PREDICTION_DC } from "./quant.ts";
 
 /** Orthonormal 8-point DCT matrix; MPEG-2 coefficients live in this basis. */
 const C8 = (() => {
@@ -178,7 +178,7 @@ function dequantChroma(
   for (let pos = 0; pos < 64; pos++) {
     const level = levels[pos]!;
     if (intra && pos === 0) {
-      out[pos] = (8 >> intraDcPrecision) * level - GRAY_DC;
+      out[pos] = (8 >> intraDcPrecision) * level - FLAT_PREDICTION_DC;
     } else if (level === 0) out[pos] = 0;
     else {
       const sign = level < 0 ? -1 : 1;
@@ -327,8 +327,9 @@ export function convertFieldChromaPair(
 /**
  * Convert one MPEG-2 intra chroma block into H.264 chroma levels.
  *
- * The prediction being removed is the flat 128 of the grey reference frame,
- * which in the transform domain is a shift of the DC coefficient alone.
+ * The prediction being removed is the flat constant of the zero-weight
+ * reference index, which in the transform domain is a shift of the DC
+ * coefficient alone.
  */
 export function convertIntraChromaBlock(
   levels: Int16Array,
@@ -340,11 +341,11 @@ export function convertIntraChromaBlock(
   intra: boolean,
 ): void {
   // MPEG-2 dequantisation, clause 7.4.2.1. An intra block is coded against the
-  // grey reference, so its flat 128 prediction comes off the DC; a non-intra
+  // flat prediction, so that constant comes off the DC; a non-intra
   // block is coded against motion compensation the H.264 side reproduces, and
   // its residual carries across untouched.
   if (intra) {
-    dequant[0] = (8 >> intraDcPrecision) * levels[0]! - GRAY_DC;
+    dequant[0] = (8 >> intraDcPrecision) * levels[0]! - FLAT_PREDICTION_DC;
     for (let pos = 1; pos < 64; pos++) {
       const level = levels[pos]!;
       dequant[pos] =

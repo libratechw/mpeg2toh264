@@ -2,6 +2,7 @@
  * H.264 slice headers (clause 7.3.3).
  */
 import type { BitWriter } from "./bitwriter.ts";
+import { FLAT_PREDICTION } from "./quant.ts";
 
 /**
  * slice_type values. The +5 forms additionally assert that every slice in the
@@ -27,8 +28,8 @@ export interface SliceHeaderConfig {
   idrPicId?: number;
   /**
    * IDR only. Marks the picture as a long-term reference with
-   * LongTermFrameIdx 0, which is how the all-grey frame is kept in the decoded
-   * picture buffer for the rest of the stream.
+   * LongTermFrameIdx 0, which is how the flat-prediction reference is kept in
+   * the decoded picture buffer for the rest of the stream.
    */
   longTermReference?: boolean;
   /** Set when the source is interlaced, i.e. frame_mbs_only_flag is 0. */
@@ -62,6 +63,56 @@ export interface SliceHeaderConfig {
    * same picture reachable through both lists.
    */
   l1FirstShortTermDelta?: number;
+  /**
+   * The reference index intra macroblocks point at, in both lists.
+   *
+   * H.264 has no "no prediction" macroblock mode short of I_PCM, so an MPEG-2
+   * intra macroblock cannot be expressed directly: H.264 intra prediction
+   * would subtract a neighbour-derived value that MPEG-2 never added, and
+   * working out those neighbours means decoding pixels, which is exactly what
+   * this transcoder exists to avoid.
+   *
+   * The way out is explicit weighted prediction. This index gets weight 0 and
+   * offset FLAT_PREDICTION, which makes its prediction that constant
+   * everywhere no matter what the reference picture holds (clause 8.4.2.3.2,
+   * Equation 8-274). The residual is then simply the MPEG-2 block with the
+   * constant removed -- in the transform domain, a shift of the DC coefficient
+   * alone -- and no reference picture has to be manufactured to carry it.
+   */
+  flatPredRefIdx?: number;
+}
+
+/**
+ * pred_weight_table, clause 7.3.3.2. Every index other than flatPredRefIdx
+ * keeps the default weight of 1 and offset of 0, so with the denominators at 0
+ * both single-list and bi-prediction reduce to the unweighted equations: in
+ * particular bi-prediction stays (P0 + P1 + 1) >> 1, which is what makes
+ * MPEG-2's half-sample filter reproducible bit for bit.
+ */
+function writePredWeightTable(
+  w: BitWriter,
+  counts: number[],
+  flatPredRefIdx?: number,
+): void {
+  w.ue(0); // luma_log2_weight_denom
+  w.ue(0); // chroma_log2_weight_denom
+  for (const count of counts) {
+    for (let i = 0; i < count; i++) {
+      const flat = i === flatPredRefIdx;
+      w.flag(flat); // luma_weight_lX_flag
+      if (flat) {
+        w.se(0); // luma_weight_lX
+        w.se(FLAT_PREDICTION); // luma_offset_lX
+      }
+      w.flag(flat); // chroma_weight_lX_flag
+      if (flat) {
+        for (let j = 0; j < 2; j++) {
+          w.se(0); // chroma_weight_lX
+          w.se(FLAT_PREDICTION); // chroma_offset_lX
+        }
+      }
+    }
+  }
 }
 
 export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
@@ -123,7 +174,16 @@ export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
     }
   }
 
-  // weighted_pred_flag is 0 and weighted_bipred_idc is 0, so no pred_weight_table.
+  // weighted_pred_flag is 1 and weighted_bipred_idc is 1, so every P and B
+  // slice carries a table, whether or not it uses the flat prediction.
+  if (isP || isB) {
+    const l0 = cfg.numRefIdxL0Active ?? 1;
+    writePredWeightTable(
+      w,
+      isB ? [l0, cfg.numRefIdxL1Active ?? 1] : [l0],
+      cfg.flatPredRefIdx,
+    );
+  }
 
   // dec_ref_pic_marking appears only for reference pictures.
   if (cfg.reference) {

@@ -97,13 +97,13 @@ try {
   const outAll = new Uint8Array(readFileSync(outYuv));
   const frameSize = (width * height * 3) / 2;
   const lumaSize = width * height;
-  // The first decoded picture is the all-grey reference frame, which exists
-  // only to stand in for intra prediction and is not part of the content.
+  // The IDR is followed by a skipped copy of itself, which starts the
+  // short-term reference chain; drop one of the pair before comparing.
   const out = outAll.subarray(frameSize);
   const frames = Math.min(src.length, out.length) / frameSize;
   console.log(
     `decoded     : source ${src.length / frameSize} frames, ` +
-      `output ${outAll.length / frameSize} frames (1 is the grey reference)`,
+      `output ${outAll.length / frameSize} frames (1 is the IDR clone)`,
   );
 
   if (frames < 1) throw new Error("nothing decoded to compare");

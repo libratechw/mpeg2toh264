@@ -1,11 +1,11 @@
 /**
- * H.264 macroblock layer for macroblocks predicted from the grey reference.
+ * H.264 macroblock layer.
  *
  * Every MPEG-2 macroblock becomes an inter macroblock, including intra ones:
- * see grayframe.ts for why H.264 intra prediction is avoided entirely. An intra
+ * see slice.ts for why H.264 intra prediction is avoided entirely. An intra
  * macroblock is coded as P_L0_16x16 with a zero motion vector pointing at the
- * all-grey long-term reference, so its prediction is a known constant and its
- * residual is just the block with 128 removed.
+ * flat-prediction reference index, so its prediction is a known constant and
+ * its residual is just the block with that constant removed.
  */
 import type { BitWriter } from "./bitwriter.ts";
 import { CBP_TO_CODE_NUM_INTER } from "./cavlc-tables.ts";
@@ -130,7 +130,7 @@ export class CoeffCountMap {
   }
 }
 
-export interface GrayRefMacroblock {
+export interface InterMacroblock {
   /** Macroblock position in the picture. */
   mbX: number;
   mbY: number;
@@ -224,11 +224,11 @@ export function makeLumaCounts(
  * Write one macroblock. Returns the QP in effect afterwards, which is the
  * macroblock's own QP only if it actually carried a mb_qp_delta.
  */
-export function writeGrayRefMacroblock(
+export function writeInterMacroblock(
   w: BitWriter,
   counts: CoeffCountMap,
   chromaCounts: ChromaCounts,
-  mb: GrayRefMacroblock,
+  mb: InterMacroblock,
 ): number {
   // P_L0_16x16 is mb_type 0 (Table 7-13). B slices use Table 7-14 below.
   w.ue(mb.pSlice ? (mb.partitions ? 1 : 0) : mb.mbType);
@@ -306,7 +306,7 @@ export function writeGrayRefMacroblock(
 function writeChromaResidual(
   w: BitWriter,
   counts: ChromaCounts,
-  mb: GrayRefMacroblock,
+  mb: InterMacroblock,
   cbpChroma: number,
 ): void {
   if (cbpChroma === 0 || !mb.chroma) {
@@ -389,7 +389,7 @@ const lumaSubBlock = new Int32Array(16);
 function writeLumaResidual8x8(
   w: BitWriter,
   counts: CoeffCountMap,
-  mb: GrayRefMacroblock,
+  mb: InterMacroblock,
   cbpLuma: number,
 ): void {
   const sub = lumaSubBlock;

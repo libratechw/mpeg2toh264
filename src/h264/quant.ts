@@ -90,15 +90,25 @@ export class Quantiser8x8 {
 }
 
 /**
- * The DC of an all-128 block in orthonormal-DCT terms. Intra macroblocks are
- * coded as a residual against the grey reference frame, so this comes off their
- * DC coefficient and nothing else changes: a constant offset touches no AC term.
+ * The constant an intra macroblock is predicted from; see h264/slice.ts.
+ *
+ * It is 127 rather than the more obvious 128 because it is carried in
+ * luma_offset_l0, whose range stops at 127. The exact value does not matter:
+ * the residual carries whatever the difference turns out to be.
  */
-export const GRAY_DC = 8 * 128;
+export const FLAT_PREDICTION = 127;
+
+/**
+ * The DC of an all-FLAT_PREDICTION block in orthonormal-DCT terms. Intra
+ * macroblocks are coded as a residual against that flat prediction, so this
+ * comes off their DC coefficient and nothing else changes: a constant offset
+ * touches no AC term.
+ */
+export const FLAT_PREDICTION_DC = 8 * FLAT_PREDICTION;
 
 /**
  * MPEG-2 dequantisation of an intra block, clause 7.4.1 and 7.4.2.1, minus the
- * grey prediction. The result is what the H.264 residual has to reconstruct.
+ * flat prediction. The result is what the H.264 residual has to reconstruct.
  *
  * DC uses intra_dc_mult rather than the quantiser matrix, so it is handled
  * separately from the AC coefficients.
@@ -111,7 +121,7 @@ export function intraTargets(
   out: Float64Array,
 ): void {
   const intraDcMult = 8 >> intraDcPrecision;
-  out[0] = intraDcMult * levels[0]! - GRAY_DC;
+  out[0] = intraDcMult * levels[0]! - FLAT_PREDICTION_DC;
   for (let pos = 1; pos < 64; pos++) {
     const level = levels[pos]!;
     // The division truncates toward zero, matching what a decoder computes.

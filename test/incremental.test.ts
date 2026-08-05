@@ -71,7 +71,7 @@ describe("incremental transcoding", () => {
     const gop = new Uint8Array(
       readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
     );
-    const session = new IncrementalTranscoder({ pcmIntra: true });
+    const session = new IncrementalTranscoder();
     session.push(gop);
     session.requestRandomAccessPoint();
     const restarted = session.push(gop).bitstream;

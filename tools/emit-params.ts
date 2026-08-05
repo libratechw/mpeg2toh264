@@ -27,8 +27,8 @@ const sps = writeSps({
   height,
   levelIdc,
   frameMbsOnly,
-  // Two MPEG-2 references plus the all-grey long-term frame that stands in for
-  // intra prediction, with headroom.
+  // Two MPEG-2 references plus the long-term picture that carries the
+  // flat-prediction weights, with headroom.
   maxNumRefFrames: 4,
   log2MaxFrameNumMinus4: 4,
   log2MaxPocLsbMinus4: 4,
