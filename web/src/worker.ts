@@ -175,6 +175,7 @@ function createWorkerSink(command: LoadCommand): MseSink {
   const id = command.id;
   const created = new MseSink({
     queueHighWaterMark: command.queueHighWaterMark,
+    maxAheadSeconds: command.maxAheadSeconds,
     keepBehindSeconds: command.keepBehindSeconds,
     seek: (time) => post({ type: "seek", id, time }),
     onMark: (name) => mark(id, name),

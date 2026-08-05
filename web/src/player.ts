@@ -16,6 +16,7 @@ import { MseSink } from "./mse.js";
 import { decoderDeinterlaces } from "./probe.js";
 import {
   DEFAULT_KEEP_BEHIND_SECONDS,
+  DEFAULT_MAX_AHEAD_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
   PLAYHEAD_REPORT_INTERVAL_MS,
   type Command,
@@ -57,6 +58,8 @@ export interface Mpeg2TsPlayerOptions {
   oversample?: number;
   /** Pause conversion above this many bytes waiting to be appended. */
   queueHighWaterMark?: number;
+  /** Pause conversion while the buffer already reaches this far past the playhead. */
+  maxAheadSeconds?: number;
   /** Seconds of played media to keep behind the playhead when evicting. */
   keepBehindSeconds?: number;
   /**
@@ -330,6 +333,8 @@ export class Mpeg2TsPlayer extends EventTarget {
       sink: this.#sinkKind,
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
+      maxAheadSeconds:
+        this.#options.maxAheadSeconds ?? DEFAULT_MAX_AHEAD_SECONDS,
       keepBehindSeconds:
         this.#options.keepBehindSeconds ?? DEFAULT_KEEP_BEHIND_SECONDS,
     } satisfies Command);
@@ -516,6 +521,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     const sink = new MseSink({
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
+      maxAheadSeconds:
+        this.#options.maxAheadSeconds ?? DEFAULT_MAX_AHEAD_SECONDS,
       keepBehindSeconds:
         this.#options.keepBehindSeconds ?? DEFAULT_KEEP_BEHIND_SECONDS,
       seek: (time) => {

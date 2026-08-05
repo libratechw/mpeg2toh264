@@ -22,6 +22,24 @@ export const DEFAULT_QUEUE_HIGH_WATER_MARK = 32 * 1024 * 1024;
  */
 export const QUEUE_HIGH_WATER_FRAGMENTS = 2;
 
+/**
+ * How far ahead of the playhead the buffer may run before conversion pauses.
+ *
+ * Converting is several times faster than watching, so without a limit the
+ * buffer fills with everything between the playhead and the end of the file.
+ * Every browser puts a ceiling on a SourceBuffer, and they do not agree on
+ * what happens at it: Chrome throws `QuotaExceededError` and hands the
+ * decision back, Firefox evicts by itself. What Firefox evicts has to leave
+ * the rest decodable, so it goes as far as the next random access point --
+ * which at a restart every twenty-four groups of pictures can be seconds in
+ * front of the playhead. Playback then stops on media that is gone, and no
+ * `seeking` event fires to say so.
+ *
+ * There is nothing to gain from a longer lead anyway: the conversion refills
+ * this in a fraction of the time it takes to watch it.
+ */
+export const DEFAULT_MAX_AHEAD_SECONDS = 8;
+
 /** Seconds of played media kept behind the playhead when evicting. */
 export const DEFAULT_KEEP_BEHIND_SECONDS = 10;
 
@@ -113,6 +131,7 @@ export interface LoadCommand {
   oversample: number | undefined;
   sink: SinkKind;
   queueHighWaterMark: number;
+  maxAheadSeconds: number;
   keepBehindSeconds: number;
 }
 

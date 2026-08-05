@@ -9,6 +9,24 @@
  */
 import { QUEUE_HIGH_WATER_FRAGMENTS } from "./protocol.js";
 
+/**
+ * How far short of a restart point a removal stops, in seconds.
+ *
+ * `remove` takes seconds as a double and the browser rounds them into its own
+ * time base, so asking it to stop exactly on a frame is asking it to agree
+ * about the last bit of a repeating fraction. It does not always: 68540 ticks
+ * of 90 kHz is 0.7615555555555555 either way round, and one unit in the last
+ * place on the wrong side puts that frame inside the range. That frame is the
+ * random access point, and removing one takes everything after it as well, as
+ * far as the *next* random access point -- twelve seconds of media, gone,
+ * including whatever was about to be shown.
+ *
+ * Stopping a little short leaves the point safely outside. It has to be less
+ * than one frame, or the frame before the point survives instead, and being no
+ * random access point itself it carries the removal onward just the same.
+ */
+const REMOVE_MARGIN_SECONDS = 0.001;
+
 /** Where a producer hands fragments, and how it learns to slow down. */
 export interface FragmentSink {
   /** Resolves once there is room for more fragments. */
@@ -66,6 +84,8 @@ export class ReadyGate {
 export interface MseSinkOptions {
   /** Stop taking fragments above this many bytes waiting to be appended. */
   queueHighWaterMark: number;
+  /** Stop taking fragments while the buffer reaches this far past the playhead. */
+  maxAheadSeconds: number;
   /** Seconds of played media to keep behind the playhead when evicting. */
   keepBehindSeconds: number;
   /** Move the playhead, which only whoever holds the media element can do. */
@@ -115,7 +135,7 @@ export class MseSink implements FragmentSink {
   #epoch = 0;
   /** A duration to put on the MediaSource as soon as it will take one. */
   #pendingDuration: number | null = null;
-  /** Media times a decoder can start from, in order; see #relieveQuota. */
+  /** Media times a decoder can start from, in order; see #evict. */
   #randomAccessPoints: number[] = [];
   /** Whether the playhead has been put where the media starts; see #startAtMedia. */
   #playheadPlaced = false;
@@ -248,7 +268,9 @@ export class MseSink implements FragmentSink {
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(time: number): void {
     this.#currentTime = time;
-    this.#relieveQuota();
+    this.#evict();
+    this.#updateRoom();
+    this.#pump();
   }
 
   #enqueue(pending: Pending): void {
@@ -311,7 +333,7 @@ export class MseSink implements FragmentSink {
         this.#options.onBlocked?.(true);
         // Try at once rather than waiting for playback to raise an event: if
         // the buffer ahead runs out first, nothing will raise one.
-        this.#relieveQuota();
+        this.#evict();
       } else this.#fail(error);
     }
   }
@@ -331,6 +353,7 @@ export class MseSink implements FragmentSink {
     }
     this.#operation = null;
     this.#applyDuration();
+    this.#evict();
     this.#updateRoom();
     this.#pump();
   };
@@ -383,7 +406,16 @@ export class MseSink implements FragmentSink {
     }
   }
 
-  #relieveQuota(): void {
+  /**
+   * Drop what is behind the playhead, once a browser has said it is out of
+   * room.
+   *
+   * Only some of them say so. Chrome and Safari throw `QuotaExceededError` and
+   * hand the decision back; Firefox keeps its own ceiling and evicts by itself,
+   * from its own bookkeeping, and does not need help. Removing anyway would
+   * only be another chance to remove the wrong thing.
+   */
+  #evict(): void {
     const sourceBuffer = this.#sourceBuffer;
     if (
       !this.#quotaBlocked ||
@@ -392,25 +424,27 @@ export class MseSink implements FragmentSink {
       this.#operation
     )
       return;
-    if (sourceBuffer.buffered.length === 0) return;
+    if (this.#clearing || sourceBuffer.buffered.length === 0) return;
     const removeStart = sourceBuffer.buffered.start(0);
     // Removing a range takes the frames after it as well, up to the next random
     // access point, so that nothing is left behind depending on what went away.
     // Restart points here are several times further apart than the margin kept
     // behind the playhead, so ending a removal at currentTime - keepBehind
     // regularly reaches past the playhead and deletes the frames about to be
-    // shown -- playback then stalls until the viewer seeks over the hole. Ending
-    // exactly on a restart point removes nothing beyond it.
+    // shown -- playback then stalls until the viewer seeks over the hole. So a
+    // removal ends just short of a restart point, and the frames after it
+    // depend on nothing that went.
     const limit = this.#currentTime - this.#options.keepBehindSeconds;
-    let removeEnd = 0;
+    let stopAt = 0;
     for (const at of this.#randomAccessPoints) {
       if (at > limit) break;
-      removeEnd = at;
+      stopAt = at;
     }
+    const removeEnd = stopAt - REMOVE_MARGIN_SECONDS;
     if (removeEnd <= removeStart) return;
     while (
       this.#randomAccessPoints.length > 0 &&
-      this.#randomAccessPoints[0]! < removeEnd
+      this.#randomAccessPoints[0]! < stopAt
     ) {
       this.#randomAccessPoints.shift();
     }
@@ -418,9 +452,17 @@ export class MseSink implements FragmentSink {
     sourceBuffer.remove(removeStart, removeEnd);
   }
 
+  /** How far past the playhead the buffer reaches, in seconds. */
+  #ahead(): number {
+    const buffered = this.#sourceBuffer?.buffered;
+    if (!buffered || buffered.length === 0) return 0;
+    return buffered.end(buffered.length - 1) - this.#currentTime;
+  }
+
   #updateRoom(): void {
     const room =
       !this.#quotaBlocked &&
+      this.#ahead() < this.#options.maxAheadSeconds &&
       this.#queuedBytes < this.#options.queueHighWaterMark &&
       this.#queue.length < QUEUE_HIGH_WATER_FRAGMENTS;
     if (this.#room.set(room)) this.#options.onReadyChange?.(room);

@@ -20,6 +20,7 @@ export {
 export type { DecoderProbe, DecoderProbeOptions } from "./probe.js";
 export {
   DEFAULT_KEEP_BEHIND_SECONDS,
+  DEFAULT_MAX_AHEAD_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
   type PlayerState,
   type Progress,
