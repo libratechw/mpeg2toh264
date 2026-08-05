@@ -180,6 +180,24 @@ fn maps_mono_sce_to_primary_audio_on_both_stereo_channels() {
     assert_eq!(frames[0].data[0] >> 5, 1, "SCE became a CPE");
 }
 
+/// A frame the encoder padded to a byte, rewritten, must not end up padded
+/// twice: a decoder that measures the block against the bytes it consumed
+/// rejects a frame with a whole byte hanging off the end, which is what a mono
+/// service sounded like on a Media Foundation decoder -- about half its frames
+/// went missing.
+#[test]
+fn the_rewrite_ends_the_block_at_id_end() {
+    // The empty SCE and ID_END of the mono case, then a byte of padding.
+    let frame = adts_frame_with_payload(3, 1, &[0, 0, 0, 7, 0]);
+    let frames = AdtsStream::new()
+        .push(&frame)
+        .expect("padded frame decodes");
+    // ID_CPE, tag, common_window, two 22-bit channel streams and ID_END: 55
+    // bits, which is seven bytes once aligned. Carrying the input's tail
+    // across would make it eight.
+    assert_eq!(frames[0].data.len(), 7);
+}
+
 #[test]
 fn accepts_mono_to_dual_mono_changes_when_the_primary_sce_is_stable() {
     let mono = adts_frame_with_payload(3, 1, &[0, 0, 0, 7]);
@@ -190,7 +208,7 @@ fn accepts_mono_to_dual_mono_changes_when_the_primary_sce_is_stable() {
     let second = adts.push(&dual).expect("dual-mono frame");
     assert_eq!(first[0].config, second[0].config);
     assert_eq!(second[0].config.channel_count, 2);
-    assert_eq!(second[0].data.len(), 8, "the secondary SCE is discarded");
+    assert_eq!(second[0].data.len(), 7, "the secondary SCE is discarded");
     for bit in 0..22 {
         let left = (second[0].data[(8 + bit) / 8] >> (7 - ((8 + bit) & 7))) & 1;
         let right = (second[0].data[(30 + bit) / 8] >> (7 - ((30 + bit) & 7))) & 1;

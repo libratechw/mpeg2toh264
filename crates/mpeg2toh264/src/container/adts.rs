@@ -100,6 +100,42 @@ fn parse_pce(data: &[u8], start: usize) -> Result<PceInfo> {
     })
 }
 
+/// Step over a fill element, which is byte-counted rather than parsed.
+fn fill_element_end(data: &[u8], at: usize) -> usize {
+    let mut at = at + 3;
+    let mut count = (0..4).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
+    at += 4;
+    if count == 15 {
+        let extra = (0..8).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
+        at += 8;
+        count += extra.saturating_sub(1);
+    }
+    at + count * 8
+}
+
+/// One past the last bit of ID_END, walking whatever fill elements sit between
+/// the channel element and it.
+///
+/// What follows ID_END is the alignment the encoder wrote, and a rewrite that
+/// carries it across ends up padding a frame that was padded already: the two
+/// together come to more than a byte about half the time, which leaves a whole
+/// byte hanging off the end of the block. Decoders that stop reading at ID_END
+/// never notice; ones that check the frame against the bytes they consumed
+/// reject it, and half the frames of a mono service went missing that way.
+fn raw_data_block_end(data: &[u8], mut at: usize) -> Result<usize> {
+    let total = data.len() * 8;
+    loop {
+        if at + 3 > total {
+            bail!("AAC raw_data_block ended before ID_END");
+        }
+        match (bit(data, at) << 2) | (bit(data, at + 1) << 1) | bit(data, at + 2) {
+            7 => return Ok(at + 3),
+            6 => at = fill_element_end(data, at),
+            id => bail!("unsupported AAC element {id} after the channel element"),
+        }
+    }
+}
+
 fn first_channel_element(data: &[u8]) -> Result<(u8, usize, Vec<(usize, usize)>, Option<PceInfo>)> {
     let mut at = 0;
     let mut pces = Vec::new();
@@ -122,15 +158,7 @@ fn first_channel_element(data: &[u8]) -> Result<(u8, usize, Vec<(usize, usize)>,
         if id != 6 {
             bail!("unsupported AAC element {id} before the channel element");
         }
-        at += 3;
-        let mut count = (0..4).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
-        at += 4;
-        if count == 15 {
-            let extra = (0..8).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
-            at += 8;
-            count += extra.saturating_sub(1);
-        }
-        at += count * 8;
+        at = fill_element_end(data, at);
         if at + 7 > data.len() * 8 {
             bail!("AAC FIL element overruns the raw_data_block");
         }
@@ -219,7 +247,7 @@ fn primary_sce_to_cpe(
     out.push(0); // common_window: each copy carries its own ics_info
     out.copy(data, sce + 7, primary_end);
     out.copy(data, sce + 7, primary_end);
-    out.copy(data, tail, data.len() * 8);
+    out.copy(data, tail, raw_data_block_end(data, tail)?);
     Ok(out.data)
 }
 
