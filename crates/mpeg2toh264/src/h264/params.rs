@@ -36,7 +36,8 @@ pub struct SpsConfig {
     /// Luma width in samples, before cropping.
     pub width: u32,
     pub height: u32,
-    /// `level_idc`, e.g. 40 for level 4.0 (enough for 1440x1080 at 30i).
+    /// `level_idc`, e.g. 51 for level 5.1. This has to cover the bit rate and
+    /// the access unit sizes, not just the frame size.
     pub level_idc: u32,
     /// False when the source is interlaced. MPEG-2 frame pictures mix frame-DCT
     /// and field-DCT macroblocks, which only macroblock-adaptive frame/field

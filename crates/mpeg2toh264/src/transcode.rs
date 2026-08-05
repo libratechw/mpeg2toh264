@@ -233,7 +233,15 @@ impl IncrementalTranscoder {
             parts.push(write_sps(&SpsConfig {
                 width,
                 height,
-                level_idc: if width * height > 720 * 576 { 40 } else { 30 },
+                // Higher than the frame size alone would ask for, because a
+                // level is a promise about the bitstream and not just about
+                // its dimensions. Requantising with no reference buffer costs
+                // bits: broadcast HD comes out around 35 Mb/s, with second-long
+                // peaks past 50, where level 4.0 promises 25. Access units are
+                // outsized too -- a random access point is a whole picture of
+                // raw samples -- and 5.1 is back to the looser MinCR that the
+                // levels below 3.1 use.
+                level_idc: 51,
                 frame_mbs_only: !mbaff,
                 // The long-term flat-prediction picture plus the two most recent
                 // I or P pictures, which are what a B picture predicts from. The
