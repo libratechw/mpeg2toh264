@@ -302,7 +302,9 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
             continue;
         }
         if awaiting_intra {
-            if picture_type != PictureType::I {
+            // Only an intra picture sent as a frame opens the buffer; the
+            // transcoder decides it the same way and for the same reason.
+            if picture_type != PictureType::I || mate.is_some() {
                 continue;
             }
             awaiting_intra = false;

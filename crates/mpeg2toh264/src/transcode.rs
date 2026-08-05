@@ -380,8 +380,13 @@ impl IncrementalTranscoder {
                 continue;
             }
             // Nothing can be coded before the IDR that starts the decoded
-            // picture buffer, and only an I picture can become one.
-            let real_idr = awaiting_idr && picture_type == PictureType::I;
+            // picture buffer, and only an I picture can become one -- an I
+            // picture sent as a frame, at that. The copy that starts the
+            // short-term chain behind an IDR is a frame, and a frame cannot
+            // follow a pair of fields and stand for them. A broadcast that
+            // sends some of its pictures as fields sends the rest as frames,
+            // so the wait is a group of pictures or two, not the whole stretch.
+            let real_idr = awaiting_idr && picture_type == PictureType::I && paired_pic.is_none();
             if awaiting_idr && !real_idr {
                 pictures_skipped += 1;
                 continue;
