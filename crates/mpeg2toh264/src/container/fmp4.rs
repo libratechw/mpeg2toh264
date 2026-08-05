@@ -576,11 +576,14 @@ fn make_av_media_segment(
     audio_base_decode_time: u64,
     first_sample_prefixes: &[&[u8]],
 ) -> Vec<u8> {
-    let video_payloads = make_video_payloads(video_samples, first_sample_prefixes);
+    let prefix_bytes: usize = first_sample_prefixes.iter().map(|nal| 4 + nal.len()).sum();
+    let video_bytes: usize =
+        video_samples.iter().map(|nal| 4 + nal.len()).sum::<usize>() + prefix_bytes;
     let mut video_entries = Buf::new();
     for i in 0..video_samples.len() {
+        let sample_bytes = 4 + video_samples[i].len() + if i == 0 { prefix_bytes } else { 0 };
         video_entries.u32(durations[i]);
-        video_entries.u32(video_payloads[i].len() as u32);
+        video_entries.u32(sample_bytes as u32);
         video_entries.u32(if sync_samples[i] {
             0x0200_0000
         } else {
@@ -595,8 +598,6 @@ fn make_av_media_segment(
         audio_entries.u32(sample.len() as u32);
     }
     let audio_entries = audio_entries.into_vec();
-    let video_bytes: usize = video_payloads.iter().map(Vec::len).sum();
-
     let make_moof = |video_offset: u32, audio_offset: u32| {
         let mfhd = {
             let mut body = Buf::new();
@@ -649,11 +650,25 @@ fn make_av_media_segment(
     let payload_start = moof.len() as u32 + 8;
     let moof = make_moof(payload_start, payload_start + video_bytes as u32);
 
-    let mut mdat_payload: Vec<u8> = video_payloads.concat();
-    for sample in audio_samples {
-        mdat_payload.extend_from_slice(sample);
+    let audio_bytes: usize = audio_samples.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(moof.len() + 8 + video_bytes + audio_bytes);
+    out.extend_from_slice(&moof);
+    out.extend_from_slice(&((8 + video_bytes + audio_bytes) as u32).to_be_bytes());
+    out.extend_from_slice(b"mdat");
+    for (index, sample) in video_samples.iter().enumerate() {
+        if index == 0 {
+            for prefix in first_sample_prefixes {
+                out.extend_from_slice(&(prefix.len() as u32).to_be_bytes());
+                out.extend_from_slice(prefix);
+            }
+        }
+        out.extend_from_slice(&(sample.len() as u32).to_be_bytes());
+        out.extend_from_slice(sample);
     }
-    concat(&[&moof, &boxed("mdat", &mdat_payload)])
+    for sample in audio_samples {
+        out.extend_from_slice(sample);
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
