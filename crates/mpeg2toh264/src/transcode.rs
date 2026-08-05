@@ -113,8 +113,51 @@ struct RefLayout {
     force_l1_short_term: bool,
 }
 
+/// The neighbour state a picture's coding reads back, kept between pictures.
+///
+/// Every picture starts from these empty, so what they hold is never carried
+/// over -- but at an HD macroblock count they are several megabytes between
+/// them, and asking the allocator for that per picture costs more than the
+/// emptying does. In the browser build it costs more still, since the zeroing
+/// an allocation comes with is a memset there.
+struct PictureScratch {
+    counts: CoeffCountMap,
+    chroma_counts: ChromaCounts,
+    motion: MotionField,
+    /// Indexed by field parity, for the pictures coded as field pairs.
+    field_counts: [CoeffCountMap; 2],
+    field_chroma_counts: [ChromaCounts; 2],
+    field_motion: [MotionField; 2],
+}
+
+impl PictureScratch {
+    fn new(mb_width: usize, mb_height: usize) -> Self {
+        let field_height = mb_height >> 1;
+        Self {
+            counts: make_luma_counts(mb_width, mb_height),
+            chroma_counts: ChromaCounts::new(mb_width, mb_height),
+            motion: MotionField::new(mb_width, mb_height),
+            field_counts: [
+                make_luma_counts(mb_width, field_height),
+                make_luma_counts(mb_width, field_height),
+            ],
+            field_chroma_counts: [
+                ChromaCounts::new(mb_width, field_height),
+                ChromaCounts::new(mb_width, field_height),
+            ],
+            field_motion: [
+                MotionField::new(mb_width, field_height),
+                MotionField::new(mb_width, field_height),
+            ],
+        }
+    }
+}
+
 pub struct IncrementalTranscoder {
     options: TranscodeOptions,
+    /// Built at the first picture and kept: the sequence dimensions may not
+    /// change while a transcoder is alive.
+    scratch: Option<PictureScratch>,
     initialized: bool,
     width: u32,
     height: u32,
@@ -134,6 +177,7 @@ impl IncrementalTranscoder {
     pub fn new(options: TranscodeOptions) -> Self {
         Self {
             options,
+            scratch: None,
             initialized: false,
             width: 0,
             height: 0,
@@ -227,9 +271,9 @@ impl IncrementalTranscoder {
         }
 
         let quant = Quantiser8x8::new(&scaling);
-        let mut counts = make_luma_counts(g.mb_width, g.mb_height);
-        let mut chroma_counts = ChromaCounts::new(g.mb_width, g.mb_height);
-        let mut motion = MotionField::new(g.mb_width, g.mb_height);
+        let scratch = self
+            .scratch
+            .get_or_insert_with(|| PictureScratch::new(g.mb_width, g.mb_height));
         let mut reader = BitReader::new(data);
         // One picture's macroblocks, reused by every picture in the group. At
         // an HD macroblock count this is several megabytes, and handing it back
@@ -354,9 +398,7 @@ impl IncrementalTranscoder {
                 &by_address,
                 &g,
                 &quant,
-                &mut counts,
-                &mut chroma_counts,
-                &mut motion,
+                scratch,
                 &ctx,
                 &mut self.stats,
                 &mut slice_writer,
@@ -835,13 +877,19 @@ fn write_picture(
     by_address: &MacroblockGrid,
     g: &FrameGeometry,
     quant: &Quantiser8x8,
-    counts: &mut CoeffCountMap,
-    chroma_counts: &mut ChromaCounts,
-    motion: &mut MotionField,
+    scratch: &mut PictureScratch,
     ctx: &PictureContext,
     stats: &mut Stats,
     writer: &mut BitWriter,
 ) -> Result<Vec<u8>> {
+    let PictureScratch {
+        counts,
+        chroma_counts,
+        motion,
+        field_counts,
+        field_chroma_counts,
+        field_motion,
+    } = scratch;
     let mut nal_parts: Vec<Vec<u8>> = Vec::new();
 
     let mut targets = [[0.0f32; 64]; 4];
@@ -854,18 +902,6 @@ fn write_picture(
     // Indexed [field][component].
     let mut pair_field_chroma: [[ChromaBlockLevels; 2]; 2] =
         std::array::from_fn(|_| std::array::from_fn(|_| ChromaBlockLevels::default()));
-    let mut field_motion = [
-        MotionField::new(g.mb_width, g.mb_height >> 1),
-        MotionField::new(g.mb_width, g.mb_height >> 1),
-    ];
-    let mut field_counts = [
-        make_luma_counts(g.mb_width, g.mb_height >> 1),
-        make_luma_counts(g.mb_width, g.mb_height >> 1),
-    ];
-    let mut field_chroma_counts = [
-        ChromaCounts::new(g.mb_width, g.mb_height >> 1),
-        ChromaCounts::new(g.mb_width, g.mb_height >> 1),
-    ];
     let mut prev_qp = PPS_INIT_QP;
     let mut slice_open = false;
     let output_slice_type = if ctx.real_idr {
@@ -908,14 +944,14 @@ fn write_picture(
             counts.reset();
             chroma_counts.reset();
             motion.reset();
-            for field in &mut field_motion {
-                field.reset();
-            }
-            for map in &mut field_counts {
+            for map in field_counts.iter_mut() {
                 map.reset();
             }
-            for maps in &mut field_chroma_counts {
+            for maps in field_chroma_counts.iter_mut() {
                 maps.reset();
+            }
+            for field in field_motion.iter_mut() {
+                field.reset();
             }
             prev_qp = PPS_INIT_QP;
             writer.clear();
