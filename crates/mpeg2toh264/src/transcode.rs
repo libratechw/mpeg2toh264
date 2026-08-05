@@ -63,6 +63,9 @@ const PPS_INIT_QP: i32 = 26;
 /// mapping and that error compounds along a chain of predicted pictures.
 const CHROMA_QP_OFFSET: i32 = -6;
 const MAX_FRAME_NUM: u32 = 1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4);
+/// `max_num_ref_frames`, which is also when the sliding window starts pushing
+/// pictures out: three short-term frames and the long-term one.
+const MAX_NUM_REF_FRAMES: u32 = 4;
 /// Picture order counts advance by this much per source frame.
 ///
 /// Four, not the two a pair of fields needs, because a random access point puts
@@ -302,7 +305,7 @@ impl IncrementalTranscoder {
                 // count also fixes how many short-term pictures the sliding
                 // window keeps, so the reference indices in RefLayout depend on
                 // it.
-                max_num_ref_frames: 4,
+                max_num_ref_frames: MAX_NUM_REF_FRAMES,
                 log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM_MINUS4,
                 log2_max_poc_lsb_minus4: LOG2_MAX_POC_LSB_MINUS4,
                 // An MPEG-2 stream codes its anchor picture before the B
@@ -984,6 +987,7 @@ fn prediction_for_field(
 
 /// Prediction for a macroblock that came from an MPEG-2 field picture and is
 /// emitted as one field-coded macroblock of an MBAFF complementary pair.
+#[allow(clippy::too_many_arguments)]
 fn prediction_for_field_picture(
     mb: Option<&Macroblock>,
     field: usize,
@@ -992,6 +996,7 @@ fn prediction_for_field_picture(
     layout: &RefLayout,
     stats: &mut Stats,
     second_reference_field: bool,
+    flat_field_idx: i32,
 ) -> Prediction {
     let (Some(mb), false) = (mb, intra) else {
         // The index the slice header hung the flat weights on, which this has
@@ -1010,7 +1015,7 @@ fn prediction_for_field_picture(
         }
         return Prediction {
             mb_type: b_mb_type::L0_16X16,
-            ref_idx_l0: layout.flat * 2 - i32::from(second_reference_field),
+            ref_idx_l0: flat_field_idx,
             ref_idx_l1: -1,
             mv_l0: [0, 0],
             mv_l1: [0, 0],
@@ -1600,6 +1605,33 @@ fn write_picture(
         } else {
             &ctx.layout
         };
+        // How many short-term reference fields stand in front of the long-term
+        // ones, which is where the flat prediction sits.
+        //
+        // A buffer of `count` frames offers twice as many fields. The second
+        // field of a reference pair sees a different set: its own first field
+        // was marked before it and stands in the list alone, without the mate
+        // it has not got yet. Clause 8.2.5.3 makes room for that frame by
+        // pushing the oldest one out, which turns a whole frame into a single
+        // field and leaves the run a field shorter -- but only once the buffer
+        // is full. It is not full for the first pictures behind a random access
+        // point, and there nothing leaves and the run is a field longer.
+        let short_term_fields = if anchor_second_field {
+            // The IDR emptied the buffer, so the first half of this very pair
+            // is the whole of it.
+            1
+        } else if second_field_of_reference_pair {
+            if layout.count == MAX_NUM_REF_FRAMES {
+                layout.flat as u32 * 2 - 1
+            } else {
+                layout.flat as u32 * 2 + 1
+            }
+        } else {
+            layout.flat as u32 * 2
+        };
+        // The long-term picture contributes both of its fields behind them,
+        // except to the pair that has not reached it yet.
+        let field_list_len = short_term_fields + if anchor_second_field { 0 } else { 2 };
         let output_slice_type = if idr_field {
             SliceType::I
         } else if ctx.options.i_frames_only && !anchor_second_field {
@@ -1685,19 +1717,13 @@ fn write_picture(
                     slice_qp: PPS_INIT_QP,
                     pps_init_qp: PPS_INIT_QP,
                     disable_deblocking_filter_idc: 1,
-                    // A field picture indexes fields, so a buffer of `count`
-                    // frames offers twice as many. The second field of a
-                    // reference pair sees a different set: its own first field
-                    // was marked before it, which by clause 8.2.5.3 both put
-                    // that frame into the buffer and pushed the oldest one out,
-                    // so one whole frame has become a single field.
                     num_ref_idx_l0_active: Some(if direct_field_pair {
-                        layout.count * 2 - u32::from(second_field_of_reference_pair)
+                        field_list_len
                     } else {
                         layout.count
                     }),
                     num_ref_idx_l1_active: Some(if direct_field_pair {
-                        layout.count * 2 - u32::from(second_field_of_reference_pair)
+                        field_list_len
                     } else {
                         layout.count
                     }),
@@ -1712,12 +1738,10 @@ fn write_picture(
                     } else {
                         // Long-term fields follow every short-term one, and
                         // both runs start with the parity of the field being
-                        // coded, so the anchor's own field leads them whichever
-                        // parity that is. One short-term field fewer stands in
-                        // front of it in the second field of a reference pair,
-                        // for the reason above.
+                        // coded, so the long-term picture's own field of this
+                        // parity leads them whichever parity that is.
                         let idx = if direct_field_pair {
-                            (layout.flat * 2) as u32 - u32::from(second_field_of_reference_pair)
+                            short_term_fields
                         } else {
                             layout.flat as u32
                         };
@@ -2120,6 +2144,7 @@ fn write_picture(
                 layout,
                 stats,
                 second_output_field && ctx.is_reference,
+                short_term_fields as i32,
             )
         } else if field_pair {
             Prediction {
@@ -2205,6 +2230,7 @@ fn write_picture(
                     layout,
                     stats,
                     second_output_field && ctx.is_reference,
+                    short_term_fields as i32,
                 );
                 let uses_part_l0 = part_pred.ref_idx_l0 >= 0;
                 let uses_part_l1 = part_pred.ref_idx_l1 >= 0;
@@ -2390,33 +2416,16 @@ fn write_picture(
                 0
             },
             partitions,
+            // The same length the slice header declared, less one. Only a list
+            // of one carries no index at all and a list of two codes it as a
+            // single bit; above that the coding is the same however long it is.
             num_ref_idx_l0_minus1: if field_pair {
-                if second_output_field && ctx.is_reference {
-                    // One field fewer than the list a first field sees, the
-                    // same subtraction the slice header made. Anything above 1
-                    // codes the index the same way, so this only has to be
-                    // exact where the list is short enough to change it -- the
-                    // second field of a random access point, whose lists hold
-                    // one field each and so carry no index at all.
-                    ref_count * 2 - 2
-                } else {
-                    ref_count * 2 - 1
-                }
+                field_list_len as i32 - 1
             } else {
                 ref_count - 1
             },
             num_ref_idx_l1_minus1: if field_pair {
-                if second_output_field && ctx.is_reference {
-                    // One field fewer than the list a first field sees, the
-                    // same subtraction the slice header made. Anything above 1
-                    // codes the index the same way, so this only has to be
-                    // exact where the list is short enough to change it -- the
-                    // second field of a random access point, whose lists hold
-                    // one field each and so carry no index at all.
-                    ref_count * 2 - 2
-                } else {
-                    ref_count * 2 - 1
-                }
+                field_list_len as i32 - 1
             } else {
                 ref_count - 1
             },
