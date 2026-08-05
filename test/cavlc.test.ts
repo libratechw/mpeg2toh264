@@ -161,6 +161,17 @@ describe("CAVLC residual blocks round-trip", () => {
     }
   });
 
+  it("handles levels needing level_prefix past 15", () => {
+    // level_prefix 15 tops out around levelCode 4125, i.e. a level of ~2063.
+    // High profile at 8 bits permits prefixes above that, and a finely
+    // quantised transcode reaches them.
+    for (const big of [2064, 3000, 6158, -6158, 12000, -12000, 32767, -32767]) {
+      const levels = new Array(16).fill(0);
+      levels[3] = big;
+      expect(roundTrip(levels, 0)[3], `level ${big}`).toBe(big);
+    }
+  });
+
   it("handles levels that escalate suffixLength", () => {
     // Rising magnitudes push suffixLength up through its range.
     const levels = [

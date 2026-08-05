@@ -33,6 +33,12 @@ export interface SliceHeaderConfig {
   longTermReference?: boolean;
   /** Set when the source is interlaced, i.e. frame_mbs_only_flag is 0. */
   mbaff: boolean;
+  /**
+   * Whether the picture is a reference, i.e. nal_ref_idc is non-zero. It
+   * governs whether dec_ref_pic_marking appears at all, so it has to match the
+   * NAL header exactly.
+   */
+  reference: boolean;
   /** QP for the slice, carried as slice_qp_delta against the PPS initial QP. */
   sliceQp: number;
   ppsInitQp: number;
@@ -94,13 +100,16 @@ export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
 
   // weighted_pred_flag is 0 and weighted_bipred_idc is 0, so no pred_weight_table.
 
-  // dec_ref_pic_marking, present because nal_ref_idc is non-zero on every
-  // picture this encoder emits.
-  if (cfg.idr) {
-    w.flag(0); // no_output_of_prior_pics_flag
-    w.flag(cfg.longTermReference ?? false);
-  } else {
-    w.flag(0); // adaptive_ref_pic_marking_mode_flag: sliding window
+  // dec_ref_pic_marking appears only for reference pictures.
+  if (cfg.reference) {
+    if (cfg.idr) {
+      w.flag(0); // no_output_of_prior_pics_flag
+      w.flag(cfg.longTermReference ?? false);
+    } else {
+      w.flag(0); // adaptive_ref_pic_marking_mode_flag: sliding window
+    }
+  } else if (cfg.idr) {
+    throw new Error("an IDR picture must be a reference picture");
   }
 
   // entropy_coding_mode_flag is 0, so no cabac_init_idc.

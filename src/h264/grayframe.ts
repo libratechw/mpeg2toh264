@@ -53,6 +53,7 @@ export function writeGrayIdr(cfg: GrayFrameConfig): Uint8Array {
     log2MaxPocLsb: cfg.log2MaxPocLsb,
     idr: true,
     idrPicId: 0,
+    reference: true,
     // This is the whole point: keep the frame in the DPB indefinitely.
     longTermReference: true,
     mbaff: cfg.mbaff,

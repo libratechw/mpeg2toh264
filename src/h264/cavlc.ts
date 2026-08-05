@@ -62,37 +62,34 @@ function writeLevel(
   let suffix = 0;
   let suffixBits = 0;
 
-  if (suffixLength === 0) {
-    if (levelCode <= 13) {
-      prefix = levelCode;
-    } else if (levelCode <= 29) {
-      prefix = 14;
-      suffix = levelCode - 14;
-      suffixBits = 4;
-    } else {
-      prefix = 15;
-      suffix = levelCode - 30;
-      suffixBits = 12;
-    }
+  // Below the escape, level_prefix carries the high part of the value directly.
+  if (suffixLength === 0 && levelCode <= 13) {
+    prefix = levelCode;
+  } else if (suffixLength === 0 && levelCode <= 29) {
+    prefix = 14;
+    suffix = levelCode - 14;
+    suffixBits = 4;
+  } else if (suffixLength > 0 && levelCode < 15 << suffixLength) {
+    prefix = levelCode >> suffixLength;
+    suffix = levelCode & ((1 << suffixLength) - 1);
+    suffixBits = suffixLength;
   } else {
-    const escape = 15 << suffixLength;
-    if (levelCode < escape) {
-      prefix = levelCode >> suffixLength;
-      suffix = levelCode & ((1 << suffixLength) - 1);
-      suffixBits = suffixLength;
-    } else {
-      prefix = 15;
-      suffix = levelCode - escape;
-      suffixBits = 12;
+    // Escape range. level_prefix 15 carries a 12-bit suffix; each prefix above
+    // that widens the suffix by a bit and continues where the last left off, so
+    // the ranges tile without gaps.
+    let p = 15;
+    let base = suffixLength === 0 ? 30 : 15 << suffixLength;
+    for (;;) {
+      const size = 1 << (p - 3);
+      if (levelCode < base + size) break;
+      base += size;
+      p++;
+      if (p > 24)
+        throw new Error(`level ${levelCode} is beyond level_prefix range`);
     }
-  }
-
-  if (suffix >= 1 << suffixBits) {
-    // Levels beyond this need level_prefix 16 or more, which only arises at
-    // bit depths above 8.
-    throw new Error(
-      `level ${levelCode} too large for suffixLength ${suffixLength}`,
-    );
+    prefix = p;
+    suffixBits = p - 3;
+    suffix = levelCode - base;
   }
 
   writeCode(w, levelPrefixCode(prefix));
@@ -101,7 +98,7 @@ function writeLevel(
 
 export interface ResidualBlock {
   /** Coefficient levels in coding scan order, lowest frequency first. */
-  levels: Int16Array | number[];
+  levels: Int16Array | Int32Array | number[];
   /** Number of coefficient positions in this block (16, 15, 4 or 8). */
   maxNumCoeff: number;
   /**

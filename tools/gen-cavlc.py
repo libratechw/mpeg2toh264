@@ -175,6 +175,32 @@ for page in pages:
                 continue
             run_before[key].setdefault(r, code)
 
+# ------------------------------------------------------------------ Table 9-4
+# coded_block_pattern is coded as me(v): a mapped Exp-Golomb, where the mapping
+# differs between intra and inter macroblocks. pdftotext renders this one
+# cleanly, so it is read from a plain layout dump rather than the geometry.
+CBP_SRC = Path("analysis/h264_cbp.txt")
+cbp_section = None
+cbp_rows = {"a": {}, "b": {}}
+for ln in CBP_SRC.read_text().splitlines():
+    if "ChromaArrayType is equal to 1 or 2" in ln:
+        cbp_section = "a"
+    elif "ChromaArrayType is equal to 0 or 3" in ln:
+        cbp_section = "b"
+    parts = ln.split()
+    if cbp_section and len(parts) == 3 and all(p.isdigit() for p in parts):
+        code_num, intra, inter = (int(p) for p in parts)
+        cbp_rows[cbp_section][code_num] = (intra, inter)
+
+# 4:2:0 and 4:2:2 use section (a): 48 patterns, since chroma contributes.
+cbp420 = cbp_rows["a"]
+if sorted(cbp420) != list(range(48)):
+    raise SystemExit(f"Table 9-4(a) is incomplete: {len(cbp420)} rows")
+cbp_intra_to_code = {v[0]: k for k, v in cbp420.items()}
+cbp_inter_to_code = {v[1]: k for k, v in cbp420.items()}
+if sorted(cbp_intra_to_code) != list(range(48)) or sorted(cbp_inter_to_code) != list(range(48)):
+    raise SystemExit("Table 9-4(a) columns are not permutations of 0..47")
+
 # ------------------------------------------------------------------ validation
 ok = True
 
@@ -301,6 +327,18 @@ export const RUN_BEFORE: readonly Readonly<Record<number, string>>[] = [
 export function levelPrefixCode(n: number): string {{
   return '0'.repeat(n) + '1';
 }}
+
+/**
+ * Table 9-4(a): coded_block_pattern to codeNum, for 4:2:0 and 4:2:2. The value
+ * is coded as ue(codeNum), and intra and inter macroblocks use different
+ * orderings. Indexed by coded_block_pattern, which runs 0..47.
+ */
+export const CBP_TO_CODE_NUM_INTRA: readonly number[] = [
+  {", ".join(str(cbp_intra_to_code[c]) for c in range(48))},
+];
+export const CBP_TO_CODE_NUM_INTER: readonly number[] = [
+  {", ".join(str(cbp_inter_to_code[c]) for c in range(48))},
+];
 '''
 
 OUT.parent.mkdir(parents=True, exist_ok=True)

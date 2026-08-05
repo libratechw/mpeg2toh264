@@ -531,3 +531,19 @@ export const RUN_BEFORE: readonly Readonly<Record<number, string>>[] = [
 export function levelPrefixCode(n: number): string {
   return "0".repeat(n) + "1";
 }
+
+/**
+ * Table 9-4(a): coded_block_pattern to codeNum, for 4:2:0 and 4:2:2. The value
+ * is coded as ue(codeNum), and intra and inter macroblocks use different
+ * orderings. Indexed by coded_block_pattern, which runs 0..47.
+ */
+export const CBP_TO_CODE_NUM_INTRA: readonly number[] = [
+  3, 29, 30, 17, 31, 18, 37, 8, 32, 38, 19, 9, 20, 10, 11, 2, 16, 33, 34, 21,
+  35, 22, 39, 4, 36, 40, 23, 5, 24, 6, 7, 1, 41, 42, 43, 25, 44, 26, 46, 12, 45,
+  47, 27, 13, 28, 14, 15, 0,
+];
+export const CBP_TO_CODE_NUM_INTER: readonly number[] = [
+  0, 2, 3, 7, 4, 8, 17, 13, 5, 18, 9, 14, 10, 15, 16, 11, 1, 32, 33, 36, 34, 37,
+  44, 40, 35, 45, 38, 41, 39, 42, 43, 19, 6, 24, 25, 20, 26, 21, 46, 28, 27, 47,
+  22, 29, 23, 30, 31, 12,
+];
