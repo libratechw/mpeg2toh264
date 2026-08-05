@@ -16,7 +16,7 @@ import { sequenceSampleAspectRatio } from "../src/mpeg2/headers.ts";
 
 function fixture(name: string) {
   return new Uint8Array(
-    readFileSync(resolve(import.meta.dirname, `fixtures/${name}`)),
+    readFileSync(resolve(import.meta.dirname, `../testdata/${name}`)),
   );
 }
 

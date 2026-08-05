@@ -12,7 +12,7 @@ import { wrapMpeg2EsInTs } from "./ts-fixture.ts";
 describe("MPEG-TS demuxing", () => {
   it("selects stream_type 0x02 and reconstructs its PES payload", () => {
     const es = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/i_only.m2v")),
     );
     const ts = wrapMpeg2EsInTs(es);
     expect(isMpegTransportStream(ts)).toBe(true);
@@ -21,7 +21,7 @@ describe("MPEG-TS demuxing", () => {
 
   it("reads the PES presentation timestamp back exactly", () => {
     const es = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/i_only.m2v")),
     );
     // A timestamp is 33 bits spread over five bytes around marker bits, so a
     // misplaced shift stays invisible for small values. These exercise the top
@@ -41,14 +41,14 @@ describe("MPEG-TS demuxing", () => {
 
   it("does not mistake an elementary stream for transport packets", () => {
     const es = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/i_only.m2v")),
     );
     expect(isMpegTransportStream(es)).toBe(false);
   });
 
   it("streams arbitrarily split TS chunks without retaining the full input", () => {
     const es = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/i_only.m2v")),
     );
     const ts = wrapMpeg2EsInTs(es);
     const demuxer = new MpegTsVideoDemuxer();
@@ -69,7 +69,7 @@ describe("MPEG-TS demuxing", () => {
 
   it("waits for a PES start when the video PID is discovered mid-PES", () => {
     const es = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/i_only.m2v")),
     );
     const ts = wrapMpeg2EsInTs(es);
     const packets = Array.from({ length: ts.length / 188 }, (_, index) =>
@@ -94,7 +94,7 @@ describe("MPEG-TS demuxing", () => {
 
   it("emits stream_type 0x0f AAC PES without modifying ADTS bytes", () => {
     const es = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/i_only.m2v")),
     );
     const ts = wrapMpeg2EsInTs(es);
     const input = new Uint8Array(ts.length + 188);

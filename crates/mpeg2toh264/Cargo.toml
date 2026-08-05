@@ -1,0 +1,13 @@
+[package]
+name = "mpeg2toh264"
+description = "MPEG-2 to H.264 bitstream-domain transcoder (no IDCT, no motion compensation)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]

@@ -1,6 +1,9 @@
 node_modules/
 dist/
 
+# Cargo build output.
+target/
+
 # ITU-T specifications. Large third-party binaries, fetched separately from
 # itu.int. analysis/annexB.txt holds the extracted text that the VLC table
 # generator actually reads, and that file *is* tracked so the build reproduces

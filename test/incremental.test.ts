@@ -19,7 +19,7 @@ function join(parts: Uint8Array[]) {
 describe("incremental transcoding", () => {
   it("preserves reference, frame number, POC, and GOP state across pushes", () => {
     const gop = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/ibbp.m2v")),
     );
     const combined = join([gop, gop]);
     const expected = transcode(combined);
@@ -33,7 +33,7 @@ describe("incremental transcoding", () => {
 
   it("emits complete GOPs while retaining only the unfinished tail", () => {
     const gop = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/ibbp.m2v")),
     );
     const combined = join([gop, gop]);
     const stream = new Mpeg2GopStream();
@@ -58,7 +58,7 @@ describe("incremental transcoding", () => {
     // starts at is not the byte it was handed. Getting that mapping wrong
     // anchors the whole presentation on the wrong picture.
     const gop = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/ibbp.m2v")),
     );
     const stream = new Mpeg2GopStream();
     const units = [
@@ -72,7 +72,7 @@ describe("incremental transcoding", () => {
 
   it("can insert a real IDR restart point between incremental GOPs", () => {
     const gop = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/ibbp.m2v")),
     );
     const session = new IncrementalTranscoder();
     session.push(gop);
@@ -89,7 +89,7 @@ describe("incremental transcoding", () => {
 
   it("restarts the I_PCM path with a content IDR and identical reference clone", () => {
     const gop = new Uint8Array(
-      readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
+      readFileSync(resolve(import.meta.dirname, "../testdata/ibbp.m2v")),
     );
     const session = new IncrementalTranscoder();
     session.push(gop);

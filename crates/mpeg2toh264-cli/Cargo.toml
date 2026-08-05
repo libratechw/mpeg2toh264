@@ -1,0 +1,18 @@
+[package]
+name = "mpeg2toh264-cli"
+description = "Command line interface for the mpeg2toh264 transcoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mpeg2toh264"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+mpeg2toh264.workspace = true

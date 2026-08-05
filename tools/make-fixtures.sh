@@ -1,11 +1,11 @@
 #!/bin/bash
-# Regenerate the synthetic MPEG-2 test streams in test/fixtures.
+# Regenerate the synthetic MPEG-2 test streams in testdata.
 #
 # The committed .m2v files are the authority -- byte-identical output is not
 # guaranteed across ffmpeg versions. This script records how they were produced
 # and what each one is meant to exercise.
 set -euo pipefail
-cd "$(dirname "$0")/../test/fixtures"
+cd "$(dirname "$0")/../testdata"
 
 # Intra only. Exercises the DC size tables (B.12/B.13) and coefficient table
 # zero (B.14) without any motion syntax at all.

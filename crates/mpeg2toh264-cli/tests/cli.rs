@@ -1,0 +1,137 @@
+//! The command line front end, driven as a user would.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+fn binary() -> PathBuf {
+    // The integration test binary sits next to the one cargo just built.
+    let mut path = std::env::current_exe().expect("test binary path");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path.join("mpeg2toh264")
+}
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata")
+        .join(name)
+}
+
+fn run(args: &[&str]) -> Output {
+    Command::new(binary())
+        .args(args)
+        .output()
+        .expect("the CLI runs")
+}
+
+/// A directory that cleans itself up, so the tests leave nothing behind.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "mpeg2toh264-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        Self(path)
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn path(p: &Path) -> &str {
+    p.to_str().expect("utf-8 path")
+}
+
+#[test]
+fn shows_help() {
+    let result = run(&["--help"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("Usage: mpeg2toh264"));
+}
+
+#[test]
+fn refuses_to_overwrite_its_own_input() {
+    let input = fixture("i_only.m2v");
+    let result = run(&[path(&input), path(&input)]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("must be different"));
+}
+
+#[test]
+fn rejects_an_unknown_option() {
+    let result = run(&["--nonsense", "a", "b"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unknown option"));
+}
+
+#[test]
+fn rejects_a_nonsensical_oversample() {
+    let result = run(&["--oversample=0", "a", "b"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("oversample"));
+}
+
+#[test]
+fn reports_a_missing_input_without_panicking() {
+    let temp = TempDir::new("missing");
+    let result = run(&["/nonexistent/input.m2v", path(&temp.join("out.h264"))]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).starts_with("mpeg2toh264: "));
+}
+
+#[test]
+fn writes_a_raw_annex_b_stream_and_a_summary() {
+    let temp = TempDir::new("h264");
+    let output = temp.join("output.h264");
+    let result = run(&[
+        "--oversample",
+        "2",
+        "--i-frames-only",
+        path(&fixture("i_only.m2v")),
+        path(&output),
+    ]);
+    assert!(result.status.success(), "{:?}", result);
+
+    let summary = String::from_utf8_lossy(&result.stdout);
+    assert!(summary.contains("MPEG-2 ES"), "{summary}");
+    assert!(summary.contains("raw H.264"), "{summary}");
+    assert!(summary.contains("pictures converted"), "{summary}");
+
+    let bytes = std::fs::read(&output).expect("output exists");
+    assert_eq!(&bytes[..5], &[0, 0, 0, 1, 0x67], "opens with an SPS NAL");
+}
+
+#[test]
+fn writes_a_fragmented_mp4_when_the_output_says_so() {
+    let temp = TempDir::new("mp4");
+    let output = temp.join("output.mp4");
+    let result = run(&["-q", path(&fixture("ibbp.m2v")), path(&output)]);
+    assert!(result.status.success(), "{:?}", result);
+    assert!(
+        result.stdout.is_empty(),
+        "--quiet suppresses the summary entirely"
+    );
+
+    let bytes = std::fs::read(&output).expect("output exists");
+    assert_eq!(&bytes[4..8], b"ftyp");
+    assert!(
+        bytes.windows(4).any(|w| w == b"moof"),
+        "the media segment follows the init segment"
+    );
+}

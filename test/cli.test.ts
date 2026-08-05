@@ -29,7 +29,7 @@ describe("mpeg2toh264 CLI", () => {
   });
 
   it("requires distinct input and output paths", () => {
-    const fixture = join(root, "test/fixtures/i_only.m2v");
+    const fixture = join(root, "testdata/i_only.m2v");
     const result = run([fixture, fixture]);
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("input and output must be different");
@@ -41,7 +41,7 @@ describe("mpeg2toh264 CLI", () => {
       "--oversample",
       "2",
       "--i-frames-only",
-      join(root, "test/fixtures/i_only.m2v"),
+      join(root, "testdata/i_only.m2v"),
       output,
     ]);
     expect(result.status).toBe(0);
@@ -53,7 +53,7 @@ describe("mpeg2toh264 CLI", () => {
 
   it("writes timestamped fragmented MP4 when the output ends in .mp4", () => {
     const output = join(temp, "output.mp4");
-    const result = run([join(root, "test/fixtures/ibbp.m2v"), output]);
+    const result = run([join(root, "testdata/ibbp.m2v"), output]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("(fragmented MP4)");
     const text = new TextDecoder("latin1").decode(readFileSync(output));
@@ -64,9 +64,7 @@ describe("mpeg2toh264 CLI", () => {
   });
 
   it("demuxes an MPEG transport stream before transcoding", () => {
-    const es = new Uint8Array(
-      readFileSync(join(root, "test/fixtures/i_only.m2v")),
-    );
+    const es = new Uint8Array(readFileSync(join(root, "testdata/i_only.m2v")));
     const input = join(temp, "input.ts");
     const output = join(temp, "transport-output.h264");
     writeFileSync(input, wrapMpeg2EsInTs(es));

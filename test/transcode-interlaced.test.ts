@@ -13,7 +13,7 @@ import { transcode } from "../src/transcode.ts";
 
 describe("interlaced frame-picture transcoding", () => {
   it("converts field-DCT and field-motion macroblocks in one slice per picture", () => {
-    const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));
+    const source = new Uint8Array(readFileSync("testdata/hd1080i.m2v"));
     resetDecodeStats();
 
     const result = transcode(source);
@@ -39,7 +39,7 @@ describe("interlaced frame-picture transcoding", () => {
   }, 15_000);
 
   it("can emit only source I pictures", () => {
-    const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));
+    const source = new Uint8Array(readFileSync("testdata/hd1080i.m2v"));
     const pictures = parseElementaryStream(source);
     const iPictures = pictures.filter(
       (picture) => picture.header.pictureCodingType === PictureType.I,
@@ -53,7 +53,7 @@ describe("interlaced frame-picture transcoding", () => {
   });
 
   it("derives skipped B macroblocks as frame-based PMV predictions", () => {
-    const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));
+    const source = new Uint8Array(readFileSync("testdata/hd1080i.m2v"));
     const pictures = parseElementaryStream(source);
     const reader = new BitReader(source);
     const skippedB = pictures.flatMap((picture) =>
@@ -75,7 +75,7 @@ describe("interlaced frame-picture transcoding", () => {
   });
 
   it("covers mixed frame/field inter macroblock pairs", () => {
-    const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));
+    const source = new Uint8Array(readFileSync("testdata/hd1080i.m2v"));
     const pictures = parseElementaryStream(source);
     const reader = new BitReader(source);
     let mixedPairs = 0;

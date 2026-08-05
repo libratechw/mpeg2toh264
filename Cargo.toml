@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/mpeg2toh264", "crates/mpeg2toh264-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT"
+repository = "https://github.com/otya128/mpeg2toh264"
+
+[workspace.dependencies]
+mpeg2toh264 = { path = "crates/mpeg2toh264" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
