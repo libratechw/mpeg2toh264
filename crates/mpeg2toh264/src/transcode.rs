@@ -42,7 +42,7 @@ use crate::mpeg2::constants::{mb_flag, PictureStructure, PictureType, QUANTISER_
 use crate::mpeg2::headers::{
     parse_elementary_stream, picture_geometry, sequence_sample_aspect_ratio, Picture,
 };
-use crate::mpeg2::macroblock::{decode_slice, motion_type, Macroblock};
+use crate::mpeg2::macroblock::{decode_slice, motion_type, Macroblock, MacroblockGrid};
 
 const LOG2_MAX_FRAME_NUM_MINUS4: u32 = 4;
 const LOG2_MAX_POC_LSB_MINUS4: u32 = 12;
@@ -235,7 +235,7 @@ impl IncrementalTranscoder {
         // an HD macroblock count this is several megabytes, and handing it back
         // to the allocator after each picture only to fault it in again for the
         // next is most of what the pictures cost outside their own coding.
-        let mut by_address: Vec<Option<Macroblock>> = Vec::new();
+        let mut by_address = MacroblockGrid::new();
         // Likewise the slice payload: a picture's worth of coded macroblocks
         // is megabytes, and asking the allocator for that per picture costs
         // more than the writing does.
@@ -335,18 +335,7 @@ impl IncrementalTranscoder {
                 (prev_ref_frame_num + 1) % MAX_FRAME_NUM
             };
             let geo = picture_geometry(pic);
-            // Emptying the slots one by one writes a discriminant each, where
-            // resizing from empty writes a whole macroblock -- five megabytes a
-            // picture, which the browser build pays for in memset.
-            let cells = geo.mb_width * geo.mb_height;
-            if by_address.len() == cells {
-                for slot in by_address.iter_mut() {
-                    *slot = None;
-                }
-            } else {
-                by_address.clear();
-                by_address.resize_with(cells, || None);
-            }
+            by_address.reset(geo.mb_width * geo.mb_height);
             for slice in &pic.slices {
                 decode_slice(&mut reader, pic, slice, geo.mb_width, &mut by_address)?;
             }
@@ -843,7 +832,7 @@ fn qp_for_scale(
 #[allow(clippy::too_many_arguments)]
 fn write_picture(
     pic: &Picture,
-    by_address: &[Option<Macroblock>],
+    by_address: &MacroblockGrid,
     g: &FrameGeometry,
     quant: &Quantiser8x8,
     counts: &mut CoeffCountMap,
@@ -962,15 +951,9 @@ fn write_picture(
             slice_open = true;
         }
 
-        let source = by_address
-            .get(mb_y * g.mb_width + mb_x)
-            .and_then(Option::as_ref);
-        let pair_top = by_address
-            .get((mb_y & !1) * g.mb_width + mb_x)
-            .and_then(Option::as_ref);
-        let pair_bottom = by_address
-            .get(((mb_y & !1) + 1) * g.mb_width + mb_x)
-            .and_then(Option::as_ref);
+        let source = by_address.get(mb_y * g.mb_width + mb_x);
+        let pair_top = by_address.get((mb_y & !1) * g.mb_width + mb_x);
+        let pair_bottom = by_address.get(((mb_y & !1) + 1) * g.mb_width + mb_x);
         // Use a uniform coding mode across an MBAFF picture. This makes every
         // horizontal and vertical neighbour live in the same field coordinate
         // system, so thousands of pair-isolating slices are unnecessary.

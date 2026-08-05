@@ -95,12 +95,12 @@ impl Macroblock {
         self.flags & mb_flag::INTRA != 0
     }
 
-    fn empty(address: usize, quantiser_scale_code: u32) -> Self {
+    fn empty() -> Self {
         Self {
-            address,
+            address: 0,
             skipped: false,
             flags: 0,
-            quantiser_scale_code,
+            quantiser_scale_code: 0,
             motion_type: motion_type::NONE,
             dct_type: 0,
             cbp: 0,
@@ -110,6 +110,91 @@ impl Macroblock {
             blocks: [[0; 64]; 6],
             coded_blocks: 0,
         }
+    }
+
+    /// Reset the header fields to decode a fresh macroblock into this cell.
+    ///
+    /// The six blocks keep whatever the previous picture left in them. Nothing
+    /// reads a block `coded_blocks` does not name, and clearing all six is 768
+    /// bytes the browser build writes by hand.
+    fn begin(&mut self, address: usize, quantiser_scale_code: u32) {
+        self.address = address;
+        self.skipped = false;
+        self.flags = 0;
+        self.quantiser_scale_code = quantiser_scale_code;
+        self.motion_type = motion_type::NONE;
+        self.dct_type = 0;
+        self.cbp = 0;
+        self.mv = [0; 8];
+        self.field_select = [0; 4];
+        self.mv_count = 1;
+        self.coded_blocks = 0;
+    }
+}
+
+/// One picture's macroblocks, indexed by raster macroblock address.
+///
+/// The cells outlive the picture they were decoded for. A macroblock is 848
+/// bytes and an HD picture has six thousand of them, so both handing the array
+/// back to the allocator and emptying it cell by cell cost more than the
+/// decoding does -- in the browser build, where a move is a library call, far
+/// more. Instead the grid keeps its storage, marks every cell absent, and hands
+/// out `&mut` cells for the decoder to write through.
+pub struct MacroblockGrid {
+    cells: Vec<Macroblock>,
+    /// Whether the cell at the same index was decoded for the current picture.
+    present: Vec<bool>,
+    /// Where a macroblock whose address falls outside the picture is decoded.
+    /// Its contents are never read.
+    outside: Macroblock,
+}
+
+impl MacroblockGrid {
+    pub fn new() -> Self {
+        Self {
+            cells: Vec::new(),
+            present: Vec::new(),
+            outside: Macroblock::empty(),
+        }
+    }
+
+    /// Start a picture of `cells` macroblocks, all of them absent.
+    pub fn reset(&mut self, cells: usize) {
+        if self.cells.len() != cells {
+            self.cells.resize_with(cells, Macroblock::empty);
+            self.present.resize(cells, false);
+        }
+        self.present.fill(false);
+    }
+
+    /// The macroblock at `address`, or `None` where this picture did not code one.
+    #[inline]
+    pub fn get(&self, address: usize) -> Option<&Macroblock> {
+        if *self.present.get(address)? {
+            Some(&self.cells[address])
+        } else {
+            None
+        }
+    }
+
+    /// The cell to decode `address` into.
+    #[inline]
+    fn slot(&mut self, address: usize) -> &mut Macroblock {
+        self.cells.get_mut(address).unwrap_or(&mut self.outside)
+    }
+
+    /// Publish a cell `slot` has just been decoded into.
+    #[inline]
+    fn mark(&mut self, address: usize) {
+        if let Some(present) = self.present.get_mut(address) {
+            *present = true;
+        }
+    }
+}
+
+impl Default for MacroblockGrid {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -315,14 +400,14 @@ fn decode_block(
     Ok(())
 }
 
-/// Decode every macroblock of one slice into `by_address`, which is indexed by
-/// raster macroblock address across the whole picture.
+/// Decode every macroblock of one slice into `grid`, which is indexed by raster
+/// macroblock address across the whole picture.
 pub fn decode_slice(
     r: &mut BitReader<'_>,
     pic: &Picture,
     slice: &Slice,
     mb_width: usize,
-    by_address: &mut [Option<Macroblock>],
+    grid: &mut MacroblockGrid,
 ) -> Result<()> {
     r.set_bit_pos(slice.data_start_bit);
 
@@ -359,35 +444,33 @@ pub fn decode_slice(
         // Everything between the previous macroblock and this one is skipped.
         for _ in 1..increment {
             address += 1;
-            let skipped = make_skipped(address as usize, &mut state, picture_type, frame);
-            store(by_address, skipped);
+            let at = address as usize;
+            make_skipped(grid.slot(at), at, &mut state, picture_type, frame);
+            grid.mark(at);
         }
         address += 1;
 
-        let mb = decode_macroblock(r, pic, &mut state, address as usize, frame)?;
+        let at = address as usize;
+        let mb = grid.slot(at);
+        decode_macroblock(r, pic, &mut state, at, frame, mb)?;
         state.prev_flags = Some(mb.flags);
-        store(by_address, mb);
+        grid.mark(at);
     }
 
     Ok(())
-}
-
-fn store(by_address: &mut [Option<Macroblock>], mb: Macroblock) {
-    if let Some(slot) = by_address.get_mut(mb.address) {
-        *slot = Some(mb);
-    }
 }
 
 /// A skipped macroblock. In P pictures it is a zero-vector copy and resets the
 /// predictors; in B pictures it repeats the previous macroblock's prediction, so
 /// the predictors carry over untouched (clause 7.6.6).
 fn make_skipped(
+    skipped: &mut Macroblock,
     address: usize,
     state: &mut SliceState,
     picture_type: PictureType,
     frame_picture: bool,
-) -> Macroblock {
-    let mut skipped = Macroblock::empty(address, state.quantiser_scale_code);
+) {
+    skipped.begin(address, state.quantiser_scale_code);
     skipped.skipped = true;
 
     if picture_type == PictureType::P {
@@ -424,7 +507,6 @@ fn make_skipped(
     }
     // A skipped macroblock has no coded blocks, so the DC predictors reset.
     state.dc_pred = [state.dc_pred_reset; 3];
-    skipped
 }
 
 fn decode_macroblock(
@@ -433,7 +515,8 @@ fn decode_macroblock(
     state: &mut SliceState,
     address: usize,
     frame: bool,
-) -> Result<Macroblock> {
+    mb: &mut Macroblock,
+) -> Result<()> {
     let picture_type = pic.header.picture_coding_type;
     let type_table: &VlcTable = match picture_type {
         PictureType::I => &V_MB_TYPE_I,
@@ -540,7 +623,7 @@ fn decode_macroblock(
         cbp = V_CBP.decode(r)?;
     }
 
-    let mut mb = Macroblock::empty(address, state.quantiser_scale_code);
+    mb.begin(address, state.quantiser_scale_code);
     mb.flags = flags;
     mb.motion_type = motion;
     mb.dct_type = dct_type;
@@ -565,5 +648,5 @@ fn decode_macroblock(
         state.dc_pred = [state.dc_pred_reset; 3];
     }
 
-    Ok(mb)
+    Ok(())
 }
