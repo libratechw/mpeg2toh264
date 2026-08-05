@@ -6,7 +6,7 @@ use mpeg2toh264::{
     extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, transcode,
     TranscodeOptions,
 };
-use support::{read_fixture, wrap_mpeg2_es_in_ts, FIXTURES};
+use support::{mux_programs, read_fixture, wrap_mpeg2_es_in_ts, FIXTURES};
 
 #[test]
 fn recognises_a_transport_stream() {
@@ -73,5 +73,48 @@ fn reads_the_last_timestamp_out_of_a_tail() {
         last_pts(&[0u8; 1024]),
         None,
         "no transport stream, no answer"
+    );
+}
+
+/// A recording is not always of one programme: a broadcaster's sub-channel
+/// rides in the same transport stream with its own picture and its own sound.
+/// Taking a stream from each would put one programme's picture against the
+/// other's audio, so both come from one service -- named, or the first that
+/// turns up.
+#[test]
+fn takes_both_streams_from_one_service() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO};
+
+    let main: &[(u16, u8)] = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO),
+        (0x110, STREAM_TYPE_AAC_ADTS),
+    ];
+    let sub: &[(u16, u8)] = &[
+        (0x200, STREAM_TYPE_MPEG2_VIDEO),
+        (0x210, STREAM_TYPE_AAC_ADTS),
+    ];
+    // The sub-channel is announced first, so an unguided demuxer takes it.
+    let stream = mux_programs(
+        &[(102, 0x1f0, sub), (101, 0x1f1, main)],
+        &[PesUnit {
+            pid: 0x200,
+            stream_id: 0xe0,
+            pts: Some(9000),
+            payload: &[0, 0, 1, 0xb3],
+        }],
+    );
+
+    let mut first = MpegTsAvDemuxer::new();
+    first.push(&stream).expect("demuxes");
+    assert_eq!(first.service_id(), Some(102), "the service that came first");
+    assert_eq!(first.service_ids(), &[102, 101]);
+
+    let mut named = MpegTsAvDemuxer::for_service(Some(101));
+    named.push(&stream).expect("demuxes");
+    assert_eq!(
+        named.service_id(),
+        Some(101),
+        "the service that was asked for"
     );
 }

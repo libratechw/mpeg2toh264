@@ -157,8 +157,18 @@ impl SectionAssembler {
 #[derive(Default)]
 struct ProgramMap {
     pmt_pids: HashSet<u16>,
+    /// Which service to take, when the caller has said. A recording can hold
+    /// more than one -- a broadcaster's sub-channel rides in the same transport
+    /// stream, with its own video and its own audio -- and without being told,
+    /// whichever program map arrives first is the one that gets used.
+    wanted_service: Option<u16>,
+    /// The service the streams below were taken from, once one has been.
+    service: Option<u16>,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
+    /// Every service seen in the program association table, in the order they
+    /// were announced.
+    services: Vec<u16>,
     assemblers: HashMap<u16, SectionAssembler>,
 }
 
@@ -191,28 +201,52 @@ impl ProgramMap {
             while i + 3 < end {
                 let program = ((section[i] as u16) << 8) | section[i + 1] as u16;
                 if program != 0 {
+                    if !self.services.contains(&program) {
+                        self.services.push(program);
+                    }
                     self.pmt_pids
                         .insert((((section[i + 2] & 0x1f) as u16) << 8) | section[i + 3] as u16);
                 }
                 i += 4;
             }
         } else if section[0] == 0x02 {
+            // The service this map describes, which is the table's own id
+            // extension. Taking a stream from one service and a stream from
+            // another would put a programme's picture against a different
+            // programme's sound, so both come from here or neither does.
+            let service = ((section[3] as u16) << 8) | section[4] as u16;
+            if self.service.is_some_and(|taken| taken != service) {
+                return;
+            }
+            if self.wanted_service.is_some_and(|wanted| wanted != service) {
+                return;
+            }
             let program_info_length = (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
             let end = section.len() - 4;
             let mut i = 12 + program_info_length;
+            let mut video = None;
+            let mut audio = None;
             while i + 4 < end {
                 let stream_type = section[i];
                 let stream_pid = (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
                 let info_length =
                     (((section[i + 3] & 0x0f) as usize) << 8) | section[i + 4] as usize;
-                if self.video_pid.is_none() && stream_type == STREAM_TYPE_MPEG2_VIDEO {
-                    self.video_pid = Some(stream_pid);
+                if video.is_none() && stream_type == STREAM_TYPE_MPEG2_VIDEO {
+                    video = Some(stream_pid);
                 }
-                if self.audio_pid.is_none() && stream_type == STREAM_TYPE_AAC_ADTS {
-                    self.audio_pid = Some(stream_pid);
+                if audio.is_none() && stream_type == STREAM_TYPE_AAC_ADTS {
+                    audio = Some(stream_pid);
                 }
                 i += 5 + info_length;
             }
+            // A service with no picture in it is not the one being watched,
+            // unless the caller named it.
+            if video.is_none() && self.wanted_service.is_none() {
+                return;
+            }
+            self.service = Some(service);
+            self.video_pid = self.video_pid.or(video);
+            self.audio_pid = self.audio_pid.or(audio);
         }
     }
 }
@@ -326,6 +360,29 @@ pub struct MpegTsAvDemuxer {
 impl MpegTsAvDemuxer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Take the streams of one named service rather than of whichever program
+    /// map turns up first.
+    pub fn for_service(service_id: Option<u16>) -> Self {
+        Self {
+            program: ProgramMap {
+                wanted_service: service_id,
+                ..ProgramMap::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// The service the streams being demuxed belong to, once a program map has
+    /// named it.
+    pub fn service_id(&self) -> Option<u16> {
+        self.program.service
+    }
+
+    /// Every service the program association table has announced, in order.
+    pub fn service_ids(&self) -> &[u16] {
+        &self.program.services
     }
 
     /// Whether the program map has named an AAC-LC audio stream yet. The

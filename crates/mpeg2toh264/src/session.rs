@@ -100,6 +100,34 @@ impl Session {
         Self::anchored(options, None)
     }
 
+    /// Take one named service out of a transport stream that carries several.
+    ///
+    /// A recording of a broadcast is not always of one programme: a
+    /// broadcaster's sub-channel rides in the same transport stream with its
+    /// own video and its own audio. Without being told which to take, the
+    /// session takes whichever program map turns up first, which is stable for
+    /// a given recording but is not a choice anyone made.
+    pub fn for_service(
+        options: TranscodeOptions,
+        origin_ticks: Option<u64>,
+        service_id: Option<u16>,
+    ) -> Self {
+        Self {
+            demuxer: MpegTsAvDemuxer::for_service(service_id),
+            ..Self::anchored(options, origin_ticks)
+        }
+    }
+
+    /// The service the fragments are being made from, once a program map has
+    /// named it, and every service the stream has announced.
+    pub fn service_id(&self) -> Option<u16> {
+        self.demuxer.service_id()
+    }
+
+    pub fn service_ids(&self) -> &[u16] {
+        self.demuxer.service_ids()
+    }
+
     /// Start a session whose timeline is measured from a PES timestamp of the
     /// caller's choosing, rather than from wherever this input happens to open.
     ///

@@ -160,39 +160,61 @@ pub struct PesUnit<'a> {
 /// `streams` names the elementary streams the PMT advertises, as
 /// `(pid, stream_type)`.
 pub fn mux_transport_stream(streams: &[(u16, u8)], units: &[PesUnit<'_>]) -> Vec<u8> {
-    let mut pat_section = vec![
-        0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00, 0, 0, 0, 0,
-    ];
-    pat_section[2] = (13 + 4) as u8; // one program, plus the CRC
-    let mut out = psi_packet(0, &pat_section);
+    mux_programs(&[(1, 0x100, streams)], units)
+}
 
-    let pcr_pid = streams.first().map_or(0x100, |&(pid, _)| pid);
-    let mut pmt_section = vec![
-        0x02,
-        0xb0,
-        (13 + 5 * streams.len()) as u8,
-        0x00,
-        0x01,
-        0xc1,
-        0x00,
-        0x00,
-        0xe0 | (pcr_pid >> 8) as u8,
-        (pcr_pid & 0xff) as u8,
-        0xf0,
-        0x00,
-    ];
-    for &(pid, stream_type) in streams {
-        pmt_section.extend_from_slice(&[
-            stream_type,
-            0xe0 | (pid >> 8) as u8,
-            (pid & 0xff) as u8,
-            0xf0,
-            0x00,
+/// One service of a transport stream: its program number, the PID its program
+/// map rides on, and the elementary streams it advertises.
+pub type Program<'a> = (u16, u16, &'a [(u16, u8)]);
+
+/// As [`mux_transport_stream`], but for a transport stream carrying more than
+/// one service.
+pub fn mux_programs(programs: &[Program<'_>], units: &[PesUnit<'_>]) -> Vec<u8> {
+    let mut pat_section = vec![0x00, 0xb0, 0x00, 0x00, 0x01, 0xc1, 0x00, 0x00];
+    for &(program, pmt_pid, _) in programs {
+        pat_section.extend_from_slice(&[
+            (program >> 8) as u8,
+            (program & 0xff) as u8,
+            0xe0 | (pmt_pid >> 8) as u8,
+            (pmt_pid & 0xff) as u8,
         ]);
     }
-    pmt_section.extend_from_slice(&[0, 0, 0, 0]); // CRC32, which nothing here checks
-    out.extend_from_slice(&psi_packet(0x100, &pmt_section));
+    pat_section.extend_from_slice(&[0, 0, 0, 0]);
+    pat_section[2] = (pat_section.len() - 3) as u8;
+    let mut out = psi_packet(0, &pat_section);
 
+    for &(program, pmt_pid, streams) in programs {
+        let pcr_pid = streams.first().map_or(0x100, |&(pid, _)| pid);
+        let mut pmt_section = vec![
+            0x02,
+            0xb0,
+            (13 + 5 * streams.len()) as u8,
+            (program >> 8) as u8,
+            (program & 0xff) as u8,
+            0xc1,
+            0x00,
+            0x00,
+            0xe0 | (pcr_pid >> 8) as u8,
+            (pcr_pid & 0xff) as u8,
+            0xf0,
+            0x00,
+        ];
+        for &(pid, stream_type) in streams {
+            pmt_section.extend_from_slice(&[
+                stream_type,
+                0xe0 | (pid >> 8) as u8,
+                (pid & 0xff) as u8,
+                0xf0,
+                0x00,
+            ]);
+        }
+        pmt_section.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&psi_packet(pmt_pid, &pmt_section));
+    }
+    mux_payloads(out, units)
+}
+
+fn mux_payloads(mut out: Vec<u8>, units: &[PesUnit<'_>]) -> Vec<u8> {
     let mut continuity: HashMap<u16, u8> = HashMap::new();
     for unit in units {
         let mut pes: Vec<u8> = match unit.pts {

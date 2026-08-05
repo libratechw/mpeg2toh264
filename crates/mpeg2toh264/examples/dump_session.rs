@@ -24,12 +24,22 @@ struct Totals {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [input, output] = args.as_slice() else {
-        eprintln!("usage: dump_session <input.ts> <output.mp4>");
-        return ExitCode::from(2);
+    let (input, output, service) = match args.as_slice() {
+        [input, output] => (input, output, None),
+        [input, output, service] => match service.parse::<u16>() {
+            Ok(service) => (input, output, Some(service)),
+            Err(_) => {
+                eprintln!("dump_session: service id must be a number");
+                return ExitCode::from(2);
+            }
+        },
+        _ => {
+            eprintln!("usage: dump_session <input.ts> <output.mp4> [service-id]");
+            return ExitCode::from(2);
+        }
     };
 
-    match run(input, output) {
+    match run(input, output, service) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("dump_session: {error}");
@@ -38,13 +48,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run(input: &str, output: &str, service: Option<u16>) -> Result<(), Box<dyn std::error::Error>> {
     // The point of a Session is that neither side ever has to be held whole:
     // the input arrives in slices and each fragment is written as it is
     // finished, so a recording of any length costs the same memory.
     let mut source = File::open(input)?;
     let mut sink = BufWriter::new(File::create(output)?);
-    let mut session = Session::default();
+    let mut session = Session::for_service(Default::default(), None, service);
     let mut totals = Totals::default();
 
     // A megabyte at a time, matching what the browser player reads per slice.
