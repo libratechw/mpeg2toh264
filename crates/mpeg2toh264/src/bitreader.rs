@@ -56,14 +56,18 @@ impl<'a> BitReader<'a> {
         // Every peek goes through here, so the window is taken in one load
         // wherever there is a whole one to take. Only the last three bytes of
         // the stream fall back to reading past the end as zeroes.
-        match self.data.get(byte..byte + 4) {
-            Some(window) => u32::from_be_bytes(window.try_into().expect("four bytes")),
-            None => {
-                (self.byte_at(byte) << 24)
-                    | (self.byte_at(byte + 1) << 16)
-                    | (self.byte_at(byte + 2) << 8)
-                    | self.byte_at(byte + 3)
-            }
+        if byte.saturating_add(4) <= self.data.len() {
+            u32::from_be_bytes([
+                self.data[byte],
+                self.data[byte + 1],
+                self.data[byte + 2],
+                self.data[byte + 3],
+            ])
+        } else {
+            (self.byte_at(byte) << 24)
+                | (self.byte_at(byte + 1) << 16)
+                | (self.byte_at(byte + 2) << 8)
+                | self.byte_at(byte + 3)
         }
     }
 
