@@ -235,6 +235,8 @@ struct ProgramMap {
     /// Set when a scan moved to a service with different streams, so that what
     /// was gathered from the old ones can be thrown away.
     changed_streams: bool,
+    all_service_pids: HashMap<u16, Vec<u16>>,
+    changed_pids: HashSet<u16>,
     assemblers: HashMap<u16, SectionAssembler>,
 }
 
@@ -252,6 +254,8 @@ impl Default for ProgramMap {
             services: Vec::new(),
             may_switch_streams: true,
             changed_streams: false,
+            all_service_pids: HashMap::new(),
+            changed_pids: HashSet::new(),
             assemblers: HashMap::new(),
         }
     }
@@ -262,7 +266,7 @@ impl ProgramMap {
         pid == 0 || self.pmt_pids.contains(&pid)
     }
 
-    fn push(&mut self, packet: &TsPayload<'_>, sections: &mut Vec<Vec<u8>>) {
+    fn push(&mut self, packet: &TsPayload<'_>, sections: &mut Vec<Vec<u8>>) -> Vec<u16> {
         sections.clear();
         self.assemblers.entry(packet.pid).or_default().push(
             packet.data,
@@ -272,6 +276,7 @@ impl ProgramMap {
         for section in sections.iter() {
             self.scan(section, packet.pid);
         }
+        self.changed_pids.drain().collect()
     }
 
     /// Scan a PAT or PMT section, recording the PMT PIDs and the first MPEG-2
@@ -324,9 +329,11 @@ impl ProgramMap {
             let mut video_tag = None;
             let mut audio = None;
             let mut private = Vec::new();
+            let mut all_pids = Vec::new();
             while i + 4 < end {
                 let stream_type = section[i];
                 let stream_pid = (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
+                all_pids.push(stream_pid);
                 let info_length =
                     (((section[i + 3] & 0x0f) as usize) << 8) | section[i + 4] as usize;
                 let info_start = i + 5;
@@ -347,12 +354,23 @@ impl ProgramMap {
                 }
                 i += 5 + info_length;
             }
-            let private = private
+            let private: Vec<u16> = private
                 .into_iter()
                 .filter_map(|(pid, tag)| {
                     private_stream_matches_video(tag, video_tag).then_some(pid)
                 })
                 .collect();
+            all_pids.sort_unstable();
+            all_pids.dedup();
+            let old = self
+                .all_service_pids
+                .insert(service, all_pids.clone())
+                .unwrap_or_default();
+            for pid in old.iter().chain(all_pids.iter()) {
+                if old.contains(pid) != all_pids.contains(pid) {
+                    self.changed_pids.insert(*pid);
+                }
+            }
             // A service with no picture in it is not the one being watched,
             // unless the caller named it.
             if video.is_none() && self.wanted_service.is_none() {
@@ -621,7 +639,10 @@ impl MpegTsAvDemuxer {
                 Ok(Some(packet)) => {
                     self.note_continuity(&packet);
                     if self.program.wants(packet.pid) {
-                        self.program.push(&packet, &mut sections);
+                        let changed_pids = self.program.push(&packet, &mut sections);
+                        for pid in changed_pids {
+                            self.continuity.remove(&pid);
+                        }
                         if std::mem::take(&mut self.program.changed_streams) {
                             // The streams belong to a different programme now, and
                             // what was gathered from the old ones is not the start
