@@ -68,6 +68,19 @@ impl Quantiser8x8 {
         round_half_up_i32(target / self.gain[qp as usize * 64 + pos])
     }
 
+    /// [`Self::level_for`] across a whole block, with the QP's gains found once
+    /// rather than per position. The division itself is not worth avoiding:
+    /// multiplying by a precomputed reciprocal instead is under 2% faster and
+    /// no longer reproduces the same levels.
+    #[inline]
+    pub fn levels_for(&self, targets: &[f64; 64], qp: i32, out: &mut [i32; 64]) {
+        let base = qp as usize * 64;
+        let gains: &[f64; 64] = self.gain[base..base + 64].try_into().expect("64 gains");
+        for pos in 0..64 {
+            out[pos] = round_half_up_i32(targets[pos] / gains[pos]);
+        }
+    }
+
     /// Pick the QP whose step is `oversample` times finer than the MPEG-2 step.
     ///
     /// MPEG-2's step at position p is `weight_scale[p] * quantiser_scale / 16`,
@@ -122,16 +135,15 @@ pub fn intra_targets(
     intra_dc_precision: u32,
     out: &mut [f64; 64],
 ) {
-    let intra_dc_mult = (8 >> intra_dc_precision) as i64;
-    out[0] = (intra_dc_mult * levels[0] as i64) as f64 - FLAT_PREDICTION_DC;
+    let intra_dc_mult = (8 >> intra_dc_precision) as i32;
+    out[0] = (intra_dc_mult * levels[0] as i32) as f64 - FLAT_PREDICTION_DC;
+    // A level of zero gives zero through the same arithmetic, so there is no
+    // branch to keep the compiler from taking these four at a time. The
+    // products stay well inside 32 bits: the widest is 2 * 2048 * 255 * 112.
     for pos in 1..64 {
-        let level = levels[pos] as i64;
+        let level = levels[pos] as i32;
         // The division truncates toward zero, matching what a decoder computes.
-        out[pos] = if level == 0 {
-            0.0
-        } else {
-            ((2 * level * weight_scale[pos] as i64 * quantiser_scale as i64) / 32) as f64
-        };
+        out[pos] = ((2 * level * weight_scale[pos] * quantiser_scale) / 32) as f64;
     }
 }
 
@@ -144,15 +156,12 @@ pub fn inter_targets(
     quantiser_scale: i32,
     out: &mut [f64; 64],
 ) {
+    // signum is zero at zero, which is exactly what a zero level has to
+    // dequantise to, so this needs no branch and can go four at a time.
     for pos in 0..64 {
-        let level = levels[pos] as i64;
-        if level == 0 {
-            out[pos] = 0.0;
-            continue;
-        }
-        let sign = if level < 0 { -1 } else { 1 };
+        let level = levels[pos] as i32;
         out[pos] =
-            (((2 * level + sign) * weight_scale[pos] as i64 * quantiser_scale as i64) / 32) as f64;
+            (((2 * level + level.signum()) * weight_scale[pos] * quantiser_scale) / 32) as f64;
     }
 }
 

@@ -4,13 +4,29 @@
 use crate::mpeg2::constants::start_code;
 
 /// Offsets of every `00 00 01 <code>` start code in the buffer.
+///
+/// The whole buffer is walked for every group boundary the splitter looks for,
+/// and at broadcast bitrates that is megabytes per group, so the common case --
+/// coded data with no zero byte anywhere near -- is skipped eight bytes at a
+/// time rather than one.
 fn starts(data: &[u8], code: u8) -> Vec<usize> {
     let mut out = Vec::new();
     if data.len() < 4 {
         return out;
     }
+    let last = data.len() - 4;
     let mut i = 0;
-    while i + 3 < data.len() {
+    while i <= last {
+        if i + 8 <= data.len() {
+            let word = u64::from_le_bytes(data[i..i + 8].try_into().expect("eight bytes"));
+            // The usual zero-byte test: a byte borrows into its high bit only
+            // if it was zero. A start code opens with two of them, so a run
+            // without any cannot hold the beginning of one.
+            if word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080 == 0 {
+                i += 8;
+                continue;
+            }
+        }
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == code {
             out.push(i);
             i += 4;

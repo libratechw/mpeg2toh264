@@ -104,20 +104,37 @@ pub fn write_residual_levels(
     max_num_coeff: usize,
     n_c: i32,
 ) -> Result<usize> {
-    // Positions of the non-zero levels, lowest frequency first.
-    let mut positions = [0usize; 16];
-    let mut total_coeff = 0usize;
+    // Which levels are non-zero, one bit each, lowest frequency in bit 0. This
+    // runs on every block of every macroblock, and most blocks are empty or
+    // nearly so, so the positions are read off the mask afterwards rather than
+    // built by a branch per coefficient.
+    let mut mask = 0u32;
     for i in 0..max_num_coeff {
-        if levels[i] != 0 {
-            positions[total_coeff] = i;
-            total_coeff += 1;
-        }
+        mask |= u32::from(levels[i] != 0) << i;
     }
+    let total_coeff = mask.count_ones() as usize;
+
+    if total_coeff == 0 {
+        let Some(token) = COEFF_TOKEN[coeff_token_table_index(n_c)][0] else {
+            bail!("no coeff_token for an empty block at nC={n_c}");
+        };
+        write_code(w, token);
+        return Ok(0);
+    }
+
+    // Positions of the non-zero levels, lowest frequency first.
+    let mut positions = [0u8; 16];
+    let mut rest = mask;
+    for slot in positions.iter_mut().take(total_coeff) {
+        *slot = rest.trailing_zeros() as u8;
+        rest &= rest - 1;
+    }
+    let position = |k: usize| positions[k] as usize;
 
     // Trailing ones are the run of +/-1 at the high frequency end, at most three.
     let mut trailing_ones = 0usize;
     for k in (0..total_coeff).rev() {
-        if trailing_ones >= 3 || levels[positions[k]].abs() != 1 {
+        if trailing_ones >= 3 || levels[position(k)].abs() != 1 {
             break;
         }
         trailing_ones += 1;
@@ -129,20 +146,16 @@ pub fn write_residual_levels(
     };
     write_code(w, token);
 
-    if total_coeff == 0 {
-        return Ok(0);
-    }
-
     // Signs of the trailing ones, highest frequency first.
     for i in 0..trailing_ones {
-        let level = levels[positions[total_coeff - 1 - i]];
+        let level = levels[position(total_coeff - 1 - i)];
         w.flag(level < 0); // 1 means negative
     }
 
     // Remaining levels, still highest frequency first.
     let mut suffix_length = u32::from(total_coeff > 10 && trailing_ones < 3);
     for i in trailing_ones..total_coeff {
-        let level = levels[positions[total_coeff - 1 - i]];
+        let level = levels[position(total_coeff - 1 - i)];
         let mut level_code = if level > 0 {
             2 * level - 2
         } else {
@@ -167,7 +180,7 @@ pub fn write_residual_levels(
     // How the zeros are distributed. The count before the lowest frequency
     // non-zero coefficient is implied by what is left over.
     if total_coeff < max_num_coeff {
-        let total_zeros = positions[total_coeff - 1] - (total_coeff - 1);
+        let total_zeros = position(total_coeff - 1) - (total_coeff - 1);
         write_code(
             w,
             total_zeros_code(total_coeff, total_zeros, max_num_coeff)?,
@@ -176,8 +189,8 @@ pub fn write_residual_levels(
         let mut zeros_left = total_zeros;
         let mut i = 0;
         while i < total_coeff - 1 && zeros_left > 0 {
-            let hi = positions[total_coeff - 1 - i];
-            let lo = positions[total_coeff - 2 - i];
+            let hi = position(total_coeff - 1 - i);
+            let lo = position(total_coeff - 2 - i);
             let run_before = hi - lo - 1;
             let table_index = zeros_left.min(7) - 1;
             let Some(code) = RUN_BEFORE[table_index].get(run_before).copied().flatten() else {

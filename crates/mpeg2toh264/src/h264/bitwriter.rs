@@ -11,11 +11,17 @@ pub mod nal_type {
 }
 
 /// Writes an RBSP (raw byte sequence payload) bit by bit.
+///
+/// Bits land in an accumulator and leave it a whole byte at a time, so a
+/// syntax element costs one shift rather than a trip around a loop per byte it
+/// straddles. `buf` therefore holds only the bytes that are already full, and
+/// the up-to-seven bits after them live in `acc`.
 pub struct BitWriter {
     buf: Vec<u8>,
-    /// Bits used in the last byte of `buf`; 0 or 8 means the next write starts a
-    /// fresh byte.
-    bits_in_last: u32,
+    /// The bits not yet in `buf`, in the low `bits` bits, most significant
+    /// first. Never eight or more: every full byte is flushed as it forms.
+    acc: u64,
+    bits: u32,
 }
 
 impl BitWriter {
@@ -26,21 +32,25 @@ impl BitWriter {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             buf: Vec::with_capacity(capacity),
-            bits_in_last: 0,
+            acc: 0,
+            bits: 0,
         }
+    }
+
+    /// Drop everything written, keeping the buffer for the next payload.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.acc = 0;
+        self.bits = 0;
     }
 
     /// Total bits written so far.
     pub fn bit_length(&self) -> usize {
-        if self.buf.is_empty() {
-            0
-        } else {
-            (self.buf.len() - 1) * 8 + self.bits_in_last as usize
-        }
+        self.buf.len() * 8 + self.bits as usize
     }
 
     pub fn is_byte_aligned(&self) -> bool {
-        self.bits_in_last == 0 || self.bits_in_last == 8
+        self.bits == 0
     }
 
     /// Write the low `n` bits of `value`, most significant first.
@@ -50,21 +60,18 @@ impl BitWriter {
         if n == 0 {
             return;
         }
-        let mut left = n;
-        while left > 0 {
-            if self.bits_in_last == 0 || self.bits_in_last == 8 {
-                self.buf.push(0);
-                self.bits_in_last = 0;
-            }
-            let room = 8 - self.bits_in_last;
-            let take = room.min(left);
-            // The `take` bits of `value` starting at bit (left - 1).
-            let chunk = (value >> (left - take)) & ((1u32 << take) - 1);
-            let at = self.buf.len() - 1;
-            self.buf[at] |= (chunk as u8) << (room - take);
-            self.bits_in_last += take;
-            left -= take;
+        // Fewer than eight bits are held, so at most 39 end up in the
+        // accumulator and nothing is shifted out of the top.
+        let value = (value as u64) & (u64::MAX >> (64 - n));
+        self.acc = (self.acc << n) | value;
+        self.bits += n;
+        while self.bits >= 8 {
+            self.bits -= 8;
+            self.buf.push((self.acc >> self.bits) as u8);
         }
+        // Drop what was flushed, so the accumulator holds the tail and nothing
+        // else. `bits` is below eight here, so the shift is always in range.
+        self.acc &= (1u64 << self.bits) - 1;
     }
 
     #[inline]
@@ -151,13 +158,15 @@ mod tests {
     use super::*;
 
     /// Everything written so far as a bit string, for comparing with the spec.
+    /// The bits still in the accumulator have not reached `buf` yet.
     fn bits(w: &BitWriter) -> String {
-        let n = w.bit_length();
         let mut s = String::new();
         for &b in &w.buf {
             s.push_str(&format!("{b:08b}"));
         }
-        s.truncate(n);
+        for i in (0..w.bits).rev() {
+            s.push(if (w.acc >> i) & 1 == 1 { '1' } else { '0' });
+        }
         s
     }
 

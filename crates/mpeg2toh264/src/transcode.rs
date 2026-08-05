@@ -231,6 +231,15 @@ impl IncrementalTranscoder {
         let mut chroma_counts = ChromaCounts::new(g.mb_width, g.mb_height);
         let mut motion = MotionField::new(g.mb_width, g.mb_height);
         let mut reader = BitReader::new(data);
+        // One picture's macroblocks, reused by every picture in the group. At
+        // an HD macroblock count this is several megabytes, and handing it back
+        // to the allocator after each picture only to fault it in again for the
+        // next is most of what the pictures cost outside their own coding.
+        let mut by_address: Vec<Option<Macroblock>> = Vec::new();
+        // Likewise the slice payload: a picture's worth of coded macroblocks
+        // is megabytes, and asking the allocator for that per picture costs
+        // more than the writing does.
+        let mut slice_writer = BitWriter::with_capacity(1 << 22);
 
         let mut pictures_converted = 0usize;
         let mut pictures_skipped = 0usize;
@@ -326,7 +335,8 @@ impl IncrementalTranscoder {
                 (prev_ref_frame_num + 1) % MAX_FRAME_NUM
             };
             let geo = picture_geometry(pic);
-            let mut by_address: Vec<Option<Macroblock>> = vec![None; geo.mb_width * geo.mb_height];
+            by_address.clear();
+            by_address.resize_with(geo.mb_width * geo.mb_height, || None);
             for slice in &pic.slices {
                 decode_slice(&mut reader, pic, slice, geo.mb_width, &mut by_address)?;
             }
@@ -350,6 +360,7 @@ impl IncrementalTranscoder {
                 &mut motion,
                 &ctx,
                 &mut self.stats,
+                &mut slice_writer,
             )?);
 
             if real_idr {
@@ -830,6 +841,7 @@ fn write_picture(
     motion: &mut MotionField,
     ctx: &PictureContext,
     stats: &mut Stats,
+    writer: &mut BitWriter,
 ) -> Result<Vec<u8>> {
     let mut nal_parts: Vec<Vec<u8>> = Vec::new();
 
@@ -856,7 +868,7 @@ fn write_picture(
         ChromaCounts::new(g.mb_width, g.mb_height >> 1),
     ];
     let mut prev_qp = PPS_INIT_QP;
-    let mut w: Option<BitWriter> = None;
+    let mut slice_open = false;
     let output_slice_type = if ctx.real_idr {
         SliceType::I
     } else if ctx.options.i_frames_only {
@@ -893,7 +905,7 @@ fn write_picture(
             position / g.mb_width
         };
 
-        if w.is_none() {
+        if !slice_open {
             counts.reset();
             chroma_counts.reset();
             motion.reset();
@@ -907,9 +919,9 @@ fn write_picture(
                 maps.reset();
             }
             prev_qp = PPS_INIT_QP;
-            let mut writer = BitWriter::with_capacity(1 << 22);
+            writer.clear();
             write_slice_header(
-                &mut writer,
+                writer,
                 &SliceHeaderConfig {
                     first_mb_in_slice: 0,
                     // I-only pictures need no bi-prediction. P slices are
@@ -937,9 +949,8 @@ fn write_picture(
                     ..Default::default()
                 },
             );
-            w = Some(writer);
+            slice_open = true;
         }
-        let writer = w.as_mut().expect("slice writer");
 
         let source = by_address
             .get(mb_y * g.mb_width + mb_x)
@@ -976,7 +987,7 @@ fn write_picture(
             if mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1 {
                 writer.rbsp_trailing_bits();
                 nal_parts.push(to_nal_unit(writer.bytes(), 3, nal_type::SLICE_IDR));
-                w = None;
+                slice_open = false;
             }
             continue;
         }
@@ -1041,9 +1052,7 @@ fn write_picture(
                         );
                     }
                     for b in 0..4 {
-                        for pos in 0..64 {
-                            raster[pos] = quant.level_for(targets[b][pos], qp, pos);
-                        }
+                        quant.levels_for(&targets[b], qp, &mut raster);
                         luma_active[b] = to_zigzag_8x8(&raster, &mut luma_scratch[b], false);
                     }
 
@@ -1141,9 +1150,7 @@ fn write_picture(
                 } else {
                     &pair_raw_targets[b / 2][source_index]
                 };
-                for pos in 0..64 {
-                    raster[pos] = quant.level_for(selected[pos], qp, pos);
-                }
+                quant.levels_for(selected, qp, &mut raster);
                 luma_active[b] = to_zigzag_8x8(&raster, &mut luma_scratch[b], true);
             }
             has_chroma =
@@ -1443,7 +1450,7 @@ fn write_picture(
                     nal_type::SLICE_NON_IDR
                 },
             ));
-            w = None;
+            slice_open = false;
         }
     }
 
