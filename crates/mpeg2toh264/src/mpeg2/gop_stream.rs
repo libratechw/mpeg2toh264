@@ -1,6 +1,7 @@
 //! Splitting an MPEG-2 elementary stream into bounded, independently
 //! transcodable units.
 
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
 use crate::mpeg2::constants::start_code;
@@ -44,41 +45,6 @@ fn scan_start_codes(data: &[u8], mut visit: impl FnMut(usize, u8) -> ControlFlow
     }
 }
 
-/// Offsets of the sequence and group headers the splitter cuts on, up to and
-/// including the second group header. Nothing beyond that is read.
-fn boundaries(data: &[u8]) -> (Vec<usize>, Vec<usize>) {
-    let mut sequences = Vec::new();
-    let mut gops = Vec::new();
-    scan_start_codes(data, |at, code| {
-        match code {
-            start_code::SEQUENCE_HEADER => sequences.push(at),
-            start_code::GROUP => {
-                gops.push(at);
-                if gops.len() == 2 {
-                    return ControlFlow::Break(());
-                }
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    });
-    (sequences, gops)
-}
-
-/// Whether the buffer holds a coded picture at all.
-fn has_picture(data: &[u8]) -> bool {
-    let mut found = false;
-    scan_start_codes(data, |_, code| {
-        if code == start_code::PICTURE {
-            found = true;
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    });
-    found
-}
-
 /// One GOP unit, and when its first coded picture is meant to be shown.
 #[derive(Clone, Debug)]
 pub struct Mpeg2Gop {
@@ -113,6 +79,13 @@ pub struct Mpeg2GopStream {
     base: usize,
     prefix_length: usize,
     marks: Vec<Mark>,
+    /// Start-code offsets in `buffer`, discovered once as bytes arrive.
+    sequences: VecDeque<usize>,
+    gops: VecDeque<usize>,
+    pictures: VecDeque<usize>,
+    /// First byte that has not been tested as the start of a four-byte code.
+    /// The final three bytes remain pending until the next chunk completes it.
+    scan_pos: usize,
 }
 
 impl Mpeg2GopStream {
@@ -128,6 +101,7 @@ impl Mpeg2GopStream {
             });
         }
         self.buffer.extend_from_slice(chunk);
+        self.scan_new_bytes();
         self.extract(false)
     }
 
@@ -141,6 +115,42 @@ impl Mpeg2GopStream {
         self.prefix_length -= from_prefix;
         self.base += count - from_prefix;
         self.buffer.drain(..count);
+        Self::consume_offsets(&mut self.sequences, count);
+        Self::consume_offsets(&mut self.gops, count);
+        Self::consume_offsets(&mut self.pictures, count);
+        self.scan_pos = self.scan_pos.saturating_sub(count);
+    }
+
+    fn consume_offsets(offsets: &mut VecDeque<usize>, count: usize) {
+        while offsets.front().is_some_and(|&offset| offset < count) {
+            offsets.pop_front();
+        }
+        for offset in offsets {
+            *offset -= count;
+        }
+    }
+
+    /// Scan only bytes that no earlier push had enough lookahead to inspect.
+    fn scan_new_bytes(&mut self) {
+        let from = self.scan_pos.min(self.buffer.len());
+        let Self {
+            buffer,
+            sequences,
+            gops,
+            pictures,
+            ..
+        } = self;
+        scan_start_codes(&buffer[from..], |at, code| {
+            let at = from + at;
+            match code {
+                start_code::SEQUENCE_HEADER => sequences.push_back(at),
+                start_code::GROUP => gops.push_back(at),
+                start_code::PICTURE => pictures.push_back(at),
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        });
+        self.scan_pos = self.buffer.len().saturating_sub(3);
     }
 
     /// The timestamp of the PES packet covering an absolute stream offset.
@@ -163,12 +173,11 @@ impl Mpeg2GopStream {
     fn extract(&mut self, final_flush: bool) -> Vec<Mpeg2Gop> {
         let mut output = Vec::new();
         loop {
-            let (sequences, gops) = boundaries(&self.buffer);
-            let Some(&first_gop) = gops.first() else {
+            let Some(&first_gop) = self.gops.front() else {
                 // Nothing to cut on yet. Anything before the first sequence
                 // header cannot be transcoded, so it is dropped rather than
                 // held.
-                if let Some(&first_sequence) = sequences.first() {
+                if let Some(&first_sequence) = self.sequences.front() {
                     if first_sequence > 0 {
                         self.consume(first_sequence);
                     }
@@ -181,7 +190,7 @@ impl Mpeg2GopStream {
             if first_gop > 0 {
                 // Remember the sequence header this group was coded under, so
                 // the units after it can be given a copy.
-                if let Some(&sequence) = sequences.iter().rev().find(|&&at| at < first_gop) {
+                if let Some(&sequence) = self.sequences.iter().rev().find(|&&at| at < first_gop) {
                     self.sequence_prefix = self.buffer[sequence..first_gop].to_vec();
                     if sequence > 0 {
                         self.consume(sequence);
@@ -189,13 +198,14 @@ impl Mpeg2GopStream {
                     }
                 }
             }
-            let Some(&second_gop) = gops.get(1) else {
+            let Some(&second_gop) = self.gops.get(1) else {
                 break;
             };
             // A sequence header of its own makes a better boundary than the
             // group header behind it, since the next unit then needs no
             // re-injected copy.
-            let next_sequence = sequences
+            let next_sequence = self
+                .sequences
                 .iter()
                 .rev()
                 .find(|&&at| at > first_gop && at < second_gop)
@@ -213,10 +223,22 @@ impl Mpeg2GopStream {
                 let mut merged = self.sequence_prefix.clone();
                 merged.append(&mut self.buffer);
                 self.buffer = merged;
-                self.prefix_length += self.sequence_prefix.len();
+                let injected = self.sequence_prefix.len();
+                self.prefix_length += injected;
+                for offset in &mut self.sequences {
+                    *offset += injected;
+                }
+                for offset in &mut self.gops {
+                    *offset += injected;
+                }
+                for offset in &mut self.pictures {
+                    *offset += injected;
+                }
+                self.sequences.push_front(0);
+                self.scan_pos += injected;
             }
         }
-        if final_flush && has_picture(&self.buffer) {
+        if final_flush && !self.pictures.is_empty() {
             let pts = self.pts_at(self.base);
             output.push(Mpeg2Gop {
                 data: std::mem::take(&mut self.buffer),
