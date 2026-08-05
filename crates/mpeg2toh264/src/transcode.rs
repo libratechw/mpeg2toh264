@@ -222,20 +222,7 @@ impl IncrementalTranscoder {
         // predicts each field separately; representing either in H.264 needs
         // macroblock-adaptive frame/field coding.
         //
-        // Field pictures are ruled out here; field DCT and field motion are
-        // caught per macroblock instead, because clearing frame_pred_frame_dct
-        // only *permits* them and progressive content often carries that flag
-        // without a single field-coded macroblock in the stream.
-        if let Some(field_picture) = pics
-            .iter()
-            .find(|p| p.coding.picture_structure != PictureStructure::Frame)
-        {
-            bail!(
-                "field pictures: this needs PAFF or MBAFF, which is not implemented \
-                 (picture_structure={})",
-                field_picture.coding.picture_structure.code()
-            );
-        }
+        // Field pictures are paired below and represented as one MBAFF frame.
 
         let g = frame_geometry(width, height, !mbaff);
         let scaling = first.quant.non_intra;
@@ -281,6 +268,7 @@ impl IncrementalTranscoder {
         // to the allocator after each picture only to fault it in again for the
         // next is most of what the pictures cost outside their own coding.
         let mut by_address = MacroblockGrid::new();
+        let mut paired_by_address = MacroblockGrid::new();
         // Likewise the slice payload: a picture's worth of coded macroblocks
         // is megabytes, and asking the allocator for that per picture costs
         // more than the writing does.
@@ -309,7 +297,30 @@ impl IncrementalTranscoder {
         // predicts.
         let mut awaiting_idr = !self.initialized || random_access;
 
-        for pic in &pics {
+        let mut logical_pictures = Vec::with_capacity(pics.len());
+        let mut source_index = 0;
+        while source_index < pics.len() {
+            let pic = &pics[source_index];
+            if pic.coding.picture_structure == PictureStructure::Frame {
+                logical_pictures.push((pic, None));
+                source_index += 1;
+                continue;
+            }
+            let Some(mate) = pics.get(source_index + 1) else {
+                bail!("unpaired MPEG-2 field picture at end of stream");
+            };
+            if mate.coding.picture_structure == PictureStructure::Frame
+                || mate.coding.picture_structure == pic.coding.picture_structure
+                || mate.header.temporal_reference != pic.header.temporal_reference
+                || mate.header.picture_coding_type != pic.header.picture_coding_type
+            {
+                bail!("MPEG-2 field picture is not followed by its complementary field");
+            }
+            logical_pictures.push((pic, Some(mate)));
+            source_index += 2;
+        }
+
+        'pictures: for &(pic, paired_pic) in &logical_pictures {
             let picture_type = pic.header.picture_coding_type;
             if !picture_type.is_ipb() {
                 pictures_skipped += 1;
@@ -381,8 +392,64 @@ impl IncrementalTranscoder {
             };
             let geo = picture_geometry(pic);
             by_address.reset(geo.mb_width * geo.mb_height);
+            let mut decoded_slices = 0usize;
+            let mut first_slice_error = None;
             for slice in &pic.slices {
-                decode_slice(&mut reader, pic, slice, geo.mb_width, &mut by_address)?;
+                match decode_slice(&mut reader, pic, slice, geo.mb_width, &mut by_address) {
+                    Ok(()) => decoded_slices += 1,
+                    Err(error) if first_slice_error.is_none() => {
+                        first_slice_error = Some((slice, error))
+                    }
+                    Err(_) => {}
+                }
+            }
+            if decoded_slices == 0 {
+                let (slice, error) = first_slice_error.expect("a picture has at least one slice");
+                bail!(
+                    "picture tr={} structure={} slice row {}: {error}",
+                    pic.header.temporal_reference,
+                    pic.coding.picture_structure.code(),
+                    slice.vertical_position
+                );
+            }
+            if first_slice_error.is_some() {
+                pictures_skipped += 1;
+                continue;
+            }
+            if let Some(mate) = paired_pic {
+                let mate_geo = picture_geometry(mate);
+                paired_by_address.reset(mate_geo.mb_width * mate_geo.mb_height);
+                let mut decoded_slices = 0usize;
+                let mut first_slice_error = None;
+                for slice in &mate.slices {
+                    match decode_slice(
+                        &mut reader,
+                        mate,
+                        slice,
+                        mate_geo.mb_width,
+                        &mut paired_by_address,
+                    ) {
+                        Ok(()) => decoded_slices += 1,
+                        Err(error) if first_slice_error.is_none() => {
+                            first_slice_error = Some((slice, error))
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if decoded_slices == 0 {
+                    let (slice, error) =
+                        first_slice_error.expect("a picture has at least one slice");
+                    bail!(
+                        "picture tr={} structure={} slice row {}: {error}",
+                        mate.header.temporal_reference,
+                        mate.coding.picture_structure.code(),
+                        slice.vertical_position
+                    );
+                }
+                if first_slice_error.is_some() {
+                    pictures_skipped += 1;
+                    continue 'pictures;
+                }
             }
             let ctx = PictureContext {
                 frame_num,
@@ -397,6 +464,7 @@ impl IncrementalTranscoder {
             parts.push(write_picture(
                 pic,
                 &by_address,
+                paired_pic.map(|mate| (mate, &paired_by_address)),
                 &g,
                 &quant,
                 scratch,
@@ -720,6 +788,88 @@ fn prediction_for_field(
     }
 }
 
+/// Prediction for a macroblock that came from an MPEG-2 field picture and is
+/// emitted as one field-coded macroblock of an MBAFF complementary pair.
+fn prediction_for_field_picture(
+    mb: Option<&Macroblock>,
+    field: usize,
+    intra: bool,
+    layout: &RefLayout,
+    stats: &mut Stats,
+) -> Prediction {
+    let (Some(mb), false) = (mb, intra) else {
+        return Prediction {
+            mb_type: b_mb_type::L0_16X16,
+            ref_idx_l0: layout.flat * 2,
+            ref_idx_l1: -1,
+            mv_l0: [0, 0],
+            mv_l1: [0, 0],
+        };
+    };
+    let has_backward = layout.bwd_l0 >= 0 && mb.flags & mb_flag::MOTION_BACKWARD != 0;
+    let has_forward = mb.flags & mb_flag::MOTION_FORWARD != 0 || !has_backward;
+    let field_ref = |frame_ref: i32, direction: usize| {
+        frame_ref * 2 + i32::from(mb.field_select[direction] as usize != field)
+    };
+    let mapped = |direction: usize| map_vector(mb.mv[direction * 2], mb.mv[direction * 2 + 1]);
+
+    if has_forward && has_backward {
+        stats.bidirectional_vectors += 1;
+        return Prediction {
+            mb_type: b_mb_type::BI_16X16,
+            ref_idx_l0: field_ref(layout.fwd_l0, 0),
+            ref_idx_l1: field_ref(layout.bwd_l1, 1),
+            mv_l0: native_position(mb.mv[0], mb.mv[1]),
+            mv_l1: native_position(mb.mv[2], mb.mv[3]),
+        };
+    }
+
+    let direction = usize::from(has_backward);
+    let motion = mapped(direction);
+    match motion.kind {
+        VectorKind::Integer => stats.integer_vectors += 1,
+        VectorKind::HalfOneAxis => stats.single_axis_half_vectors += 1,
+        VectorKind::HalfBothAxes => stats.both_axis_half_vectors += 1,
+    }
+    let use_backward = !has_forward;
+    let primary = if use_backward {
+        layout.bwd_l0
+    } else {
+        layout.fwd_l0
+    };
+    let secondary = if use_backward {
+        layout.bwd_l1
+    } else {
+        layout.fwd_l1
+    };
+    let Some(second) = motion.b else {
+        return if use_backward {
+            Prediction {
+                mb_type: b_mb_type::L1_16X16,
+                ref_idx_l0: -1,
+                ref_idx_l1: field_ref(layout.bwd_l1, 1),
+                mv_l0: [0, 0],
+                mv_l1: motion.a,
+            }
+        } else {
+            Prediction {
+                mb_type: b_mb_type::L0_16X16,
+                ref_idx_l0: field_ref(layout.fwd_l0, 0),
+                ref_idx_l1: -1,
+                mv_l0: motion.a,
+                mv_l1: [0, 0],
+            }
+        };
+    };
+    Prediction {
+        mb_type: b_mb_type::BI_16X16,
+        ref_idx_l0: field_ref(primary, direction),
+        ref_idx_l1: field_ref(secondary, direction),
+        mv_l0: motion.a,
+        mv_l1: second,
+    }
+}
+
 /// Copy the content IDR into a short-term reference without changing pixels.
 ///
 /// The IDR itself is kept as a long-term picture, purely to have a reference
@@ -876,6 +1026,7 @@ fn qp_for_scale(
 fn write_picture(
     pic: &Picture,
     by_address: &MacroblockGrid,
+    paired_field: Option<(&Picture, &MacroblockGrid)>,
     g: &FrameGeometry,
     quant: &Quantiser8x8,
     scratch: &mut PictureScratch,
@@ -909,8 +1060,11 @@ fn write_picture(
     } else {
         SliceType::B
     };
-    let picture_field_pairs =
-        ctx.mbaff && !ctx.options.i_frames_only && pic.header.picture_coding_type != PictureType::I;
+    let direct_field_pair = paired_field.is_some();
+    let picture_field_pairs = direct_field_pair
+        || (ctx.mbaff
+            && !ctx.options.i_frames_only
+            && pic.header.picture_coding_type != PictureType::I);
     let mut cached_pair_address: isize = -1;
     let mut cached_pair_targets = [FieldTargetSet::default(); 2];
     let mut cached_pair_qp = PPS_INIT_QP;
@@ -985,9 +1139,33 @@ fn write_picture(
             slice_open = true;
         }
 
-        let source = by_address.get(mb_y * g.mb_width + mb_x);
-        let pair_top = by_address.get((mb_y & !1) * g.mb_width + mb_x);
-        let pair_bottom = by_address.get(((mb_y & !1) + 1) * g.mb_width + mb_x);
+        let field_row = mb_y >> 1;
+        let (top_grid, bottom_grid) = if let Some((mate, mate_grid)) = paired_field {
+            if pic.coding.picture_structure == PictureStructure::TopField {
+                (by_address, mate_grid)
+            } else {
+                debug_assert_eq!(mate.coding.picture_structure, PictureStructure::TopField);
+                (mate_grid, by_address)
+            }
+        } else {
+            (by_address, by_address)
+        };
+        let source = if direct_field_pair {
+            let grid = if mb_y & 1 == 0 { top_grid } else { bottom_grid };
+            grid.get(field_row * g.mb_width + mb_x)
+        } else {
+            by_address.get(mb_y * g.mb_width + mb_x)
+        };
+        let pair_top = if direct_field_pair {
+            top_grid.get(field_row * g.mb_width + mb_x)
+        } else {
+            by_address.get((mb_y & !1) * g.mb_width + mb_x)
+        };
+        let pair_bottom = if direct_field_pair {
+            bottom_grid.get(field_row * g.mb_width + mb_x)
+        } else {
+            by_address.get(((mb_y & !1) + 1) * g.mb_width + mb_x)
+        };
         // Use a uniform coding mode across an MBAFF picture. This makes every
         // horizontal and vertical neighbour live in the same field coordinate
         // system, so thousands of pair-isolating slices are unnecessary.
@@ -1004,7 +1182,7 @@ fn write_picture(
         if ctx.real_idr {
             stats.intra_macroblocks += 1;
             if ctx.mbaff && mb_y % 2 == 0 {
-                writer.flag(false); // frame-coded MB pair
+                writer.flag(direct_field_pair); // field-coded for paired field pictures
             }
             let samples = match source {
                 Some(mb) if intra => reconstruct_intra_pcm(mb, pic)?,
@@ -1023,7 +1201,7 @@ fn write_picture(
         let mut chroma_from_pair = false;
         let mut qp = prev_qp;
 
-        if !field_pair {
+        if !field_pair || direct_field_pair {
             if let Some(source) = source {
                 if !source.skipped && (source.flags & mb_flag::PATTERN != 0 || intra) {
                     let quantiser_scale = QUANTISER_SCALE[pic.coding.q_scale_type]
@@ -1041,7 +1219,7 @@ fn write_picture(
                     };
 
                     for b in 0..4 {
-                        let target = if source.dct_type == 1 {
+                        let target = if source.dct_type == 1 && !direct_field_pair {
                             &mut field_targets[b]
                         } else {
                             &mut targets[b]
@@ -1062,7 +1240,7 @@ fn write_picture(
                             inter_targets(block, matrix, quantiser_scale, target);
                         }
                     }
-                    if source.dct_type == 1 {
+                    if source.dct_type == 1 && !direct_field_pair {
                         let (upper, lower) = targets.split_at_mut(2);
                         field_dct_to_frame_targets(
                             &field_targets[0],
@@ -1081,7 +1259,11 @@ fn write_picture(
                         luma_active[b] = quant.scanned_levels_for(
                             &targets[b],
                             qp,
-                            &ZIGZAG_8X8,
+                            if direct_field_pair {
+                                &FIELD_SCAN_8X8
+                            } else {
+                                &ZIGZAG_8X8
+                            },
                             &mut luma_scratch[b],
                         );
                     }
@@ -1106,7 +1288,7 @@ fn write_picture(
             }
         }
 
-        if field_pair {
+        if field_pair && !direct_field_pair {
             let (Some(pair_top), Some(pair_bottom)) = (pair_top, pair_bottom) else {
                 bail!(
                     "MBAFF macroblock pair at ({mb_x}, {}) is missing from the source",
@@ -1193,10 +1375,12 @@ fn write_picture(
         } else {
             stats.inter_macroblocks += 1;
         }
-        if field_pair {
+        if field_pair && !direct_field_pair {
             count_field_pair_vector(source, intra, &ctx.layout, stats);
         }
-        let pred = if field_pair {
+        let pred = if direct_field_pair {
+            prediction_for_field_picture(source, mb_y & 1, intra, &ctx.layout, stats)
+        } else if field_pair {
             Prediction {
                 mb_type: b_mb_type::L0_16X16,
                 ref_idx_l0: -1,
@@ -1210,12 +1394,16 @@ fn write_picture(
 
         let uses_l0 = pred.mb_type != b_mb_type::L1_16X16;
         let uses_l1 = pred.mb_type != b_mb_type::L0_16X16;
-        let pred_l0 = if !field_pair && uses_l0 {
+        let pred_l0 = if direct_field_pair && uses_l0 {
+            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 0, pred.ref_idx_l0)
+        } else if !field_pair && uses_l0 {
             motion.predict(mb_x, mb_y, 0, pred.ref_idx_l0)
         } else {
             [0, 0]
         };
-        let pred_l1 = if !field_pair && uses_l1 {
+        let pred_l1 = if direct_field_pair && uses_l1 {
+            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 1, pred.ref_idx_l1)
+        } else if !field_pair && uses_l1 {
             motion.predict(mb_x, mb_y, 1, pred.ref_idx_l1)
         } else {
             [0, 0]
@@ -1259,7 +1447,7 @@ fn write_picture(
                 };
             }
             partitions = Some(built);
-        } else if field_pair {
+        } else if field_pair && !direct_field_pair {
             let (Some(pair_top), Some(pair_bottom)) = (pair_top, pair_bottom) else {
                 bail!("MBAFF macroblock pair is missing from the source");
             };
@@ -1406,7 +1594,20 @@ fn write_picture(
             prev_qp,
         };
 
-        if !split_frame_mb && !field_pair {
+        if direct_field_pair {
+            field_motion[mb_y & 1].set(
+                mb_x,
+                mb_y >> 1,
+                &MbMotion {
+                    ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
+                    ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
+                    mv_l0x: if uses_l0 { pred.mv_l0[0] } else { 0 },
+                    mv_l0y: if uses_l0 { pred.mv_l0[1] } else { 0 },
+                    mv_l1x: if uses_l1 { pred.mv_l1[0] } else { 0 },
+                    mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
+                },
+            );
+        } else if !split_frame_mb && !field_pair {
             motion.set(
                 mb_x,
                 mb_y,

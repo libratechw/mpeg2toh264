@@ -5,7 +5,7 @@
 //! be re-entropy-coded.
 
 use crate::bitreader::{find_start_codes, BitReader};
-use crate::error::{bail, Result};
+use crate::error::Result;
 use crate::mpeg2::constants::{
     chroma_format, extension, start_code, PictureStructure, PictureType, ALTERNATE_SCAN,
     DEFAULT_INTRA_QUANT, DEFAULT_NON_INTRA_QUANT, ZIGZAG_SCAN,
@@ -430,8 +430,13 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 }
             }
         } else if sc.code == start_code::PICTURE {
+            // A transport-stream recording can begin in the middle of a GOP.
+            // Pictures before the first sequence header have no dimensions or
+            // coding parameters with which to decode them, so discard that
+            // incomplete prefix and start at the first self-describing unit.
             let Some(sequence) = seq else {
-                bail!("picture_start_code before any sequence_header");
+                current = None;
+                continue;
             };
             let header = read_picture_header(&mut r);
             pictures.push(Picture {
