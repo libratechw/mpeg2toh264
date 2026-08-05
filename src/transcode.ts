@@ -30,6 +30,11 @@ import {
   decodeSlice,
   type Macroblock,
 } from "./mpeg2/macroblock.ts";
+import {
+  macroblockSamples,
+  reconstructPicture,
+  type PixelFrame,
+} from "./mpeg2/pixels.ts";
 import { BitWriter, NalType, toNalUnit } from "./h264/bitwriter.ts";
 import {
   chromaQp,
@@ -85,7 +90,7 @@ export interface TranscodeOptions {
   oversample?: number;
   /** Convert only MPEG-2 I pictures; P and B pictures are counted as skipped. */
   iFramesOnly?: boolean;
-  /** Reconstruct MPEG-2 intra MBs as H.264 I_PCM instead of using a grey reference. */
+  /** Reconstruct pictures as H.264 I_PCM instead of using a grey reference. */
   pcmIntra?: boolean;
 }
 
@@ -144,6 +149,9 @@ export class IncrementalTranscoder {
   private randomAccessPending = false;
   private picturesConverted = 0;
   private picturesSkipped = 0;
+  /** MPEG-2 anchor pictures in display order: previous, then current/future. */
+  private previousPixels: PixelFrame | null = null;
+  private currentPixels: PixelFrame | null = null;
   private readonly stats: Stats = {
     integerVectors: 0,
     singleAxisHalfVectors: 0,
@@ -204,6 +212,10 @@ export class IncrementalTranscoder {
     const scaling = first.quant.nonIntra;
 
     const randomAccess = this.initialized && this.randomAccessPending;
+    if (randomAccess) {
+      this.previousPixels = null;
+      this.currentPixels = null;
+    }
     const parts: Uint8Array[] = this.initialized
       ? []
       : [
@@ -357,8 +369,24 @@ export class IncrementalTranscoder {
       );
       if (realIdr) emittedRealIdr = true;
       const frameNum = realIdr ? 0 : (prevRefFrameNum + 1) % MAX_FRAME_NUM;
+      const geo = pictureGeometry(pic);
+      const byAddress: (Macroblock | undefined)[] = new Array(
+        geo.mbWidth * geo.mbHeight,
+      );
+      for (const slice of pic.slices) {
+        for (const mb of decodeSlice(reader, pic, slice, geo.mbWidth))
+          byAddress[mb.address] = mb;
+      }
+      const pixels = options.pcmIntra
+        ? reconstructPicture(
+            pic,
+            byAddress,
+            type === PictureType.B ? this.previousPixels : this.currentPixels,
+            type === PictureType.B ? this.currentPixels : null,
+          )
+        : null;
       parts.push(
-        writePicture(reader, pic, g, quant, counts, chromaCounts, motion, {
+        writePicture(pic, byAddress, g, quant, counts, chromaCounts, motion, {
           frameNum,
           // The grey frame is the IDR at POC 0, so content starts past it.
           poc: realIdr ? 0 : 2 * (gopBase + tr) + (options.pcmIntra ? 0 : 2),
@@ -368,8 +396,13 @@ export class IncrementalTranscoder {
           mbaff,
           stats,
           realIdr,
+          pixels,
         }),
       );
+      if (pixels && type !== PictureType.B) {
+        this.previousPixels = this.currentPixels;
+        this.currentPixels = pixels;
+      }
       if (realIdr) {
         parts.push(writeReferenceClone(g, mbaff));
         prevRefFrameNum = 1;
@@ -426,6 +459,7 @@ interface PictureContext {
   mbaff: boolean;
   stats: Stats;
   realIdr: boolean;
+  pixels: PixelFrame | null;
 }
 
 /** How one macroblock is predicted, once the source's motion has been mapped. */
@@ -686,8 +720,8 @@ function writeReferenceClone(
 }
 
 function writePicture(
-  reader: BitReader,
   pic: Picture,
+  byAddress: readonly (Macroblock | undefined)[],
   g: ReturnType<typeof frameGeometry>,
   quant: Quantiser8x8,
   counts: CoeffCountMap,
@@ -695,17 +729,7 @@ function writePicture(
   motion: MotionField,
   ctx: PictureContext,
 ): Uint8Array {
-  const geo = pictureGeometry(pic);
   const nalParts: Uint8Array[] = [];
-
-  const byAddress: (Macroblock | undefined)[] = new Array(
-    geo.mbWidth * geo.mbHeight,
-  );
-  for (const slice of pic.slices) {
-    for (const mb of decodeSlice(reader, pic, slice, geo.mbWidth)) {
-      byAddress[mb.address] = mb;
-    }
-  }
 
   const targets = Array.from({ length: 4 }, () => new Float64Array(64));
   const fieldTargets = Array.from({ length: 4 }, () => new Float64Array(64));
@@ -875,24 +899,22 @@ function writePicture(
     const fieldPair = pictureFieldPairs;
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
-    // I_PCM is reserved for the initial all-intra content IDR. Forcing both
-    // halves of a later mixed MBAFF pair to I_PCM required inventing pixels
-    // for the inter half; the old 128-valued fallback produced visible grey
-    // blocks and polluted subsequent reference pictures.
-    const pcm = Boolean(ctx.options.pcmIntra && ctx.realIdr);
+    // Pixel-domain and coefficient-domain pictures cannot share a prediction
+    // chain: the latter deliberately tracks H.264 transform drift rather
+    // than exact MPEG-2 pixels. Keep this repair mode entirely I_PCM.
+    const pcm = Boolean(ctx.options.pcmIntra);
 
     if (pcm) {
       ctx.stats.intraMacroblocks++;
       if (!ctx.realIdr) writer.ue(0); // mb_skip_run in P/B slices
       if (ctx.mbaff && mbY % 2 === 0) writer.flag(0); // frame-coded MB pair
-      const samples =
-        source && intra
+      const samples = ctx.pixels
+        ? macroblockSamples(ctx.pixels, mbX, mbY)
+        : source && intra
           ? reconstructIntraPcm(source, pic)
-          : {
-              luma: new Uint8Array(256).fill(128),
-              cb: new Uint8Array(64).fill(128),
-              cr: new Uint8Array(64).fill(128),
-            };
+          : (() => {
+              throw new Error("I_PCM macroblock has no reconstructed pixels");
+            })();
       writePcmMacroblock(
         writer,
         ctx.realIdr ? "I" : outputSliceType === SliceType.P ? "P" : "B",

@@ -10,6 +10,16 @@ function sample(value: number): number {
   return Math.max(0, Math.min(255, Math.round(value)));
 }
 
+function mismatchControl(coeff: Float64Array): void {
+  let sum = 0;
+  for (let i = 0; i < 64; i++) {
+    const value = Math.max(-2048, Math.min(2047, Math.trunc(coeff[i]!)));
+    coeff[i] = value;
+    sum += value;
+  }
+  if ((sum & 1) === 0) coeff[63] = Math.trunc(coeff[63]!) ^ 1;
+}
+
 /** Reconstruct one MPEG-2 intra macroblock as planar 4:2:0 samples. */
 export function reconstructIntraPcm(
   mb: Macroblock,
@@ -36,6 +46,7 @@ export function reconstructIntraPcm(
       target,
     );
     target[0] = target[0]! + GRAY_DC;
+    mismatchControl(target);
   }
 
   // Field-DCT luma blocks carry alternating lines. Convert them into ordinary

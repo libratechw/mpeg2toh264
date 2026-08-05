@@ -20,7 +20,7 @@ Arguments:
 Options:
   -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
       --i-frames-only       Convert MPEG-2 I pictures only
-      --pcm-intra           Reconstruct intra MBs as real H.264 I_PCM/IDR
+      --pcm-intra           Reconstruct every picture as H.264 I_PCM
   -q, --quiet               Do not print the conversion summary
   -h, --help                Show this help
 `;
