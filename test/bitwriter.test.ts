@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BitWriter, toNalUnit } from "../src/h264/bitwriter.ts";
+import { b16x8MbType } from "../src/h264/mb.ts";
 
 /** Render everything written so far as a bit string, for comparing with the spec. */
 function bits(w: BitWriter): string {
@@ -118,5 +119,17 @@ describe("NAL unit wrapping", () => {
     // 00 00 00 00 needs an escape after each pair, not one for the whole run.
     const nal = toNalUnit(new Uint8Array([0x00, 0x00, 0x00, 0x00]), 0, 1);
     expect([...nal.slice(5)]).toEqual([0x00, 0x00, 0x03, 0x00, 0x00]);
+  });
+});
+
+describe("B-slice 16x8 macroblock types", () => {
+  it("maps both partition prediction modes to Table 7-14", () => {
+    expect(b16x8MbType("L0", "L0")).toBe(4);
+    expect(b16x8MbType("L1", "L1")).toBe(6);
+    expect(b16x8MbType("L0", "L1")).toBe(8);
+    expect(b16x8MbType("L1", "L0")).toBe(10);
+    expect(b16x8MbType("L0", "BI")).toBe(12);
+    expect(b16x8MbType("BI", "L1")).toBe(18);
+    expect(b16x8MbType("BI", "BI")).toBe(20);
   });
 });

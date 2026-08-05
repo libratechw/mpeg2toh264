@@ -26,6 +26,30 @@ export const BMbType = {
   BI_16X16: 3,
 } as const;
 
+export type PredictionMode = "L0" | "L1" | "BI";
+
+/** B-slice mb_type for two 16x8 partitions (Table 7-14). */
+export function b16x8MbType(
+  top: PredictionMode,
+  bottom: PredictionMode,
+): number {
+  const types: Record<PredictionMode, Record<PredictionMode, number>> = {
+    L0: { L0: 4, L1: 8, BI: 12 },
+    L1: { L0: 10, L1: 6, BI: 14 },
+    BI: { L0: 16, L1: 18, BI: 20 },
+  };
+  return types[top][bottom];
+}
+
+export interface MotionPartition {
+  refIdxL0: number;
+  refIdxL1: number;
+  mvdL0x: number;
+  mvdL0y: number;
+  mvdL1x: number;
+  mvdL1y: number;
+}
+
 /**
  * te(v): with exactly two choices the value is a single inverted bit, otherwise
  * it is plain ue(v) (clause 9.1.1).
@@ -113,6 +137,8 @@ export interface GrayRefMacroblock {
   mvdL0y: number;
   mvdL1x: number;
   mvdL1y: number;
+  /** Two entries select 16x8 partition syntax; absent means one 16x16 partition. */
+  partitions?: [MotionPartition, MotionPartition];
   /** Highest reference index available in each list, for te(v). */
   numRefIdxL0Minus1: number;
   numRefIdxL1Minus1: number;
@@ -165,28 +191,34 @@ export function writeGrayRefMacroblock(
   mb: GrayRefMacroblock,
 ): number {
   // P_L0_16x16 is mb_type 0 (Table 7-13). B slices use Table 7-14 below.
-  w.ue(mb.pSlice ? 0 : mb.mbType);
+  w.ue(mb.pSlice ? (mb.partitions ? 1 : 0) : mb.mbType);
 
   // mb_pred: reference indices for whichever lists this type uses, then their
   // vector differences. ref_idx is omitted when the list holds one picture.
-  const usesL0 =
-    mb.pSlice ||
-    mb.mbType === BMbType.L0_16X16 ||
-    mb.mbType === BMbType.BI_16X16;
-  const usesL1 =
-    !mb.pSlice &&
-    (mb.mbType === BMbType.L1_16X16 || mb.mbType === BMbType.BI_16X16);
-  if (usesL0 && mb.numRefIdxL0Minus1 > 0)
-    writeTe(w, mb.refIdxL0, mb.numRefIdxL0Minus1);
-  if (usesL1 && mb.numRefIdxL1Minus1 > 0)
-    writeTe(w, mb.refIdxL1, mb.numRefIdxL1Minus1);
-  if (usesL0) {
-    w.se(mb.mvdL0x);
-    w.se(mb.mvdL0y);
+  const partitions: readonly MotionPartition[] = mb.partitions ?? [mb];
+  const usesL0 = partitions.map((p) => p.refIdxL0 >= 0);
+  const usesL1 = partitions.map((p) => !mb.pSlice && p.refIdxL1 >= 0);
+  for (let i = 0; i < partitions.length; i++) {
+    if (usesL0[i] && mb.numRefIdxL0Minus1 > 0) {
+      writeTe(w, partitions[i]!.refIdxL0, mb.numRefIdxL0Minus1);
+    }
   }
-  if (usesL1) {
-    w.se(mb.mvdL1x);
-    w.se(mb.mvdL1y);
+  for (let i = 0; i < partitions.length; i++) {
+    if (usesL1[i] && mb.numRefIdxL1Minus1 > 0) {
+      writeTe(w, partitions[i]!.refIdxL1, mb.numRefIdxL1Minus1);
+    }
+  }
+  for (let i = 0; i < partitions.length; i++) {
+    if (usesL0[i]) {
+      w.se(partitions[i]!.mvdL0x);
+      w.se(partitions[i]!.mvdL0y);
+    }
+  }
+  for (let i = 0; i < partitions.length; i++) {
+    if (usesL1[i]) {
+      w.se(partitions[i]!.mvdL1x);
+      w.se(partitions[i]!.mvdL1y);
+    }
   }
 
   let cbpLuma = 0;
