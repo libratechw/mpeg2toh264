@@ -71,7 +71,8 @@ pub enum Fragment {
         stream_id: u8,
         pid: u16,
         data: Vec<u8>,
-        /// Absolute 90 kHz PES timestamp. private_stream_2 has no PES PTS.
+        /// Absolute 90 kHz timestamp, supplemented from accompanying media for
+        /// an untimed character-superimpose PES.
         pts: Option<u64>,
     },
 }

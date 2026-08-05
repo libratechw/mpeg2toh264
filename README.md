@@ -120,7 +120,7 @@ await player.load('https://example.com/video.ts');
 
 `load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`・`seekable`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
 
-選択サービスのprivate PESはfMP4へ入れず、`private_stream_1`（stream_id `0xbd`）または`private_stream_2`（`0xbf`）イベントで通知します。`event.detail`は`{ pid, data, pts }`で、`data`はPESヘッダーを除いた`ArrayBuffer`、`pts`は動画の時刻原点に合わせた秒です。PTSを持たないPESでは`null`になります。デモは`aribb24.js`の`MPEGTSFeeder`へこのpayloadを渡し、`SVGDOMRenderer`で字幕（data_identifier `0x80`）と文字スーパー（`0x81`）を映像上へ重ねます。
+選択サービスのprivate PESはfMP4へ入れず、`private_stream_1`（stream_id `0xbd`）または`private_stream_2`（`0xbf`）イベントで通知します。`event.detail`は`{ pid, data, pts }`で、`data`はPESヘッダーを除いた`ArrayBuffer`、`pts`は動画の時刻原点に合わせた秒です。文字スーパー自身にPTSがない場合は、同じサービスの直前の音声PTS（音声がなければ映像PTS）で補います。利用できる時刻がなければ`null`になります。デモは`aribb24.js`の`MPEGTSFeeder`へこのpayloadを渡し、`SVGDOMRenderer`で字幕（data_identifier `0x80`）と文字スーパー（`0x81`）を映像上へ重ねます。
 
 オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds` / `deinterlace` / `deinterlacer`。`deinterlacer`には`PlayerDeinterlacer`を返すfactoryを渡します。player自身は特定の方式に依存せず、`enabled`とストリームの`scan`情報を実装へ渡します。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`packages/demo/src/demo.ts`がそうしています）。ファイルはページの外へ出ません。
 

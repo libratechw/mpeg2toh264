@@ -168,18 +168,26 @@ fn prefers_the_service_the_announcement_puts_first() {
 fn emits_private_stream_pes_from_the_selected_service() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{
-        mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, STREAM_TYPE_PRIVATE_DATA,
+        mux_transport_stream, PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO,
+        STREAM_TYPE_PRIVATE_DATA,
     };
 
     let caption = vec![0x80; 300];
     let superimpose = vec![0x81; 40];
     let streams = &[
         (0x100, STREAM_TYPE_MPEG2_VIDEO),
+        (0x110, STREAM_TYPE_AAC_ADTS),
         (0x120, STREAM_TYPE_PRIVATE_DATA),
     ];
     let ts = mux_transport_stream(
         streams,
         &[
+            PesUnit {
+                pid: 0x110,
+                stream_id: 0xc0,
+                pts: Some(135_000),
+                payload: &[0xff],
+            },
             PesUnit {
                 pid: 0x120,
                 stream_id: 0xbd,
@@ -191,8 +199,8 @@ fn emits_private_stream_pes_from_the_selected_service() {
             PesUnit {
                 pid: 0x120,
                 stream_id: 0xbd,
-                pts: Some(180_000),
-                payload: &[0x80],
+                pts: None,
+                payload: &[0x81],
             },
             PesUnit {
                 pid: 0x120,
@@ -223,11 +231,21 @@ fn emits_private_stream_pes_from_the_selected_service() {
     assert_eq!(private1.pts, Some(90_000));
     assert_eq!(private1.data, caption);
 
+    let untimed_superimpose = packets
+        .iter()
+        .find(|packet| packet.kind == ElementaryKind::PrivateStream1 && packet.data == [0x81])
+        .expect("untimed superimpose packet");
+    assert_eq!(
+        untimed_superimpose.pts,
+        Some(135_000),
+        "uses the accompanying audio PTS"
+    );
+
     let private2 = packets
         .iter()
         .find(|packet| packet.kind == ElementaryKind::PrivateStream2)
         .expect("private_stream_2 packet");
     assert_eq!(private2.pid, 0x120);
-    assert_eq!(private2.pts, None);
+    assert_eq!(private2.pts, Some(135_000));
     assert_eq!(private2.data, superimpose);
 }

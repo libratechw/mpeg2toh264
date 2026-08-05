@@ -46,7 +46,7 @@ export type Fragment =
       streamId: number;
       pid: number;
       data: Uint8Array;
-      /** Absolute 90 kHz PES timestamp, absent for private_stream_2. */
+      /** Absolute 90 kHz timestamp, or null when no media clock is available. */
       pts: number | null;
     };
 "#;

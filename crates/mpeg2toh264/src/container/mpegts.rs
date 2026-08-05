@@ -394,6 +394,8 @@ fn is_pes_start(packet: &[u8], kind: ElementaryKind) -> bool {
 struct PesState {
     parts: Vec<u8>,
     collecting: bool,
+    /// Timestamp of the accompanying media when this private PES began.
+    fallback_pts: Option<u64>,
 }
 
 impl PesState {
@@ -407,15 +409,22 @@ impl PesState {
             return Ok(());
         }
         let packet = std::mem::take(&mut self.parts);
+        let data = pes_payload(&packet, kind)?.to_vec();
+        let pts = match kind {
+            ElementaryKind::PrivateStream2 => self.fallback_pts,
+            ElementaryKind::PrivateStream1 if data.first() == Some(&0x81) => {
+                pes_pts(&packet).or(self.fallback_pts)
+            }
+            _ => pes_pts(&packet),
+        };
         output.push(ElementaryPacket {
             kind,
             pid,
-            data: pes_payload(&packet, kind)?.to_vec(),
-            pts: (kind != ElementaryKind::PrivateStream2)
-                .then(|| pes_pts(&packet))
-                .flatten(),
+            data,
+            pts,
         });
         self.collecting = false;
+        self.fallback_pts = None;
         Ok(())
     }
 }
@@ -430,6 +439,8 @@ pub struct MpegTsAvDemuxer {
     video: PesState,
     audio: PesState,
     private: HashMap<u16, PesState>,
+    video_pts: Option<u64>,
+    audio_pts: Option<u64>,
 }
 
 impl MpegTsAvDemuxer {
@@ -467,6 +478,16 @@ impl MpegTsAvDemuxer {
         self.program.audio_pid.is_some()
     }
 
+    /// ARIB character superimpose is timed by the accompanying audio PES, or
+    /// by video when the service has no audio. Its own PES commonly has no PTS.
+    fn superimpose_pts(&self) -> Option<u64> {
+        if self.program.audio_pid.is_some() {
+            self.audio_pts
+        } else {
+            self.video_pts
+        }
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ElementaryPacket>> {
         self.pending.extend_from_slice(chunk);
         let input = std::mem::take(&mut self.pending);
@@ -498,6 +519,8 @@ impl MpegTsAvDemuxer {
                         self.video = PesState::default();
                         self.audio = PesState::default();
                         self.private.clear();
+                        self.video_pts = None;
+                        self.audio_pts = None;
                     }
                 }
                 let kind = if Some(packet.pid) == self.program.video_pid {
@@ -521,6 +544,22 @@ impl MpegTsAvDemuxer {
                     None
                 };
                 if let Some(kind) = kind {
+                    if packet.payload_unit_start {
+                        match kind {
+                            ElementaryKind::Video => {
+                                if let Some(pts) = pes_pts(packet.data) {
+                                    self.video_pts = Some(pts);
+                                }
+                            }
+                            ElementaryKind::Audio => {
+                                if let Some(pts) = pes_pts(packet.data) {
+                                    self.audio_pts = Some(pts);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let superimpose_pts = self.superimpose_pts();
                     let state = match kind {
                         ElementaryKind::Video => &mut self.video,
                         ElementaryKind::Audio => &mut self.audio,
@@ -536,6 +575,12 @@ impl MpegTsAvDemuxer {
                         };
                         state.flush(previous_kind, packet.pid, &mut output)?;
                         state.collecting = is_pes_start(packet.data, kind);
+                        if matches!(
+                            kind,
+                            ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2
+                        ) {
+                            state.fallback_pts = superimpose_pts;
+                        }
                     }
                     if state.collecting {
                         state.parts.extend_from_slice(packet.data);
