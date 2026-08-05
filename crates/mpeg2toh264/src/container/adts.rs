@@ -119,11 +119,11 @@ impl AdtsStream {
 
     pub fn finish(&mut self) -> Result<Vec<AacFrame>> {
         let output = self.push(&[])?;
-        // A lone 0xff is the first byte of a syncword that never arrived, which
-        // a stream cut mid-frame leaves behind and nothing can be done about.
-        if !self.pending.is_empty() && self.pending != [0xff] {
-            bail!("truncated ADTS frame");
-        }
+        // Whatever is left is the part of a frame the input was cut in the
+        // middle of, which a recording that stopped mid-frame ends with. A
+        // fraction of an access unit is not something a decoder can be given,
+        // and refusing the whole stream over the last few milliseconds of it
+        // would be worse, so it goes.
         self.pending.clear();
         Ok(output)
     }

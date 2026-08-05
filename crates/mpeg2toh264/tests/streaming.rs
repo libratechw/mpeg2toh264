@@ -167,13 +167,20 @@ fn rejects_audio_that_is_not_aac_lc() {
 }
 
 #[test]
-fn rejects_a_truncated_final_frame() {
+fn drops_a_truncated_final_frame() {
+    // A recording that stops mid-frame ends with part of an access unit. There
+    // is nothing to hand a decoder there, and the frames before it are still
+    // good, so the remainder is dropped rather than failing the stream.
     let stream = adts_stream(2, 3, 2);
     let mut adts = AdtsStream::new();
-    adts.push(&stream[..stream.len() - 4])
+    let frames = adts
+        .push(&stream[..stream.len() - 4])
         .expect("frames decode");
-    let error = adts.finish().expect_err("must fail");
-    assert!(error.to_string().contains("truncated"), "{error}");
+    assert_eq!(frames.len(), 1, "the frame that did arrive whole");
+    assert!(adts
+        .finish()
+        .expect("the partial frame is dropped")
+        .is_empty());
 }
 
 // ------------------------------------------------------------------- Session
