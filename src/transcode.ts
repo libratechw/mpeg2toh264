@@ -302,7 +302,9 @@ function predictionFor(
     return {
       mbType: BMbType.BI_16X16,
       refIdxL0: layout.fwdL0,
-      refIdxL1: layout.bwdL0,
+      // The backward picture's index in list 1, not its index in list 0: the
+      // two lists hold the same pictures in opposite orders.
+      refIdxL1: layout.bwdL1,
       mvL0: nativePosition(mb.mv[0]!, mb.mv[1]!),
       mvL1: nativePosition(mb.mv[2]!, mb.mv[3]!),
     };

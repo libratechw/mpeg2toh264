@@ -40,7 +40,7 @@ export function chromaQp(lumaQp: number, offset: number): number {
 }
 
 /** Inverse 8x8 DCT, orthonormal, into `out` in raster order. */
-function idct8(coeff: Float64Array, out: Float64Array): void {
+export function idct8(coeff: Float64Array, out: Float64Array): void {
   // Columns first: tmp = C8^T * coeff
   const tmp = new Float64Array(64);
   for (let x = 0; x < 8; x++) {
