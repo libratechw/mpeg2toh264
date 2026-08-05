@@ -66,4 +66,21 @@ describe("incremental transcoding", () => {
       timeline.presentationIndices.length * timeline.sampleDuration + 1,
     );
   });
+
+  it("restarts the I_PCM path with a content IDR instead of a grey prefix", () => {
+    const gop = new Uint8Array(
+      readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
+    );
+    const session = new IncrementalTranscoder({ pcmIntra: true });
+    session.push(gop);
+    session.requestRandomAccessPoint();
+    const restarted = session.push(gop).bitstream;
+    expect([...restarted.subarray(0, 5)]).toEqual([0, 0, 0, 1, 0x65]);
+    const timeline = mpeg2VideoTimeline(gop, { hasReferences: false });
+    const fragment = h264GopToFmp4(restarted, timeline, 2, 0, 0);
+    expect(fragment.sampleCount).toBe(timeline.presentationIndices.length);
+    expect(fragment.duration).toBe(
+      timeline.presentationIndices.length * timeline.sampleDuration,
+    );
+  });
 });

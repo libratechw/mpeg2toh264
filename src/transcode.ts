@@ -1,11 +1,12 @@
 /**
  * MPEG-2 to H.264 transcoding.
  *
- * No pixels are reconstructed anywhere on the luma path: MPEG-2 coefficient
+ * The normal path reconstructs no pixels on the luma path: MPEG-2 coefficient
  * levels are dequantised into orthonormal-DCT values and requantised straight
  * into H.264 levels, with no inverse transform, no motion compensation and no
  * reference frame buffer. Chroma is the exception and is documented in
- * h264/chroma.ts.
+ * h264/chroma.ts. The optional I_PCM path deliberately reconstructs intra
+ * macroblocks to obtain real content IDRs without a grey reference picture.
  *
  * Every output picture is a B slice, even those that were I or P in the source,
  * because the half-sample motion mapping needs bi-prediction and that is only
@@ -40,6 +41,7 @@ import {
   type ChromaBlockLevels,
 } from "./h264/chroma.ts";
 import { writeGrayIdr } from "./h264/grayframe.ts";
+import { reconstructIntraPcm } from "./h264/intra-pcm.ts";
 import {
   BMbType,
   b16x8MbType,
@@ -50,6 +52,7 @@ import {
   markNoCoefficients,
   toZigzag8x8,
   writeGrayRefMacroblock,
+  writePcmMacroblock,
   type ChromaCounts,
   type GrayRefMacroblock,
 } from "./h264/mb.ts";
@@ -82,6 +85,8 @@ export interface TranscodeOptions {
   oversample?: number;
   /** Convert only MPEG-2 I pictures; P and B pictures are counted as skipped. */
   iFramesOnly?: boolean;
+  /** Reconstruct MPEG-2 intra MBs as H.264 I_PCM instead of using a grey reference. */
+  pcmIntra?: boolean;
 }
 
 export interface TranscodeResult {
@@ -165,7 +170,10 @@ export class IncrementalTranscoder {
 
     const width = first.sequence.horizontalSize;
     const height = first.sequence.verticalSize;
-    const mbaff = !first.sequenceExt.progressiveSequence;
+    // I_PCM inside MBAFF pairs has additional pair-state semantics. The
+    // expensive fallback emits ordinary frame macroblocks and uses the existing
+    // field-DCT/motion-to-frame conversion paths instead.
+    const mbaff = !first.sequenceExt.progressiveSequence && !options.pcmIntra;
     if (
       this.initialized &&
       (width !== this.width || height !== this.height || mbaff !== this.mbaff)
@@ -225,7 +233,7 @@ export class IncrementalTranscoder {
             chromaQpIndexOffset: CHROMA_QP_OFFSET,
           }),
         ];
-    if (!this.initialized || randomAccess)
+    if ((!this.initialized || randomAccess) && !options.pcmIntra)
       parts.push(
         writeGrayIdr({
           mbWidth: g.mbWidth,
@@ -254,9 +262,10 @@ export class IncrementalTranscoder {
     let shortTermCount = randomAccess ? 0 : this.shortTermCount;
     // temporal_reference restarts at each group of pictures, so display order is
     // recovered by accumulating a base as the counter wraps.
-    let gopBase = this.gopBase;
-    let seenPicture = this.seenPicture;
-    let maxTrInGop = this.maxTrInGop;
+    let gopBase = options.pcmIntra && randomAccess ? 0 : this.gopBase;
+    let seenPicture =
+      options.pcmIntra && randomAccess ? false : this.seenPicture;
+    let maxTrInGop = options.pcmIntra && randomAccess ? 0 : this.maxTrInGop;
 
     for (const pic of pics) {
       const type = pic.header.pictureCodingType;
@@ -290,49 +299,75 @@ export class IncrementalTranscoder {
       // frame move through the default reference list, and serves no purpose.
       const isReference = !options.iFramesOnly && type !== PictureType.B;
 
-      const layout: RefLayout = options.iFramesOnly
-        ? {
-            count: 1,
-            fwdL0: 0,
-            fwdL1: 0,
-            bwdL0: -1,
-            bwdL1: -1,
-            gray: 0,
-            forceL1ShortTerm: false,
-          }
-        : type === PictureType.B
+      const layout: RefLayout = options.pcmIntra
+        ? type === PictureType.B
           ? {
-              // A B picture sits between its two references, so list 0 defaults to
-              // [forward, backward, grey] and list 1 to [backward, forward, grey].
-              count: 3,
+              count: 2,
               fwdL0: 0,
               fwdL1: 1,
               bwdL0: 1,
               bwdL1: 0,
-              gray: 2,
+              gray: -1,
               forceL1ShortTerm: false,
             }
           : {
-              count: shortTermCount + 1,
+              count: Math.max(1, shortTermCount),
               fwdL0: 0,
               fwdL1: 0,
               bwdL0: -1,
               bwdL1: -1,
-              gray: shortTermCount,
-              forceL1ShortTerm: shortTermCount > 0,
-            };
+              gray: -1,
+              forceL1ShortTerm: shortTermCount > 1,
+            }
+        : options.iFramesOnly
+          ? {
+              count: 1,
+              fwdL0: 0,
+              fwdL1: 0,
+              bwdL0: -1,
+              bwdL1: -1,
+              gray: 0,
+              forceL1ShortTerm: false,
+            }
+          : type === PictureType.B
+            ? {
+                // A B picture sits between its two references, so list 0 defaults to
+                // [forward, backward, grey] and list 1 to [backward, forward, grey].
+                count: 3,
+                fwdL0: 0,
+                fwdL1: 1,
+                bwdL0: 1,
+                bwdL1: 0,
+                gray: 2,
+                forceL1ShortTerm: false,
+              }
+            : {
+                count: shortTermCount + 1,
+                fwdL0: 0,
+                fwdL1: 0,
+                bwdL0: -1,
+                bwdL1: -1,
+                gray: shortTermCount,
+                forceL1ShortTerm: shortTermCount > 0,
+              };
 
-      const frameNum = (prevRefFrameNum + 1) % MAX_FRAME_NUM;
+      const realIdr = Boolean(
+        options.pcmIntra &&
+        type === PictureType.I &&
+        (!this.initialized || randomAccess),
+      );
+      const frameNum = realIdr ? 0 : (prevRefFrameNum + 1) % MAX_FRAME_NUM;
       parts.push(
         writePicture(reader, pic, g, quant, counts, chromaCounts, motion, {
           frameNum,
           // The grey frame is the IDR at POC 0, so content starts past it.
-          poc: 2 * (gopBase + tr) + 2,
+          poc: realIdr ? 0 : 2 * (gopBase + tr) + (options.pcmIntra ? 0 : 2),
           isReference,
           layout,
           options,
           mbaff,
           stats,
+          realIdr,
         }),
       );
       if (isReference) {
@@ -386,6 +421,7 @@ interface PictureContext {
   options: TranscodeOptions;
   mbaff: boolean;
   stats: Stats;
+  realIdr: boolean;
 }
 
 /** How one macroblock is predicted, once the source's motion has been mapped. */
@@ -670,6 +706,11 @@ function writePicture(
   ];
   let prevQp = PPS_INIT_QP;
   let w: BitWriter | null = null;
+  const outputSliceType = ctx.realIdr
+    ? SliceType.I
+    : ctx.options.iFramesOnly
+      ? SliceType.P
+      : SliceType.B;
   const pictureFieldPairs =
     ctx.mbaff &&
     !ctx.options.iFramesOnly &&
@@ -773,12 +814,12 @@ function writePicture(
         // I-only pictures need no bi-prediction. P slices are simpler and much
         // more widely handled than a stream consisting solely of reference-less B
         // pictures, while still predicting every source intra MB from grey.
-        sliceType: ctx.options.iFramesOnly ? SliceType.P : SliceType.B,
+        sliceType: outputSliceType,
         frameNum: ctx.frameNum,
         log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
         picOrderCntLsb: ctx.poc,
         log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
-        idr: false,
+        idr: ctx.realIdr,
         reference: ctx.isReference,
         mbaff: ctx.mbaff,
         sliceQp: PPS_INIT_QP,
@@ -800,6 +841,59 @@ function writePicture(
     const fieldPair = pictureFieldPairs;
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
+    const pcm = Boolean(
+      ctx.options.pcmIntra && (intra || (ctx.realIdr && !source)),
+    );
+
+    if (pcm) {
+      ctx.stats.intraMacroblocks++;
+      if (!ctx.realIdr) writer.ue(0); // mb_skip_run in P/B slices
+      if (ctx.mbaff && mbY % 2 === 0) writer.flag(0); // frame-coded MB pair
+      const samples =
+        source && intra
+          ? reconstructIntraPcm(source, pic)
+          : {
+              luma: new Uint8Array(256).fill(128),
+              cb: new Uint8Array(64).fill(128),
+              cr: new Uint8Array(64).fill(128),
+            };
+      writePcmMacroblock(
+        writer,
+        ctx.realIdr ? "I" : outputSliceType === SliceType.P ? "P" : "B",
+        samples,
+      );
+      for (let by = 0; by < 4; by++) {
+        for (let bx = 0; bx < 4; bx++)
+          counts.set(mbX * 4 + bx, mbY * 4 + by, 16);
+      }
+      for (const map of [chromaCounts.cb, chromaCounts.cr]) {
+        for (let by = 0; by < 2; by++) {
+          for (let bx = 0; bx < 2; bx++)
+            map.set(mbX * 2 + bx, mbY * 2 + by, 16);
+        }
+      }
+      motion.set(mbX, mbY, {
+        refIdxL0: -1,
+        refIdxL1: -1,
+        mvL0x: 0,
+        mvL0y: 0,
+        mvL1x: 0,
+        mvL1y: 0,
+      });
+      const endsSlice = mbX === g.mbWidth - 1 && mbY === g.mbHeight - 1;
+      if (endsSlice) {
+        writer.rbspTrailingBits();
+        nalParts.push(
+          toNalUnit(
+            writer.bytes(),
+            3,
+            ctx.realIdr ? NalType.SLICE_IDR : NalType.SLICE_NON_IDR,
+          ),
+        );
+        w = null;
+      }
+      return;
+    }
     const luma: (Int32Array | null)[] = [null, null, null, null];
     let chroma: [ChromaBlockLevels, ChromaBlockLevels] | null = null;
     let qp = prevQp;
@@ -1146,8 +1240,8 @@ function writePicture(
       nalParts.push(
         toNalUnit(
           writer.bytes(),
-          ctx.isReference ? 2 : 0,
-          NalType.SLICE_NON_IDR,
+          ctx.realIdr ? 3 : ctx.isReference ? 2 : 0,
+          ctx.realIdr ? NalType.SLICE_IDR : NalType.SLICE_NON_IDR,
         ),
       );
       w = null;

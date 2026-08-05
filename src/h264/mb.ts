@@ -164,6 +164,37 @@ export interface GrayRefMacroblock {
   prevQp: number;
 }
 
+export interface PcmMacroblockSamples {
+  /** Sixteen raster-order luma rows of sixteen samples. */
+  luma: Uint8Array;
+  /** Eight raster-order 4:2:0 chroma rows for each component. */
+  cb: Uint8Array;
+  cr: Uint8Array;
+}
+
+/** Write an independently decodable I_PCM macroblock. */
+export function writePcmMacroblock(
+  w: BitWriter,
+  sliceType: "I" | "P" | "B",
+  samples: PcmMacroblockSamples,
+): void {
+  if (
+    samples.luma.length !== 256 ||
+    samples.cb.length !== 64 ||
+    samples.cr.length !== 64
+  ) {
+    throw new Error(
+      "I_PCM requires 256 luma and 64 samples per chroma component",
+    );
+  }
+  // I_PCM is mb_type 25 in an I slice, offset by the inter types in P and B.
+  w.ue(sliceType === "I" ? 25 : sliceType === "P" ? 30 : 48);
+  while (!w.isByteAligned) w.flag(0); // pcm_alignment_zero_bit
+  for (const plane of [samples.luma, samples.cb, samples.cr]) {
+    for (const sample of plane) w.u(8, sample);
+  }
+}
+
 /** Coefficient counts for the chroma 4x4 blocks, one map per component. */
 export interface ChromaCounts {
   cb: CoeffCountMap;

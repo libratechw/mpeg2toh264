@@ -34,7 +34,7 @@ function reset() {
   audioBaseDecodeTime = 0;
   presentationBase = 0;
   initialized = false;
-  transcoder = new IncrementalTranscoder();
+  transcoder = new IncrementalTranscoder({ pcmIntra: true });
   pendingGops = [];
   pendingAudio = [];
   audioConfig = null;
@@ -47,7 +47,6 @@ function emitGop(mpeg2: Uint8Array, audioFrames: AacFrame[]) {
   if (randomAccess) {
     transcoder.requestRandomAccessPoint();
   }
-  const firstFragment = !initialized;
   const timeline = mpeg2VideoTimeline(mpeg2, {
     hasReferences: initialized && !randomAccess,
   });
@@ -87,7 +86,7 @@ function emitGop(mpeg2: Uint8Array, audioFrames: AacFrame[]) {
     {
       type: "fragment",
       data: fragment.mediaSegment.buffer,
-      samples: fragment.sampleCount - (firstFragment ? 1 : 0),
+      samples: fragment.sampleCount,
       audioSamples: audioFrames.length,
     },
     [fragment.mediaSegment.buffer],

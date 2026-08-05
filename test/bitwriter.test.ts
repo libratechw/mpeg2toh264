@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { BitWriter, toNalUnit } from "../src/h264/bitwriter.ts";
-import { b16x8MbType, FIELD_SCAN_8X8, toZigzag8x8 } from "../src/h264/mb.ts";
+import {
+  b16x8MbType,
+  FIELD_SCAN_8X8,
+  toZigzag8x8,
+  writePcmMacroblock,
+} from "../src/h264/mb.ts";
 
 /** Render everything written so far as a bit string, for comparing with the spec. */
 function bits(w: BitWriter): string {
@@ -143,5 +148,20 @@ describe("B-slice 16x8 macroblock types", () => {
     expect(b16x8MbType("L0", "BI")).toBe(12);
     expect(b16x8MbType("BI", "L1")).toBe(18);
     expect(b16x8MbType("BI", "BI")).toBe(20);
+  });
+});
+
+describe("I_PCM macroblocks", () => {
+  it("byte-aligns and writes all 4:2:0 samples", () => {
+    const w = new BitWriter();
+    const luma = Uint8Array.from({ length: 256 }, (_, i) => i);
+    const cb = new Uint8Array(64).fill(0x55);
+    const cr = new Uint8Array(64).fill(0xaa);
+    writePcmMacroblock(w, "I", { luma, cb, cr });
+    const out = w.bytes();
+    expect(out).toHaveLength(386);
+    expect([...out.subarray(0, 4)]).toEqual([0x0d, 0x00, 0x00, 0x01]);
+    expect([...out.subarray(258, 262)]).toEqual([0x55, 0x55, 0x55, 0x55]);
+    expect([...out.subarray(-4)]).toEqual([0xaa, 0xaa, 0xaa, 0xaa]);
   });
 });
