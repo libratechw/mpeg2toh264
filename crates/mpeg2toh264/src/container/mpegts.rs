@@ -460,7 +460,7 @@ impl MpegTsAvDemuxer {
         let mut output = Vec::new();
         let mut sections = Vec::new();
         while at + TS_PACKET_SIZE <= input.len() {
-            if let Some(packet) = payload_at(&input, at)? {
+            if let Ok(Some(packet)) = payload_at(&input, at) {
                 if self.program.wants(packet.pid) {
                     self.program.push(&packet, &mut sections);
                     if std::mem::take(&mut self.program.changed_streams) {

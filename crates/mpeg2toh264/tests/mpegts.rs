@@ -26,6 +26,20 @@ fn recovers_the_elementary_stream_byte_for_byte() {
 }
 
 #[test]
+fn skips_a_packet_with_reserved_adaptation_field_control() {
+    let es = read_fixture("ibbp.m2v");
+    let mut ts = wrap_mpeg2_es_in_ts(&es, None);
+    let mut damaged = vec![0xff; 188];
+    damaged[..4].copy_from_slice(&[0x47, 0x1f, 0xff, 0x00]);
+    damaged.append(&mut ts);
+
+    assert_eq!(
+        extract_mpeg2_video_es(&damaged).expect("one damaged packet is skipped"),
+        es
+    );
+}
+
+#[test]
 fn survives_a_pes_header_carrying_a_timestamp() {
     let es = read_fixture("ibbp.m2v");
     let ts = wrap_mpeg2_es_in_ts(&es, Some(900_000));
