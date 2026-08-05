@@ -4,10 +4,18 @@
   "description": "Browser MSE player for the mpeg2toh264 transcoder",
   "type": "module",
   "license": "MIT",
+  "files": [
+    "dist"
+  ],
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "scripts": {
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json"
   }
 }

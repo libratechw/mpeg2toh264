@@ -213,12 +213,15 @@ Android端末など、デコーダーがデインタレース済みのフレー�
 ```bash
 ./tools/build-wasm.sh    # 先にWASMを生成しておく
 npm install
+npm run packages:build    # playerとyadifの配布用ファイルを生成
 npm run web:dev          # 開発サーバー
 npm run web:build        # dist/ へ出力
 npm run typecheck        # ページ側とWorker側の2プログラム
 ```
 
 `packages/player/wasm/`はビルド生成物なのでgit管理外です。`build-wasm.sh`を通していないと`npm run typecheck`もvite buildもimportを解決できません。
+
+`@mpeg2toh264/player`と`@mpeg2toh264/yadif`の`exports`は、それぞれの`dist/`に生成したJavaScriptと型定義を参照します。playerのdistにはworkerとWASMも含まれ、workerのURLは`import.meta.url`を基準に解決されます。このため、利用側でViteによるTypeScriptやWorkerの変換は必要ありません。`npm pack`と`npm publish`では`prepack`が配布用ビルドを実行します。
 
 `packages/player/src/mse.ts`は両方のプログラムに属します。ページ側は`lib.dom`のMSE宣言を使い、Worker側は`packages/player/src/worker-mse.d.ts`を使います（`lib.webworker.d.ts`は`MediaSourceHandle`しか宣言していないため）。tsconfigの`include`を明示しているのはこの衝突を避けるためです。
 

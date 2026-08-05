@@ -8,8 +8,9 @@
     "packages/*"
   ],
   "scripts": {
-    "web:dev": "npm run dev --workspace @mpeg2toh264/demo",
-    "web:build": "npm run build --workspace @mpeg2toh264/demo",
+    "packages:build": "npm run build --workspace @mpeg2toh264/player && npm run build --workspace @mpeg2toh264/yadif",
+    "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
+    "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {

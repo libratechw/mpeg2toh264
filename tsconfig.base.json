@@ -10,6 +10,10 @@
     "noEmit": true,
     "skipLibCheck": true,
     "verbatimModuleSyntax": true,
-    "types": []
+    "types": [],
+    "paths": {
+      "@mpeg2toh264/player": ["./packages/player/src/index.ts"],
+      "@mpeg2toh264/yadif": ["./packages/yadif/src/index.ts"]
+    }
   }
 }
