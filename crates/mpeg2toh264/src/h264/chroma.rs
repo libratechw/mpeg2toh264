@@ -34,6 +34,23 @@ static C8: LazyLock<[f32; 64]> = LazyLock::new(|| {
     m
 });
 
+/// Reciprocal reconstruction gains indexed by chroma QP. Keeping these in one
+/// table removes a `powi` and 64 floating-point divisions from every converted
+/// chroma block.
+static CHROMA_RECIPROCAL_GAIN: LazyLock<([[f32; 16]; 40], [f32; 40])> = LazyLock::new(|| {
+    let mut ac = [[0.0; 16]; 40];
+    let mut dc = [0.0; 40];
+    for qp in 0..40 {
+        let shift = 2f32.powi(qp as i32 / 6);
+        let base = &CHROMA_AC_GAIN_4X4[qp % 6];
+        for pos in 1..16 {
+            ac[qp][pos] = 1.0 / (base[pos >> 2][pos & 3] as f32 * shift);
+        }
+        dc[qp] = 1.0 / (CHROMA_DC_GAIN[qp % 6] as f32 * shift);
+    }
+    (ac, dc)
+});
+
 /// H.264 Table 8-14: 4x4 field scan for field-coded macroblocks.
 pub static FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 2, 6, 13, 10, 3, 7, 14, 11, 15];
 
@@ -130,9 +147,9 @@ fn spatial_to_chroma_levels(
     out: &mut ChromaBlockLevels,
     field_scan: bool,
 ) {
-    let ac_gain = &CHROMA_AC_GAIN_4X4[(qp_c % 6) as usize];
-    let shift = 2f32.powi(qp_c / 6);
-    let dc_gain = CHROMA_DC_GAIN[(qp_c % 6) as usize] as f32 * shift;
+    let qp_c = qp_c as usize;
+    let ac_reciprocal = &CHROMA_RECIPROCAL_GAIN.0[qp_c];
+    let dc_reciprocal = CHROMA_RECIPROCAL_GAIN.1[qp_c];
     let scan: &[usize; 16] = if field_scan {
         &FIELD_SCAN_4X4
     } else {
@@ -148,8 +165,7 @@ fn spatial_to_chroma_levels(
         let ac_out = &mut out.ac[b];
         for k in 1..16 {
             let pos = scan[k];
-            let gain = ac_gain[pos >> 2][pos & 3] as f32 * shift;
-            let level = round_half_up_i32(coeff4[pos] / gain);
+            let level = round_half_up_i32(coeff4[pos] * ac_reciprocal[pos]);
             ac_out[k - 1] = level;
             if level != 0 {
                 out.any_ac = true;
@@ -157,10 +173,10 @@ fn spatial_to_chroma_levels(
         }
     }
 
-    let f0 = dc_target[0] / dc_gain;
-    let f1 = dc_target[1] / dc_gain;
-    let f2 = dc_target[2] / dc_gain;
-    let f3 = dc_target[3] / dc_gain;
+    let f0 = dc_target[0] * dc_reciprocal;
+    let f1 = dc_target[1] * dc_reciprocal;
+    let f2 = dc_target[2] * dc_reciprocal;
+    let f3 = dc_target[3] * dc_reciprocal;
     out.dc[0] = round_half_up_i32((f0 + f1 + f2 + f3) / 4.0);
     out.dc[1] = round_half_up_i32((f0 - f1 + f2 - f3) / 4.0);
     out.dc[2] = round_half_up_i32((f0 + f1 - f2 - f3) / 4.0);
