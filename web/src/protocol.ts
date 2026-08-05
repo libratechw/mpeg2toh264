@@ -129,6 +129,12 @@ export interface LoadCommand {
   /** Where the `.wasm` is, or null to take the copy next to the worker. */
   wasmUrl: string | null;
   oversample: number | undefined;
+  /**
+   * Which service to convert, out of a transport stream that carries more than
+   * one. Null takes the first that turns up with a picture in it, which is
+   * what a recording of a single programme has anyway.
+   */
+  serviceId: number | null;
   sink: SinkKind;
   queueHighWaterMark: number;
   maxAheadSeconds: number;
@@ -183,6 +189,12 @@ export type Notification =
       bytesRead: number;
       totalBytes: number | null;
     }
+  /**
+   * What services the transport stream announced and which of them is being
+   * converted. Sent once the program tables have been read, and again after a
+   * seek re-reads them.
+   */
+  | { type: "services"; id: number; services: Services }
   | { type: "stats"; id: number; stats: Stats }
   /** The MSE buffer filled up, or made room again. Worker-sink loads only. */
   | { type: "blocked"; id: number; blocked: boolean }
@@ -265,6 +277,14 @@ export interface Stats {
   convertingMs: number;
   readingMs: number;
   waitingMs: number;
+}
+
+/** What a transport stream is carrying, and which of it is being watched. */
+export interface Services {
+  /** Every service the program association table announced, in its order. */
+  available: number[];
+  /** The one the fragments are being made from, or null before it is known. */
+  current: number | null;
 }
 
 export interface Progress {

@@ -87,8 +87,16 @@ impl Session {
     /// caller's choosing rather than from wherever this input opens, which is
     /// what makes a stream starting mid-file appendable at the time it really
     /// holds. Pass the `originTicks` an earlier session reported.
+    ///
+    /// `serviceId` takes one named service out of a transport stream that
+    /// carries several. `undefined` takes the first that turns up with a
+    /// picture in it. See `serviceIds` for what a recording is offering.
     #[wasm_bindgen(constructor)]
-    pub fn new(oversample: Option<f64>, origin_ticks: Option<f64>) -> Result<Session, JsError> {
+    pub fn new(
+        oversample: Option<f64>,
+        origin_ticks: Option<f64>,
+        service_id: Option<u16>,
+    ) -> Result<Session, JsError> {
         let defaults = TranscodeOptions::default();
         let oversample = oversample.unwrap_or(defaults.oversample);
         if !oversample.is_finite() || oversample <= 0.0 {
@@ -102,14 +110,29 @@ impl Session {
             None => None,
         };
         Ok(Self {
-            inner: mpeg2toh264::Session::anchored(
+            inner: mpeg2toh264::Session::for_service(
                 TranscodeOptions {
                     oversample,
                     ..defaults
                 },
                 origin,
+                service_id,
             ),
         })
+    }
+
+    /// The service the fragments are being made from, once a program map has
+    /// named it, and `undefined` until then.
+    #[wasm_bindgen(getter, js_name = serviceId)]
+    pub fn service_id(&self) -> Option<u16> {
+        self.inner.service_id()
+    }
+
+    /// Every service this transport stream has announced, in the order it
+    /// announced them. Empty until the program association table arrives.
+    #[wasm_bindgen(getter, js_name = serviceIds)]
+    pub fn service_ids(&self) -> Vec<u16> {
+        self.inner.service_ids().to_vec()
     }
 
     /// The PES timestamp presentation time zero stands for, once the first

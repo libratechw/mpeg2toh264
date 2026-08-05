@@ -22,6 +22,7 @@ import {
   type LoadCommand,
   type Notification,
   type Scan,
+  type Services,
   type TimingMark,
 } from "./protocol.js";
 import { openSource, readSlice, readTail, type Source } from "./source.js";
@@ -216,6 +217,8 @@ class Playback {
   #transcoder: Transcoder | null = null;
   /** Wall time the read loop spent on each of the two things it waits for. */
   #readingMs = 0;
+  /** The last services reported, so the same news is not sent twice. */
+  #announced: Services | null = null;
   #waitingMs = 0;
 
   #totalBytes: number | null = null;
@@ -458,7 +461,11 @@ class Playback {
         bytesRead: offset,
         totalBytes: this.#totalBytes,
       });
-      const converter = new Transcoder(this.#command.oversample, this.#origin);
+      const converter = new Transcoder(
+        this.#command.oversample,
+        this.#origin,
+        this.#command.serviceId,
+      );
       this.#transcoder = converter;
       await this.#convert(leg, source, converter);
     } catch (error) {
@@ -497,6 +504,7 @@ class Playback {
       bytesRead += result.value.byteLength;
       post({ type: "progress", id, bytesRead, totalBytes: this.#totalBytes });
       const fragments = converter.push(result.value);
+      this.#announceServices(id, converter);
       if (!converted && fragments.length > 0) {
         converted = true;
         mark(id, "first-fragment");
@@ -571,6 +579,26 @@ class Playback {
     if (origin === null) return;
     this.#origin = origin;
     this.#announceDuration();
+  }
+
+  /**
+   * Say what the transport stream is carrying, once it has said so itself, and
+   * again when a seek re-reads its tables. A recording of one programme
+   * announces one service and nothing here has to be decided; one that carries
+   * a sub-channel as well leaves a choice that only the page can make.
+   */
+  #announceServices(id: number, converter: Transcoder): void {
+    const available = converter.serviceIds;
+    const current = converter.serviceId;
+    if (available.length === 0) return;
+    const same =
+      this.#announced !== null &&
+      this.#announced.current === current &&
+      this.#announced.available.length === available.length &&
+      this.#announced.available.every((at, index) => at === available[index]);
+    if (same) return;
+    this.#announced = { available, current };
+    post({ type: "services", id, services: { available, current } });
   }
 
   #report(converter: Transcoder): void {

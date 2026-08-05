@@ -61,14 +61,31 @@ export class Transcoder {
    * `originTicks` measures the timeline from a timestamp the caller names,
    * rather than from wherever this input opens, which is what lets a stream
    * that starts mid-file be appended where it belongs.
+   *
+   * `serviceId` takes one named service out of a transport stream carrying
+   * several; null takes the first that turns up with a picture in it.
    */
-  constructor(oversample: number | undefined, originTicks: number | null) {
-    this.#session = new Session(oversample, originTicks);
+  constructor(
+    oversample: number | undefined,
+    originTicks: number | null,
+    serviceId: number | null,
+  ) {
+    this.#session = new Session(oversample, originTicks, serviceId);
   }
 
   /** The timestamp presentation time zero stands for, once a fragment fixed it. */
   get originTicks(): number | null {
     return this.#session.originTicks ?? null;
+  }
+
+  /** The service being converted, once a program map has named it. */
+  get serviceId(): number | null {
+    return this.#session.serviceId ?? null;
+  }
+
+  /** Every service this transport stream announced, in the order it did. */
+  get serviceIds(): number[] {
+    return Array.from(this.#session.serviceIds);
   }
 
   push(chunk: Uint8Array): Fragment[] {

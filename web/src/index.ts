@@ -25,6 +25,7 @@ export {
   type PlayerState,
   type Progress,
   type Scan,
+  type Services,
   type SinkKind,
   type Stats,
   type Timing,

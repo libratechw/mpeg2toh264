@@ -26,6 +26,8 @@ const mute = document.querySelector<HTMLButtonElement>("#mute")!;
 const rate = document.querySelector<HTMLSelectElement>("#rate")!;
 const stage = document.querySelector<HTMLElement>("#stage")!;
 const fullscreen = document.querySelector<HTMLButtonElement>("#fullscreen")!;
+const service = document.querySelector<HTMLSelectElement>("#service")!;
+const serviceLabel = document.querySelector<HTMLElement>("#service-label")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
 const status = document.querySelector<HTMLElement>("#status")!;
@@ -103,6 +105,7 @@ function createPlayer(): Mpeg2TsPlayer {
   const mediaSource = placement.value as "auto" | "worker" | "main";
   const created = new Mpeg2TsPlayer(video, {
     mediaSource,
+    serviceId: wantedService ?? undefined,
     deinterlace: deinterlace.checked && { doubleRate: doubleRate.checked },
   });
   created.addEventListener("statechange", (event) => {
@@ -142,6 +145,29 @@ function createPlayer(): Mpeg2TsPlayer {
     // its controls with it.
     syncControls();
   });
+  // A recording of one programme announces one service and the control stays
+  // out of the way. One that carries a broadcaster's sub-channel as well is
+  // offering a choice nothing but a viewer can make, so it goes on the page.
+  created.addEventListener("services", (event) => {
+    const { available, current } = event.detail;
+    if (available.length < 2) {
+      service.hidden = true;
+      serviceLabel.hidden = true;
+      return;
+    }
+    const wanted = String(wantedService ?? current ?? available[0]);
+    service.replaceChildren(
+      ...available.map((id) => {
+        const option = document.createElement("option");
+        option.value = String(id);
+        option.textContent = String(id);
+        option.selected = String(id) === wanted;
+        return option;
+      }),
+    );
+    service.hidden = false;
+    serviceLabel.hidden = false;
+  });
   created.addEventListener("seekable", (event) => {
     duration = event.detail.duration;
     length = `${formatDuration(duration)}（シーク可能）`;
@@ -179,11 +205,17 @@ function createPlayer(): Mpeg2TsPlayer {
   return created;
 }
 
+/** The service a viewer picked, which only a fresh load can act on. */
+let wantedService: number | null = null;
+/** What was last played, so switching service can start it again. */
+let playing: { url: string; label: string } | null = null;
+
 function play(
   url: string,
   sourceLabel: string,
   ownedUrl: string | null = null,
 ) {
+  playing = { url, label: sourceLabel };
   if (fileUrl && fileUrl !== ownedUrl) URL.revokeObjectURL(fileUrl);
   fileUrl = ownedUrl;
   label = sourceLabel;
@@ -385,13 +417,39 @@ function applyDeinterlace() {
 function syncControls() {
   video.controls = !(player?.deinterlace ?? false);
 }
+/**
+ * Put the service picker away and stop asking for what was picked.
+ *
+ * A choice belongs to the recording it was made on: carried to another one it
+ * names a service that may not be there, and the conversion would wait for a
+ * program map that never comes.
+ */
+function forgetService(): void {
+  wantedService = null;
+  service.hidden = true;
+  serviceLabel.hidden = true;
+  service.replaceChildren();
+}
+
+// A service is chosen at the head of the conversion, so changing it means
+// converting the input again from the beginning.
+service.addEventListener("change", () => {
+  const chosen = Number(service.value);
+  if (!Number.isFinite(chosen) || chosen === wantedService) return;
+  wantedService = chosen;
+  if (playing) play(playing.url, playing.label, fileUrl);
+});
+
 deinterlace.addEventListener("change", applyDeinterlace);
 doubleRate.addEventListener("change", applyDeinterlace);
 
 urlForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const url = urlInput.value.trim();
-  if (url) play(url, url);
+  if (url) {
+    forgetService();
+    play(url, url);
+  }
 });
 
 // The library takes a URL, so a picked file becomes one. The worker fetches
@@ -400,6 +458,7 @@ fileInput.addEventListener("change", () => {
   const selected = fileInput.files?.[0];
   if (!selected) return;
   const url = URL.createObjectURL(selected);
+  forgetService();
   play(url, selected.name, url);
 });
 

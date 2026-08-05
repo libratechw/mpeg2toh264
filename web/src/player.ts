@@ -24,6 +24,7 @@ import {
   type PlayerState,
   type Progress,
   type Scan,
+  type Services,
   type SinkKind,
   type Stats,
   type Timing,
@@ -56,6 +57,12 @@ export interface Mpeg2TsPlayerOptions {
   mediaSource?: "auto" | "worker" | "main";
   /** The quantiser search factor. Higher is slower and closer to the source. */
   oversample?: number;
+  /**
+   * Which service to convert, out of a transport stream carrying more than
+   * one. Left unset, the first that turns up with a picture in it. The
+   * `services` event says what a given input is offering.
+   */
+  serviceId?: number;
   /** Pause conversion above this many bytes waiting to be appended. */
   queueHighWaterMark?: number;
   /** Pause conversion while the buffer already reaches this far past the playhead. */
@@ -94,6 +101,13 @@ export interface Mpeg2TsPlayerEventMap {
    * converted and again whenever it changes. See `Scan`.
    */
   scan: CustomEvent<Scan>;
+  /**
+   * What services the transport stream announced, and which of them is being
+   * converted. A recording of one programme announces one and there is nothing
+   * to decide; one that carries a broadcaster's sub-channel as well leaves a
+   * choice, which `serviceId` makes on the next `load()`. See `Services`.
+   */
+  services: CustomEvent<Services>;
   /**
    * The input turned out to be one that can be seeked in, and this is how long
    * it is. Until this arrives -- and for a live stream it never does -- the
@@ -330,6 +344,7 @@ export class Mpeg2TsPlayer extends EventTarget {
           ? null
           : String(this.#options.wasmUrl),
       oversample: this.#options.oversample,
+      serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
@@ -460,6 +475,9 @@ export class Mpeg2TsPlayer extends EventTarget {
         // point that would need deciding on.
         this.#applyDeinterlace();
         this.#emit("scan", notification.scan);
+        break;
+      case "services":
+        this.#emit("services", notification.services);
         break;
       case "mark":
         this.#mark(notification.name, notification.at);
