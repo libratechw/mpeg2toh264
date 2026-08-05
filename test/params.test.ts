@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   writePps,
   writeSps,
+  ZIGZAG_4X4,
   ZIGZAG_8X8,
   frameGeometry,
 } from "../src/h264/params.ts";
@@ -52,11 +53,11 @@ class Reader {
 }
 
 /** Reconstruct a scaling list exactly as clause 7.3.2.1.1.1 specifies. */
-function readScalingList(r: Reader): number[] {
-  const list = new Array<number>(64).fill(0);
+function readScalingList(r: Reader, size: 16 | 64 = 64): number[] {
+  const list = new Array<number>(size).fill(0);
   let lastScale = 8;
   let nextScale = 8;
-  for (let j = 0; j < 64; j++) {
+  for (let j = 0; j < size; j++) {
     if (nextScale !== 0) {
       nextScale = (lastScale + r.se() + 256) % 256;
     }
@@ -64,8 +65,9 @@ function readScalingList(r: Reader): number[] {
     lastScale = list[j]!;
   }
   // Transmitted in zig-zag order; return raster.
-  const raster = new Array<number>(64).fill(0);
-  for (let j = 0; j < 64; j++) raster[ZIGZAG_8X8[j]!] = list[j]!;
+  const scan = size === 16 ? ZIGZAG_4X4 : ZIGZAG_8X8;
+  const raster = new Array<number>(size).fill(0);
+  for (let j = 0; j < size; j++) raster[scan[j]!] = list[j]!;
   return raster;
 }
 
@@ -93,7 +95,14 @@ function ppsScalingLists(pps: Uint8Array): {
   const transform8x8 = r.u1();
   expect(transform8x8).toBe(1);
   expect(r.u1()).toBe(1); // pic_scaling_matrix_present_flag
-  for (let i = 0; i < 6; i++) expect(r.u1()).toBe(0); // the 4x4 lists stay default
+  // The six 4x4 lists must be sent explicitly. Omitting them does not leave
+  // chroma unweighted: fall-back rule set A substitutes H.264's default 4x4
+  // matrices, which are far from flat.
+  const flat = new Array(16).fill(16);
+  for (let i = 0; i < 6; i++) {
+    expect(r.u1(), `pic_scaling_list_present_flag[${i}]`).toBe(1);
+    expect(readScalingList(r, 16), `4x4 list ${i}`).toEqual(flat);
+  }
   expect(r.u1()).toBe(1);
   const intra = readScalingList(r);
   expect(r.u1()).toBe(1);

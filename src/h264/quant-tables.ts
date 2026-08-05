@@ -224,3 +224,73 @@ export const BASE_GAIN_8X8: readonly (readonly (readonly number[])[])[] = [
     ],
   ],
 ];
+
+/**
+ * Chroma follows a different route. MPEG-2 codes one 8x8 DCT per chroma block
+ * while H.264 4:2:0 uses four 4x4 transforms plus a 2x2 DC block, and one 8x8
+ * coefficient spreads across roughly 22 of the 4x4 ones, so there is no
+ * per-coefficient shortcut: the block is inverse transformed and forward
+ * transformed for real.
+ *
+ * That has a compensating advantage. The forward transform used is H.264's own
+ * core transform, whose rows are mutually orthogonal, so the result is exactly
+ * what the decoder reconstructs from. The 0.287% basis-shape mismatch that
+ * limits the luma path does not arise here.
+ *
+ * Gains assume flat scaling weights of 16, which is what the PPS sends for the
+ * 4x4 lists.
+ */
+export const CHROMA_AC_GAIN_4X4: readonly (readonly (readonly number[])[])[] = [
+  [
+    [0.0, 4.0625, 2.5, 4.0625],
+    [4.0625, 6.25, 4.0625, 6.25],
+    [2.5, 4.0625, 2.5, 4.0625],
+    [4.0625, 6.25, 4.0625, 6.25],
+  ],
+  [
+    [0.0, 4.375, 2.75, 4.375],
+    [4.375, 7.03125, 4.375, 7.03125],
+    [2.75, 4.375, 2.75, 4.375],
+    [4.375, 7.03125, 4.375, 7.03125],
+  ],
+  [
+    [0.0, 5.0, 3.25, 5.0],
+    [5.0, 7.8125, 5.0, 7.8125],
+    [3.25, 5.0, 3.25, 5.0],
+    [5.0, 7.8125, 5.0, 7.8125],
+  ],
+  [
+    [0.0, 5.625, 3.5, 5.625],
+    [5.625, 8.984375, 5.625, 8.984375],
+    [3.5, 5.625, 3.5, 5.625],
+    [5.625, 8.984375, 5.625, 8.984375],
+  ],
+  [
+    [0.0, 6.25, 4.0, 6.25],
+    [6.25, 9.765625, 6.25, 9.765625],
+    [4.0, 6.25, 4.0, 6.25],
+    [6.25, 9.765625, 6.25, 9.765625],
+  ],
+  [
+    [0.0, 7.1875, 4.5, 7.1875],
+    [7.1875, 11.328125, 7.1875, 11.328125],
+    [4.5, 7.1875, 4.5, 7.1875],
+    [7.1875, 11.328125, 7.1875, 11.328125],
+  ],
+];
+
+/**
+ * DC coefficient reconstructed per unit of the post-Hadamard value, indexed by
+ * qP % 6 and scaled by 2 ** (qP / 6). The 2x2 Hadamard itself is applied by the
+ * encoder.
+ */
+export const CHROMA_DC_GAIN: readonly number[] = [
+  1.25, 1.375, 1.625, 1.75, 2.0, 2.25,
+];
+
+/** Table 8-15: chroma QP as a function of qPi. Below 30 the two are equal. */
+export const QPC_FROM_QPI: readonly number[] = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+  22, 23, 24, 25, 26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36,
+  36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39,
+];

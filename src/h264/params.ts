@@ -86,15 +86,24 @@ export function frameGeometry(
   };
 }
 
+/** H.264's 4x4 zig-zag scan, used to serialise the 4x4 scaling lists. */
+export const ZIGZAG_4X4: readonly number[] = [
+  0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15,
+];
+
+/** Flat weights, i.e. no frequency-dependent weighting at all. */
+const FLAT_4X4: readonly number[] = new Array(16).fill(16);
+
 /**
  * Serialise one scaling list. The syntax codes successive differences, and the
  * decoder treats a next value of zero as "hold the previous one for the rest of
  * the list" -- harmless here because scaling weights are always 1..255.
  */
 function writeScalingList(w: BitWriter, listRaster: readonly number[]): void {
+  const scan = listRaster.length === 16 ? ZIGZAG_4X4 : ZIGZAG_8X8;
   let lastScale = 8;
-  for (let j = 0; j < 64; j++) {
-    const nextScale = listRaster[ZIGZAG_8X8[j]!]!;
+  for (let j = 0; j < listRaster.length; j++) {
+    const nextScale = listRaster[scan[j]!]!;
     if (nextScale < 1 || nextScale > 255) {
       throw new Error(`scaling list value ${nextScale} out of range at ${j}`);
     }
@@ -182,9 +191,15 @@ export function writePps(cfg: PpsConfig): Uint8Array {
     cfg.scaling8x8Intra !== null || cfg.scaling8x8Inter !== null;
   w.flag(anyScaling);
   if (anyScaling) {
-    // Six 4x4 lists come first and are left at their defaults, then the two
-    // 8x8 luma lists (intra, inter) that carry the MPEG-2 matrices.
-    for (let i = 0; i < 6; i++) w.flag(0);
+    // The six 4x4 lists are sent explicitly as flat 16. Leaving them absent
+    // does not mean "no weighting": fall-back rule set A would substitute
+    // H.264's default 4x4 matrices, which are far from flat, and chroma runs
+    // through the 4x4 transform. Then the two 8x8 luma lists carry the MPEG-2
+    // quantiser matrices.
+    for (let i = 0; i < 6; i++) {
+      w.flag(1);
+      writeScalingList(w, FLAT_4X4);
+    }
     for (const list of [cfg.scaling8x8Intra, cfg.scaling8x8Inter]) {
       w.flag(list !== null);
       if (list !== null) writeScalingList(w, list);

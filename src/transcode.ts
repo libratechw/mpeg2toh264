@@ -18,11 +18,21 @@ import { BitWriter, NalType, toNalUnit } from "./h264/bitwriter.ts";
 import { writeGrayIdr } from "./h264/grayframe.ts";
 import {
   CoeffCountMap,
+  makeChromaCounts,
+  makeLumaCounts,
   markNoCoefficients,
+  markNoChromaCoefficients,
   toZigzag8x8,
   writeGrayRefMacroblock,
+  type ChromaCounts,
   type GrayRefMacroblock,
 } from "./h264/mb.ts";
+import {
+  chromaQp,
+  convertIntraChromaBlock,
+  makeChromaBlockLevels,
+  type ChromaBlockLevels,
+} from "./h264/chroma.ts";
 import { frameGeometry, writePps, writeSps } from "./h264/params.ts";
 import {
   DEFAULT_QUANTISER_OPTIONS,
@@ -96,7 +106,8 @@ export function transcodeIntraOnly(
   // The scaling list sent in the PPS is the MPEG-2 intra matrix, so the
   // quantiser is built from the same weights the decoder will apply.
   const quant = new Quantiser8x8(first.quant.intra);
-  const counts = new CoeffCountMap(g.mbWidth, g.mbHeight);
+  const counts = makeLumaCounts(g.mbWidth, g.mbHeight);
+  const chromaCounts = makeChromaCounts(g.mbWidth, g.mbHeight);
   const reader = new BitReader(data);
 
   let converted = 0;
@@ -115,6 +126,7 @@ export function transcodeIntraOnly(
       g,
       quant,
       counts,
+      chromaCounts,
       poc,
       options,
     );
@@ -147,12 +159,15 @@ function writeIntraPicture(
   g: ReturnType<typeof frameGeometry>,
   quant: Quantiser8x8,
   counts: CoeffCountMap,
+  chromaCounts: ChromaCounts,
   poc: number,
   options: TranscodeOptions,
 ): { nal: Uint8Array; worstError: number } {
   const geo = pictureGeometry(pic);
   const w = new BitWriter(1 << 16);
   counts.reset();
+  chromaCounts.cb.reset();
+  chromaCounts.cr.reset();
 
   // One slice per picture: the source's slice structure carries no information
   // the output needs, and a single slice keeps neighbour availability simple.
@@ -182,6 +197,10 @@ function writeIntraPicture(
 
   const targets = new Float64Array(64);
   const raster = new Int32Array(64);
+  const chromaScratch: [ChromaBlockLevels, ChromaBlockLevels] = [
+    makeChromaBlockLevels(),
+    makeChromaBlockLevels(),
+  ];
   let prevQp = PPS_INIT_QP;
   let worstError = 0;
   // In a CAVLC P slice every coded macroblock is preceded by a count of the
@@ -194,6 +213,7 @@ function writeIntraPicture(
     for (let mbX = 0; mbX < g.mbWidth; mbX++) {
       const source = byAddress.get(mbY * g.mbWidth + mbX);
       const luma: (Int32Array | null)[] = [null, null, null, null];
+      let chroma: [ChromaBlockLevels, ChromaBlockLevels] | null = null;
       let qp = prevQp;
 
       if (source && !source.skipped) {
@@ -220,18 +240,43 @@ function writeIntraPicture(
           const out = new Int32Array(64);
           if (toZigzag8x8(raster, out)) luma[b] = out;
         }
+
+        // MPEG-2 blocks 4 and 5 are Cb and Cr, each a single 8x8 DCT that has
+        // to be re-expressed as four 4x4 transforms plus a 2x2 DC block.
+        const qpC = chromaQp(qp);
+        for (let c = 0; c < 2; c++) {
+          const block = source.blocks[4 + c];
+          if (!block) continue;
+          convertIntraChromaBlock(
+            block,
+            pic.quant.chromaIntra,
+            quantiserScale,
+            pic.coding.intraDcPrecision,
+            qpC,
+            chromaScratch[c]!,
+          );
+        }
+        if (
+          chromaScratch[0]!.anyDc ||
+          chromaScratch[0]!.anyAc ||
+          chromaScratch[1]!.anyDc ||
+          chromaScratch[1]!.anyAc
+        ) {
+          chroma = chromaScratch;
+        }
       }
 
-      if (!luma[0] && !luma[1] && !luma[2] && !luma[3]) {
+      if (!luma[0] && !luma[1] && !luma[2] && !luma[3] && !chroma) {
         skipRun++;
         markNoCoefficients(counts, mbX, mbY);
+        markNoChromaCoefficients(chromaCounts, mbX, mbY);
         continue;
       }
 
       w.ue(skipRun);
       skipRun = 0;
-      const mb: GrayRefMacroblock = { mbX, mbY, luma, qp, prevQp };
-      prevQp = writeGrayRefMacroblock(w, counts, mb);
+      const mb: GrayRefMacroblock = { mbX, mbY, luma, chroma, qp, prevQp };
+      prevQp = writeGrayRefMacroblock(w, counts, chromaCounts, mb);
     }
   }
 

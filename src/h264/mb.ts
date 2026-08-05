@@ -10,6 +10,7 @@
 import type { BitWriter } from "./bitwriter.ts";
 import { CBP_TO_CODE_NUM_INTER } from "./cavlc-tables.ts";
 import { writeResidualBlock } from "./cavlc.ts";
+import type { ChromaBlockLevels } from "./chroma.ts";
 import { ZIGZAG_8X8 } from "./params.ts";
 
 /** mb_type 0 in a P slice: one 16x16 partition predicted from list 0. */
@@ -48,10 +49,11 @@ export class CoeffCountMap {
   readonly blkW: number;
   readonly blkH: number;
 
-  constructor(mbWidth: number, mbHeight: number) {
-    this.blkW = mbWidth * 4;
-    this.blkH = mbHeight * 4;
-    this.counts = new Int16Array(this.blkW * this.blkH).fill(-1);
+  /** Dimensions are in 4x4 blocks, which differ between luma and chroma. */
+  constructor(blkW: number, blkH: number) {
+    this.blkW = blkW;
+    this.blkH = blkH;
+    this.counts = new Int16Array(blkW * blkH).fill(-1);
   }
 
   reset(): void {
@@ -85,10 +87,37 @@ export interface GrayRefMacroblock {
    * or null where the block has no coefficients at all.
    */
   luma: (Int32Array | null)[];
+  /** Cb and Cr, or null to leave chroma at the grey prediction. */
+  chroma: [ChromaBlockLevels, ChromaBlockLevels] | null;
   /** QP this macroblock is coded at. */
   qp: number;
   /** QP of the previous macroblock in decoding order, for mb_qp_delta. */
   prevQp: number;
+}
+
+/** Coefficient counts for the chroma 4x4 blocks, one map per component. */
+export interface ChromaCounts {
+  cb: CoeffCountMap;
+  cr: CoeffCountMap;
+}
+
+export function makeChromaCounts(
+  mbWidth: number,
+  mbHeight: number,
+): ChromaCounts {
+  // 4:2:0 chroma is a 2x2 grid of 4x4 blocks per macroblock.
+  return {
+    cb: new CoeffCountMap(mbWidth * 2, mbHeight * 2),
+    cr: new CoeffCountMap(mbWidth * 2, mbHeight * 2),
+  };
+}
+
+/** Luma is a 4x4 grid of 4x4 blocks per macroblock. */
+export function makeLumaCounts(
+  mbWidth: number,
+  mbHeight: number,
+): CoeffCountMap {
+  return new CoeffCountMap(mbWidth * 4, mbHeight * 4);
 }
 
 /**
@@ -98,6 +127,7 @@ export interface GrayRefMacroblock {
 export function writeGrayRefMacroblock(
   w: BitWriter,
   counts: CoeffCountMap,
+  chromaCounts: ChromaCounts,
   mb: GrayRefMacroblock,
 ): number {
   w.ue(MB_TYPE_P_L0_16X16);
@@ -112,8 +142,14 @@ export function writeGrayRefMacroblock(
   for (let i8x8 = 0; i8x8 < 4; i8x8++) {
     if (mb.luma[i8x8]) cbpLuma |= 1 << i8x8;
   }
-  // Chroma is not carried yet, so CodedBlockPatternChroma stays 0.
-  const cbp = cbpLuma;
+  // 0 means no chroma coefficients, 1 means DC only, 2 means DC and AC.
+  let cbpChroma = 0;
+  if (mb.chroma) {
+    const [cb, cr] = mb.chroma;
+    if (cb.anyAc || cr.anyAc) cbpChroma = 2;
+    else if (cb.anyDc || cr.anyDc) cbpChroma = 1;
+  }
+  const cbp = cbpLuma + 16 * cbpChroma;
   w.ue(CBP_TO_CODE_NUM_INTER[cbp]!);
 
   if (cbpLuma > 0) {
@@ -124,11 +160,68 @@ export function writeGrayRefMacroblock(
   if (cbp !== 0) {
     w.se(wrapQpDelta(mb.qp - mb.prevQp));
     qpAfter = mb.qp;
-    writeLumaResidual8x8(w, counts, mb, cbpLuma);
+    if (cbpLuma > 0) {
+      writeLumaResidual8x8(w, counts, mb, cbpLuma);
+    } else {
+      markNoCoefficients(counts, mb.mbX, mb.mbY);
+    }
+    writeChromaResidual(w, chromaCounts, mb, cbpChroma);
   } else {
     markNoCoefficients(counts, mb.mbX, mb.mbY);
+    markNoChromaCoefficients(chromaCounts, mb.mbX, mb.mbY);
   }
   return qpAfter;
+}
+
+/**
+ * Chroma residual: both DC blocks first, then every AC block (clause 7.3.5.3).
+ * The DC blocks use the dedicated chroma table, signalled by nC of -1.
+ */
+function writeChromaResidual(
+  w: BitWriter,
+  counts: ChromaCounts,
+  mb: GrayRefMacroblock,
+  cbpChroma: number,
+): void {
+  if (cbpChroma === 0 || !mb.chroma) {
+    markNoChromaCoefficients(counts, mb.mbX, mb.mbY);
+    return;
+  }
+  const maps = [counts.cb, counts.cr];
+
+  for (let c = 0; c < 2; c++) {
+    writeResidualBlock(w, { levels: mb.chroma[c]!.dc, maxNumCoeff: 4, nC: -1 });
+  }
+
+  for (let c = 0; c < 2; c++) {
+    const map = maps[c]!;
+    for (let b = 0; b < 4; b++) {
+      const bx = mb.mbX * 2 + (b & 1);
+      const by = mb.mbY * 2 + (b >> 1);
+      if (cbpChroma !== 2) {
+        map.set(bx, by, 0);
+        continue;
+      }
+      const total = writeResidualBlock(w, {
+        levels: mb.chroma[c]!.ac[b]!,
+        maxNumCoeff: 15,
+        nC: map.nC(bx, by),
+      });
+      map.set(bx, by, total);
+    }
+  }
+}
+
+export function markNoChromaCoefficients(
+  counts: ChromaCounts,
+  mbX: number,
+  mbY: number,
+): void {
+  for (const map of [counts.cb, counts.cr]) {
+    for (let b = 0; b < 4; b++) {
+      map.set(mbX * 2 + (b & 1), mbY * 2 + (b >> 1), 0);
+    }
+  }
 }
 
 /**

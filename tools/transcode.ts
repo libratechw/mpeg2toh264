@@ -91,25 +91,39 @@ try {
 
   if (frames < 1) throw new Error("nothing decoded to compare");
 
-  let sse = 0;
-  let worst = 0;
-  let count = 0;
-  for (let f = 0; f < frames; f++) {
-    const base = f * frameSize;
-    for (let i = 0; i < lumaSize; i++) {
-      const d = src[base + i]! - out[base + i]!;
-      sse += d * d;
-      if (Math.abs(d) > worst) worst = Math.abs(d);
-      count++;
+  const chromaSize = lumaSize / 4;
+  /** Compare one plane across every frame. */
+  function plane(offset: number, size: number) {
+    let sse = 0;
+    let worst = 0;
+    for (let f = 0; f < frames; f++) {
+      const base = f * frameSize + offset;
+      for (let i = 0; i < size; i++) {
+        const d = src[base + i]! - out[base + i]!;
+        sse += d * d;
+        if (Math.abs(d) > worst) worst = Math.abs(d);
+      }
     }
+    const mse = sse / (size * frames);
+    return {
+      psnr: mse === 0 ? Infinity : 10 * Math.log10((255 * 255) / mse),
+      worst,
+      mse,
+    };
   }
-  const mse = sse / count;
-  const psnr = mse === 0 ? Infinity : 10 * Math.log10((255 * 255) / mse);
-  console.log(
-    `\nluma PSNR   : ${psnr === Infinity ? "lossless" : psnr.toFixed(2) + " dB"}`,
-  );
-  console.log(`worst sample error: ${worst}`);
-  console.log(`mean squared error: ${mse.toFixed(4)}`);
+
+  const planes: [string, ReturnType<typeof plane>][] = [
+    ["Y", plane(0, lumaSize)],
+    ["Cb", plane(lumaSize, chromaSize)],
+    ["Cr", plane(lumaSize + chromaSize, chromaSize)],
+  ];
+  console.log("");
+  for (const [name, p] of planes) {
+    const psnr = p.psnr === Infinity ? "lossless" : `${p.psnr.toFixed(2)} dB`;
+    console.log(
+      `${name.padEnd(3)} PSNR ${psnr.padStart(9)}   worst error ${String(p.worst).padStart(3)}   mse ${p.mse.toFixed(4)}`,
+    );
+  }
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }
