@@ -1,16 +1,22 @@
-const CHUNK_SIZE = 1024 * 1024;
 const QUEUE_HIGH_WATER = 32 * 1024 * 1024;
 const KEEP_BEHIND_SECONDS = 10;
 
-const input = document.querySelector<HTMLInputElement>("#file")!;
+const fileInput = document.querySelector<HTMLInputElement>("#file")!;
+const urlForm = document.querySelector<HTMLFormElement>("#url-form")!;
+const urlInput = document.querySelector<HTMLInputElement>("#url")!;
 const video = document.querySelector<HTMLVideoElement>("#video")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const details = document.querySelector<HTMLElement>("#details")!;
 const fps = document.querySelector<HTMLElement>("#fps")!;
 
 let worker: Worker | null = null;
-let file: File | null = null;
-let fileOffset = 0;
+let inputReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+let inputAbortController: AbortController | null = null;
+let inputObjectUrl: string | null = null;
+let inputLabel = "";
+let inputLength: number | null = null;
+let inputBytesRead = 0;
+let sourceGeneration = 0;
 let workerWantsChunk = false;
 let workerDone = false;
 let mediaSource: MediaSource | null = null;
@@ -35,9 +41,18 @@ function setStatus(message: string, error = false) {
 }
 
 function resetState() {
+  sourceGeneration++;
   worker?.terminate();
   worker = null;
-  fileOffset = 0;
+  void inputReader?.cancel();
+  inputReader = null;
+  inputAbortController?.abort();
+  inputAbortController = null;
+  if (inputObjectUrl) URL.revokeObjectURL(inputObjectUrl);
+  inputObjectUrl = null;
+  inputLabel = "";
+  inputLength = null;
+  inputBytesRead = 0;
   workerWantsChunk = false;
   workerDone = false;
   sourceBuffer = null;
@@ -62,22 +77,50 @@ function resetState() {
 async function maybeFeedWorker() {
   if (
     !worker ||
-    !file ||
+    !inputReader ||
     !workerWantsChunk ||
     quotaBlocked ||
     queuedBytes >= QUEUE_HIGH_WATER
   )
     return;
+  const activeWorker = worker;
+  const activeReader = inputReader;
+  const generation = sourceGeneration;
   workerWantsChunk = false;
-  if (fileOffset >= file.size) {
-    worker.postMessage({ type: "end" });
+  let result: ReadableStreamReadResult<Uint8Array>;
+  try {
+    result = await activeReader.read();
+  } catch (error) {
+    if (generation !== sourceGeneration || inputAbortController?.signal.aborted)
+      return;
+    setStatus(
+      `入力の読み込みに失敗しました: ${error instanceof Error ? error.message : String(error)}`,
+      true,
+    );
     return;
   }
-  const end = Math.min(file.size, fileOffset + CHUNK_SIZE);
-  const data = await file.slice(fileOffset, end).arrayBuffer();
-  fileOffset = end;
-  worker.postMessage({ type: "chunk", data }, [data]);
-  setStatus(`変換中… ${((100 * fileOffset) / file.size).toFixed(1)}%`);
+  if (
+    generation !== sourceGeneration ||
+    worker !== activeWorker ||
+    inputReader !== activeReader
+  )
+    return;
+  if (result.done) {
+    inputReader = null;
+    activeWorker.postMessage({ type: "end" });
+    return;
+  }
+  const chunk = result.value;
+  inputBytesRead += chunk.byteLength;
+  const data = chunk.buffer.slice(
+    chunk.byteOffset,
+    chunk.byteOffset + chunk.byteLength,
+  ) as ArrayBuffer;
+  activeWorker.postMessage({ type: "chunk", data }, [data]);
+  const progress = inputLength
+    ? ` ${((100 * inputBytesRead) / inputLength).toFixed(1)}%`
+    : ` ${(inputBytesRead / 1024 / 1024).toFixed(1)} MiB`;
+  setStatus(`変換中…${progress}`);
 }
 
 function maybeFinish() {
@@ -212,12 +255,54 @@ video.addEventListener("timeupdate", relieveQuota);
 video.addEventListener("waiting", relieveQuota);
 video.addEventListener("stalled", relieveQuota);
 
-input.addEventListener("change", () => {
-  const selected = input.files?.[0];
-  if (!selected) return;
+async function startSource(
+  url: string,
+  label: string,
+  objectUrl: string | null = null,
+) {
   resetState();
-  file = selected;
-  details.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MiB`;
+  const generation = sourceGeneration;
+  inputObjectUrl = objectUrl;
+  inputLabel = label;
+  const abortController = new AbortController();
+  inputAbortController = abortController;
+  setStatus("入力を読み込んでいます…");
+
+  let response: Response;
+  try {
+    response = await fetch(url, { signal: abortController.signal });
+  } catch (error) {
+    if (abortController.signal.aborted || generation !== sourceGeneration)
+      return;
+    setStatus(
+      `URLを取得できません: ${error instanceof Error ? error.message : String(error)}（配信元のCORS設定も確認してください）`,
+      true,
+    );
+    return;
+  }
+  if (generation !== sourceGeneration) return;
+  if (!response.ok) {
+    setStatus(
+      `URLを取得できません: HTTP ${response.status} ${response.statusText}`,
+      true,
+    );
+    return;
+  }
+  if (!response.body) {
+    setStatus(
+      "このURLのレスポンスはストリーミング読み込みに対応していません。",
+      true,
+    );
+    return;
+  }
+
+  const contentLength = Number(response.headers.get("content-length"));
+  inputLength =
+    Number.isFinite(contentLength) && contentLength > 0 ? contentLength : null;
+  inputReader = response.body.getReader();
+  details.textContent = inputLength
+    ? `${inputLabel} · ${(inputLength / 1024 / 1024).toFixed(1)} MiB`
+    : inputLabel;
   worker = new Worker(new URL("./worker.ts", import.meta.url), {
     type: "module",
   });
@@ -241,7 +326,7 @@ input.addEventListener("change", () => {
       audioSampleCount += message.audioSamples ?? 0;
       const audio =
         audioSampleCount > 0 ? ` · ${audioSampleCount} AAC frames` : "";
-      details.textContent = `${file!.name} · ${sampleCount} video frames${audio} · queue ${(queuedBytes / 1024 / 1024).toFixed(1)} MiB`;
+      details.textContent = `${inputLabel} · ${sampleCount} video frames${audio} · queue ${(queuedBytes / 1024 / 1024).toFixed(1)} MiB`;
       pump();
     } else if (message.type === "performance") {
       fps.textContent = `変換FPS: 瞬間 ${message.instantFps.toFixed(1)} · トータル ${message.totalFps.toFixed(1)}`;
@@ -252,4 +337,18 @@ input.addEventListener("change", () => {
   };
   setStatus("ストリーミング変換を開始します…");
   worker.postMessage({ type: "start" });
+}
+
+fileInput.addEventListener("change", () => {
+  const selected = fileInput.files?.[0];
+  if (!selected) return;
+  const url = URL.createObjectURL(selected);
+  void startSource(url, selected.name, url);
+});
+
+urlForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const url = urlInput.value.trim();
+  if (!url) return;
+  void startSource(url, url);
 });
