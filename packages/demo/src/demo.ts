@@ -380,6 +380,9 @@ function syncPlayPause() {
 }
 
 playPause.addEventListener("click", togglePlay);
+video.addEventListener("click", () => {
+  if (player?.deinterlace) togglePlay();
+});
 back.addEventListener("click", () => skip(-SKIP_SECONDS));
 forward.addEventListener("click", () => skip(SKIP_SECONDS));
 for (const name of [
