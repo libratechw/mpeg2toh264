@@ -113,7 +113,12 @@ fn fill_element_end(data: &[u8], at: usize) -> usize {
     if count == 15 {
         let extra = (0..8).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
         at += 8;
-        count += extra.saturating_sub(1);
+        // `cnt = count + esc_count - 1`, and `count` is 15 to have got here, so
+        // the escape spans fourteen bytes upwards. Fourteen is the one length
+        // both forms can write, and an encoder that writes it the long way was
+        // costing a byte here, which walked the element past the end of the
+        // block it was in.
+        count = 14 + extra;
     }
     at + count * 8
 }

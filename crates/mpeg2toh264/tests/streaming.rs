@@ -287,6 +287,33 @@ fn the_rewrite_ends_the_block_at_id_end() {
     assert_eq!(frames[0].data.len(), 7);
 }
 
+/// A fill element's escape form spans `count + esc_count - 1` bytes, and
+/// `count` is 15 to have reached it, so `esc_count` 0 is fourteen bytes.
+/// Fourteen is the one length both forms can write, so an encoder that writes
+/// it the long way is rare -- and reading it as fifteen walks the element a byte
+/// past the end of the block it is in, which loses the frame and with it the
+/// stream. A news recording ran forty seconds before hitting one.
+#[test]
+fn reads_a_fill_element_written_with_an_escape_count_of_zero() {
+    // The empty SCE of the mono case, then a fill element written as count 15
+    // with esc_count 0, its fourteen bytes of payload, ID_END and alignment.
+    let mut payload = vec![0x00, 0x00, 0x00, 0x06, 0xf0];
+    payload.extend_from_slice(&[0x00; 14]);
+    payload.push(0x0e);
+    let frame = adts_frame_with_payload(3, 1, &payload);
+    let frames = AdtsStream::new()
+        .push(&frame)
+        .expect("the fill element is fourteen bytes, not fifteen");
+    assert_eq!(frames[0].data[0] >> 5, 1, "SCE became a CPE");
+    // ID_CPE, tag, common_window, two 22-bit channel streams, and the 130 bits
+    // from the fill element to one past ID_END: 182 bits, or 23 bytes aligned.
+    assert_eq!(
+        frames[0].data.len(),
+        23,
+        "the fill element is carried across"
+    );
+}
+
 #[test]
 fn accepts_mono_to_dual_mono_changes_when_the_primary_sce_is_stable() {
     let mono = adts_frame_with_payload(3, 1, &[0, 0, 0, 7]);
