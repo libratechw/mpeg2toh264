@@ -401,6 +401,33 @@ impl MpegTsAvDemuxer {
     }
 }
 
+/// The last presentation timestamp in a slice of transport stream, in 90 kHz
+/// units, or `None` when it carries no timestamped PES packet at all.
+///
+/// A player hands this the tail of a file to learn how long the file is, so it
+/// reads the PES headers where they lie rather than following a PID: the tail
+/// may open mid-packet, and a program map it happens to miss would leave a
+/// PID-driven demuxer with nothing to report.
+pub fn last_pts(data: &[u8]) -> Option<u64> {
+    let mut at = sync_offset(data)?;
+    let mut last = None;
+    while at + TS_PACKET_SIZE <= data.len() {
+        // A payload the sync check walked past is worth stepping over rather
+        // than giving up on: a tail is a fragment of a file, and one damaged
+        // packet says nothing about the ones after it.
+        if let Ok(Some(packet)) = payload_at(data, at) {
+            if packet.payload_unit_start
+                && (is_pes_start(packet.data, ElementaryKind::Video)
+                    || is_pes_start(packet.data, ElementaryKind::Audio))
+            {
+                last = pes_pts(packet.data).or(last);
+            }
+        }
+        at += TS_PACKET_SIZE;
+    }
+    last
+}
+
 /// Extract the first ISO/IEC 13818-2 video stream advertised by PAT/PMT, from a
 /// transport stream held whole in memory.
 pub fn extract_mpeg2_video_es(data: &[u8]) -> Result<Vec<u8>> {

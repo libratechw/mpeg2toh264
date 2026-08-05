@@ -6,7 +6,7 @@ mod support;
 use mpeg2toh264::container::adts::AdtsStream;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use mpeg2toh264::{Fragment, Session};
+use mpeg2toh264::{Fragment, Session, TranscodeOptions};
 use support::{
     adts_frame, adts_frame_with_payload, adts_stream, mux_transport_stream, read_fixture, PesUnit,
     AUDIO_PID, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
@@ -552,6 +552,147 @@ fn spreads_audio_across_the_fragments_it_belongs_to() {
     for (index, &count) in per_fragment.iter().enumerate().take(per_fragment.len() - 1) {
         assert!(count > 0, "fragment {index} has no audio at all");
     }
+}
+
+// ------------------------------------------------------ resuming mid-stream
+
+/// Ticks of one copy of the fixture: fifteen pictures at 25 Hz.
+const GOP_TICKS: u64 = 15 * 3_600;
+
+/// A stream a cut can be taken out of the middle of.
+///
+/// It differs from the ones above in the two ways a real broadcast does and
+/// they do not: the program map is repeated rather than sent once, so a cut
+/// still says what its PIDs are, and the timestamps advance with the pictures
+/// rather than with the bytes, so a resumed session and a session that read the
+/// whole file can be expected to agree.
+fn seekable_stream(copies: usize, audio_per_copy: usize) -> Vec<u8> {
+    let video = read_fixture("ibbp.m2v");
+    let audio = adts_stream(audio_per_copy, 3, 2);
+    let mut streams = vec![(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)];
+    if audio_per_copy > 0 {
+        streams.push((AUDIO_PID, STREAM_TYPE_AAC_ADTS));
+    }
+    let mut out = Vec::new();
+    for copy in 0..copies as u64 {
+        let mut units = vec![PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload: &video,
+            pts: Some(900_000 + copy * GOP_TICKS),
+        }];
+        if audio_per_copy > 0 {
+            units.push(PesUnit {
+                pid: AUDIO_PID,
+                stream_id: 0xc0,
+                payload: &audio,
+                // The audio starts a little after the video, as a broadcast's does.
+                pts: Some(903_600 + copy * GOP_TICKS),
+            });
+        }
+        // Each call opens with a PAT and a PMT, which is the repetition.
+        out.extend_from_slice(&mux_transport_stream(&streams, &units));
+    }
+    out
+}
+
+/// Run a session over `stream`, and report the origin its timeline settled on.
+fn run_anchored(stream: &[u8], origin: Option<u64>) -> (Vec<Fragment>, Option<u64>) {
+    let mut session = Session::anchored(TranscodeOptions::default(), origin);
+    let mut fragments = Vec::new();
+    for chunk in stream.chunks(64 * 1024) {
+        fragments.extend(session.push(chunk).expect("push succeeds"));
+    }
+    fragments.extend(session.finish().expect("finish succeeds"));
+    (fragments, session.origin_ticks())
+}
+
+fn media_starts(fragments: &[Fragment]) -> Vec<f64> {
+    fragments
+        .iter()
+        .filter_map(|f| match f {
+            Fragment::Media { start, .. } => Some(*start),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where in the byte stream to cut, on no boundary in particular.
+fn midpoint(stream: &[u8]) -> usize {
+    stream.len() / 2 + 37
+}
+
+#[test]
+fn reports_the_origin_its_timeline_starts_from() {
+    let (fragments, origin) = run_anchored(&seekable_stream(2, 0), None);
+    let origin = origin.expect("the opening fragment fixes the origin");
+    assert_eq!(
+        origin, 900_000,
+        "a video-only timeline starts where its video does"
+    );
+    assert_eq!(media_starts(&fragments)[0], 0.0);
+}
+
+#[test]
+fn an_anchored_session_puts_a_cut_where_the_whole_file_puts_it() {
+    let stream = seekable_stream(6, 0);
+    let (whole, origin) = run_anchored(&stream, None);
+    let origin = origin.expect("the opening fragment fixes the origin");
+    let whole_starts = media_starts(&whole);
+
+    let (cut, _) = run_anchored(&stream[midpoint(&stream)..], Some(origin));
+    let cut_starts = media_starts(&cut);
+
+    assert!(
+        !cut_starts.is_empty(),
+        "the cut yields fragments of its own"
+    );
+    let first = cut_starts[0];
+    assert!(
+        first > 1.0,
+        "the cut lands where it was taken from, not at the start: {first}"
+    );
+    let matched = whole_starts
+        .iter()
+        .any(|&start| (start - first).abs() < 0.04);
+    assert!(
+        matched,
+        "cut starts at {first}, which is no fragment of {whole_starts:?}"
+    );
+
+    // The control: without an origin the same bytes open at zero, which is
+    // what a player appending them over a seek would place wrongly.
+    let (adrift, _) = run_anchored(&stream[midpoint(&stream)..], None);
+    assert_eq!(media_starts(&adrift)[0], 0.0);
+}
+
+#[test]
+fn an_anchored_session_carries_both_tracks_over_a_cut() {
+    let stream = seekable_stream(6, 40);
+    let (whole, origin) = run_anchored(&stream, None);
+    let origin = origin.expect("the opening fragment fixes the origin");
+    let whole_starts = media_starts(&whole);
+
+    let (cut, _) = run_anchored(&stream[midpoint(&stream)..], Some(origin));
+    let starts = media_starts(&cut);
+    assert!(!starts.is_empty(), "the cut yields fragments of its own");
+    assert!(
+        whole_starts.iter().any(|&s| (s - starts[0]).abs() < 0.04),
+        "cut starts at {}, which is no fragment of {whole_starts:?}",
+        starts[0]
+    );
+    let audio: usize = cut
+        .iter()
+        .map(|f| match f {
+            Fragment::Media { audio_samples, .. } => *audio_samples,
+            _ => 0,
+        })
+        .sum();
+    assert!(
+        audio > 0,
+        "the audio track resumes too -- the count it measures from is the \
+         audio's own start, not the file's"
+    );
 }
 
 #[test]

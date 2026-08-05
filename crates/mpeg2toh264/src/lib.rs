@@ -29,7 +29,7 @@ pub use container::fmp4::{
     Mpeg2VideoTimeline,
 };
 pub use container::mpegts::{
-    extract_mpeg2_video_es, is_mpeg_transport_stream, ElementaryKind, MpegTsAvDemuxer,
+    extract_mpeg2_video_es, is_mpeg_transport_stream, last_pts, ElementaryKind, MpegTsAvDemuxer,
 };
 pub use session::{Fragment, Session};
 pub use transcode::{transcode, IncrementalTranscoder, TranscodeOptions, TranscodeResult};

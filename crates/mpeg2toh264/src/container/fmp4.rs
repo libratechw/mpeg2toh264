@@ -42,6 +42,11 @@ impl Buf {
         self
     }
 
+    fn u64(&mut self, value: u64) -> &mut Self {
+        self.0.extend_from_slice(&value.to_be_bytes());
+        self
+    }
+
     fn bytes(&mut self, value: &[u8]) -> &mut Self {
         self.0.extend_from_slice(value);
         self
@@ -598,7 +603,7 @@ fn make_media_segment(
     compositions: &[u32],
     sync_samples: &[bool],
     sequence_number: u32,
-    base_decode_time: u32,
+    base_decode_time: u64,
     first_sample_prefixes: &[&[u8]],
 ) -> Vec<u8> {
     let payloads = make_video_payloads(samples, first_sample_prefixes);
@@ -629,8 +634,11 @@ fn make_media_segment(
         };
         let tfdt = {
             let mut body = Buf::new();
-            body.u32(base_decode_time);
-            full_box("tfdt", 0, 0, &body.into_vec())
+            // Version 1: a session resumed mid-file starts where it sits in the
+            // whole presentation, and 32 bits of 90 kHz ticks runs out after
+            // thirteen hours.
+            body.u64(base_decode_time);
+            full_box("tfdt", 1, 0, &body.into_vec())
         };
         let trun = {
             let mut body = Buf::new();
@@ -710,14 +718,15 @@ fn make_av_media_segment(
             let mut tfhd_body = Buf::new();
             tfhd_body.u32(track);
             let mut tfdt_body = Buf::new();
-            tfdt_body.u32(base_decode_time as u32);
+            tfdt_body.u64(base_decode_time);
             let mut trun_body = Buf::new();
             trun_body.u32(count as u32).u32(offset).bytes(entries);
             boxed(
                 "traf",
                 &concat(&[
                     &full_box("tfhd", 0, 0x020000, &tfhd_body.into_vec()),
-                    &full_box("tfdt", 0, 0, &tfdt_body.into_vec()),
+                    // Version 1: see the video-only segment above.
+                    &full_box("tfdt", 1, 0, &tfdt_body.into_vec()),
                     &full_box("trun", version, flags, &trun_body.into_vec()),
                 ]),
             )
@@ -916,7 +925,7 @@ pub fn h264_gop_to_fmp4(
             &timing.compositions,
             &sync_samples,
             sequence_number,
-            base_decode_time as u32,
+            base_decode_time,
             &prefixes,
         ),
     };

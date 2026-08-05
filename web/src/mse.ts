@@ -15,6 +15,11 @@ export interface FragmentSink {
   /** Take the initialization segment and open the stream for `mimeCodec`. */
   open(mimeCodec: string, data: ArrayBuffer): Promise<void>;
   push(data: ArrayBuffer, start: number, randomAccess: boolean): void;
+  /**
+   * Throw away everything buffered and everything queued, and expect the
+   * fragments after this to belong somewhere else on the timeline.
+   */
+  reset(): void;
   /** No more fragments: drain what is queued and end the stream. */
   finish(): Promise<void>;
   /** Give up, releasing anyone waiting on `ready` or `finish`. */
@@ -89,10 +94,20 @@ export class MseSink implements FragmentSink {
   readonly #options: MseSinkOptions;
   readonly #opened: Promise<void>;
   #sourceBuffer: SourceBuffer | null = null;
+  /** What the `SourceBuffer` was opened with, or last changed to. */
+  #mimeCodec = "";
+  /** A codec to move the `SourceBuffer` to before the next append. */
+  #retype: string | null = null;
   #queue: Pending[] = [];
   #queuedBytes = 0;
-  #operation: "append" | "remove" | null = null;
+  #operation: "append" | "remove" | "clear" | null = null;
   #quotaBlocked = false;
+  /** Whether everything buffered is waiting to be thrown away; see `reset`. */
+  #clearing = false;
+  /** Which stretch of timeline is being filled. Bumped by every `reset`. */
+  #epoch = 0;
+  /** A duration to put on the MediaSource as soon as it will take one. */
+  #pendingDuration: number | null = null;
   /** Media times a decoder can start from, in order; see #relieveQuota. */
   #randomAccessPoints: number[] = [];
   /** Whether the playhead has been put where the media starts; see #startAtMedia. */
@@ -116,17 +131,31 @@ export class MseSink implements FragmentSink {
     return this.#room.wait();
   }
 
+  /**
+   * Open the stream, or -- for the initialization segment a seek brings with
+   * it -- re-open the one already running.
+   */
   async open(mimeCodec: string, data: ArrayBuffer): Promise<void> {
     if (!MediaSource.isTypeSupported(mimeCodec))
       throw new Error(`unsupported codec: ${mimeCodec}`);
     await this.#opened;
     if (this.#closed) return;
-    const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
-    sourceBuffer.mode = "segments";
-    sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
-    sourceBuffer.addEventListener("error", this.#onSourceBufferError);
-    this.#sourceBuffer = sourceBuffer;
+    if (!this.#sourceBuffer) {
+      const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
+      sourceBuffer.mode = "segments";
+      sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
+      sourceBuffer.addEventListener("error", this.#onSourceBufferError);
+      this.#sourceBuffer = sourceBuffer;
+      this.#mimeCodec = mimeCodec;
+    } else if (mimeCodec !== this.#mimeCodec) {
+      // Resuming elsewhere in the same file can turn up a different profile,
+      // and only changeType lets a SourceBuffer accept one. It cannot run
+      // while an append is in flight, so it waits with the segment it belongs
+      // to; see #pump.
+      this.#retype = mimeCodec;
+    }
     this.#enqueue({ data, init: true });
+    this.#applyDuration();
   }
 
   push(data: ArrayBuffer, start: number, randomAccess: boolean): void {
@@ -135,17 +164,60 @@ export class MseSink implements FragmentSink {
     this.#enqueue({ data, init: false });
   }
 
+  /**
+   * How long the whole presentation is.
+   *
+   * Without this the media element has no timeline to offer a viewer: it is
+   * what turns `seekable` into the length of the file rather than the length
+   * of what has been converted so far.
+   */
+  setDuration(seconds: number): void {
+    this.#pendingDuration = seconds;
+    this.#applyDuration();
+  }
+
+  /**
+   * Throw away everything buffered and everything queued.
+   *
+   * A seek lands somewhere the buffer does not reach, and what follows it is
+   * a different part of the file: keeping the old media would leave the
+   * timeline with a hole in the middle and the eviction bookkeeping describing
+   * bytes that are no longer there.
+   */
+  reset(): void {
+    if (this.#closed) return;
+    this.#epoch++;
+    this.#queue = [];
+    this.#queuedBytes = 0;
+    this.#randomAccessPoints = [];
+    this.#playheadPlaced = false;
+    this.#ending = false;
+    if (this.#quotaBlocked) {
+      this.#quotaBlocked = false;
+      this.#options.onBlocked?.(false);
+    }
+    if (this.#sourceBuffer) this.#clearing = true;
+    // Whoever was waiting on the drain is waiting for a stream that is not
+    // being ended after all.
+    this.#settleDrain(true);
+    this.#updateRoom();
+    this.#pump();
+  }
+
   async finish(): Promise<void> {
     this.#ending = true;
     // Nothing was ever opened, so there is nothing to drain and no stream to
     // end -- an input we could make no track out of takes this path.
     if (this.#closed || !this.#sourceBuffer) return;
+    const epoch = this.#epoch;
     await new Promise<void>((resolve) => {
       this.#drained.push(resolve);
       this.#pump();
     });
-    if (!this.#closed && this.mediaSource.readyState === "open")
-      this.mediaSource.endOfStream();
+    // A seek during the drain releases this without the queue having emptied,
+    // and what follows is a stream that is not ending after all.
+    if (this.#closed || this.#epoch !== epoch) return;
+    if (this.mediaSource.readyState === "open") this.mediaSource.endOfStream();
   }
 
   close(): void {
@@ -180,15 +252,38 @@ export class MseSink implements FragmentSink {
       this.#closed ||
       !sourceBuffer ||
       sourceBuffer.updating ||
-      this.#operation ||
-      this.#quotaBlocked
-    ) {
+      this.#operation
+    )
+      return;
+    // Emptying the buffer comes before anything queued behind it, and settles
+    // the quota on its own.
+    if (this.#clearing) {
+      this.#operation = "clear";
+      try {
+        sourceBuffer.remove(0, Number.POSITIVE_INFINITY);
+      } catch (error) {
+        this.#operation = null;
+        this.#clearing = false;
+        this.#fail(error);
+      }
       return;
     }
+    if (this.#quotaBlocked) return;
     const next = this.#queue[0];
     if (!next) {
       this.#settleDrain(false);
       return;
+    }
+    if (this.#retype !== null) {
+      const mimeCodec = this.#retype;
+      this.#retype = null;
+      try {
+        sourceBuffer.changeType(mimeCodec);
+        this.#mimeCodec = mimeCodec;
+      } catch (error) {
+        this.#fail(error);
+        return;
+      }
     }
     this.#operation = "append";
     try {
@@ -219,8 +314,11 @@ export class MseSink implements FragmentSink {
     } else if (this.#operation === "remove") {
       this.#quotaBlocked = false;
       this.#options.onBlocked?.(false);
+    } else if (this.#operation === "clear") {
+      this.#clearing = false;
     }
     this.#operation = null;
+    this.#applyDuration();
     this.#updateRoom();
     this.#pump();
   };
@@ -246,6 +344,30 @@ export class MseSink implements FragmentSink {
     if (this.#playheadPlaced || !buffered || buffered.length === 0) return;
     this.#playheadPlaced = true;
     this.#options.seek(buffered.start(0));
+  }
+
+  /**
+   * Put the length of the file on the MediaSource, once it will take one.
+   *
+   * The setter only exists while the stream is open and nothing is updating,
+   * so this runs again after every operation until it finds its moment. A
+   * duration shorter than what is already buffered would evict the difference,
+   * so what is buffered wins: it is the file speaking for itself.
+   */
+  #applyDuration(): void {
+    const duration = this.#pendingDuration;
+    if (duration === null || this.#closed) return;
+    if (this.mediaSource.readyState !== "open") return;
+    if (this.#operation || this.#sourceBuffer?.updating) return;
+    const buffered = this.#sourceBuffer?.buffered;
+    const end =
+      buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) : 0;
+    this.#pendingDuration = null;
+    try {
+      this.mediaSource.duration = Math.max(duration, end);
+    } catch (error) {
+      this.#fail(error);
+    }
   }
 
   #relieveQuota(): void {

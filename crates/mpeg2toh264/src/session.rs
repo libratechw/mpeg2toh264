@@ -30,6 +30,15 @@ const RANDOM_ACCESS_GOP_INTERVAL: usize = 24;
 
 const TIMESCALE: u64 = 90_000;
 
+/// The PES timestamp field is 33 bits and wraps every 26.5 hours (clause
+/// 2.4.3.7), so the distance between two of them is modular.
+const PTS_MODULUS: i64 = 1 << 33;
+
+/// Ticks from `origin` to `pts`, across however many wraps lie between them.
+fn ticks_since(origin: i64, pts: i64) -> u64 {
+    (pts - origin).rem_euclid(PTS_MODULUS) as u64
+}
+
 /// One thing to hand to Media Source Extensions.
 #[derive(Clone, Debug)]
 pub enum Fragment {
@@ -74,11 +83,25 @@ pub struct Session {
     audio_start_pts: Option<u64>,
     /// Where the audio track begins on the shared timeline, once it is fixed.
     audio_origin_ticks: u64,
+    /// The PES timestamp presentation time zero stands for. Supplied by a
+    /// caller resuming mid-file, and worked out from the stream otherwise.
+    timeline_origin: Option<i64>,
     timelines_aligned: bool,
 }
 
 impl Session {
     pub fn new(options: TranscodeOptions) -> Self {
+        Self::anchored(options, None)
+    }
+
+    /// Start a session whose timeline is measured from a PES timestamp of the
+    /// caller's choosing, rather than from wherever this input happens to open.
+    ///
+    /// This is what makes a stream that begins mid-file playable: fed the
+    /// origin an earlier session reported, the fragments it produces carry the
+    /// presentation times they hold in the whole file, and a player can append
+    /// them where the viewer asked to be.
+    pub fn anchored(options: TranscodeOptions, origin_ticks: Option<u64>) -> Self {
         Self {
             demuxer: MpegTsAvDemuxer::new(),
             gops: Mpeg2GopStream::new(),
@@ -94,8 +117,17 @@ impl Session {
             audio_config: None,
             audio_start_pts: None,
             audio_origin_ticks: 0,
+            timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
         }
+    }
+
+    /// The PES timestamp presentation time zero stands for, once the opening
+    /// fragment has fixed it. Hand it to [`Session::anchored`] to continue this
+    /// timeline from somewhere else in the same file.
+    pub fn origin_ticks(&self) -> Option<u64> {
+        self.timeline_origin
+            .map(|origin| origin.rem_euclid(PTS_MODULUS) as u64)
     }
 
     /// Feed the next slice of the transport stream, taking back whatever
@@ -213,8 +245,9 @@ impl Session {
     /// Video and audio in a broadcast stream do not start at the same PTS -- a
     /// few hundred milliseconds apart is normal -- so starting both tracks at
     /// zero shifts the audio by exactly that difference. Both are instead
-    /// placed at their real distance from whichever starts first, which keeps
-    /// either base time from going negative.
+    /// placed at their real distance from the origin, which for a session that
+    /// picks its own is whichever track starts first, and for an anchored one
+    /// is the timestamp the caller named.
     fn align_timelines(&mut self, gop: &Mpeg2Gop, timeline: &Mpeg2VideoTimeline) {
         if self.timelines_aligned {
             return;
@@ -226,10 +259,9 @@ impl Session {
             self.timelines_aligned = true;
             return;
         }
-        let (Some(video_pts), Some(audio_pts)) = (gop.pts, self.audio_start_pts) else {
+        let Some(video_pts) = gop.pts else {
             return;
         };
-        self.timelines_aligned = true;
         // A GOP's timestamp belongs to its I picture, which is coded first but
         // displayed after the B pictures that lead the group. This only ever
         // runs on the opening fragment, where those pictures are missing and
@@ -238,12 +270,31 @@ impl Session {
         let leading_slots = timeline.presentation_indices.first().copied().unwrap_or(1) - 1;
         let video_start =
             video_pts as i64 - (leading_slots as i64 * timeline.sample_duration as i64);
-        // Decoding leads display by up to one frame, and the muxer needs
-        // somewhere to put that, so the timeline starts a frame before the
-        // earlier track.
-        let origin = (video_start - timeline.sample_duration as i64).min(audio_pts as i64);
-        self.video_presentation_start = (video_start - origin) as u64;
-        self.audio_origin_ticks = (audio_pts as i64 - origin) as u64;
+        let origin = match self.timeline_origin {
+            Some(origin) => origin,
+            None => {
+                let chosen = match self.audio_start_pts {
+                    // Decoding leads display by up to one frame, and the muxer
+                    // needs somewhere to put that, so the timeline starts a
+                    // frame before the earlier track.
+                    Some(audio_pts) => {
+                        (video_start - timeline.sample_duration as i64).min(audio_pts as i64)
+                    }
+                    // A stream with no audio track to wait for begins where its
+                    // video does; one that has yet to name its audio waits,
+                    // because the origin cannot be moved afterwards.
+                    None if self.demuxer.has_aac_audio() => return,
+                    None => video_start,
+                };
+                self.timeline_origin = Some(chosen);
+                chosen
+            }
+        };
+        self.timelines_aligned = true;
+        self.video_presentation_start = ticks_since(origin, video_start);
+        if let Some(audio_pts) = self.audio_start_pts {
+            self.audio_origin_ticks = ticks_since(origin, audio_pts as i64);
+        }
     }
 
     /// Decode time of the next audio sample, in the audio track's own timescale.

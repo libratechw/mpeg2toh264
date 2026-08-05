@@ -50,6 +50,8 @@ for fragment in session.finish()? { /* 同上 */ }
 
 `Media`が持つ`start`（秒）と`random_access`は、再生済み範囲を破棄するときにどこまで消してよいかを決めるためのものです。24 GOPごとにIDRを置いて復帰点にしています。
 
+ファイルの途中から読み直すときは`Session::anchored(options, Some(origin))`を使います。`origin`には最初のセッションの`origin_ticks()`（時刻0が指すPES timestamp、90 kHz）を渡します。こうすると、GOPヘッダーの手前で切れたバイト列から始めても、フラグメントの`start`はファイル全体で見た本当の時刻になります。末尾だけを読んで`last_pts()`にかければ、`origin`との差がそのまま動画長です。
+
 ブラウザなしで動作を見るには次を使います。出力はそのまま再生可能なfMP4です。
 
 ```bash
@@ -109,9 +111,20 @@ player.addEventListener('stats', (e) => console.log(e.detail.instantFps));
 await player.load('https://example.com/video.ts');
 ```
 
-`load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
+`load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`・`seekable`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
 
 オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds`。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`web/demo.ts`がそうしています）。ファイルはページの外へ出ません。
+
+### シーク
+
+サーバーが長さと途中のバイトを返せる入力なら、シークは勝手に効きます。ライブ配信やRangeを断るサーバーでは従来どおり、変換済みの範囲だけが再生対象です。
+
+1. `Content-Length`がない → 生配信として扱い、以降は何もしません。
+2. 末尾1 MiBをRangeリクエストで取り、失敗（206以外／取れた範囲が末尾でない）なら生配信のまま。Viteの開発サーバーのように`bytes=-N`を取り違える実装があるので、返ってきた`Content-Range`を見て絶対位置で取り直します。
+3. 成功したら、その中の最後のPTSと`Session`が報告する原点との差が動画長です。`MediaSource.duration`に入り、`seekable`が全長になって`seekable`イベントで通知されます。
+4. バッファ外へシークされたら、バッファを全消去し、平均ビットレートから割り出したバイト位置でRangeリクエストをやり直します。要求時刻より後ろに着いてしまった場合だけ、戻して最大3回まで試します（手前に着くぶんには少し早く再生が始まるだけなので、そのままです）。
+
+肝は`Session::anchored`です。ふつうのセッションは自分が読み始めた場所を時刻0にしますが、シーク後のセッションには最初のセッションが報告した原点（`origin_ticks`）を渡します。フラグメントはファイル全体の中での本当の時刻を持って出てくるので、appendした先がそのまま`currentTime`と一致します。33ビットで一周するPTSの折り返しも原点からの差で吸収します。
 
 ### MediaSourceの置き場所
 

@@ -24,9 +24,25 @@ const STATES: Record<PlayerState, string> = {
   loading: "入力を読み込んでいます…",
   converting: "変換中…",
   "buffer-full": "MSEバッファが満杯です。再生が進むまで変換を停止しています…",
+  seeking: "シーク先を読み込んでいます…",
   completed: "変換完了。",
   error: "",
 };
+
+function formatDuration(seconds: number): string {
+  const whole = Math.floor(seconds);
+  const parts = [
+    Math.floor(whole / 3600),
+    Math.floor(whole / 60) % 60,
+    whole % 60,
+  ];
+  return parts
+    .slice(parts[0] === 0 ? 1 : 0)
+    .map((part, index) =>
+      index === 0 ? String(part) : String(part).padStart(2, "0"),
+    )
+    .join(":");
+}
 
 let player: Mpeg2TsPlayer | null = null;
 /** The blob URL for a picked file, revoked when the next source replaces it. */
@@ -34,6 +50,7 @@ let fileUrl: string | null = null;
 let label = "";
 let progress = "";
 let counts = "";
+let length = "";
 
 function setStatus(message: string, error = false) {
   status.textContent = message;
@@ -41,7 +58,9 @@ function setStatus(message: string, error = false) {
 }
 
 function setDetails() {
-  details.textContent = [label, progress, counts].filter(Boolean).join(" · ");
+  details.textContent = [label, length, progress, counts]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 /**
@@ -64,6 +83,10 @@ function createPlayer(): Mpeg2TsPlayer {
       : ` ${(bytesRead / 1024 / 1024).toFixed(1)} MiB`;
     if (created.state === "converting")
       setStatus(`${STATES.converting}${progress}`);
+  });
+  created.addEventListener("seekable", (event) => {
+    length = `${formatDuration(event.detail.duration)}（シーク可能）`;
+    setDetails();
   });
   created.addEventListener("stats", (event) => {
     const { instantFps, totalFps, videoFrames, audioFrames } = event.detail;
@@ -89,6 +112,7 @@ function play(
   label = sourceLabel;
   progress = "";
   counts = "";
+  length = "";
   fps.textContent = IDLE_FPS;
   setDetails();
   // Failures already arrive as an error event, which is what writes the

@@ -2,7 +2,9 @@
 
 mod support;
 
-use mpeg2toh264::{extract_mpeg2_video_es, is_mpeg_transport_stream, transcode, TranscodeOptions};
+use mpeg2toh264::{
+    extract_mpeg2_video_es, is_mpeg_transport_stream, last_pts, transcode, TranscodeOptions,
+};
 use support::{read_fixture, wrap_mpeg2_es_in_ts, FIXTURES};
 
 #[test]
@@ -49,5 +51,25 @@ fn rejects_a_transport_stream_with_no_video() {
         error.to_string().contains("no PES packets")
             || error.to_string().contains("not a 188-byte"),
         "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn reads_the_last_timestamp_out_of_a_tail() {
+    let es = read_fixture("ibbp.m2v");
+    let mut stream = wrap_mpeg2_es_in_ts(&es, Some(900_000));
+    stream.extend_from_slice(&wrap_mpeg2_es_in_ts(&es, Some(954_000)));
+
+    assert_eq!(last_pts(&stream), Some(954_000));
+    // A player asks this of the end of a file, so it has to work on a slice
+    // that opens mid-packet and carries no program map at all. The cut is
+    // ahead of the second PES header, which is the only timestamp in reach:
+    // the fixture is one PES per copy, where a broadcast is one per picture.
+    let tail = &stream[stream.len() * 2 / 5 + 11..];
+    assert_eq!(last_pts(tail), Some(954_000));
+    assert_eq!(
+        last_pts(&[0u8; 1024]),
+        None,
+        "no transport stream, no answer"
     );
 }

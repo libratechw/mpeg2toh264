@@ -29,10 +29,14 @@ interface SourceBuffer extends EventTarget {
   readonly buffered: TimeRanges;
   appendBuffer(data: BufferSource): void;
   remove(start: number, end: number): void;
+  /** Take segments of a different codec from here on; see MseSink.open. */
+  changeType(type: string): void;
 }
 
 interface MediaSource extends EventTarget {
   readonly readyState: ReadyState;
+  /** How long the presentation is, in seconds, and NaN until something says. */
+  duration: number;
   /** The transferable proxy the page attaches to a media element. */
   readonly handle: MediaSourceHandle;
   addSourceBuffer(type: string): SourceBuffer;

@@ -5,7 +5,11 @@
  * two-track timeline all live inside the `Session`. This is the bookkeeping
  * around it.
  */
-import init, { Session, type Fragment } from "../wasm/mpeg2toh264_wasm.js";
+import init, {
+  lastTimestamp as wasmLastTimestamp,
+  Session,
+  type Fragment,
+} from "../wasm/mpeg2toh264_wasm.js";
 import type { Stats } from "./protocol.js";
 
 export type { Fragment };
@@ -26,6 +30,15 @@ export function loadWasm(wasmUrl: string | null): Promise<unknown> {
   return loaded.module;
 }
 
+/**
+ * The last presentation timestamp in a slice of transport stream, in 90 kHz
+ * ticks, or null when it holds none. Read from the end of a file, this is
+ * where the file ends. Needs `loadWasm` first, like everything else here.
+ */
+export function lastTimestamp(data: Uint8Array): number | null {
+  return wasmLastTimestamp(data) ?? null;
+}
+
 export class Transcoder {
   #session: Session;
   #totalMs = 0;
@@ -35,8 +48,18 @@ export class Transcoder {
   #videoFrames = 0;
   #audioFrames = 0;
 
-  constructor(oversample: number | undefined) {
-    this.#session = new Session(oversample);
+  /**
+   * `originTicks` measures the timeline from a timestamp the caller names,
+   * rather than from wherever this input opens, which is what lets a stream
+   * that starts mid-file be appended where it belongs.
+   */
+  constructor(oversample: number | undefined, originTicks: number | null) {
+    this.#session = new Session(oversample, originTicks);
+  }
+
+  /** The timestamp presentation time zero stands for, once a fragment fixed it. */
+  get originTicks(): number | null {
+    return this.#session.originTicks ?? null;
   }
 
   push(chunk: Uint8Array): Fragment[] {

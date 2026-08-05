@@ -21,6 +21,32 @@ export const DEFAULT_KEEP_BEHIND_SECONDS = 10;
  */
 export const PLAYHEAD_REPORT_INTERVAL_MS = 200;
 
+/**
+ * How much of the end of the input to read when looking for its length.
+ *
+ * The answer is in the last PES header the slice holds, and a transport stream
+ * carries one per picture, so this is orders of magnitude more than it takes.
+ * It is sized instead so that a file ending in padding still has a timestamp
+ * somewhere inside it.
+ */
+export const TAIL_PROBE_BYTES = 1 << 20;
+
+/**
+ * How far past the requested time a seek may land before it is tried again.
+ *
+ * Where the bytes are is worked out from the average bitrate, so a variable
+ * bitrate lands somewhere either side of the mark. Undershooting is free --
+ * playback simply starts a little early -- but overshooting loses what the
+ * viewer asked to see, so only that is worth another request.
+ */
+export const SEEK_OVERSHOOT_TOLERANCE_SECONDS = 1;
+
+/** How far back beyond the overshoot to aim when trying again. */
+export const SEEK_RETRY_MARGIN_SECONDS = 2;
+
+/** How many range requests one seek may spend before taking what it gets. */
+export const SEEK_ATTEMPTS = 3;
+
 /** Which side of the wire owns the `MediaSource`. */
 export type SinkKind = "worker" | "main";
 
@@ -30,6 +56,8 @@ export type PlayerState =
   | "converting"
   /** The MSE buffer is full; conversion is paused until playback frees room. */
   | "buffer-full"
+  /** Playback moved outside the buffer; the input is being read again. */
+  | "seeking"
   /** The input has been converted in full. Playback may still be running. */
   | "completed"
   | "error";
@@ -52,6 +80,8 @@ export type Command =
   | { type: "time"; id: number; currentTime: number }
   /** Whether the page's sink has room for more. Main-sink loads only. */
   | { type: "flow"; id: number; ready: boolean }
+  /** Play from here instead; the buffer does not reach it. See `seekable`. */
+  | { type: "seek"; id: number; time: number }
   | { type: "stop"; id: number };
 
 export type Notification =
@@ -69,6 +99,14 @@ export type Notification =
     }
   /** The source is attached and the first bytes are in: the load is playable. */
   | { type: "opened"; id: number }
+  /**
+   * The input turned out to be one that can be seeked in, and this is how long
+   * it is, in seconds. A live stream, or a server that will not serve byte
+   * ranges, never sends this.
+   */
+  | { type: "seekable"; id: number; duration: number }
+  /** Throw away everything buffered; a seek is about to refill it. */
+  | { type: "reset"; id: number }
   /** Put the playhead here; the media does not begin at zero. See MseSink. */
   | { type: "seek"; id: number; time: number }
   | {
@@ -96,6 +134,7 @@ export interface Stats {
 }
 
 export interface Progress {
+  /** How far into the input reading has got, which a seek moves. */
   bytesRead: number;
   /** The size of the input, when the server said what it was. */
   totalBytes: number | null;

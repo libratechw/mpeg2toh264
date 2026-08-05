@@ -39,6 +39,12 @@ export interface Mpeg2TsPlayerEventMap {
   statechange: CustomEvent<{ state: PlayerState }>;
   progress: CustomEvent<Progress>;
   stats: CustomEvent<Stats>;
+  /**
+   * The input turned out to be one that can be seeked in, and this is how long
+   * it is. Until this arrives -- and for a live stream it never does -- the
+   * element has only what has been converted so far to offer a viewer.
+   */
+  seekable: CustomEvent<{ duration: number }>;
   /** Every failure, including the one that rejects a pending `load`. */
   error: CustomEvent<{ error: Error }>;
 }
@@ -75,6 +81,12 @@ function toError(error: unknown): Error {
  * the element is playable; the conversion runs on past that and reports itself
  * through `progress`, `stats` and `statechange`. Failures always raise `error`,
  * and additionally reject a `load` that has not resolved yet.
+ *
+ * Seeking looks after itself: where the input is a file whose length and whose
+ * middle a server will serve, the element gets a duration and the player
+ * answers a seek outside the buffer by reading the input again from there.
+ * Where it is not -- a live stream, a server that refuses byte ranges -- the
+ * viewer has what has been converted so far, as before.
  */
 export class Mpeg2TsPlayer extends EventTarget {
   readonly video: HTMLVideoElement;
@@ -91,6 +103,8 @@ export class Mpeg2TsPlayer extends EventTarget {
   #playhead: ReturnType<typeof setInterval> | null = null;
   #pending: { resolve: () => void; reject: (error: Error) => void } | null =
     null;
+  /** How long the input is, when it turned out to be one that can be seeked. */
+  #duration: number | null = null;
   #destroyed = false;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
@@ -104,10 +118,19 @@ export class Mpeg2TsPlayer extends EventTarget {
           ? "worker"
           : "main"
         : preference;
+    this.video.addEventListener("seeking", this.#onSeeking);
   }
 
   get state(): PlayerState {
     return this.#state;
+  }
+
+  /**
+   * How long the input is, or null while it is a stream that plays as it
+   * arrives. The same number reaches the media element as its duration.
+   */
+  get duration(): number | null {
+    return this.#duration;
   }
 
   /** Which side of the wire ended up owning the MediaSource. */
@@ -125,6 +148,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     }
     this.stop();
     const id = this.#generation;
+    this.#duration = null;
     const worker = this.#ensureWorker();
     const promise = new Promise<void>((resolve, reject) => {
       this.#pending = { resolve, reject };
@@ -145,10 +169,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       keepBehindSeconds:
         this.#options.keepBehindSeconds ?? DEFAULT_KEEP_BEHIND_SECONDS,
     } satisfies Command);
-    this.#playhead = setInterval(
-      this.#reportPlayhead,
-      PLAYHEAD_REPORT_INTERVAL_MS,
-    );
+    this.#startPlayhead();
     return promise;
   }
 
@@ -167,6 +188,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     if (this.#destroyed) return;
     this.stop();
     this.#destroyed = true;
+    this.video.removeEventListener("seeking", this.#onSeeking);
     this.#worker?.terminate();
     this.#worker = null;
   }
@@ -244,6 +266,14 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#setState("converting");
         this.#settle(null);
         break;
+      case "seekable":
+        this.#duration = notification.duration;
+        this.#sink?.setDuration(notification.duration);
+        this.#emit("seekable", { duration: notification.duration });
+        break;
+      case "reset":
+        this.#sink?.reset();
+        break;
       case "seek":
         if (this.video.currentTime < notification.time)
           this.video.currentTime = notification.time;
@@ -279,6 +309,25 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Open a MediaSource here, for browsers that cannot have one in a worker. */
   #openSink(mimeCodec: string, data: ArrayBuffer): void {
     const id = this.#generation;
+    // A seek opens the stream again, with the initialization segment of
+    // wherever it landed. The MediaSource behind it is the same one: rebuilding
+    // it would take the element's playback state with it.
+    const sink = this.#sink ?? this.#createSink(id);
+    sink.open(mimeCodec, data).then(
+      // The worker is waiting on flow to know the open succeeded. Going
+      // through ready() rather than saying true covers the case where the
+      // append filled the queue on its own.
+      () =>
+        sink
+          .ready()
+          .then(() => this.#report(id, { type: "flow", id, ready: true })),
+      (error: unknown) => {
+        if (id === this.#generation) this.#fail(toError(error));
+      },
+    );
+  }
+
+  #createSink(id: number): MseSink {
     const sink = new MseSink({
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
@@ -299,18 +348,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#sink = sink;
     this.#objectUrl = URL.createObjectURL(sink.mediaSource);
     this.video.src = this.#objectUrl;
-    sink.open(mimeCodec, data).then(
-      // The worker is waiting on flow to know the open succeeded. Going
-      // through ready() rather than saying true covers the case where the
-      // append filled the queue on its own.
-      () =>
-        sink
-          .ready()
-          .then(() => this.#report(id, { type: "flow", id, ready: true })),
-      (error: unknown) => {
-        if (id === this.#generation) this.#fail(toError(error));
-      },
-    );
+    if (this.#duration !== null) sink.setDuration(this.#duration);
+    return sink;
   }
 
   #drainSink(): void {
@@ -325,6 +364,39 @@ export class Mpeg2TsPlayer extends EventTarget {
         if (id === this.#generation) this.#fail(toError(error));
       },
     );
+  }
+
+  /**
+   * Answer the viewer moving the playhead somewhere the buffer does not reach.
+   *
+   * Everything inside a buffered range is Media Source Extensions' own affair,
+   * including the correction #startAtMedia asks for, so those go no further.
+   * What is left is a real seek: the worker throws the buffer away and reads
+   * the input again from where the viewer asked to be.
+   */
+  #onSeeking = (): void => {
+    if (this.#duration === null) return;
+    if (this.#state === "idle" || this.#state === "error") return;
+    const time = this.video.currentTime;
+    if (this.#isBuffered(time)) return;
+    this.#setState("seeking");
+    // A load that had run to the end stopped reporting the playhead, and the
+    // buffer it left behind is about to start filling again.
+    this.#startPlayhead();
+    this.#worker?.postMessage({
+      type: "seek",
+      id: this.#generation,
+      time,
+    } satisfies Command);
+  };
+
+  #isBuffered(time: number): boolean {
+    const buffered = this.video.buffered;
+    for (let index = 0; index < buffered.length; index++) {
+      if (time >= buffered.start(index) && time < buffered.end(index))
+        return true;
+    }
+    return false;
   }
 
   /**
@@ -345,6 +417,14 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #report(id: number, command: Command): void {
     if (id === this.#generation) this.#worker?.postMessage(command);
+  }
+
+  #startPlayhead(): void {
+    if (this.#playhead !== null) return;
+    this.#playhead = setInterval(
+      this.#reportPlayhead,
+      PLAYHEAD_REPORT_INTERVAL_MS,
+    );
   }
 
   #stopPlayhead(): void {

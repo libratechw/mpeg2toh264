@@ -74,19 +74,41 @@ pub struct Session {
 impl Session {
     /// Start a session. `oversample` is the quantiser search factor, and
     /// `undefined` takes the default of 2.
+    ///
+    /// `originTicks` measures the timeline from a PES timestamp of the
+    /// caller's choosing rather than from wherever this input opens, which is
+    /// what makes a stream starting mid-file appendable at the time it really
+    /// holds. Pass the `originTicks` an earlier session reported.
     #[wasm_bindgen(constructor)]
-    pub fn new(oversample: Option<f64>) -> Result<Session, JsError> {
+    pub fn new(oversample: Option<f64>, origin_ticks: Option<f64>) -> Result<Session, JsError> {
         let defaults = TranscodeOptions::default();
         let oversample = oversample.unwrap_or(defaults.oversample);
         if !oversample.is_finite() || oversample <= 0.0 {
             return Err(JsError::new("oversample must be a positive number"));
         }
+        let origin = match origin_ticks {
+            Some(ticks) if !ticks.is_finite() || ticks < 0.0 => {
+                return Err(JsError::new("originTicks must be a timestamp"))
+            }
+            Some(ticks) => Some(ticks as u64),
+            None => None,
+        };
         Ok(Self {
-            inner: mpeg2toh264::Session::new(TranscodeOptions {
-                oversample,
-                ..defaults
-            }),
+            inner: mpeg2toh264::Session::anchored(
+                TranscodeOptions {
+                    oversample,
+                    ..defaults
+                },
+                origin,
+            ),
         })
+    }
+
+    /// The PES timestamp presentation time zero stands for, once the first
+    /// fragment has fixed it, and `undefined` until then.
+    #[wasm_bindgen(getter, js_name = originTicks)]
+    pub fn origin_ticks(&self) -> Option<f64> {
+        self.inner.origin_ticks().map(|ticks| ticks as f64)
     }
 
     /// Feed the next slice of the transport stream.
@@ -98,6 +120,17 @@ impl Session {
     pub fn finish(&mut self) -> Result<FragmentArray, JsError> {
         to_js_array(self.inner.finish().map_err(to_js_error)?)
     }
+}
+
+/// The last presentation timestamp in a slice of transport stream, in 90 kHz
+/// units, or `undefined` when it carries none.
+///
+/// Handed the tail of a file, this is how long the file is: the distance from
+/// the `originTicks` a [`Session`] reported to what comes back here is the
+/// duration a player can put on its timeline.
+#[wasm_bindgen(js_name = lastTimestamp)]
+pub fn last_timestamp(data: &[u8]) -> Option<f64> {
+    mpeg2toh264::last_pts(data).map(|ticks| ticks as f64)
 }
 
 fn to_js_array(fragments: Vec<Fragment>) -> Result<FragmentArray, JsError> {
