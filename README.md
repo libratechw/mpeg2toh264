@@ -11,10 +11,11 @@ npm run web:dev
 
 表示されたURLを開き、MPEG-2映像を含む188-byte MPEG-TSファイルを選択します。処理はブラウザ内のWeb Workerで行われます。
 
-1. PAT/PMTを解析してMPEG-2 Video PESを抽出
-2. MPEG-2映像をAnnex B H.264へ変換
-3. SPS/PPSと各access unitをvideo-only fragmented MP4へmux
-4. Media Source Extensionsの`SourceBuffer`へinit segmentとmedia segmentをappend
+1. `File.slice()`でTSを1 MiBずつ読み、PAT/PMTとPESを状態付きで逐次解析
+2. GOP単位でMPEG-2映像をAnnex B H.264へ変換
+3. 各GOPをvideo-only fragmented MP4 fragmentへmux
+4. Media Source Extensionsの`SourceBuffer`へ順次append
+5. MSE quota到達時はTS読み込みとappendを停止し、再生済み範囲を削除後に再開
 
 音声にはまだ対応していません。プロダクションビルドは次のコマンドで`dist/`へ生成できます。
 

@@ -124,83 +124,20 @@ type Stats = Omit<
   "bitstream" | "picturesConverted" | "picturesSkipped"
 >;
 
-export function transcode(
-  data: Uint8Array,
-  options: TranscodeOptions = DEFAULT_QUANTISER_OPTIONS,
-): TranscodeResult {
-  const pics = parseElementaryStream(data);
-  const first = pics[0];
-  if (!first) throw new Error("no pictures in stream");
-
-  const width = first.sequence.horizontalSize;
-  const height = first.sequence.verticalSize;
-  const mbaff = !first.sequenceExt.progressiveSequence;
-
-  // Interlaced coding is not handled. A field-DCT macroblock builds its 8x8
-  // blocks from alternate lines and field motion predicts each field
-  // separately; representing either in H.264 needs macroblock-adaptive
-  // frame/field coding, which the macroblock layer here does not emit. Refusing
-  // beats silently producing a picture assembled from the wrong lines.
-  //
-  // Field pictures are ruled out here; field DCT and field motion are caught per
-  // macroblock instead, because clearing frame_pred_frame_dct only *permits*
-  // them and progressive content often carries that flag without a single
-  // field-coded macroblock in the stream.
-  const fieldPicture = pics.find(
-    (p) => p.coding.pictureStructure !== PictureStructure.FRAME,
-  );
-  if (fieldPicture) {
-    throw new Error(
-      "field pictures: this needs PAFF or MBAFF, which is not implemented " +
-        `(picture_structure=${fieldPicture.coding.pictureStructure})`,
-    );
-  }
-
-  const g = frameGeometry(width, height, !mbaff);
-  const scaling = first.quant.nonIntra;
-
-  const parts: Uint8Array[] = [
-    writeSps({
-      width,
-      height,
-      levelIdc: width * height > 720 * 576 ? 40 : 30,
-      frameMbsOnly: !mbaff,
-      // The grey frame plus the two most recent I or P pictures, which are what
-      // a B picture predicts from.
-      maxNumRefFrames: 3,
-      log2MaxFrameNumMinus4: LOG2_MAX_FRAME_NUM_MINUS4,
-      log2MaxPocLsbMinus4: LOG2_MAX_POC_LSB_MINUS4,
-      // An MPEG-2 stream codes its anchor picture before the B pictures that
-      // display ahead of it, so one picture has to be held back.
-      maxNumReorderFrames: 1,
-      maxDecFrameBuffering: 4,
-    }),
-    writePps({
-      initQp: PPS_INIT_QP,
-      scaling8x8Intra: scaling,
-      scaling8x8Inter: scaling,
-      chromaQpIndexOffset: CHROMA_QP_OFFSET,
-    }),
-    writeGrayIdr({
-      mbWidth: g.mbWidth,
-      mbHeight: g.mbHeight,
-      log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
-      log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
-      ppsInitQp: PPS_INIT_QP,
-      mbaff,
-      // I-only pictures are non-reference P slices, so this ordinary short-term
-      // IDR remains the sole DPB entry without long-term reference machinery.
-      longTermReference: !options.iFramesOnly,
-    }),
-  ];
-
-  const quant = new Quantiser8x8(scaling);
-  const counts = makeLumaCounts(g.mbWidth, g.mbHeight);
-  const chromaCounts = makeChromaCounts(g.mbWidth, g.mbHeight);
-  const motion = new MotionField(g.mbWidth, g.mbHeight);
-  const reader = new BitReader(data);
-
-  const stats: Stats = {
+export class IncrementalTranscoder {
+  private readonly options: TranscodeOptions;
+  private initialized = false;
+  private width = 0;
+  private height = 0;
+  private mbaff = false;
+  private prevRefFrameNum = 0;
+  private shortTermCount = 0;
+  private gopBase = 0;
+  private seenPicture = false;
+  private maxTrInGop = 0;
+  private picturesConverted = 0;
+  private picturesSkipped = 0;
+  private readonly stats: Stats = {
     integerVectors: 0,
     singleAxisHalfVectors: 0,
     bothAxisHalfVectors: 0,
@@ -208,110 +145,224 @@ export function transcode(
     intraMacroblocks: 0,
     interMacroblocks: 0,
   };
-  let picturesConverted = 0;
-  let picturesSkipped = 0;
 
-  let prevRefFrameNum = 0; // the grey IDR
-  let shortTermCount = 0;
-  // temporal_reference restarts at each group of pictures, so display order is
-  // recovered by accumulating a base as the counter wraps.
-  let gopBase = 0;
-  let seenPicture = false;
-  let maxTrInGop = 0;
+  constructor(options: TranscodeOptions = DEFAULT_QUANTISER_OPTIONS) {
+    this.options = options;
+  }
 
-  for (const pic of pics) {
-    const type = pic.header.pictureCodingType;
+  push(data: Uint8Array): TranscodeResult {
+    const options = this.options;
+    const pics = parseElementaryStream(data);
+    const first = pics[0];
+    if (!first) throw new Error("no pictures in stream");
+
+    const width = first.sequence.horizontalSize;
+    const height = first.sequence.verticalSize;
+    const mbaff = !first.sequenceExt.progressiveSequence;
     if (
-      type !== PictureType.I &&
-      type !== PictureType.P &&
-      type !== PictureType.B
+      this.initialized &&
+      (width !== this.width || height !== this.height || mbaff !== this.mbaff)
     ) {
-      picturesSkipped++;
-      continue;
+      throw new Error(
+        "MPEG-2 sequence parameters changed during incremental transcode",
+      );
     }
-    if (options.iFramesOnly && type !== PictureType.I) {
-      picturesSkipped++;
-      continue;
-    }
-    const tr = pic.header.temporalReference;
-    if (pic.startsGop && seenPicture) {
-      gopBase += maxTrInGop + 1;
-      maxTrInGop = 0;
-    }
-    seenPicture = true;
-    maxTrInGop = Math.max(maxTrInGop, tr);
 
-    // A B picture needs both of its references present.
-    if (type === PictureType.B && shortTermCount < 2) {
-      picturesSkipped++;
-      continue;
+    // Interlaced coding is not handled. A field-DCT macroblock builds its 8x8
+    // blocks from alternate lines and field motion predicts each field
+    // separately; representing either in H.264 needs macroblock-adaptive
+    // frame/field coding, which the macroblock layer here does not emit. Refusing
+    // beats silently producing a picture assembled from the wrong lines.
+    //
+    // Field pictures are ruled out here; field DCT and field motion are caught per
+    // macroblock instead, because clearing frame_pred_frame_dct only *permits*
+    // them and progressive content often carries that flag without a single
+    // field-coded macroblock in the stream.
+    const fieldPicture = pics.find(
+      (p) => p.coding.pictureStructure !== PictureStructure.FRAME,
+    );
+    if (fieldPicture) {
+      throw new Error(
+        "field pictures: this needs PAFF or MBAFF, which is not implemented " +
+          `(picture_structure=${fieldPicture.coding.pictureStructure})`,
+      );
     }
-    // In I-only mode every content picture depends solely on the long-term
-    // grey IDR. Keeping content pictures as references only makes the grey
-    // frame move through the default reference list, and serves no purpose.
-    const isReference = !options.iFramesOnly && type !== PictureType.B;
 
-    const layout: RefLayout = options.iFramesOnly
-      ? {
-          count: 1,
-          fwdL0: 0,
-          fwdL1: 0,
-          bwdL0: -1,
-          bwdL1: -1,
-          gray: 0,
-          forceL1ShortTerm: false,
-        }
-      : type === PictureType.B
+    const g = frameGeometry(width, height, !mbaff);
+    const scaling = first.quant.nonIntra;
+
+    const parts: Uint8Array[] = this.initialized
+      ? []
+      : [
+          writeSps({
+            width,
+            height,
+            levelIdc: width * height > 720 * 576 ? 40 : 30,
+            frameMbsOnly: !mbaff,
+            // The grey frame plus the two most recent I or P pictures, which are what
+            // a B picture predicts from.
+            maxNumRefFrames: 3,
+            log2MaxFrameNumMinus4: LOG2_MAX_FRAME_NUM_MINUS4,
+            log2MaxPocLsbMinus4: LOG2_MAX_POC_LSB_MINUS4,
+            // An MPEG-2 stream codes its anchor picture before the B pictures that
+            // display ahead of it, so one picture has to be held back.
+            maxNumReorderFrames: 1,
+            maxDecFrameBuffering: 4,
+          }),
+          writePps({
+            initQp: PPS_INIT_QP,
+            scaling8x8Intra: scaling,
+            scaling8x8Inter: scaling,
+            chromaQpIndexOffset: CHROMA_QP_OFFSET,
+          }),
+          writeGrayIdr({
+            mbWidth: g.mbWidth,
+            mbHeight: g.mbHeight,
+            log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
+            log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
+            ppsInitQp: PPS_INIT_QP,
+            mbaff,
+            // I-only pictures are non-reference P slices, so this ordinary short-term
+            // IDR remains the sole DPB entry without long-term reference machinery.
+            longTermReference: !options.iFramesOnly,
+          }),
+        ];
+
+    const quant = new Quantiser8x8(scaling);
+    const counts = makeLumaCounts(g.mbWidth, g.mbHeight);
+    const chromaCounts = makeChromaCounts(g.mbWidth, g.mbHeight);
+    const motion = new MotionField(g.mbWidth, g.mbHeight);
+    const reader = new BitReader(data);
+
+    const stats = this.stats;
+    let picturesConverted = 0;
+    let picturesSkipped = 0;
+
+    let prevRefFrameNum = this.prevRefFrameNum;
+    let shortTermCount = this.shortTermCount;
+    // temporal_reference restarts at each group of pictures, so display order is
+    // recovered by accumulating a base as the counter wraps.
+    let gopBase = this.gopBase;
+    let seenPicture = this.seenPicture;
+    let maxTrInGop = this.maxTrInGop;
+
+    for (const pic of pics) {
+      const type = pic.header.pictureCodingType;
+      if (
+        type !== PictureType.I &&
+        type !== PictureType.P &&
+        type !== PictureType.B
+      ) {
+        picturesSkipped++;
+        continue;
+      }
+      if (options.iFramesOnly && type !== PictureType.I) {
+        picturesSkipped++;
+        continue;
+      }
+      const tr = pic.header.temporalReference;
+      if (pic.startsGop && seenPicture) {
+        gopBase += maxTrInGop + 1;
+        maxTrInGop = 0;
+      }
+      seenPicture = true;
+      maxTrInGop = Math.max(maxTrInGop, tr);
+
+      // A B picture needs both of its references present.
+      if (type === PictureType.B && shortTermCount < 2) {
+        picturesSkipped++;
+        continue;
+      }
+      // In I-only mode every content picture depends solely on the long-term
+      // grey IDR. Keeping content pictures as references only makes the grey
+      // frame move through the default reference list, and serves no purpose.
+      const isReference = !options.iFramesOnly && type !== PictureType.B;
+
+      const layout: RefLayout = options.iFramesOnly
         ? {
-            // A B picture sits between its two references, so list 0 defaults to
-            // [forward, backward, grey] and list 1 to [backward, forward, grey].
-            count: 3,
-            fwdL0: 0,
-            fwdL1: 1,
-            bwdL0: 1,
-            bwdL1: 0,
-            gray: 2,
-            forceL1ShortTerm: false,
-          }
-        : {
-            count: shortTermCount + 1,
+            count: 1,
             fwdL0: 0,
             fwdL1: 0,
             bwdL0: -1,
             bwdL1: -1,
-            gray: shortTermCount,
-            forceL1ShortTerm: shortTermCount > 0,
-          };
+            gray: 0,
+            forceL1ShortTerm: false,
+          }
+        : type === PictureType.B
+          ? {
+              // A B picture sits between its two references, so list 0 defaults to
+              // [forward, backward, grey] and list 1 to [backward, forward, grey].
+              count: 3,
+              fwdL0: 0,
+              fwdL1: 1,
+              bwdL0: 1,
+              bwdL1: 0,
+              gray: 2,
+              forceL1ShortTerm: false,
+            }
+          : {
+              count: shortTermCount + 1,
+              fwdL0: 0,
+              fwdL1: 0,
+              bwdL0: -1,
+              bwdL1: -1,
+              gray: shortTermCount,
+              forceL1ShortTerm: shortTermCount > 0,
+            };
 
-    const frameNum = (prevRefFrameNum + 1) % MAX_FRAME_NUM;
-    parts.push(
-      writePicture(reader, pic, g, quant, counts, chromaCounts, motion, {
-        frameNum,
-        // The grey frame is the IDR at POC 0, so content starts past it.
-        poc: 2 * (gopBase + tr) + 2,
-        isReference,
-        layout,
-        options,
-        mbaff,
-        stats,
-      }),
-    );
-    if (isReference) {
-      prevRefFrameNum = frameNum;
-      shortTermCount = Math.min(2, shortTermCount + 1);
+      const frameNum = (prevRefFrameNum + 1) % MAX_FRAME_NUM;
+      parts.push(
+        writePicture(reader, pic, g, quant, counts, chromaCounts, motion, {
+          frameNum,
+          // The grey frame is the IDR at POC 0, so content starts past it.
+          poc: 2 * (gopBase + tr) + 2,
+          isReference,
+          layout,
+          options,
+          mbaff,
+          stats,
+        }),
+      );
+      if (isReference) {
+        prevRefFrameNum = frameNum;
+        shortTermCount = Math.min(2, shortTermCount + 1);
+      }
+      picturesConverted++;
     }
-    picturesConverted++;
-  }
 
-  let total = 0;
-  for (const p of parts) total += p.length;
-  const bitstream = new Uint8Array(total);
-  let at = 0;
-  for (const p of parts) {
-    bitstream.set(p, at);
-    at += p.length;
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const bitstream = new Uint8Array(total);
+    let at = 0;
+    for (const p of parts) {
+      bitstream.set(p, at);
+      at += p.length;
+    }
+    this.initialized = true;
+    this.width = width;
+    this.height = height;
+    this.mbaff = mbaff;
+    this.prevRefFrameNum = prevRefFrameNum;
+    this.shortTermCount = shortTermCount;
+    this.gopBase = gopBase;
+    this.seenPicture = seenPicture;
+    this.maxTrInGop = maxTrInGop;
+    this.picturesConverted += picturesConverted;
+    this.picturesSkipped += picturesSkipped;
+    return {
+      bitstream,
+      picturesConverted: this.picturesConverted,
+      picturesSkipped: this.picturesSkipped,
+      ...stats,
+    };
   }
-  return { bitstream, picturesConverted, picturesSkipped, ...stats };
+}
+
+export function transcode(
+  data: Uint8Array,
+  options: TranscodeOptions = DEFAULT_QUANTISER_OPTIONS,
+): TranscodeResult {
+  return new IncrementalTranscoder(options).push(data);
 }
 
 interface PictureContext {

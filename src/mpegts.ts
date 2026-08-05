@@ -214,3 +214,87 @@ export function extractMpeg2VideoEs(data: Uint8Array): Uint8Array {
     throw new Error("MPEG-TS MPEG-2 video PID has no PES packets");
   return concat(elementaryParts);
 }
+
+/** Stateful TS demuxer for bounded-memory browser/file streaming. */
+export class MpegTsVideoDemuxer {
+  private pending: Uint8Array = new Uint8Array(0);
+  private synced = false;
+  private readonly pmtPids = new Set<number>();
+  private readonly assemblers = new Map<number, SectionAssembler>([
+    [0, new SectionAssembler()],
+  ]);
+  private videoPid = -1;
+  private pesParts: Uint8Array[] = [];
+
+  push(chunk: Uint8Array): Uint8Array[] {
+    const input = concat([this.pending, chunk]);
+    let at = 0;
+    if (!this.synced) {
+      const offset = syncOffset(input);
+      if (offset < 0) {
+        this.pending = input;
+        return [];
+      }
+      at = offset;
+      this.synced = true;
+    }
+    const output: Uint8Array[] = [];
+    for (; at + TS_PACKET_SIZE <= input.length; at += TS_PACKET_SIZE) {
+      const packet = payloadAt(input, at);
+      if (!packet) continue;
+      if (packet.pid === 0 || this.pmtPids.has(packet.pid))
+        this.pushPsi(packet);
+      if (packet.pid !== this.videoPid) continue;
+      if (packet.payloadUnitStart) this.flushPes(output);
+      this.pesParts.push(packet.data);
+    }
+    this.pending = input.slice(at);
+    return output;
+  }
+
+  finish(): Uint8Array[] {
+    if (!this.synced)
+      throw new Error("input is not a 188-byte MPEG transport stream");
+    if (this.videoPid < 0)
+      throw new Error(
+        "MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)",
+      );
+    const output: Uint8Array[] = [];
+    this.flushPes(output);
+    return output;
+  }
+
+  private pushPsi(packet: TsPayload) {
+    let assembler = this.assemblers.get(packet.pid);
+    if (!assembler) {
+      assembler = new SectionAssembler();
+      this.assemblers.set(packet.pid, assembler);
+    }
+    assembler.push(packet.data, packet.payloadUnitStart, (section) => {
+      if (packet.pid === 0 && section[0] === 0x00) {
+        const end = section.length - 4;
+        for (let i = 8; i + 3 < end; i += 4) {
+          const program = (section[i]! << 8) | section[i + 1]!;
+          if (program !== 0)
+            this.pmtPids.add(((section[i + 2]! & 0x1f) << 8) | section[i + 3]!);
+        }
+      } else if (section[0] === 0x02) {
+        const info = ((section[10]! & 0x0f) << 8) | section[11]!;
+        for (let i = 12 + info, end = section.length - 4; i + 4 < end;) {
+          const streamType = section[i]!;
+          const pid = ((section[i + 1]! & 0x1f) << 8) | section[i + 2]!;
+          const length = ((section[i + 3]! & 0x0f) << 8) | section[i + 4]!;
+          if (this.videoPid < 0 && streamType === STREAM_TYPE_MPEG2_VIDEO)
+            this.videoPid = pid;
+          i += 5 + length;
+        }
+      }
+    });
+  }
+
+  private flushPes(output: Uint8Array[]) {
+    if (this.pesParts.length === 0) return;
+    output.push(pesPayload(concat(this.pesParts)));
+    this.pesParts = [];
+  }
+}

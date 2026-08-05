@@ -90,7 +90,10 @@ export interface Mpeg2VideoTimeline {
 }
 
 /** Reproduce the transcoder's accepted-picture timeline in MP4 timescale units. */
-export function mpeg2VideoTimeline(data: Uint8Array): Mpeg2VideoTimeline {
+export function mpeg2VideoTimeline(
+  data: Uint8Array,
+  options: { hasReferences?: boolean } = {},
+): Mpeg2VideoTimeline {
   const pictures = parseElementaryStream(data);
   const first = pictures[0];
   if (!first) throw new Error("no MPEG-2 pictures for MP4 timeline");
@@ -103,7 +106,7 @@ export function mpeg2VideoTimeline(data: Uint8Array): Mpeg2VideoTimeline {
   const denominator = baseRate[1] * (first.sequenceExt.frameRateExtensionD + 1);
   const sampleDuration = Math.round((TIMESCALE * denominator) / numerator);
 
-  let references = 0;
+  let references = options.hasReferences ? 2 : 0;
   let gopBase = 0;
   let seenPicture = false;
   let maxTrInGop = 0;
@@ -273,25 +276,26 @@ function lengthPrefixed(nal: Uint8Array): Uint8Array {
 
 function makeMediaSegment(
   samples: Uint8Array[],
-  duration: number,
-  presentation: number[],
+  durations: number[],
+  compositions: number[],
+  sequenceNumber = 1,
+  baseDecodeTime = 0,
 ) {
   const payloads = samples.map(lengthPrefixed);
   const entries: Uint8Array[] = [];
   for (let i = 0; i < samples.length; i++) {
     const sync = (samples[i]![0]! & 0x1f) === 5;
-    const composition = (presentation[i]! - i) * duration;
     entries.push(
-      u32(duration),
+      u32(durations[i]!),
       u32(payloads[i]!.length),
       u32(sync ? 0x02000000 : 0x01010000),
-      u32(composition),
+      u32(compositions[i]!),
     );
   }
   const makeMoof = (dataOffset: number) => {
-    const mfhd = fullBox("mfhd", 0, 0, u32(1));
+    const mfhd = fullBox("mfhd", 0, 0, u32(sequenceNumber));
     const tfhd = fullBox("tfhd", 0, 0x020000, u32(1));
-    const tfdt = fullBox("tfdt", 0, 0, u32(0));
+    const tfdt = fullBox("tfdt", 0, 0, u32(baseDecodeTime));
     const trun = fullBox(
       "trun",
       1,
@@ -340,10 +344,81 @@ export function h264ToFmp4(
     initSegment: makeInitSegment(timeline.width, timeline.height, sps, pps),
     mediaSegment: makeMediaSegment(
       samples,
-      timeline.sampleDuration,
-      presentation,
+      samples.map(() => timeline.sampleDuration),
+      presentation.map(
+        (value, index) => (value - index) * timeline.sampleDuration,
+      ),
     ),
     mimeCodec: `video/mp4; codecs="avc1.${codec}"`,
     sampleCount: samples.length,
+  };
+}
+
+export interface Fmp4FragmentOutput extends Fmp4Output {
+  /** Decode timeline consumed by content pictures; the zero-duration grey IDR is excluded. */
+  duration: number;
+}
+
+/** Package one independently transcoded GOP for incremental MSE appending. */
+export function h264GopToFmp4(
+  h264: Uint8Array,
+  timeline: Mpeg2VideoTimeline,
+  sequenceNumber: number,
+  baseDecodeTime: number,
+  presentationBase = 0,
+): Fmp4FragmentOutput {
+  const nals = splitAnnexB(h264);
+  const sps = nals.find((nal) => (nal[0]! & 0x1f) === 7);
+  const pps = nals.find((nal) => (nal[0]! & 0x1f) === 8);
+  const samples = nals.filter((nal) => {
+    const type = nal[0]! & 0x1f;
+    return type === 1 || type === 5;
+  });
+  const hasGreyIdr = Boolean(sps && pps);
+  const expectedSamples =
+    timeline.presentationIndices.length + (hasGreyIdr ? 1 : 0);
+  if (samples.length !== expectedSamples) {
+    throw new Error("H.264 GOP sample count does not match MPEG-2 timeline");
+  }
+  const contentDurations = timeline.presentationIndices.map(
+    () => timeline.sampleDuration,
+  );
+  const contentCompositions = timeline.presentationIndices.map(
+    (presentationIndex, decodeIndex) => {
+      const desired =
+        (presentationBase + presentationIndex) * timeline.sampleDuration;
+      const decoded =
+        baseDecodeTime +
+        (hasGreyIdr ? timeline.sampleDuration : 0) +
+        decodeIndex * timeline.sampleDuration;
+      return desired - decoded;
+    },
+  );
+  const durations = hasGreyIdr
+    ? [timeline.sampleDuration, ...contentDurations]
+    : contentDurations;
+  const compositions = hasGreyIdr
+    ? [0, ...contentCompositions]
+    : contentCompositions;
+  const codec = sps
+    ? [sps[1]!, sps[2]!, sps[3]!]
+        .map((v) => v.toString(16).padStart(2, "0"))
+        .join("")
+    : "";
+  return {
+    initSegment:
+      sps && pps
+        ? makeInitSegment(timeline.width, timeline.height, sps, pps)
+        : new Uint8Array(0),
+    mediaSegment: makeMediaSegment(
+      samples,
+      durations,
+      compositions,
+      sequenceNumber,
+      baseDecodeTime,
+    ),
+    mimeCodec: codec ? `video/mp4; codecs="avc1.${codec}"` : "",
+    sampleCount: samples.length,
+    duration: durations.reduce((sum, value) => sum + value, 0),
   };
 }
