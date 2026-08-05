@@ -14,6 +14,7 @@
  * reconstructs from, and the basis-shape mismatch that puts a floor under the
  * luma path does not arise here.
  */
+import { COS_PI_OVER_16 } from "./cos-table.ts";
 import { ZIGZAG_4X4 } from "./params.ts";
 import {
   CHROMA_AC_GAIN_4X4,
@@ -28,7 +29,7 @@ const C8 = (() => {
   for (let k = 0; k < 8; k++) {
     const scale = Math.sqrt((k === 0 ? 0.5 : 1) / 4);
     for (let n = 0; n < 8; n++) {
-      m[k * 8 + n] = Math.cos(((2 * n + 1) * k * Math.PI) / 16) * scale;
+      m[k * 8 + n] = COS_PI_OVER_16[(2 * n + 1) * k]! * scale;
     }
   }
   return m;

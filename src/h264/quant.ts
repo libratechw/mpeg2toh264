@@ -6,6 +6,7 @@
  * an H.264 decoder reconstructs live in the same space, so the level is just
  * the target divided by what one unit of level is worth.
  */
+import { COS_PI_OVER_16 } from "./cos-table.ts";
 import { BASE_GAIN_8X8 } from "./quant-tables.ts";
 
 /** How much finer than the source the H.264 quantiser is made. */
@@ -162,7 +163,7 @@ const DCT8_BASIS = (() => {
   for (let y = 0; y < 8; y++) {
     for (let k = 0; k < 8; k++) {
       const scale = k === 0 ? 1 / Math.sqrt(8) : 0.5;
-      basis[y * 8 + k] = scale * Math.cos(((2 * y + 1) * k * Math.PI) / 16);
+      basis[y * 8 + k] = scale * COS_PI_OVER_16[(2 * y + 1) * k]!;
     }
   }
   return basis;
