@@ -45,4 +45,29 @@ describe("MPEG-TS demuxing", () => {
     }
     expect(joined).toEqual(es);
   });
+
+  it("waits for a PES start when the video PID is discovered mid-PES", () => {
+    const es = new Uint8Array(
+      readFileSync(resolve(import.meta.dirname, "fixtures/i_only.m2v")),
+    );
+    const ts = wrapMpeg2EsInTs(es);
+    const packets = Array.from({ length: ts.length / 188 }, (_, index) =>
+      ts.subarray(index * 188, (index + 1) * 188),
+    );
+    expect(packets.length).toBeGreaterThan(3);
+
+    // PAT/PMT followed by a continuation packet models tuning in halfway
+    // through a broadcast PES. A complete PES follows on the repeated TS.
+    const input = new Uint8Array((3 + packets.length - 2) * 188);
+    input.set(packets[0]!, 0);
+    input.set(packets[1]!, 188);
+    input.set(packets[3]!, 376);
+    for (let index = 2; index < packets.length; index++) {
+      input.set(packets[index]!, (index + 1) * 188);
+    }
+
+    const demuxer = new MpegTsVideoDemuxer();
+    const parts = [...demuxer.push(input), ...demuxer.finish()];
+    expect(parts).toEqual([es]);
+  });
 });

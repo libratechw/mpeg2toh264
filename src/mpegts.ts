@@ -141,6 +141,17 @@ function pesPayload(packet: Uint8Array): Uint8Array {
   return packet.subarray(start, end);
 }
 
+function isVideoPesStart(packet: Uint8Array): boolean {
+  return (
+    packet.length >= 4 &&
+    packet[0] === 0 &&
+    packet[1] === 0 &&
+    packet[2] === 1 &&
+    packet[3]! >= 0xe0 &&
+    packet[3]! <= 0xef
+  );
+}
+
 /** Extract the first ISO/IEC 13818-2 video stream advertised by PAT/PMT. */
 export function extractMpeg2VideoEs(data: Uint8Array): Uint8Array {
   const firstPacket = syncOffset(data);
@@ -225,6 +236,7 @@ export class MpegTsVideoDemuxer {
   ]);
   private videoPid = -1;
   private pesParts: Uint8Array[] = [];
+  private collectingPes = false;
 
   push(chunk: Uint8Array): Uint8Array[] {
     const input = concat([this.pending, chunk]);
@@ -245,8 +257,11 @@ export class MpegTsVideoDemuxer {
       if (packet.pid === 0 || this.pmtPids.has(packet.pid))
         this.pushPsi(packet);
       if (packet.pid !== this.videoPid) continue;
-      if (packet.payloadUnitStart) this.flushPes(output);
-      this.pesParts.push(packet.data);
+      if (packet.payloadUnitStart) {
+        this.flushPes(output);
+        this.collectingPes = isVideoPesStart(packet.data);
+      }
+      if (this.collectingPes) this.pesParts.push(packet.data);
     }
     this.pending = input.slice(at);
     return output;
@@ -296,5 +311,6 @@ export class MpegTsVideoDemuxer {
     if (this.pesParts.length === 0) return;
     output.push(pesPayload(concat(this.pesParts)));
     this.pesParts = [];
+    this.collectingPes = false;
   }
 }
