@@ -26,7 +26,7 @@ use crate::error::{bail, Result};
 use crate::h264::bitwriter::{nal_type, to_nal_unit, BitWriter};
 use crate::h264::chroma::{
     chroma_qp, convert_chroma_block, convert_field_chroma_pair, convert_intra_chroma_block,
-    ChromaBlockLevels, FieldChromaScratch, FieldChromaSource,
+    ChromaBlockLevels, FieldChromaScratch, FieldChromaSource, FIELD_SCAN_4X4,
 };
 use crate::h264::intra::{chroma_dc, luma_8x8_dc, CodingOrder, ReconstructedPicture};
 use crate::h264::mb::{
@@ -1316,6 +1316,10 @@ impl IntraState {
     ///
     /// `cbp_chroma` below 2 means the AC levels were never written, whatever
     /// the conversion produced, and 0 means the DC ones were not either.
+    ///
+    /// `scan` is the one the conversion wrote the AC levels in, which is the
+    /// field scan of Table 8-13 for a macroblock of a coded field.
+    #[allow(clippy::too_many_arguments)]
     fn store_chroma(
         &mut self,
         mb_x: usize,
@@ -1324,6 +1328,7 @@ impl IntraState {
         levels: &[ChromaBlockLevels; 2],
         qp_c: i32,
         cbp_chroma: u32,
+        scan: &[usize; 16],
     ) {
         let width = self.picture.chroma_width();
         for c in 0..2 {
@@ -1342,10 +1347,8 @@ impl IntraState {
             for blk in 0..4 {
                 ac.fill(0);
                 if cbp_chroma == 2 {
-                    // Chroma conversion always writes the frame scan, whatever
-                    // the luma blocks use, so this reads it back the same way.
                     for k in 1..16 {
-                        ac[ZIGZAG_4X4[k]] = levels[c].ac[blk][k - 1];
+                        ac[scan[k]] = levels[c].ac[blk][k - 1];
                     }
                 }
                 chroma_residual_4x4(&ac, dc[blk], qp_c, &mut residual);
@@ -1991,6 +1994,11 @@ fn write_picture(
                 &chroma_scratch,
                 chroma_qp(written.qp, CHROMA_QP_OFFSET),
                 written.cbp_chroma,
+                if direct_field_pair {
+                    &FIELD_SCAN_4X4
+                } else {
+                    &ZIGZAG_4X4
+                },
             );
             let end_of_field =
                 direct_field_pair && mb_x == g.mb_width - 1 && field_position == field_size - 1;
