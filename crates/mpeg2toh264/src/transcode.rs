@@ -952,11 +952,10 @@ fn prediction_for_field_picture(
     let (Some(mb), false) = (mb, intra) else {
         return Prediction {
             mb_type: b_mb_type::L0_16X16,
-            ref_idx_l0: if second_reference_field {
-                4
-            } else {
-                layout.flat * 2 + field as i32
-            },
+            // The index the slice header hung the flat weights on, which this
+            // has to name exactly or the macroblock predicts from a picture
+            // instead of from the constant its residual was taken against.
+            ref_idx_l0: layout.flat * 2 - i32::from(second_reference_field),
             ref_idx_l1: -1,
             mv_l0: [0, 0],
             mv_l1: [0, 0],
