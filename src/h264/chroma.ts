@@ -116,10 +116,16 @@ const spatial = new Float64Array(64);
 const dequant = new Float64Array(64);
 const coeff4 = new Float64Array(16);
 
+/** H.264 Table 8-14: 4x4 field scan for field-coded macroblocks. */
+export const FIELD_SCAN_4X4: readonly number[] = [
+  0, 4, 1, 8, 12, 5, 9, 2, 6, 13, 10, 3, 7, 14, 11, 15,
+];
+
 function spatialToChromaLevels(
   samples: Float64Array,
   qpC: number,
   out: ChromaBlockLevels,
+  fieldScan = false,
 ): void {
   const acGain = CHROMA_AC_GAIN_4X4[qpC % 6]!;
   const shift = 2 ** Math.floor(qpC / 6);
@@ -132,7 +138,7 @@ function spatialToChromaLevels(
     dcTarget[b] = coeff4[0]!;
     const acOut = out.ac[b]!;
     for (let k = 1; k < 16; k++) {
-      const pos = ZIGZAG_4X4[k]!;
+      const pos = (fieldScan ? FIELD_SCAN_4X4 : ZIGZAG_4X4)[k]!;
       const gain = acGain[pos >> 2]![pos & 3]! * shift;
       const level = Math.round(coeff4[pos]! / gain);
       acOut[k - 1] = level;
@@ -200,7 +206,7 @@ export function convertInterFieldChromaBlocks(
       fieldSpatial[(y + 4) * 8 + x] = lowerSpatial[(y * 2 + field) * 8 + x]!;
     }
   }
-  spatialToChromaLevels(fieldSpatial, qpC, out);
+  spatialToChromaLevels(fieldSpatial, qpC, out, true);
 }
 
 /**

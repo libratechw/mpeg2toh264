@@ -743,7 +743,7 @@ function writePicture(
           raster[pos] = quant.levelFor(selected[b]![pos]!, qp, pos);
         }
         const out = new Int32Array(64);
-        if (toZigzag8x8(raster, out)) luma[b] = out;
+        if (toZigzag8x8(raster, out, true)) luma[b] = out;
       }
       for (let c = 0; c < 2; c++) {
         clearChromaBlockLevels(chromaScratch[c]!);

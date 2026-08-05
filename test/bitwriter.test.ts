@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BitWriter, toNalUnit } from "../src/h264/bitwriter.ts";
-import { b16x8MbType } from "../src/h264/mb.ts";
+import { b16x8MbType, FIELD_SCAN_8X8, toZigzag8x8 } from "../src/h264/mb.ts";
 
 /** Render everything written so far as a bit string, for comparing with the spec. */
 function bits(w: BitWriter): string {
@@ -21,6 +21,18 @@ function rawBytes(w: BitWriter): Uint8Array {
   void copy;
   return b;
 }
+
+describe("field coefficient scan", () => {
+  it("serialises 8x8 raster coefficients in field-scan order", () => {
+    const raster = Int32Array.from({ length: 64 }, (_, i) => i + 1);
+    const out = new Int32Array(64);
+
+    expect(toZigzag8x8(raster, out, true)).toBe(true);
+    expect(Array.from(out)).toEqual(
+      FIELD_SCAN_8X8.map((position) => position + 1),
+    );
+  });
+});
 
 describe("Exp-Golomb coding", () => {
   // Canonical codeword table from H.264 clause 9.1.

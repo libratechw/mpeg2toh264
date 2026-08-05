@@ -13,6 +13,14 @@ import { writeResidualBlock } from "./cavlc.ts";
 import type { ChromaBlockLevels } from "./chroma.ts";
 import { ZIGZAG_8X8 } from "./params.ts";
 
+/** H.264 Table 8-14: 8x8 field scan for field-coded macroblocks. */
+export const FIELD_SCAN_8X8: readonly number[] = [
+  0, 8, 16, 1, 9, 24, 32, 17, 2, 10, 25, 40, 48, 33, 18, 3, 11, 26, 41, 56, 49,
+  34, 19, 4, 12, 27, 42, 57, 50, 35, 20, 5, 13, 28, 43, 58, 51, 36, 21, 6, 14,
+  29, 44, 59, 52, 37, 22, 7, 15, 30, 45, 60, 53, 38, 23, 31, 46, 61, 54, 39, 47,
+  62, 55, 63,
+];
+
 /**
  * B slice macroblock types for a single 16x16 partition (Table 7-14).
  *
@@ -376,10 +384,12 @@ function writeLumaResidual8x8(
 export function toZigzag8x8(
   raster: Float64Array | Int32Array,
   out: Int32Array,
+  fieldScan = false,
 ): boolean {
   let any = false;
+  const scan = fieldScan ? FIELD_SCAN_8X8 : ZIGZAG_8X8;
   for (let k = 0; k < 64; k++) {
-    const v = raster[ZIGZAG_8X8[k]!]!;
+    const v = raster[scan[k]!]!;
     out[k] = v;
     if (v !== 0) any = true;
   }
