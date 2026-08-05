@@ -48,6 +48,16 @@ const TICKS_PER_SECOND = 90_000;
  */
 const MINIMUM_SEEK_TAIL_BYTES = 1 << 20;
 
+/**
+ * The most input handed to one synchronous WASM call.
+ *
+ * Fetch normally yields modest chunks, but the Streams API does not promise
+ * an upper bound and Safari may hand a buffered response over in one very
+ * large read. `Session.push` is synchronous, so splitting here keeps one read
+ * from occupying the worker (and copying into WASM) all at once.
+ */
+const MAX_TRANSCODE_CHUNK_BYTES = 1 << 20;
+
 /** The PES timestamp field is 33 bits, so distances along it are modular. */
 const PTS_MODULUS = 2 ** 33;
 
@@ -503,20 +513,41 @@ class Playback {
       if (read++ === 0) mark(id, "first-byte");
       bytesRead += result.value.byteLength;
       post({ type: "progress", id, bytesRead, totalBytes: this.#totalBytes });
-      const fragments = converter.push(result.value);
-      this.#announceServices(id, converter);
-      if (!converted && fragments.length > 0) {
-        converted = true;
-        mark(id, "first-fragment");
-        // Where the leg actually opened, which is a better sample of the file
-        // than the probe that aimed it: this is the group of pictures the
-        // conversion begins at, not the byte the search stopped on.
-        const first = fragments.find((fragment) => fragment.kind === "media");
-        if (first) this.#record({ byte: source.offset, seconds: first.start });
+      for (
+        let at = 0;
+        at < result.value.byteLength;
+        at += MAX_TRANSCODE_CHUNK_BYTES
+      ) {
+        // The first slice already passed the gate before reader.read(). Large
+        // reads pass it again between slices so messages, MSE appends, aborts,
+        // and playback can run instead of waiting for the whole read.
+        if (at > 0) {
+          const sliceWaitStarted = performance.now();
+          await breathe();
+          await this.#sink.ready();
+          this.#waitingMs += performance.now() - sliceWaitStarted;
+          if (!this.#running(leg)) return;
+        }
+        const chunk = result.value.subarray(
+          at,
+          Math.min(at + MAX_TRANSCODE_CHUNK_BYTES, result.value.byteLength),
+        );
+        const fragments = converter.push(chunk);
+        this.#announceServices(id, converter);
+        if (!converted && fragments.length > 0) {
+          converted = true;
+          mark(id, "first-fragment");
+          // Where the leg actually opened, which is a better sample of the file
+          // than the probe that aimed it: this is the group of pictures the
+          // conversion begins at, not the byte the search stopped on.
+          const first = fragments.find((fragment) => fragment.kind === "media");
+          if (first)
+            this.#record({ byte: source.offset, seconds: first.start });
+        }
+        if (!(await this.#deliver(leg, fragments))) return;
+        this.#place(converter);
+        this.#report(converter);
       }
-      if (!(await this.#deliver(leg, fragments))) return;
-      this.#place(converter);
-      this.#report(converter);
     }
     if (!(await this.#deliver(leg, converter.finish()))) return;
     this.#place(converter);
