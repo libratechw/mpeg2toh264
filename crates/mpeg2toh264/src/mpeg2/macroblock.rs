@@ -443,14 +443,17 @@ pub fn decode_slice(
     let mut address = (slice.vertical_position as isize - 1) * mb_width as isize - 1;
 
     // Clause 6.2.4: macroblocks continue until 23 zero bits appear at the
-    // current position. Testing here rather than seeking to a byte-aligned start
-    // code is what makes trailing stuffing bits and zero stuffing bytes work out.
-    while r.peek(23) != 0 {
+    // current position. decode_or_zero_stuffing folds that check into the first
+    // address VLC lookup, avoiding two reads from every normal boundary.
+    loop {
         let mut increment = 0i32;
+        let Some(mut sym) = V_MB_ADDR.decode_or_zero_stuffing(r)? else {
+            break;
+        };
         loop {
-            let sym = V_MB_ADDR.decode(r)?;
             if sym == MB_ADDR_ESCAPE {
                 increment += 33;
+                sym = V_MB_ADDR.decode(r)?;
                 continue;
             }
             increment += sym;
