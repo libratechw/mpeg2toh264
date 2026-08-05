@@ -5,3 +5,6 @@ node_modules/
 # generator actually reads, and that file *is* tracked so the build reproduces
 # without needing the PDFs.
 *.pdf
+
+# Per-machine Claude Code permissions, not shared state.
+.claude/settings.local.json
