@@ -208,3 +208,61 @@ export function fieldDctToFrameTargets(
     }
   }
 }
+
+/**
+ * Inverse of fieldDctToFrameTargets. This is needed when an MBAFF macroblock
+ * pair must be field-coded because either source macroblock uses field motion:
+ * frame-DCT neighbours in the same pair then have to be expressed in the field
+ * transform basis as well.
+ */
+export function frameDctToFieldTargets(
+  upper: Float64Array,
+  lower: Float64Array,
+  firstField: Float64Array,
+  secondField: Float64Array,
+): void {
+  const samples = new Float64Array(16);
+  const scale = (k: number) => (k === 0 ? 1 / Math.sqrt(8) : 0.5);
+
+  for (
+    let horizontalFrequency = 0;
+    horizontalFrequency < 8;
+    horizontalFrequency++
+  ) {
+    for (let half = 0; half < 2; half++) {
+      const input = half === 0 ? upper : lower;
+      for (let y = 0; y < 8; y++) {
+        let sample = 0;
+        for (
+          let verticalFrequency = 0;
+          verticalFrequency < 8;
+          verticalFrequency++
+        ) {
+          sample +=
+            scale(verticalFrequency) *
+            Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16) *
+            input[verticalFrequency * 8 + horizontalFrequency]!;
+        }
+        samples[half * 8 + y] = sample;
+      }
+    }
+
+    for (let field = 0; field < 2; field++) {
+      const out = field === 0 ? firstField : secondField;
+      for (
+        let verticalFrequency = 0;
+        verticalFrequency < 8;
+        verticalFrequency++
+      ) {
+        let coefficient = 0;
+        for (let y = 0; y < 8; y++) {
+          coefficient +=
+            samples[y * 2 + field]! *
+            scale(verticalFrequency) *
+            Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16);
+        }
+        out[verticalFrequency * 8 + horizontalFrequency] = coefficient;
+      }
+    }
+  }
+}

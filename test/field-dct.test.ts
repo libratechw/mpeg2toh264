@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { fieldDctToFrameTargets } from "../src/h264/quant.ts";
+import {
+  fieldDctToFrameTargets,
+  frameDctToFieldTargets,
+} from "../src/h264/quant.ts";
 
 describe("fieldDctToFrameTargets", () => {
   it("keeps a constant residual constant in both frame blocks", () => {
@@ -40,5 +43,28 @@ describe("fieldDctToFrameTargets", () => {
       energy(first) + energy(second),
       8,
     );
+  });
+
+  it("round-trips between field and frame transform bases", () => {
+    const first = Float64Array.from(
+      { length: 64 },
+      (_, i) => ((i * 37) % 29) - 14,
+    );
+    const second = Float64Array.from(
+      { length: 64 },
+      (_, i) => ((i * 19) % 31) - 15,
+    );
+    const upper = new Float64Array(64);
+    const lower = new Float64Array(64);
+    const firstAgain = new Float64Array(64);
+    const secondAgain = new Float64Array(64);
+
+    fieldDctToFrameTargets(first, second, upper, lower);
+    frameDctToFieldTargets(upper, lower, firstAgain, secondAgain);
+
+    for (let i = 0; i < 64; i++) {
+      expect(firstAgain[i]).toBeCloseTo(first[i]!, 9);
+      expect(secondAgain[i]).toBeCloseTo(second[i]!, 9);
+    }
   });
 });
