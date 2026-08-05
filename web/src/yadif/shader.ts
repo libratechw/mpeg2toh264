@@ -45,7 +45,6 @@ export const YADIF_UNIFORMS = {
   parity: "uParity",
   tff: "uTff",
   spatialCheck: "uSpatialCheck",
-  temporal: "uTemporal",
 } as const;
 
 /**
@@ -57,15 +56,13 @@ export const YADIF_UNIFORMS = {
  * is the same one three times over; every comparison below is per channel,
  * which is what the `mix` by a `lessThan` mask is doing.
  *
- * One thing here is not in the reference: `uTemporal`. The reference is never
- * without a frame either side of the one it is filtering, because it holds
- * frames back until it has them. A player driven by the frames the browser
- * presents has no such luxury at the start of a stream and after a seek, and
- * with the neighbours it lacks replaced by copies of the current frame the
- * temporal check would clamp the answer back onto the woven line -- that is,
- * to no deinterlacing at all. `uTemporal` false takes the spatial prediction
- * as it stands instead, which is the best that can be said about a frame with
- * nothing to compare it to.
+ * The reference is never without a frame either side of the one it is
+ * filtering: it holds frames back until it has them, and where its input ends
+ * it duplicates rather than doing without. A caller here is expected to do the
+ * same. A frame standing in as its own neighbour leaves the temporal check
+ * nothing to measure, and what comes back is then the picture as it was --
+ * except where it alternates strongly from line to line, which is what combing
+ * is, and which is where the spatial check lets the interpolation through.
  */
 export const YADIF_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
@@ -82,8 +79,6 @@ uniform int uParity;
 uniform int uTff;
 /** Whether the temporal bound is widened by the local vertical range. */
 uniform bool uSpatialCheck;
-/** Whether the neighbouring frames are real. See YADIF_UNIFORMS. */
-uniform bool uTemporal;
 
 out vec4 fragColor;
 
@@ -200,7 +195,6 @@ vec3 filterPixel(sampler2D prev2, sampler2D next2, int x, int y) {
   bool interior = x >= 3 && x + 3 < uSize.x;
   vec3 spatialPred = interior ? spatialPredictor(a, b, c, d, e, f, g, h, i, j, k, l, m, n)
                               : (d + k) * 0.5;
-  if (!uTemporal) return spatialPred;
 
   vec3 A = fetch(uPrev, x, y - 1);
   vec3 B = fetch(uPrev, x, y + 1);
