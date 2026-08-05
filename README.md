@@ -9,7 +9,7 @@ npm install
 npm run web:dev
 ```
 
-表示されたURLを開き、MPEG-2映像を含む188-byte MPEG-TSファイルを選択します。処理はブラウザ内のWeb Workerで行われます。
+表示されたURLを開き、MPEG-2映像を含む188-byte MPEG-TSファイル（`.ts`または`.m2ts`など）を選択します。処理はブラウザ内のWeb Workerで行われます。
 
 1. `File.slice()`でTSを1 MiBずつ読み、PAT/PMTとPESを状態付きで逐次解析
 2. GOP単位でMPEG-2映像をAnnex B H.264へ変換
