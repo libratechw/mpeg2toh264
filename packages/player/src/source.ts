@@ -18,6 +18,10 @@ export interface Source {
   totalBytes: number | null;
   /** Where in the input this stream begins. */
   offset: number;
+  /** Whether this response says a later byte can be opened on its own. */
+  resumable: boolean;
+  /** Abort this particular request and release its link to the load signal. */
+  close(): void;
 }
 
 /** The end of a file, when the server was willing to serve just the end. */
@@ -39,11 +43,32 @@ export async function openSource(
   signal: AbortSignal,
   offset = 0,
 ): Promise<Source> {
-  const headers = offset > 0 ? { Range: `bytes=${offset}-` } : undefined;
+  // Ask from zero too: a 206 proves this response can be cancelled at an
+  // input high-water mark and resumed later without trusting Accept-Ranges.
+  const headers = { Range: `bytes=${offset}-` };
+  // A leg outlives each individual range. Give the request its own controller
+  // so reaching the input high-water mark stops fetch itself, not merely the
+  // JavaScript reader layered over it.
+  const request = new AbortController();
+  const abortRequest = (): void => request.abort(signal.reason);
+  if (signal.aborted) abortRequest();
+  else signal.addEventListener("abort", abortRequest, { once: true });
+  let closed = false;
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    signal.removeEventListener("abort", abortRequest);
+    request.abort();
+  };
   let response: Response;
   try {
-    response = await fetch(url, { signal, headers });
+    response = await fetch(url, {
+      signal: request.signal,
+      headers,
+      cache: "no-store",
+    });
   } catch (error) {
+    signal.removeEventListener("abort", abortRequest);
     if (signal.aborted) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(
@@ -51,18 +76,24 @@ export async function openSource(
     );
   }
   if (!response.ok) {
+    close();
     throw new Error(
       `could not fetch the input: HTTP ${response.status} ${response.statusText}`,
     );
   }
-  if (!response.body)
+  if (!response.body) {
+    close();
     throw new Error("the response cannot be read as a stream");
+  }
   const range = contentRange(response);
-  if (offset > 0 && (response.status !== 206 || range?.start !== offset)) {
+  if (
+    (response.status === 206 && range?.start !== offset) ||
+    (offset > 0 && response.status !== 206)
+  ) {
     // Seeking was offered on the strength of an earlier range request, so
     // anything but the bytes asked for is the server changing its mind.
     // Playing what came instead would play the wrong part of the file.
-    await response.body.cancel();
+    close();
     throw new Error(
       `the server would not serve the byte range asked for (HTTP ${response.status})`,
     );
@@ -71,7 +102,8 @@ export async function openSource(
   const totalBytes =
     range?.totalBytes ??
     (Number.isFinite(length) && length > 0 ? length : null);
-  return { stream: response.body, totalBytes, offset };
+  const resumable = response.status === 206;
+  return { stream: response.body, totalBytes, offset, resumable, close };
 }
 
 /**

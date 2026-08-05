@@ -58,6 +58,12 @@ const MINIMUM_SEEK_TAIL_BYTES = 1 << 20;
  */
 const MAX_TRANSCODE_CHUNK_BYTES = 1 << 20;
 
+/** Stop one response once this much unconverted transport stream is queued. */
+const INPUT_QUEUE_HIGH_WATER_BYTES = 32 << 20;
+
+/** Open the next byte range after the input queue drains this far. */
+const INPUT_QUEUE_LOW_WATER_BYTES = 8 << 20;
+
 /** The PES timestamp field is 33 bits, so distances along it are modular. */
 const PTS_MODULUS = 2 ** 33;
 
@@ -491,64 +497,142 @@ class Playback {
     converter: Transcoder,
   ): Promise<void> {
     const id = this.#command.id;
-    const reader = source.stream.getReader();
-    let bytesRead = source.offset;
-    let read = 0;
+    const chunks: Uint8Array[] = [];
+    const available = new ReadyGate();
+    const refill = new ReadyGate();
+    available.set(false);
+    let queuedBytes = 0;
+    let nextByte = source.offset;
+    let response: Source | null = source;
+    let ended = false;
+    let readError: unknown = null;
+    let firstRead = true;
     let converted = false;
+
+    // Pull independently of conversion. Firefox may continue buffering a
+    // response whose reader is idle, so a seekable response is cancelled at
+    // the high-water mark and reopened at the exact next byte after the queue
+    // has drained below the low-water mark.
+    const reading = (async (): Promise<void> => {
+      try {
+        while (this.#running(leg)) {
+          if (queuedBytes >= INPUT_QUEUE_HIGH_WATER_BYTES) {
+            refill.set(false);
+            await refill.wait();
+            if (!this.#running(leg)) return;
+          }
+          if (!response) {
+            response = await openSource(
+              this.#command.url,
+              this.#leg!.signal,
+              nextByte,
+            );
+            if (!this.#running(leg)) return;
+          }
+          const reader = response.stream.getReader();
+          let reopen = false;
+          for (;;) {
+            const readStarted = performance.now();
+            const result = await reader.read();
+            this.#readingMs += performance.now() - readStarted;
+            if (!this.#running(leg)) return;
+            if (result.done) {
+              response.close();
+              ended = true;
+              available.set(true);
+              return;
+            }
+            if (firstRead) {
+              firstRead = false;
+              mark(id, "first-byte");
+            }
+            // Keep the whole read even when it crosses the high-water mark.
+            // The browser has already received and allocated these bytes;
+            // throwing the excess away would only download it again after the
+            // next Range request. The mark controls whether another read is
+            // made, so the queue is bounded by the mark plus one browser read.
+            for (
+              let at = 0;
+              at < result.value.byteLength;
+              at += MAX_TRANSCODE_CHUNK_BYTES
+            ) {
+              chunks.push(
+                result.value.subarray(
+                  at,
+                  Math.min(
+                    at + MAX_TRANSCODE_CHUNK_BYTES,
+                    result.value.byteLength,
+                  ),
+                ),
+              );
+            }
+            queuedBytes += result.value.byteLength;
+            nextByte += result.value.byteLength;
+            post({
+              type: "progress",
+              id,
+              bytesRead: nextByte,
+              totalBytes: this.#totalBytes,
+            });
+            available.set(true);
+            if (queuedBytes >= INPUT_QUEUE_HIGH_WATER_BYTES) {
+              // Close the gate before cancel yields, otherwise the consumer
+              // can drain and signal a gate that is subsequently closed.
+              refill.set(false);
+              if (response.resumable) {
+                response.close();
+                response = null;
+                reopen = true;
+              } else reader.releaseLock();
+              break;
+            }
+          }
+          await refill.wait();
+          if (!this.#running(leg)) return;
+          if (!reopen) continue;
+        }
+      } catch (error) {
+        if (this.#running(leg) && !this.#leg!.signal.aborted) readError = error;
+      } finally {
+        ended = true;
+        available.abandon();
+        refill.abandon();
+      }
+    })();
+
     for (;;) {
-      // What the loop is doing when it is not converting: letting the events
-      // it depends on through, waiting for the sink to take more, and waiting
-      // for the input to arrive. Reported with the conversion time so that one
-      // line accounts for all of the wall clock.
+      if (chunks.length === 0) {
+        if (ended) break;
+        await available.wait();
+        if (!this.#running(leg)) return;
+        continue;
+      }
       const waitStarted = performance.now();
       await breathe();
       await this.#sink.ready();
       this.#waitingMs += performance.now() - waitStarted;
       if (!this.#running(leg)) return;
-      const readStarted = performance.now();
-      const result = await reader.read();
-      this.#readingMs += performance.now() - readStarted;
-      if (!this.#running(leg)) return;
-      if (result.done) break;
-      if (read++ === 0) mark(id, "first-byte");
-      bytesRead += result.value.byteLength;
-      post({ type: "progress", id, bytesRead, totalBytes: this.#totalBytes });
-      for (
-        let at = 0;
-        at < result.value.byteLength;
-        at += MAX_TRANSCODE_CHUNK_BYTES
-      ) {
-        // The first slice already passed the gate before reader.read(). Large
-        // reads pass it again between slices so messages, MSE appends, aborts,
-        // and playback can run instead of waiting for the whole read.
-        if (at > 0) {
-          const sliceWaitStarted = performance.now();
-          await breathe();
-          await this.#sink.ready();
-          this.#waitingMs += performance.now() - sliceWaitStarted;
-          if (!this.#running(leg)) return;
-        }
-        const chunk = result.value.subarray(
-          at,
-          Math.min(at + MAX_TRANSCODE_CHUNK_BYTES, result.value.byteLength),
-        );
-        const fragments = converter.push(chunk);
-        this.#announceServices(id, converter);
-        if (!converted && fragments.length > 0) {
-          converted = true;
-          mark(id, "first-fragment");
-          // Where the leg actually opened, which is a better sample of the file
-          // than the probe that aimed it: this is the group of pictures the
-          // conversion begins at, not the byte the search stopped on.
-          const first = fragments.find((fragment) => fragment.kind === "media");
-          if (first)
-            this.#record({ byte: source.offset, seconds: first.start });
-        }
-        if (!(await this.#deliver(leg, fragments))) return;
-        this.#place(converter);
-        this.#report(converter);
+      const chunk = chunks.shift()!;
+      queuedBytes -= chunk.byteLength;
+      available.set(chunks.length > 0 || ended);
+      if (queuedBytes <= INPUT_QUEUE_LOW_WATER_BYTES) refill.set(true);
+      const fragments = converter.push(chunk);
+      this.#announceServices(id, converter);
+      if (!converted && fragments.length > 0) {
+        converted = true;
+        mark(id, "first-fragment");
+        // Where the leg actually opened, which is a better sample of the file
+        // than the probe that aimed it: this is the group of pictures the
+        // conversion begins at, not the byte the search stopped on.
+        const first = fragments.find((fragment) => fragment.kind === "media");
+        if (first) this.#record({ byte: source.offset, seconds: first.start });
       }
+      if (!(await this.#deliver(leg, fragments))) return;
+      this.#place(converter);
+      this.#report(converter);
     }
+    await reading;
+    if (readError) throw readError;
     if (!(await this.#deliver(leg, converter.finish()))) return;
     this.#place(converter);
     this.#report(converter);
