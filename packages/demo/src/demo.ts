@@ -28,6 +28,8 @@ const time = document.querySelector<HTMLElement>("#time")!;
 const volume = document.querySelector<HTMLInputElement>("#volume")!;
 const mute = document.querySelector<HTMLButtonElement>("#mute")!;
 const rate = document.querySelector<HTMLSelectElement>("#rate")!;
+const captionToggle =
+  document.querySelector<HTMLButtonElement>("#caption-toggle")!;
 const stage = document.querySelector<HTMLElement>("#stage")!;
 const fullscreen = document.querySelector<HTMLButtonElement>("#fullscreen")!;
 const service = document.querySelector<HTMLSelectElement>("#service")!;
@@ -78,7 +80,11 @@ function formatDuration(seconds: number): string {
 
 let player: Mpeg2TsPlayer | null = null;
 let yadif: Deinterlacer | null = null;
-let captions: { destroy(): void } | null = null;
+let captions: {
+  setCaptionEnabled(enabled: boolean): void;
+  destroy(): void;
+} | null = null;
+let captionsEnabled = true;
 /** The blob URL for a picked file, revoked when the next source replaces it. */
 let fileUrl: string | null = null;
 let label = "";
@@ -125,6 +131,7 @@ function createPlayer(): Mpeg2TsPlayer {
     },
   });
   captions = createCaptionOverlay(created);
+  captions.setCaptionEnabled(captionsEnabled);
   created.addEventListener("statechange", (event) => {
     const { state } = event.detail;
     if (state === "converting") setStatus(`${STATES.converting}${progress}`);
@@ -211,7 +218,10 @@ function createPlayer(): Mpeg2TsPlayer {
 }
 
 /** Render ARIB captions and character superimpose as SVG over the picture. */
-function createCaptionOverlay(created: Mpeg2TsPlayer): { destroy(): void } {
+function createCaptionOverlay(created: Mpeg2TsPlayer): {
+  setCaptionEnabled(enabled: boolean): void;
+  destroy(): void;
+} {
   const entries = (["Caption", "Superimpose"] as const).map((type) => {
     const feeder = new MPEGTSFeeder({
       recieve: { type },
@@ -223,7 +233,7 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): { destroy(): void } {
     controller.attachFeeder(feeder);
     controller.attachRenderer(renderer);
     controller.attachMedia(video, picture);
-    return { controller, feeder, renderer };
+    return { type, controller, feeder, renderer };
   });
 
   const feed = (
@@ -237,6 +247,11 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): { destroy(): void } {
   created.addEventListener("private_stream_2", feed);
 
   return {
+    setCaptionEnabled(enabled: boolean): void {
+      for (const { type, controller } of entries) {
+        if (type === "Caption") enabled ? controller.show() : controller.hide();
+      }
+    },
     destroy(): void {
       created.removeEventListener("private_stream_1", feed);
       created.removeEventListener("private_stream_2", feed);
@@ -406,6 +421,13 @@ rate.addEventListener(
   "change",
   () => (video.playbackRate = Number(rate.value)),
 );
+
+captionToggle.addEventListener("click", () => {
+  captionsEnabled = !captionsEnabled;
+  captions?.setCaptionEnabled(captionsEnabled);
+  captionToggle.textContent = captionsEnabled ? "字幕を隠す" : "字幕を表示";
+  captionToggle.ariaPressed = String(captionsEnabled);
+});
 
 /**
  * The whole stage goes on the screen, controls and all. The element on its own
