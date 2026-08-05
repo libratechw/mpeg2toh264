@@ -136,22 +136,19 @@ pub fn write_masked_levels(
         return Ok(0);
     }
 
-    // Positions of the non-zero levels, lowest frequency first.
-    let mut positions = [0u8; 16];
-    let mut rest = mask;
-    for slot in positions.iter_mut().take(total_coeff) {
-        *slot = rest.trailing_zeros() as u8;
-        rest &= rest - 1;
-    }
-    let position = |k: usize| positions[k] as usize;
-
     // Trailing ones are the run of +/-1 at the high frequency end, at most three.
     let mut trailing_ones = 0usize;
-    for k in (0..total_coeff).rev() {
-        if trailing_ones >= 3 || levels[position(k)].abs() != 1 {
+    let mut rest = mask;
+    while trailing_ones < 3 {
+        let position = 31 - rest.leading_zeros() as usize;
+        if levels[position].abs() != 1 {
             break;
         }
         trailing_ones += 1;
+        rest ^= 1 << position;
+        if rest == 0 {
+            break;
+        }
     }
 
     let token = COEFF_TOKEN[coeff_token_table_index(n_c)][trailing_ones * 17 + total_coeff];
@@ -161,15 +158,20 @@ pub fn write_masked_levels(
     write_code(w, token);
 
     // Signs of the trailing ones, highest frequency first.
-    for i in 0..trailing_ones {
-        let level = levels[position(total_coeff - 1 - i)];
+    let mut rest = mask;
+    for _ in 0..trailing_ones {
+        let position = 31 - rest.leading_zeros() as usize;
+        let level = levels[position];
         w.flag(level < 0); // 1 means negative
+        rest ^= 1 << position;
     }
 
     // Remaining levels, still highest frequency first.
     let mut suffix_length = u32::from(total_coeff > 10 && trailing_ones < 3);
     for i in trailing_ones..total_coeff {
-        let level = levels[position(total_coeff - 1 - i)];
+        let position = 31 - rest.leading_zeros() as usize;
+        let level = levels[position];
+        rest ^= 1 << position;
         let mut level_code = if level > 0 {
             2 * level - 2
         } else {
@@ -194,17 +196,19 @@ pub fn write_masked_levels(
     // How the zeros are distributed. The count before the lowest frequency
     // non-zero coefficient is implied by what is left over.
     if total_coeff < max_num_coeff {
-        let total_zeros = position(total_coeff - 1) - (total_coeff - 1);
+        let highest = 31 - mask.leading_zeros() as usize;
+        let total_zeros = highest - (total_coeff - 1);
         write_code(
             w,
             total_zeros_code(total_coeff, total_zeros, max_num_coeff)?,
         );
 
         let mut zeros_left = total_zeros;
-        let mut i = 0;
-        while i < total_coeff - 1 && zeros_left > 0 {
-            let hi = position(total_coeff - 1 - i);
-            let lo = position(total_coeff - 2 - i);
+        let mut rest = mask ^ (1 << highest);
+        let mut hi = highest;
+        let mut remaining = total_coeff - 1;
+        while remaining > 0 && zeros_left > 0 {
+            let lo = 31 - rest.leading_zeros() as usize;
             let run_before = hi - lo - 1;
             let table_index = zeros_left.min(7) - 1;
             let Some(code) = RUN_BEFORE[table_index].get(run_before).copied().flatten() else {
@@ -212,7 +216,9 @@ pub fn write_masked_levels(
             };
             write_code(w, code);
             zeros_left -= run_before;
-            i += 1;
+            hi = lo;
+            rest ^= 1 << lo;
+            remaining -= 1;
         }
     }
 
