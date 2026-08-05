@@ -22,13 +22,13 @@ use crate::h264::quant_tables::{CHROMA_AC_GAIN_4X4, CHROMA_DC_GAIN, QPC_FROM_QPI
 use crate::round_half_up_i32;
 
 /// Orthonormal 8-point DCT matrix; MPEG-2 coefficients live in this basis.
-static C8: LazyLock<[f64; 64]> = LazyLock::new(|| {
+static C8: LazyLock<[f32; 64]> = LazyLock::new(|| {
     let mut m = [0.0; 64];
     for k in 0..8 {
-        let norm = if k == 0 { 0.5f64 } else { 1.0 };
+        let norm: f64 = if k == 0 { 0.5 } else { 1.0 };
         let scale = (norm / 4.0).sqrt();
         for n in 0..8 {
-            m[k * 8 + n] = COS_PI_OVER_16[(2 * n + 1) * k] * scale;
+            m[k * 8 + n] = (COS_PI_OVER_16[(2 * n + 1) * k] * scale) as f32;
         }
     }
     m
@@ -43,7 +43,7 @@ pub fn chroma_qp(luma_qp: i32, offset: i32) -> i32 {
 }
 
 /// Inverse 8x8 DCT, orthonormal, into `out` in raster order.
-pub fn idct8(coeff: &[f64; 64], out: &mut [f64; 64], tmp: &mut [f64; 64]) {
+pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
     let c8 = &*C8;
     // Columns first: tmp = C8^T * coeff
     for x in 0..8 {
@@ -69,9 +69,9 @@ pub fn idct8(coeff: &[f64; 64], out: &mut [f64; 64], tmp: &mut [f64; 64]) {
 
 /// H.264's forward 4x4 core transform, `W = Cf * X * Cf^T`, applied to the 4x4
 /// sub-block at (bx, by) of an 8x8 sample block.
-fn forward4x4(block: &[f64; 64], bx: usize, by: usize, out: &mut [f64; 16]) {
+fn forward4x4(block: &[f32; 64], bx: usize, by: usize, out: &mut [f32; 16]) {
     // Cf rows are [1,1,1,1], [2,1,-1,-2], [1,-1,-1,1], [1,-2,2,-1].
-    let mut t = [0.0f64; 16];
+    let mut t = [0.0f32; 16];
     for i in 0..4 {
         let r = (by + i) * 8 + bx;
         let (a, b, c, d) = (block[r], block[r + 1], block[r + 2], block[r + 3]);
@@ -125,22 +125,22 @@ impl ChromaBlockLevels {
 }
 
 fn spatial_to_chroma_levels(
-    samples: &[f64; 64],
+    samples: &[f32; 64],
     qp_c: i32,
     out: &mut ChromaBlockLevels,
     field_scan: bool,
 ) {
     let ac_gain = &CHROMA_AC_GAIN_4X4[(qp_c % 6) as usize];
-    let shift = 2f64.powi(qp_c / 6);
-    let dc_gain = CHROMA_DC_GAIN[(qp_c % 6) as usize] * shift;
+    let shift = 2f32.powi(qp_c / 6);
+    let dc_gain = CHROMA_DC_GAIN[(qp_c % 6) as usize] as f32 * shift;
     let scan: &[usize; 16] = if field_scan {
         &FIELD_SCAN_4X4
     } else {
         &ZIGZAG_4X4
     };
 
-    let mut coeff4 = [0.0f64; 16];
-    let mut dc_target = [0.0f64; 4];
+    let mut coeff4 = [0.0f32; 16];
+    let mut dc_target = [0.0f32; 4];
     out.any_ac = false;
     for b in 0..4 {
         forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, &mut coeff4);
@@ -148,7 +148,7 @@ fn spatial_to_chroma_levels(
         let ac_out = &mut out.ac[b];
         for k in 1..16 {
             let pos = scan[k];
-            let gain = ac_gain[pos >> 2][pos & 3] * shift;
+            let gain = ac_gain[pos >> 2][pos & 3] as f32 * shift;
             let level = round_half_up_i32(coeff4[pos] / gain);
             ac_out[k - 1] = level;
             if level != 0 {
@@ -174,7 +174,7 @@ fn dequant_chroma(
     quantiser_scale: i32,
     intra_dc_precision: u32,
     intra: bool,
-    out: &mut [f64; 64],
+    out: &mut [f32; 64],
 ) {
     let Some(levels) = levels else {
         out.fill(0.0);
@@ -183,14 +183,14 @@ fn dequant_chroma(
     for pos in 0..64 {
         let level = levels[pos] as i64;
         if intra && pos == 0 {
-            out[pos] = ((8 >> intra_dc_precision) as i64 * level) as f64 - FLAT_PREDICTION_DC;
+            out[pos] = ((8 >> intra_dc_precision) as i64 * level) as f32 - FLAT_PREDICTION_DC;
         } else if level == 0 {
             out[pos] = 0.0;
         } else {
             let sign: i64 = if level < 0 { -1 } else { 1 };
             let numerator = if intra { 2 * level } else { 2 * level + sign };
             let scaled = numerator * weight_scale[pos] as i64 * quantiser_scale as i64;
-            out[pos] = (scaled / 32) as f64;
+            out[pos] = (scaled / 32) as f32;
         }
     }
 }
@@ -207,12 +207,12 @@ pub struct FieldChromaSource<'a> {
 /// Reusable buffers for the field-pair conversion, which runs per macroblock
 /// pair and would otherwise allocate six 8x8 blocks each time.
 pub struct FieldChromaScratch {
-    upper_coeff: [f64; 64],
-    lower_coeff: [f64; 64],
-    upper_spatial: [f64; 64],
-    lower_spatial: [f64; 64],
-    field_spatial: [f64; 64],
-    idct_temp: [f64; 64],
+    upper_coeff: [f32; 64],
+    lower_coeff: [f32; 64],
+    upper_spatial: [f32; 64],
+    lower_spatial: [f32; 64],
+    field_spatial: [f32; 64],
+    idct_temp: [f32; 64],
 }
 
 impl Default for FieldChromaScratch {
@@ -300,9 +300,9 @@ pub fn convert_chroma_block(
     out: &mut ChromaBlockLevels,
     intra: bool,
 ) {
-    let mut dequant = [0.0f64; 64];
-    let mut spatial = [0.0f64; 64];
-    let mut tmp = [0.0f64; 64];
+    let mut dequant = [0.0f32; 64];
+    let mut spatial = [0.0f32; 64];
+    let mut tmp = [0.0f32; 64];
 
     dequant_chroma(
         Some(levels),
@@ -332,10 +332,10 @@ mod tests {
 
     #[test]
     fn the_inverse_transform_turns_a_dc_term_into_a_flat_block() {
-        let mut coeff = [0.0f64; 64];
+        let mut coeff = [0.0f32; 64];
         coeff[0] = 8.0 * 100.0; // orthonormal DC of a block of 100s
-        let mut out = [0.0f64; 64];
-        let mut tmp = [0.0f64; 64];
+        let mut out = [0.0f32; 64];
+        let mut tmp = [0.0f32; 64];
         idct8(&coeff, &mut out, &mut tmp);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 100.0).abs() < 1e-9, "sample {i} is {v}");

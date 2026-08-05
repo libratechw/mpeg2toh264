@@ -44,7 +44,11 @@ pub(crate) fn round_half_up(value: f64) -> f64 {
 }
 
 /// [`round_half_up`] straight to an integer, for the quantiser hot paths.
+///
+/// Single precision: the coefficient path works in f32, where a dequantised
+/// MPEG-2 value -- at most about 3.7 million -- is still exact, and twice as
+/// many of them fit in a vector register.
 #[inline]
-pub(crate) fn round_half_up_i32(value: f64) -> i32 {
+pub(crate) fn round_half_up_i32(value: f32) -> i32 {
     (value + 0.5).floor() as i32
 }

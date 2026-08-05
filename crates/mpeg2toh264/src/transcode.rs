@@ -723,8 +723,8 @@ struct FieldTargetSet {
 fn source_field_targets(
     pic: &Picture,
     field_source: &Macroblock,
-    raw: &mut [[f64; 64]; 4],
-    converted: &mut [[f64; 64]; 4],
+    raw: &mut [[f32; 64]; 4],
+    converted: &mut [[f32; 64]; 4],
 ) -> FieldTargetSet {
     let mut active_mask = 0u32;
     if field_source.skipped {
@@ -845,8 +845,8 @@ fn write_picture(
 ) -> Result<Vec<u8>> {
     let mut nal_parts: Vec<Vec<u8>> = Vec::new();
 
-    let mut targets = [[0.0f64; 64]; 4];
-    let mut field_targets = [[0.0f64; 64]; 4];
+    let mut targets = [[0.0f32; 64]; 4];
+    let mut field_targets = [[0.0f32; 64]; 4];
     let mut raster = [0i32; 64];
     let mut luma_scratch = [[0i32; 64]; 4];
     let mut chroma_scratch: [ChromaBlockLevels; 2] =
@@ -882,8 +882,8 @@ fn write_picture(
     let mut cached_pair_targets = [FieldTargetSet::default(); 2];
     let mut cached_pair_qp = PPS_INIT_QP;
     let mut qp_by_scale = [-1i16; 256];
-    let mut pair_raw_targets = [[[0.0f64; 64]; 4]; 2];
-    let mut pair_converted_targets = [[[0.0f64; 64]; 4]; 2];
+    let mut pair_raw_targets = [[[0.0f32; 64]; 4]; 2];
+    let mut pair_converted_targets = [[[0.0f32; 64]; 4]; 2];
     let concealment = PcmMacroblockSamples::grey();
     let oversample = ctx.options.oversample;
 

@@ -36,35 +36,40 @@ impl Default for QuantiserOptions {
 /// QP. Small enough to build eagerly: 52 QPs by 64 positions.
 pub struct Quantiser8x8 {
     /// Indexed by `qp * 64 + position`, in raster order.
-    gain: Vec<f64>,
-    weight_scale: [i32; 64],
+    gain: Vec<f32>,
+    /// Mean of `gain / weight_scale` over the positions, per QP, kept in double
+    /// precision: [`Self::choose_qp`] compares QPs whose steps are 12% apart and
+    /// runs once per quantiser scale, so it has no reason to narrow.
+    mean_ratio: [f64; 52],
 }
 
 impl Quantiser8x8 {
     pub fn new(weight_scale: &[i32; 64]) -> Self {
-        let mut gain = vec![0.0; 52 * 64];
+        let mut gain = vec![0.0f32; 52 * 64];
+        let mut mean_ratio = [0.0f64; 52];
         for qp in 0..52usize {
             let plane = &BASE_GAIN_8X8[qp % 6];
             let shift = 2f64.powi(qp as i32 / 6);
+            let mut mean = 0.0;
             for pos in 0..64 {
-                gain[qp * 64 + pos] = plane[pos >> 3][pos & 7] * weight_scale[pos] as f64 * shift;
+                let g = plane[pos >> 3][pos & 7] * weight_scale[pos] as f64 * shift;
+                gain[qp * 64 + pos] = g as f32;
+                mean += g / weight_scale[pos] as f64;
             }
+            mean_ratio[qp] = mean / 64.0;
         }
-        Self {
-            gain,
-            weight_scale: *weight_scale,
-        }
+        Self { gain, mean_ratio }
     }
 
     /// Orthonormal-DCT value reconstructed per unit of coefficient level.
     #[inline]
-    pub fn gain_at(&self, qp: i32, pos: usize) -> f64 {
+    pub fn gain_at(&self, qp: i32, pos: usize) -> f32 {
         self.gain[qp as usize * 64 + pos]
     }
 
     /// The level whose reconstruction lands closest to `target`.
     #[inline]
-    pub fn level_for(&self, target: f64, qp: i32, pos: usize) -> i32 {
+    pub fn level_for(&self, target: f32, qp: i32, pos: usize) -> i32 {
         round_half_up_i32(target / self.gain[qp as usize * 64 + pos])
     }
 
@@ -73,9 +78,9 @@ impl Quantiser8x8 {
     /// multiplying by a precomputed reciprocal instead is under 2% faster and
     /// no longer reproduces the same levels.
     #[inline]
-    pub fn levels_for(&self, targets: &[f64; 64], qp: i32, out: &mut [i32; 64]) {
+    pub fn levels_for(&self, targets: &[f32; 64], qp: i32, out: &mut [i32; 64]) {
         let base = qp as usize * 64;
-        let gains: &[f64; 64] = self.gain[base..base + 64].try_into().expect("64 gains");
+        let gains: &[f32; 64] = self.gain[base..base + 64].try_into().expect("64 gains");
         for pos in 0..64 {
             out[pos] = round_half_up_i32(targets[pos] / gains[pos]);
         }
@@ -94,12 +99,7 @@ impl Quantiser8x8 {
         let mut best_err = f64::INFINITY;
         for qp in 0..52usize {
             // Compare using the mean over positions, since the spread is only ~2.7%.
-            let mut mean = 0.0;
-            for pos in 0..64 {
-                mean += self.gain[qp * 64 + pos] / self.weight_scale[pos] as f64;
-            }
-            mean /= 64.0;
-            let err = (mean / target_ratio).ln().abs();
+            let err = (self.mean_ratio[qp] / target_ratio).ln().abs();
             if err < best_err {
                 best_err = err;
                 best_qp = qp as i32;
@@ -121,7 +121,7 @@ pub const FLAT_PREDICTION: i32 = 127;
 /// macroblocks are coded as a residual against that flat prediction, so this
 /// comes off their DC coefficient and nothing else changes: a constant offset
 /// touches no AC term.
-pub const FLAT_PREDICTION_DC: f64 = 8.0 * FLAT_PREDICTION as f64;
+pub const FLAT_PREDICTION_DC: f32 = 8.0 * FLAT_PREDICTION as f32;
 
 /// MPEG-2 dequantisation of an intra block, clause 7.4.1 and 7.4.2.1, minus the
 /// flat prediction. The result is what the H.264 residual has to reconstruct.
@@ -133,17 +133,17 @@ pub fn intra_targets(
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
     intra_dc_precision: u32,
-    out: &mut [f64; 64],
+    out: &mut [f32; 64],
 ) {
-    let intra_dc_mult = (8 >> intra_dc_precision) as i32;
-    out[0] = (intra_dc_mult * levels[0] as i32) as f64 - FLAT_PREDICTION_DC;
+    let intra_dc_mult: i32 = 8 >> intra_dc_precision;
+    out[0] = (intra_dc_mult * levels[0] as i32) as f32 - FLAT_PREDICTION_DC;
     // A level of zero gives zero through the same arithmetic, so there is no
     // branch to keep the compiler from taking these four at a time. The
     // products stay well inside 32 bits: the widest is 2 * 2048 * 255 * 112.
     for pos in 1..64 {
         let level = levels[pos] as i32;
         // The division truncates toward zero, matching what a decoder computes.
-        out[pos] = ((2 * level * weight_scale[pos] * quantiser_scale) / 32) as f64;
+        out[pos] = ((2 * level * weight_scale[pos] * quantiser_scale) / 32) as f32;
     }
 }
 
@@ -154,24 +154,24 @@ pub fn inter_targets(
     levels: &[i16; 64],
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
-    out: &mut [f64; 64],
+    out: &mut [f32; 64],
 ) {
     // signum is zero at zero, which is exactly what a zero level has to
     // dequantise to, so this needs no branch and can go four at a time.
     for pos in 0..64 {
         let level = levels[pos] as i32;
         out[pos] =
-            (((2 * level + level.signum()) * weight_scale[pos] * quantiser_scale) / 32) as f64;
+            (((2 * level + level.signum()) * weight_scale[pos] * quantiser_scale) / 32) as f32;
     }
 }
 
 /// Orthonormal 8-point DCT basis, indexed by sample then frequency.
-static DCT8_BASIS: LazyLock<[f64; 64]> = LazyLock::new(|| {
+static DCT8_BASIS: LazyLock<[f32; 64]> = LazyLock::new(|| {
     let mut basis = [0.0; 64];
     for y in 0..8 {
         for k in 0..8 {
-            let scale = if k == 0 { 1.0 / 8f64.sqrt() } else { 0.5 };
-            basis[y * 8 + k] = scale * COS_PI_OVER_16[(2 * y + 1) * k];
+            let scale: f64 = if k == 0 { 1.0 / 8f64.sqrt() } else { 0.5 };
+            basis[y * 8 + k] = (scale * COS_PI_OVER_16[(2 * y + 1) * k]) as f32;
         }
     }
     basis
@@ -186,13 +186,13 @@ static DCT8_BASIS: LazyLock<[f64; 64]> = LazyLock::new(|| {
 /// multiplied by the orthonormal DCT basis. `first_field` supplies lines
 /// 0,2,...,14 and `second_field` lines 1,3,...,15.
 pub fn field_dct_to_frame_targets(
-    first_field: &[f64; 64],
-    second_field: &[f64; 64],
-    upper: &mut [f64; 64],
-    lower: &mut [f64; 64],
+    first_field: &[f32; 64],
+    second_field: &[f32; 64],
+    upper: &mut [f32; 64],
+    lower: &mut [f32; 64],
 ) {
     let dct = &*DCT8_BASIS;
-    let mut samples = [0.0f64; 16];
+    let mut samples = [0.0f32; 16];
 
     for horizontal_frequency in 0..8 {
         for y in 0..8 {
@@ -209,7 +209,7 @@ pub fn field_dct_to_frame_targets(
         }
 
         for half in 0..2 {
-            let out: &mut [f64; 64] = if half == 0 { upper } else { lower };
+            let out: &mut [f32; 64] = if half == 0 { upper } else { lower };
             for vertical_frequency in 0..8 {
                 let mut coefficient = 0.0;
                 for y in 0..8 {
@@ -226,17 +226,17 @@ pub fn field_dct_to_frame_targets(
 /// field motion: frame-DCT neighbours in the same pair then have to be expressed
 /// in the field transform basis as well.
 pub fn frame_dct_to_field_targets(
-    upper: &[f64; 64],
-    lower: &[f64; 64],
-    first_field: &mut [f64; 64],
-    second_field: &mut [f64; 64],
+    upper: &[f32; 64],
+    lower: &[f32; 64],
+    first_field: &mut [f32; 64],
+    second_field: &mut [f32; 64],
 ) {
     let dct = &*DCT8_BASIS;
-    let mut samples = [0.0f64; 16];
+    let mut samples = [0.0f32; 16];
 
     for horizontal_frequency in 0..8 {
         for half in 0..2 {
-            let input: &[f64; 64] = if half == 0 { upper } else { lower };
+            let input: &[f32; 64] = if half == 0 { upper } else { lower };
             for y in 0..8 {
                 let mut sample = 0.0;
                 for vertical_frequency in 0..8 {
@@ -248,7 +248,7 @@ pub fn frame_dct_to_field_targets(
         }
 
         for field in 0..2 {
-            let out: &mut [f64; 64] = if field == 0 {
+            let out: &mut [f32; 64] = if field == 0 {
                 first_field
             } else {
                 second_field
@@ -299,7 +299,7 @@ mod tests {
                 let gain = quant.gain_at(qp, pos);
                 for target in [0.0, gain * 3.2, -gain * 7.8, gain * 100.0] {
                     let level = quant.level_for(target, qp, pos);
-                    let error = (level as f64 * gain - target).abs();
+                    let error = (level as f32 * gain - target).abs();
                     assert!(error <= gain / 2.0 + 1e-9, "qp {qp} pos {pos}");
                 }
             }
@@ -311,7 +311,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = 200;
         levels[1] = 4;
-        let mut out = [0.0f64; 64];
+        let mut out = [0.0f32; 64];
         intra_targets(&levels, &DEFAULT_INTRA_QUANT, 8, 0, &mut out);
         assert_eq!(out[0], 8.0 * 200.0 - FLAT_PREDICTION_DC);
         // AC position 1 has weight 16, so 2 * 4 * 16 * 8 / 32 = 32, and nothing
@@ -325,7 +325,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = 3;
         levels[1] = -3;
-        let mut out = [0.0f64; 64];
+        let mut out = [0.0f32; 64];
         inter_targets(&levels, &DEFAULT_NON_INTRA_QUANT, 1, &mut out);
         // (2 * 3 + 1) * 16 * 1 / 32 = 3.5, truncated to 3.
         assert_eq!(out[0], 3.0);
@@ -333,25 +333,31 @@ mod tests {
         assert_eq!(out[1], -3.0);
     }
 
+    /// What a round trip through two eight-point transforms is allowed to
+    /// lose. Single precision holds about seven digits and a pass spends a few
+    /// of them; a basis that was actually wrong would be out by whole units, so
+    /// nothing is given up by checking to a thousandth.
+    const ROUND_TRIP_TOLERANCE: f32 = 1e-3;
+
     #[test]
     fn the_field_and_frame_dct_bases_are_inverses_of_each_other() {
-        let first: [f64; 64] = std::array::from_fn(|i| ((i * 37) % 61) as f64 - 30.0);
-        let second: [f64; 64] = std::array::from_fn(|i| ((i * 53) % 47) as f64 - 23.0);
-        let mut upper = [0.0f64; 64];
-        let mut lower = [0.0f64; 64];
+        let first: [f32; 64] = std::array::from_fn(|i| ((i * 37) % 61) as f32 - 30.0);
+        let second: [f32; 64] = std::array::from_fn(|i| ((i * 53) % 47) as f32 - 23.0);
+        let mut upper = [0.0f32; 64];
+        let mut lower = [0.0f32; 64];
         field_dct_to_frame_targets(&first, &second, &mut upper, &mut lower);
 
-        let mut back_first = [0.0f64; 64];
-        let mut back_second = [0.0f64; 64];
+        let mut back_first = [0.0f32; 64];
+        let mut back_second = [0.0f32; 64];
         frame_dct_to_field_targets(&upper, &lower, &mut back_first, &mut back_second);
 
         for i in 0..64 {
             assert!(
-                (back_first[i] - first[i]).abs() < 1e-9,
+                (back_first[i] - first[i]).abs() < ROUND_TRIP_TOLERANCE,
                 "first field at {i}"
             );
             assert!(
-                (back_second[i] - second[i]).abs() < 1e-9,
+                (back_second[i] - second[i]).abs() < ROUND_TRIP_TOLERANCE,
                 "second field at {i}"
             );
         }
@@ -361,18 +367,18 @@ mod tests {
     fn the_basis_change_leaves_a_constant_block_constant() {
         // A block with only a DC term is flat in the sample domain, so
         // interleaving its lines cannot change either half.
-        let mut first = [0.0f64; 64];
-        let mut second = [0.0f64; 64];
+        let mut first = [0.0f32; 64];
+        let mut second = [0.0f32; 64];
         first[0] = 100.0;
         second[0] = 100.0;
-        let mut upper = [0.0f64; 64];
-        let mut lower = [0.0f64; 64];
+        let mut upper = [0.0f32; 64];
+        let mut lower = [0.0f32; 64];
         field_dct_to_frame_targets(&first, &second, &mut upper, &mut lower);
-        assert!((upper[0] - 100.0).abs() < 1e-9);
-        assert!((lower[0] - 100.0).abs() < 1e-9);
+        assert!((upper[0] - 100.0).abs() < ROUND_TRIP_TOLERANCE);
+        assert!((lower[0] - 100.0).abs() < ROUND_TRIP_TOLERANCE);
         for i in 1..64 {
-            assert!(upper[i].abs() < 1e-9, "upper AC at {i}");
-            assert!(lower[i].abs() < 1e-9, "lower AC at {i}");
+            assert!(upper[i].abs() < ROUND_TRIP_TOLERANCE, "upper AC at {i}");
+            assert!(lower[i].abs() < ROUND_TRIP_TOLERANCE, "lower AC at {i}");
         }
     }
 }

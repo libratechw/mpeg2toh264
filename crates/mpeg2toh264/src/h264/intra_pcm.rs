@@ -9,13 +9,13 @@ use crate::mpeg2::headers::Picture;
 use crate::mpeg2::macroblock::Macroblock;
 use crate::round_half_up;
 
-fn sample(value: f64) -> u8 {
-    round_half_up(value).clamp(0.0, 255.0) as u8
+fn sample(value: f32) -> u8 {
+    round_half_up(value as f64).clamp(0.0, 255.0) as u8
 }
 
 /// H.262 clause 7.4.4: the reconstructed coefficients are clipped and their sum
 /// forced odd, so that different IDCT implementations cannot drift apart.
-fn mismatch_control(coeff: &mut [f64; 64]) {
+fn mismatch_control(coeff: &mut [f32; 64]) {
     let mut sum = 0i64;
     for value in coeff.iter_mut() {
         let clamped = value.trunc().clamp(-2048.0, 2047.0);
@@ -23,7 +23,7 @@ fn mismatch_control(coeff: &mut [f64; 64]) {
         sum += clamped as i64;
     }
     if sum & 1 == 0 {
-        coeff[63] = ((coeff[63].trunc() as i32) ^ 1) as f64;
+        coeff[63] = ((coeff[63].trunc() as i32) ^ 1) as f32;
     }
 }
 
@@ -34,7 +34,7 @@ pub fn reconstruct_intra_pcm(mb: &Macroblock, pic: &Picture) -> Result<PcmMacrob
     }
     let quantiser_scale =
         QUANTISER_SCALE[pic.coding.q_scale_type][mb.quantiser_scale_code as usize];
-    let mut coeff = [[0.0f64; 64]; 6];
+    let mut coeff = [[0.0f32; 64]; 6];
     for block in 0..6 {
         let Some(levels) = mb.block(block) else {
             continue;
@@ -59,7 +59,7 @@ pub fn reconstruct_intra_pcm(mb: &Macroblock, pic: &Picture) -> Result<PcmMacrob
     // Field-DCT luma blocks carry alternating lines. Convert them into ordinary
     // upper/lower frame blocks before the inverse transform.
     if mb.dct_type == 1 {
-        let mut converted = [[0.0f64; 64]; 4];
+        let mut converted = [[0.0f32; 64]; 4];
         {
             let (upper, lower) = converted.split_at_mut(2);
             field_dct_to_frame_targets(&coeff[0], &coeff[2], &mut upper[0], &mut lower[0]);
@@ -68,8 +68,8 @@ pub fn reconstruct_intra_pcm(mb: &Macroblock, pic: &Picture) -> Result<PcmMacrob
         coeff[..4].copy_from_slice(&converted);
     }
 
-    let mut spatial = [[0.0f64; 64]; 6];
-    let mut tmp = [0.0f64; 64];
+    let mut spatial = [[0.0f32; 64]; 6];
+    let mut tmp = [0.0f32; 64];
     for block in 0..6 {
         idct8(&coeff[block], &mut spatial[block], &mut tmp);
     }
