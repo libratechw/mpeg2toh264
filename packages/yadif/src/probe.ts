@@ -35,6 +35,8 @@ const SAMPLE_TIME = 0.1;
 /** How many columns of the frame to read. The pattern is in the rows. */
 const COLUMNS = 16;
 
+const PROBE_CODEC = 'video/mp4; codecs="avc1.640029"';
+
 export interface DecoderProbeOptions {
   /** See DEFAULT_TOLERANCE. Between 0 and 1. */
   tolerance?: number;
@@ -108,12 +110,23 @@ async function measure(options: DecoderProbeOptions): Promise<DecoderProbe> {
   }
   const video = document.createElement("video");
   video.muted = true;
+  video.defaultMuted = true;
   video.playsInline = true;
   video.preload = "auto";
-  video.src = PROBE_CLIP;
+  let source: ProbeSource | null = null;
   try {
-    await deadline(event(video, "loadeddata"), timeoutMs);
-    await settle(video, timeoutMs);
+    source = probeClipSource(video, timeoutMs);
+    const loaded = deadline(event(video, "loadeddata"), timeoutMs);
+    // iOS may ignore preload until playback has been requested. Starting here
+    // also makes loadeddata mean that the hardware path we want to inspect has
+    // actually been opened. A rejected autoplay falls back to seeking below.
+    const playing = video.play().then(
+      () => true,
+      () => false,
+    );
+    await source.ready;
+    await loaded;
+    await settle(video, timeoutMs, await playing);
     if (video.videoWidth === 0 || video.videoHeight === 0) {
       return failed(new Error("the probe clip decoded to nothing"));
     }
@@ -129,7 +142,43 @@ async function measure(options: DecoderProbeOptions): Promise<DecoderProbe> {
     video.pause();
     video.removeAttribute("src");
     video.load();
+    if (source) URL.revokeObjectURL(source.url);
   }
+}
+
+interface ProbeSource {
+  url: string;
+  ready: Promise<void>;
+}
+
+/** Feed the clip through the same MSE path used for playback where possible. */
+function probeClipSource(
+  video: HTMLVideoElement,
+  timeoutMs: number,
+): ProbeSource {
+  if (
+    typeof MediaSource === "undefined" ||
+    !MediaSource.isTypeSupported(PROBE_CODEC)
+  ) {
+    throw new Error("the probe clip needs Media Source Extensions");
+  }
+  const comma = PROBE_CLIP.indexOf(",");
+  const bytes = atob(PROBE_CLIP.slice(comma + 1));
+  const data = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) data[i] = bytes.charCodeAt(i);
+
+  const mediaSource = new MediaSource();
+  const url = URL.createObjectURL(mediaSource);
+  video.src = url;
+  const ready = (async (): Promise<void> => {
+    await deadline(event(mediaSource, "sourceopen"), timeoutMs);
+    const buffer = mediaSource.addSourceBuffer(PROBE_CODEC);
+    const updated = deadline(event(buffer, "updateend"), timeoutMs);
+    buffer.appendBuffer(data);
+    await updated;
+    mediaSource.endOfStream();
+  })();
+  return { url, ready };
 }
 
 /**
@@ -143,9 +192,9 @@ async function measure(options: DecoderProbeOptions): Promise<DecoderProbe> {
 async function settle(
   video: HTMLVideoElement,
   timeoutMs: number,
+  playing: boolean,
 ): Promise<void> {
-  try {
-    await video.play();
+  if (playing) {
     const started = performance.now();
     while (
       video.currentTime < SAMPLE_TIME &&
@@ -154,7 +203,7 @@ async function settle(
       await new Promise((resolve) => requestAnimationFrame(resolve));
     }
     video.pause();
-  } catch {
+  } else {
     video.currentTime = SAMPLE_TIME;
     await deadline(event(video, "seeked"), timeoutMs);
   }
@@ -206,10 +255,14 @@ function event(target: EventTarget, name: string): Promise<void> {
     target.addEventListener(name, () => resolve(), { once: true });
     target.addEventListener(
       "error",
-      () => reject(new Error(`the probe clip ${name} failed`)),
-      {
-        once: true,
+      () => {
+        const media = target instanceof HTMLMediaElement ? target.error : null;
+        const detail = media
+          ? ` (MediaError ${media.code}${media.message ? `: ${media.message}` : ""})`
+          : "";
+        reject(new Error(`the probe clip ${name} failed${detail}`));
       },
+      { once: true },
     );
   });
 }
