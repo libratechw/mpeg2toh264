@@ -49,6 +49,7 @@ const SEEK_STEPS = 1000;
 /** What the arrow keys and the buttons move by, in seconds. */
 const ARROW_SECONDS = 5;
 const SKIP_SECONDS = 10;
+const DOUBLE_CLICK_DELAY_MS = 300;
 
 const IDLE_FPS = "瞬間 — · トータル —";
 const IDLE_DEINTERLACE = "—";
@@ -233,8 +234,9 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): {
     controller.attachFeeder(feeder);
     controller.attachRenderer(renderer);
     controller.attachMedia(video, picture);
-    picture.lastElementChild?.setAttribute("preserveAspectRatio", "none");
-    return { type, controller, feeder, renderer };
+    const overlay = picture.lastElementChild as SVGSVGElement;
+    overlay.setAttribute("preserveAspectRatio", "none");
+    return { type, controller, feeder, renderer, overlay };
   });
 
   const feed = (
@@ -249,8 +251,15 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): {
 
   return {
     setCaptionEnabled(enabled: boolean): void {
-      for (const { type, controller } of entries) {
-        if (type === "Caption") enabled ? controller.show() : controller.hide();
+      for (const { type, controller, overlay } of entries) {
+        if (type !== "Caption") continue;
+        if (enabled) {
+          overlay.style.removeProperty("display");
+          controller.show();
+        } else {
+          controller.hide();
+          overlay.style.display = "none";
+        }
       }
     },
     destroy(): void {
@@ -390,8 +399,28 @@ function syncPlayPause() {
 }
 
 playPause.addEventListener("click", togglePlay);
-video.addEventListener("click", () => {
-  if (player?.deinterlace) togglePlay();
+let stageClickTimer: number | null = null;
+stage.addEventListener("click", (event) => {
+  if (event.target instanceof Element && event.target.closest("#playback"))
+    return;
+  if (!player?.deinterlace && document.fullscreenElement !== stage) return;
+  if (event.detail > 1) {
+    if (stageClickTimer !== null) window.clearTimeout(stageClickTimer);
+    stageClickTimer = null;
+    return;
+  }
+  stageClickTimer = window.setTimeout(() => {
+    stageClickTimer = null;
+    togglePlay();
+  }, DOUBLE_CLICK_DELAY_MS);
+});
+stage.addEventListener("dblclick", (event) => {
+  if (event.target instanceof Element && event.target.closest("#playback"))
+    return;
+  if (stageClickTimer !== null) window.clearTimeout(stageClickTimer);
+  stageClickTimer = null;
+  event.preventDefault();
+  toggleFullscreen();
 });
 back.addEventListener("click", () => skip(-SKIP_SECONDS));
 forward.addEventListener("click", () => skip(SKIP_SECONDS));
