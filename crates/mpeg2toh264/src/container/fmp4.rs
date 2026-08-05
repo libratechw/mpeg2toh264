@@ -170,6 +170,25 @@ pub struct Mpeg2VideoTimeline {
     pub interlacing: Interlacing,
 }
 
+/// The field that pairs with `picture` to make a frame, if `candidate` is it.
+///
+/// A unit that begins between the two fields of a pair has only the second, and
+/// one that ends between them has only the first; a broadcast that loses a
+/// field leaves the same thing in the middle. None of the three can be made
+/// into a frame, so the odd field is dropped -- by the transcoder and by the
+/// timeline alike, which is why this decision lives in one place.
+pub fn complementary_field<'a>(
+    candidate: Option<&'a Picture>,
+    picture: &Picture,
+) -> Option<&'a Picture> {
+    candidate.filter(|mate| {
+        mate.coding.picture_structure != PictureStructure::Frame
+            && mate.coding.picture_structure != picture.coding.picture_structure
+            && mate.header.temporal_reference == picture.header.temporal_reference
+            && mate.header.picture_coding_type == picture.header.picture_coding_type
+    })
+}
+
 /// Whether every slice in a source picture reaches its end cleanly. The
 /// transcoder drops a picture when any of its independently decodable slices
 /// is damaged or truncated; the MP4 timeline must make the identical decision
@@ -220,22 +239,21 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
     while picture_index < pictures.len() {
         let picture = &pictures[picture_index];
         let mut mate = None;
+        let mut unpaired = false;
         if picture.coding.picture_structure != PictureStructure::Frame {
-            let Some(field_mate) = pictures.get(picture_index + 1) else {
-                bail!("unpaired MPEG-2 field picture in MP4 timeline");
-            };
-            if field_mate.coding.picture_structure == PictureStructure::Frame
-                || field_mate.coding.picture_structure == picture.coding.picture_structure
-                || field_mate.header.temporal_reference != picture.header.temporal_reference
-                || field_mate.header.picture_coding_type != picture.header.picture_coding_type
-            {
-                bail!("MPEG-2 field picture timeline has no complementary field");
+            match complementary_field(pictures.get(picture_index + 1), picture) {
+                // The transcoder combines complementary fields into one MBAFF
+                // frame, so they occupy one MP4 sample and advance reference
+                // state only once as well.
+                Some(field_mate) => {
+                    mate = Some(field_mate);
+                    picture_index += 2;
+                }
+                None => {
+                    unpaired = true;
+                    picture_index += 1;
+                }
             }
-            // The transcoder combines complementary fields into one MBAFF
-            // frame, so they occupy one MP4 sample and advance reference state
-            // only once as well.
-            mate = Some(field_mate);
-            picture_index += 2;
         } else {
             picture_index += 1;
         }
@@ -250,6 +268,12 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
         }
         seen_picture = true;
         max_tr_in_gop = max_tr_in_gop.max(tr);
+        // A lone field is no frame, and the transcoder drops it for the same
+        // reason. Both have to, or the timeline reserves a sample the H.264
+        // stream does not hold.
+        if unpaired {
+            continue;
+        }
         if !picture_is_decodable(&mut reader, picture, &mut grid)
             || mate.is_some_and(|field| !picture_is_decodable(&mut reader, field, &mut grid))
         {

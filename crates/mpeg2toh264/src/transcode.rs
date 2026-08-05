@@ -21,6 +21,7 @@
 //! available in B slices. See [`crate::h264::mvmap`].
 
 use crate::bitreader::BitReader;
+use crate::container::fmp4::complementary_field;
 use crate::error::{bail, Result};
 use crate::h264::bitwriter::{nal_type, to_nal_unit, BitWriter};
 use crate::h264::chroma::{
@@ -322,16 +323,13 @@ impl IncrementalTranscoder {
                 source_index += 1;
                 continue;
             }
-            let Some(mate) = pics.get(source_index + 1) else {
-                bail!("unpaired MPEG-2 field picture at end of stream");
+            let Some(mate) = complementary_field(pics.get(source_index + 1), pic) else {
+                // Carried through unpaired so the group's temporal references
+                // still account for it, and dropped below.
+                logical_pictures.push((pic, None));
+                source_index += 1;
+                continue;
             };
-            if mate.coding.picture_structure == PictureStructure::Frame
-                || mate.coding.picture_structure == pic.coding.picture_structure
-                || mate.header.temporal_reference != pic.header.temporal_reference
-                || mate.header.picture_coding_type != pic.header.picture_coding_type
-            {
-                bail!("MPEG-2 field picture is not followed by its complementary field");
-            }
             logical_pictures.push((pic, Some(mate)));
             source_index += 2;
         }
@@ -355,6 +353,12 @@ impl IncrementalTranscoder {
             seen_picture = true;
             max_tr_in_gop = max_tr_in_gop.max(tr);
 
+            // A lone field is no frame. The MP4 timeline drops it for the same
+            // reason and has to make the identical decision.
+            if paired_pic.is_none() && pic.coding.picture_structure != PictureStructure::Frame {
+                pictures_skipped += 1;
+                continue;
+            }
             // A B picture needs both of its references present.
             if picture_type == PictureType::B && short_term_count < 2 {
                 pictures_skipped += 1;
@@ -420,16 +424,11 @@ impl IncrementalTranscoder {
                     Err(_) => {}
                 }
             }
-            if decoded_slices == 0 {
-                let (slice, error) = first_slice_error.expect("a picture has at least one slice");
-                bail!(
-                    "picture tr={} structure={} slice row {}: {error}",
-                    pic.header.temporal_reference,
-                    pic.coding.picture_structure.code(),
-                    slice.vertical_position
-                );
-            }
-            if first_slice_error.is_some() {
+            // A damaged slice takes its picture with it, and a unit that
+            // begins part way through one has every slice truncated. Either way
+            // the MP4 timeline reaches the same verdict from the same slices,
+            // so the two stay in step; what was lost is in `pictures_skipped`.
+            if first_slice_error.is_some() || decoded_slices == 0 {
                 pictures_skipped += 1;
                 continue;
             }
@@ -453,17 +452,7 @@ impl IncrementalTranscoder {
                         Err(_) => {}
                     }
                 }
-                if decoded_slices == 0 {
-                    let (slice, error) =
-                        first_slice_error.expect("a picture has at least one slice");
-                    bail!(
-                        "picture tr={} structure={} slice row {}: {error}",
-                        mate.header.temporal_reference,
-                        mate.coding.picture_structure.code(),
-                        slice.vertical_position
-                    );
-                }
-                if first_slice_error.is_some() {
+                if first_slice_error.is_some() || decoded_slices == 0 {
                     pictures_skipped += 1;
                     continue 'pictures;
                 }
