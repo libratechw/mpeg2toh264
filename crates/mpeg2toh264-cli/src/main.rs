@@ -1,21 +1,24 @@
 //! Command line front end: MPEG-TS or MPEG-2 elementary stream in, raw Annex B
 //! H.264 or fragmented MP4 out.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use mpeg2toh264::{
     extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_video_timeline,
-    transcode, TranscodeOptions,
+    transcode, Fragment, Session, TranscodeOptions,
 };
 
 const USAGE: &str = "\
 Usage: mpeg2toh264 [options] <input.ts|input.m2v> <output.h264|output.mp4>
 
 Transcode an MPEG transport stream or MPEG-2 video elementary stream to raw
-Annex B H.264 or video-only fragmented MP4. The output format is selected from
-the output extension. The first MPEG-2 video program in a TS is selected.
+Annex B H.264 or fragmented MP4. MP4 is the default; use the .h264 output
+extension for raw Annex B. MP4 output from a transport stream includes its AAC
+audio track. The first MPEG-2 video program in a TS is selected.
 
 Arguments:
   input.ts|input.m2v        MPEG-TS or MPEG-2 video elementary stream
@@ -23,8 +26,7 @@ Arguments:
 
 Options:
   -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
-      --i-frames-only       Convert MPEG-2 I pictures only
-  -q, --quiet               Do not print the conversion summary
+  -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 ";
 
@@ -51,7 +53,6 @@ fn fail(message: &str) -> ! {
 fn parse_args(args: &[String]) -> Invocation {
     let mut positional: Vec<&str> = Vec::new();
     let mut oversample: f64 = 2.0;
-    let mut i_frames_only = false;
     let mut quiet = false;
 
     let mut i = 0;
@@ -59,7 +60,6 @@ fn parse_args(args: &[String]) -> Invocation {
         let arg = args[i].as_str();
         match arg {
             "-h" | "--help" => return Invocation::Help,
-            "--i-frames-only" => i_frames_only = true,
             "-q" | "--quiet" => quiet = true,
             "-o" | "--oversample" => {
                 i += 1;
@@ -95,10 +95,7 @@ fn parse_args(args: &[String]) -> Invocation {
         input,
         output,
         quiet,
-        transcode: TranscodeOptions {
-            oversample,
-            i_frames_only,
-        },
+        transcode: TranscodeOptions { oversample },
     }))
 }
 
@@ -107,8 +104,19 @@ fn absolute(path: &Path) -> PathBuf {
 }
 
 fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let container = std::fs::read(&options.input)?;
-    let transport_stream = is_mpeg_transport_stream(&container);
+    let mut input = BufReader::new(File::open(&options.input)?);
+    let transport_stream = is_mpeg_transport_stream(input.fill_buf()?);
+    let raw_h264 = options
+        .output
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("h264"));
+
+    if transport_stream && !raw_h264 {
+        return run_session_mp4(options, input);
+    }
+
+    let mut container = Vec::new();
+    input.read_to_end(&mut container)?;
     let source = if transport_stream {
         extract_mpeg2_video_es(&container)?
     } else {
@@ -119,11 +127,7 @@ fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
     let result = transcode(&source, options.transcode)?;
     let elapsed = started.elapsed();
 
-    let is_mp4 = options
-        .output
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
-    let (output_data, output_kind) = if is_mp4 {
+    let (output_data, output_kind) = if !raw_h264 {
         let timeline = mpeg2_video_timeline(&source, false)?;
         let mp4 = h264_to_fmp4(&result.bitstream, &timeline)?;
         let mut data = mp4.init_segment;
@@ -159,6 +163,114 @@ fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
             seconds * 1000.0,
         );
     }
+    Ok(())
+}
+
+#[derive(Default)]
+struct SessionTotals {
+    fragments: usize,
+    video_samples: usize,
+    audio_samples: usize,
+    bytes: usize,
+}
+
+fn run_session_mp4(
+    options: &CliOptions,
+    mut input: BufReader<File>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut output = BufWriter::new(File::create(&options.output)?);
+    let mut session = Session::new(options.transcode);
+    let mut totals = SessionTotals::default();
+    let mut chunk = vec![0; 1 << 20];
+
+    loop {
+        let read = input.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        for fragment in session.push(&chunk[..read])? {
+            write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
+        }
+    }
+    for fragment in session.finish()? {
+        write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
+    }
+    output.flush()?;
+
+    if !options.quiet {
+        let seconds = started.elapsed().as_secs_f64();
+        let fps = if seconds > 0.0 {
+            totals.video_samples as f64 / seconds
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "{} (MPEG-TS) -> {} (fragmented MP4)",
+            options.input.display(),
+            options.output.display(),
+        );
+        println!(
+            "{} media fragments, {} video samples, {} audio samples, {} bytes, {:.1} ms ({fps:.2} fps)",
+            totals.fragments,
+            totals.video_samples,
+            totals.audio_samples,
+            totals.bytes,
+            seconds * 1000.0,
+        );
+    }
+    Ok(())
+}
+
+fn write_fragment(
+    output: &mut impl Write,
+    fragment: Fragment,
+    totals: &mut SessionTotals,
+    quiet: bool,
+    started: Instant,
+) -> Result<(), std::io::Error> {
+    let data = match fragment {
+        Fragment::Init { data, mime_codec } => {
+            if !quiet {
+                println!("init: {mime_codec} ({} bytes)", data.len());
+            }
+            data
+        }
+        Fragment::Media {
+            data,
+            start,
+            random_access,
+            video_samples,
+            audio_samples,
+            interlacing,
+        } => {
+            totals.fragments += 1;
+            totals.video_samples += video_samples;
+            totals.audio_samples += audio_samples;
+            if !quiet && random_access {
+                let scan = match (interlacing.interlaced, interlacing.top_field_first) {
+                    (false, _) => "progressive",
+                    (true, true) => "interlaced tff",
+                    (true, false) => "interlaced bff",
+                };
+                let seconds = started.elapsed().as_secs_f64();
+                let fps = if seconds > 0.0 {
+                    totals.video_samples as f64 / seconds
+                } else {
+                    f64::INFINITY
+                };
+                println!(
+                    "fragment {} at {start:.3}s: restart point, {video_samples} video, \
+                     {audio_samples} audio, {scan}, {fps:.2} fps",
+                    totals.fragments
+                );
+            }
+            data
+        }
+        Fragment::PrivateStream { .. } => return Ok(()),
+    };
+    output.write_all(&data)?;
+    totals.bytes += data.len();
     Ok(())
 }
 

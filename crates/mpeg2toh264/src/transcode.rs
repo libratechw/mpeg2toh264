@@ -81,15 +81,12 @@ const CLONE_POC: u32 = 2;
 #[derive(Clone, Copy, Debug)]
 pub struct TranscodeOptions {
     pub oversample: f64,
-    /// Convert only MPEG-2 I pictures; P and B pictures are counted as skipped.
-    pub i_frames_only: bool,
 }
 
 impl Default for TranscodeOptions {
     fn default() -> Self {
         Self {
             oversample: DEFAULT_OVERSAMPLE,
-            i_frames_only: false,
         }
     }
 }
@@ -394,10 +391,6 @@ impl IncrementalTranscoder {
                 pictures_skipped += 1;
                 continue;
             }
-            if options.i_frames_only && picture_type != PictureType::I {
-                pictures_skipped += 1;
-                continue;
-            }
             let tr = pic.header.temporal_reference;
             if pic.starts_gop && seen_picture {
                 gop_base += max_tr_in_gop + 1;
@@ -424,12 +417,7 @@ impl IncrementalTranscoder {
                 pictures_skipped += 1;
                 continue;
             }
-            // In I-only mode every content picture depends solely on the
-            // long-term picture. Keeping content pictures as references only
-            // makes that picture move through the default reference list, and
-            // serves no purpose.
-            let is_reference =
-                real_idr || (!options.i_frames_only && picture_type != PictureType::B);
+            let is_reference = real_idr || picture_type != PictureType::B;
 
             let frame_num = if real_idr {
                 0
@@ -545,19 +533,15 @@ impl IncrementalTranscoder {
             )?);
 
             if real_idr {
-                // In I-only mode nothing predicts from anything but the
-                // flat-prediction picture, so the IDR needs no copy to hold and
-                // no short-term chain to start. Otherwise the copy follows and
-                // takes the long-term slot, leaving the IDR short-term.
-                if !options.i_frames_only {
-                    if has_field_pairs {
-                        parts.push(write_access_unit_delimiter());
-                    }
-                    parts.push(write_reference_clone(&g, mbaff));
-                    prev_ref_frame_num = 1;
-                    short_term_count = 1;
-                    newest_short_term = frame_num;
+                // The copy follows and takes the long-term slot, leaving the
+                // IDR short-term.
+                if has_field_pairs {
+                    parts.push(write_access_unit_delimiter());
                 }
+                parts.push(write_reference_clone(&g, mbaff));
+                prev_ref_frame_num = 1;
+                short_term_count = 1;
+                newest_short_term = frame_num;
             } else if is_reference {
                 prev_ref_frame_num = frame_num;
                 short_term_count = (short_term_count + 1).min(3);
@@ -1563,10 +1547,8 @@ fn write_picture(
         l1_short_term_delta: None,
         anchor_second_field: true,
     };
-    let picture_field_pairs = direct_field_pair
-        || (ctx.mbaff
-            && !ctx.options.i_frames_only
-            && pic.header.picture_coding_type != PictureType::I);
+    let picture_field_pairs =
+        direct_field_pair || (ctx.mbaff && pic.header.picture_coding_type != PictureType::I);
     let mut cached_pair_address: isize = -1;
     let mut cached_pair_targets = [FieldTargetSet::default(); 2];
     let mut cached_pair_qp = PPS_INIT_QP;
@@ -1634,8 +1616,6 @@ fn write_picture(
         let field_list_len = short_term_fields + if anchor_second_field { 0 } else { 2 };
         let output_slice_type = if idr_field {
             SliceType::I
-        } else if ctx.options.i_frames_only && !anchor_second_field {
-            SliceType::P
         } else {
             // A B slice is the only one with a list 1 to put the flat weights in.
             SliceType::B
@@ -2175,7 +2155,7 @@ fn write_picture(
             [0, 0]
         };
 
-        let split_frame_mb = ctx.mbaff && !ctx.options.i_frames_only && !field_pair;
+        let split_frame_mb = ctx.mbaff && !field_pair;
         let mode = PredictionMode::from_mb_type(pred.mb_type);
 
         let mut partitions: Option<[MotionPartition; 2]> = None;

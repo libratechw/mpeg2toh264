@@ -27,12 +27,11 @@ cargo build --release
 ./target/release/mpeg2toh264 input.ts output.mp4
 ```
 
-MPEG-TSとMPEG-2 video elementary streamを自動判別します。出力は拡張子で選択され、`.mp4`ならvideo-only fragmented MP4、それ以外は生のAnnex B H.264です。
+MPEG-TSとMPEG-2 video elementary streamを自動判別します。出力はfragmented MP4が既定で、`.h264`を指定したときだけ生のAnnex B H.264になります。TSからMP4へ変換するときは`Session`と同じ経路を通り、AAC音声もmuxします。video elementary streamには音声がないため、MP4もvideo-onlyです。
 
 ```
   -o, --oversample <n>      量子化探索のオーバーサンプル係数（既定: 2）
-      --i-frames-only       MPEG-2 Iピクチャのみ変換
-  -q, --quiet               変換サマリを表示しない
+  -q, --quiet               変換の進捗とサマリを表示しない
   -h, --help                ヘルプを表示
 ```
 
@@ -58,10 +57,10 @@ for fragment in session.finish()? { /* 同上 */ }
 
 ファイルの途中から読み直すときは`Session::anchored(options, Some(origin))`を使います。`origin`には最初のセッションの`origin_ticks()`（時刻0が指すPES timestamp、90 kHz）を渡します。こうすると、GOPヘッダーの手前で切れたバイト列から始めても、フラグメントの`start`はファイル全体で見た本当の時刻になります。末尾だけを読んで`last_pts()`にかければ、`origin`との差がそのまま動画長です。同じく`first_pts()`は「そのスライスの先頭バイトは何秒地点か」を返すので、索引のないTSでシーク位置を探すのに使えます。
 
-ブラウザなしで動作を見るには次を使います。出力はそのまま再生可能なfMP4です。
+CLIでTSをMP4へ変換すると、このストリーミング経路が使われます。出力はそのまま再生可能なfMP4です。
 
 ```bash
-cargo run --release --example dump_session -- input.ts output.mp4
+./target/release/mpeg2toh264 input.ts output.mp4
 ```
 
 AAC-LC音声はスペクトルを再エンコードせず、通常のステレオCPEはそのまま、モノラルSCEは同じICSを左右へ複製したCPE、デュアルモノは主音声SCEだけを左右へ複製したCPEへ組み替えてからmuxします。このため放送中にモノラルとデュアルモノが切り替わっても、出力トラックは一貫して2chステレオです。5.1chは暗黙のチャンネル構成とPCEによる明示構成のどちらも6chのまま保持します。映像と音声はPESのタイムスタンプが示す実際の間隔で配置されるので、放送でよくある数百ミリ秒のずれがそのまま保たれます。
@@ -231,5 +230,4 @@ npm run typecheck        # ページ側とWorker側の2プログラム
 
 ## 残作業
 
-- CLIの`.mp4`出力はvideo-onlyのままです。音声が要るなら`Session`を通す必要があります
 - `tools/gen-*.py`はまだTypeScriptを出力するので、テーブルを再生成するにはエミッタ側の移植が必要です

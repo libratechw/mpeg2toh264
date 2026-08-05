@@ -3,6 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "../../mpeg2toh264/tests/support/mod.rs"]
+mod support;
+
+use support::{
+    adts_stream, mux_transport_stream, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS,
+    STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+};
+
 fn binary() -> PathBuf {
     // The integration test binary sits next to the one cargo just built.
     let mut path = std::env::current_exe().expect("test binary path");
@@ -102,7 +110,6 @@ fn writes_a_raw_annex_b_stream_and_a_summary() {
     let result = run(&[
         "--oversample",
         "2",
-        "--i-frames-only",
         path(&fixture("i_only.m2v")),
         path(&output),
     ]);
@@ -134,4 +141,64 @@ fn writes_a_fragmented_mp4_when_the_output_says_so() {
         bytes.windows(4).any(|w| w == b"moof"),
         "the media segment follows the init segment"
     );
+}
+
+#[test]
+fn mp4_is_the_default_for_other_output_extensions() {
+    let temp = TempDir::new("default-mp4");
+    let output = temp.join("output.bin");
+    let result = run(&[path(&fixture("ibbp.m2v")), path(&output)]);
+    assert!(result.status.success(), "{:?}", result);
+
+    let bytes = std::fs::read(output).expect("output exists");
+    assert_eq!(&bytes[4..8], b"ftyp");
+}
+
+#[test]
+fn ts_mp4_carries_its_aac_audio_track() {
+    let temp = TempDir::new("av-mp4");
+    let input = temp.join("input.ts");
+    let output = temp.join("output.mp4");
+    let video = std::fs::read(fixture("ibbp.m2v")).expect("video fixture");
+    let audio = adts_stream(16, 3, 2);
+    let units = [
+        PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload: &video,
+            pts: Some(900_000),
+        },
+        PesUnit {
+            pid: AUDIO_PID,
+            stream_id: 0xc0,
+            payload: &audio,
+            pts: Some(900_000),
+        },
+    ];
+    let ts = mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+    );
+    std::fs::write(&input, ts).expect("transport stream fixture");
+
+    let result = run(&[path(&input), path(&output)]);
+    assert!(result.status.success(), "{:?}", result);
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("16 audio samples"),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let progress = String::from_utf8_lossy(&result.stdout);
+    assert!(progress.contains("init: video/mp4"), "{progress}");
+    assert!(progress.contains("fragment 1 at"), "{progress}");
+    assert!(progress.contains("restart point"), "{progress}");
+    assert!(progress.contains(" fps"), "{progress}");
+
+    let bytes = std::fs::read(output).expect("output exists");
+    assert_eq!(&bytes[4..8], b"ftyp");
+    assert!(bytes.windows(4).any(|window| window == b"mp4a"));
+    assert!(bytes.windows(4).any(|window| window == b"moof"));
 }

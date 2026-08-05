@@ -6,7 +6,6 @@
 
 mod support;
 
-use mpeg2toh264::mpeg2::constants::PictureType;
 use mpeg2toh264::mpeg2::headers::{parse_elementary_stream, pictures_interlacing};
 use mpeg2toh264::{
     h264_to_fmp4, mpeg2_video_timeline, transcode, IncrementalTranscoder, TranscodeOptions,
@@ -89,34 +88,6 @@ fn accounts_for_every_codeable_picture() {
             "{name}: every I/P/B picture is either converted or counted as skipped"
         );
     }
-}
-
-#[test]
-fn i_frames_only_converts_exactly_the_i_pictures() {
-    let source = read_fixture("ibbp.m2v");
-    let result = transcode(
-        &source,
-        TranscodeOptions {
-            i_frames_only: true,
-            ..Default::default()
-        },
-    )
-    .expect("transcode succeeds");
-    let pictures = parse_elementary_stream(&source).expect("parses");
-    let i_pictures = pictures
-        .iter()
-        .filter(|p| p.header.picture_coding_type == PictureType::I)
-        .count();
-    let others = pictures
-        .iter()
-        .filter(|p| p.header.picture_coding_type.is_ipb())
-        .count()
-        - i_pictures;
-    assert_eq!(result.pictures_converted, i_pictures);
-    assert_eq!(
-        result.pictures_skipped, others,
-        "P and B pictures are skipped"
-    );
 }
 
 #[test]

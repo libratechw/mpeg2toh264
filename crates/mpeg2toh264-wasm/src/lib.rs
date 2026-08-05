@@ -120,10 +120,7 @@ impl Session {
         };
         Ok(Self {
             inner: mpeg2toh264::Session::for_service(
-                TranscodeOptions {
-                    oversample,
-                    ..defaults
-                },
+                TranscodeOptions { oversample },
                 origin,
                 service_id,
             ),
