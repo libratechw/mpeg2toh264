@@ -83,21 +83,17 @@ impl MotionField {
 
     fn set_rect(&mut self, bx: usize, by: usize, width: usize, height: usize, m: &MbMotion) {
         for y in by..by + height {
-            for x in bx..bx + width {
-                self.set_block(x, y, m);
+            let start = y * self.blk_w + bx;
+            let end = start + width;
+            self.coded[start..end].fill(1);
+            for refs in self.ref_idx[start * 2..end * 2].chunks_exact_mut(2) {
+                refs[0] = m.ref_idx_l0 as i8;
+                refs[1] = m.ref_idx_l1 as i8;
+            }
+            for mv in self.mv[start * 4..end * 4].chunks_exact_mut(4) {
+                mv.copy_from_slice(&[m.mv_l0x, m.mv_l0y, m.mv_l1x, m.mv_l1y]);
             }
         }
-    }
-
-    fn set_block(&mut self, bx: usize, by: usize, m: &MbMotion) {
-        let i = by * self.blk_w + bx;
-        self.ref_idx[i * 2] = m.ref_idx_l0 as i8;
-        self.ref_idx[i * 2 + 1] = m.ref_idx_l1 as i8;
-        self.mv[i * 4] = m.mv_l0x;
-        self.mv[i * 4 + 1] = m.mv_l0y;
-        self.mv[i * 4 + 2] = m.mv_l1x;
-        self.mv[i * 4 + 3] = m.mv_l1y;
-        self.coded[i] = 1;
     }
 
     fn at(&self, bx: isize, by: isize, list: usize) -> Neighbour {
