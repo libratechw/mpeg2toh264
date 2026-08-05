@@ -3,7 +3,8 @@
 mod support;
 
 use mpeg2toh264::{
-    extract_mpeg2_video_es, is_mpeg_transport_stream, last_pts, transcode, TranscodeOptions,
+    extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, transcode,
+    TranscodeOptions,
 };
 use support::{read_fixture, wrap_mpeg2_es_in_ts, FIXTURES};
 
@@ -61,6 +62,7 @@ fn reads_the_last_timestamp_out_of_a_tail() {
     stream.extend_from_slice(&wrap_mpeg2_es_in_ts(&es, Some(954_000)));
 
     assert_eq!(last_pts(&stream), Some(954_000));
+    assert_eq!(first_pts(&stream), Some(900_000), "and the other end of it");
     // A player asks this of the end of a file, so it has to work on a slice
     // that opens mid-packet and carries no program map at all. The cut is
     // ahead of the second PES header, which is the only timestamp in reach:

@@ -1,6 +1,7 @@
 //! Minimal MPEG-TS demuxing for MPEG-2 video and AAC-LC audio.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use crate::error::{bail, Result};
 
@@ -401,30 +402,59 @@ impl MpegTsAvDemuxer {
     }
 }
 
-/// The last presentation timestamp in a slice of transport stream, in 90 kHz
-/// units, or `None` when it carries no timestamped PES packet at all.
+/// Walk the presentation timestamps in a slice of transport stream, in 90 kHz
+/// units, and hand each to `visit` until it says to stop.
 ///
-/// A player hands this the tail of a file to learn how long the file is, so it
-/// reads the PES headers where they lie rather than following a PID: the tail
+/// A player reads these out of a slice taken from anywhere in a file, so this
+/// reads the PES headers where they lie rather than following a PID: the slice
 /// may open mid-packet, and a program map it happens to miss would leave a
 /// PID-driven demuxer with nothing to report.
-pub fn last_pts(data: &[u8]) -> Option<u64> {
-    let mut at = sync_offset(data)?;
-    let mut last = None;
+fn walk_pts(data: &[u8], mut visit: impl FnMut(u64) -> ControlFlow<()>) {
+    let Some(mut at) = sync_offset(data) else {
+        return;
+    };
     while at + TS_PACKET_SIZE <= data.len() {
         // A payload the sync check walked past is worth stepping over rather
-        // than giving up on: a tail is a fragment of a file, and one damaged
+        // than giving up on: a slice is a fragment of a file, and one damaged
         // packet says nothing about the ones after it.
         if let Ok(Some(packet)) = payload_at(data, at) {
             if packet.payload_unit_start
                 && (is_pes_start(packet.data, ElementaryKind::Video)
                     || is_pes_start(packet.data, ElementaryKind::Audio))
             {
-                last = pes_pts(packet.data).or(last);
+                if let Some(pts) = pes_pts(packet.data) {
+                    if visit(pts).is_break() {
+                        return;
+                    }
+                }
             }
         }
         at += TS_PACKET_SIZE;
     }
+}
+
+/// The first presentation timestamp in a slice, or `None` when it holds none.
+///
+/// This is what time it is at the byte the slice was taken from, which is what
+/// a player seeking by byte needs to know: a hundred kilobytes answers it,
+/// where transcoding to find out costs seconds of video.
+pub fn first_pts(data: &[u8]) -> Option<u64> {
+    let mut first = None;
+    walk_pts(data, |pts| {
+        first = Some(pts);
+        ControlFlow::Break(())
+    });
+    first
+}
+
+/// The last presentation timestamp in a slice, or `None` when it holds none.
+/// Read from the end of a file, this is where the file ends.
+pub fn last_pts(data: &[u8]) -> Option<u64> {
+    let mut last = None;
+    walk_pts(data, |pts| {
+        last = Some(pts);
+        ControlFlow::Continue(())
+    });
     last
 }
 

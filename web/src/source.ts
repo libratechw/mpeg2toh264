@@ -103,6 +103,28 @@ export async function readTail(
   return absolute;
 }
 
+/**
+ * Read `length` bytes from `start`, or nothing when the server will not.
+ *
+ * This is what a seek reads to find out what time it is at a byte, so it is
+ * deliberately small: the answer is in the first PES header it contains.
+ */
+export async function readSlice(
+  url: string,
+  start: number,
+  length: number,
+  signal: AbortSignal,
+): Promise<Uint8Array | null> {
+  const range = await readRange(
+    url,
+    `bytes=${start}-${start + length - 1}`,
+    signal,
+  );
+  // A server that answered with some other part of the file would have the
+  // seek aiming at a timestamp that is not there.
+  return range && range.start === start ? range.data : null;
+}
+
 /** Whether what came back really is the end of the file. */
 function endsTheFile(range: Range): boolean {
   return range.start + range.data.byteLength === range.totalBytes;

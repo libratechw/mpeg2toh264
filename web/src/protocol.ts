@@ -45,20 +45,30 @@ export const PLAYHEAD_REPORT_INTERVAL_MS = 200;
 export const TAIL_PROBE_BYTES = 1 << 20;
 
 /**
- * How far past the requested time a seek may land before it is tried again.
+ * How much of the input to read when asking what time it is at a byte.
  *
- * Where the bytes are is worked out from the average bitrate, so a variable
- * bitrate lands somewhere either side of the mark. Undershooting is free --
- * playback simply starts a little early -- but overshooting loses what the
- * viewer asked to see, so only that is worth another request.
+ * A transport stream carries a PES header every picture, so the answer is in
+ * the first few kilobytes; this is sized for the gap between them in a stream
+ * whose video has stopped for a moment, and it is small enough that spending
+ * several of them still costs less than transcoding a second of video.
  */
-export const SEEK_OVERSHOOT_TOLERANCE_SECONDS = 1;
+export const SEEK_PROBE_BYTES = 128 * 1024;
 
-/** How far back beyond the overshoot to aim when trying again. */
-export const SEEK_RETRY_MARGIN_SECONDS = 2;
+/** How many of those a seek may read before it takes the best offset it has. */
+export const SEEK_PROBE_ATTEMPTS = 4;
 
-/** How many range requests one seek may spend before taking what it gets. */
-export const SEEK_ATTEMPTS = 3;
+/** How near the mark a probe has to land for the search to stop. */
+export const SEEK_PROBE_TOLERANCE_SECONDS = 0.5;
+
+/**
+ * How far before the requested time a seek aims to open the input.
+ *
+ * Landing after it would lose what the viewer asked to see, and reading is
+ * cheap next to converting, so the search aims a little early on purpose. The
+ * conversion then starts at the first group of pictures after that, which is
+ * itself up to a group later.
+ */
+export const SEEK_LEAD_SECONDS = 1;
 
 /** Which side of the wire owns the `MediaSource`. */
 export type SinkKind = "worker" | "main";

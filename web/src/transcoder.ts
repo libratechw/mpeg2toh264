@@ -6,6 +6,7 @@
  * around it.
  */
 import init, {
+  firstTimestamp as wasmFirstTimestamp,
   lastTimestamp as wasmLastTimestamp,
   Session,
   type Fragment,
@@ -37,6 +38,14 @@ export function loadWasm(wasmUrl: string | null): Promise<unknown> {
  */
 export function lastTimestamp(data: Uint8Array): number | null {
   return wasmLastTimestamp(data) ?? null;
+}
+
+/**
+ * The first presentation timestamp in a slice, in 90 kHz ticks, or null when
+ * it holds none. This is what time it is at the byte the slice was read from.
+ */
+export function firstTimestamp(data: Uint8Array): number | null {
+  return wasmFirstTimestamp(data) ?? null;
 }
 
 export class Transcoder {

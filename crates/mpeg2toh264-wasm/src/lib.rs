@@ -133,6 +133,18 @@ pub fn last_timestamp(data: &[u8]) -> Option<f64> {
     mpeg2toh264::last_pts(data).map(|ticks| ticks as f64)
 }
 
+/// The first presentation timestamp in a slice of transport stream, in 90 kHz
+/// units, or `undefined` when it carries none.
+///
+/// This is what time it is at the byte the slice was read from. A player
+/// seeking in a file with no index asks this of a slice at the byte its
+/// estimate points to, and asks again nearer the mark, which costs a hundred
+/// kilobytes where transcoding to find out costs seconds of video.
+#[wasm_bindgen(js_name = firstTimestamp)]
+pub fn first_timestamp(data: &[u8]) -> Option<f64> {
+    mpeg2toh264::first_pts(data).map(|ticks| ticks as f64)
+}
+
 fn to_js_array(fragments: Vec<Fragment>) -> Result<FragmentArray, JsError> {
     let array = Array::new_with_length(fragments.len() as u32);
     for (index, fragment) in fragments.into_iter().enumerate() {

@@ -13,18 +13,20 @@
  */
 import { MseSink, ReadyGate, type FragmentSink } from "./mse.js";
 import {
-  SEEK_ATTEMPTS,
-  SEEK_OVERSHOOT_TOLERANCE_SECONDS,
-  SEEK_RETRY_MARGIN_SECONDS,
+  SEEK_LEAD_SECONDS,
+  SEEK_PROBE_ATTEMPTS,
+  SEEK_PROBE_BYTES,
+  SEEK_PROBE_TOLERANCE_SECONDS,
   TAIL_PROBE_BYTES,
   type Command,
   type LoadCommand,
   type Notification,
   type TimingMark,
 } from "./protocol.js";
-import { openSource, readTail, type Source } from "./source.js";
+import { openSource, readSlice, readTail, type Source } from "./source.js";
 import {
   detach,
+  firstTimestamp,
   lastTimestamp,
   loadWasm,
   Transcoder,
@@ -183,14 +185,17 @@ function createWorkerSink(command: LoadCommand): MseSink {
   return created;
 }
 
-/** How a leg of the conversion ended. */
-type Outcome =
-  /** The input ran out: this leg reached the end of the file. */
-  | { kind: "done" }
-  /** Something newer took over -- a seek, a stop, another load. */
-  | { kind: "stale" }
-  /** The leg opened later than the seek asked for, and has appended nothing. */
-  | { kind: "overshoot"; start: number };
+/**
+ * A byte of the input and what time it is there.
+ *
+ * A transport stream carries no index, so a seek builds one as it goes: the
+ * two ends of the file are known from the start, every probe adds a point in
+ * between, and each one narrows what the next seek has to search.
+ */
+interface Sample {
+  byte: number;
+  seconds: number;
+}
 
 /**
  * One load: the input, the sink, and whichever leg of it is being read now.
@@ -219,6 +224,8 @@ class Playback {
   /** The last timestamp in the file, once the tail has been read. */
   #endTicks: number | null = null;
   #duration: number | null = null;
+  /** What is known of where the timeline sits in the file; see `Sample`. */
+  #index: Sample[] = [];
 
   constructor(command: LoadCommand) {
     this.#command = command;
@@ -237,34 +244,111 @@ class Playback {
   /** Read the file from the beginning. */
   async start(): Promise<void> {
     flow.set(true);
-    await this.#run(0, null);
+    await this.#run(0);
   }
 
   /**
    * Play from `time` instead.
    *
-   * Where that is in bytes is the average bitrate and nothing else -- a
-   * transport stream carries no index -- so a variable bitrate lands either
-   * side of the mark. Landing early is left alone, since playback simply
-   * begins a little before what was asked for; landing late is measured and
-   * tried again from further back.
+   * A transport stream carries no index, so where that is in bytes has to be
+   * searched for. The search reads: a slice of a hundred kilobytes says what
+   * time it is where it was taken from, which places the estimate and aims the
+   * next one, and two or three of those land within a group of pictures of the
+   * mark. Transcoding to find out instead -- converting from the estimate and
+   * seeing where it came out -- costs seconds of video for the same answer,
+   * and throws them away when the answer is wrong.
+   *
+   * It aims a little before the mark on purpose: landing after it would lose
+   * what the viewer asked to see.
    */
   async seek(time: number): Promise<void> {
-    const bytesPerSecond = this.#bytesPerSecond();
-    if (bytesPerSecond === null || this.#totalBytes === null) return;
+    if (this.#totalBytes === null || this.#duration === null) return;
     mark(this.#command.id, "seek");
+    // Stop reading where we are before emptying the buffer, and before the
+    // search that now stands between the two. Whatever the running leg
+    // appended after the reset would be the wrong part of the file, and being
+    // the first media in an empty buffer it is also what the playhead is put
+    // at -- which is a seek quietly undoing itself.
+    const leg = this.#nextLeg();
+    const signal = this.#leg!.signal;
     this.#sink.reset();
-    const last = Math.max(0, this.#totalBytes - MINIMUM_SEEK_TAIL_BYTES);
-    let offset = Math.min(Math.round(Math.max(0, time) * bytesPerSecond), last);
-    for (let attempt = 1; ; attempt++) {
-      const outcome = await this.#run(
+    const offset = await this.#search(
+      Math.max(0, time - SEEK_LEAD_SECONDS),
+      leg,
+      signal,
+    );
+    // A newer seek, or a stop, took over while this one was reading.
+    if (!this.#running(leg)) return;
+    await this.#run(offset);
+  }
+
+  /**
+   * Find the byte where the input is at `seconds`, by reading slices of it.
+   *
+   * Each probe is a point on the curve of time against bytes, and between two
+   * known points the interpolation is a straight line -- true of a transport
+   * stream over a short enough stretch, and closer to true with every probe.
+   * The samples outlive the seek, so a second seek to somewhere near the first
+   * starts from what the first learned.
+   */
+  async #search(
+    seconds: number,
+    leg: number,
+    signal: AbortSignal,
+  ): Promise<number> {
+    let offset = this.#byteFor(seconds);
+    for (let attempt = 0; attempt < SEEK_PROBE_ATTEMPTS; attempt++) {
+      const slice = await readSlice(
+        this.#command.url,
         offset,
-        attempt < SEEK_ATTEMPTS ? time : null,
-      );
-      if (outcome.kind !== "overshoot") return;
-      const overshot = outcome.start - time + SEEK_RETRY_MARGIN_SECONDS;
-      offset = Math.max(0, offset - Math.ceil(overshot * bytesPerSecond));
+        SEEK_PROBE_BYTES,
+        signal,
+      ).catch(() => null);
+      if (!this.#running(leg)) return offset;
+      const ticks =
+        slice && this.#origin !== null ? firstTimestamp(slice) : null;
+      if (ticks === null) return offset;
+      const at = ticksSince(this.#origin!, ticks) / TICKS_PER_SECOND;
+      this.#record({ byte: offset, seconds: at });
+      if (Math.abs(at - seconds) <= SEEK_PROBE_TOLERANCE_SECONDS) break;
+      const next = this.#byteFor(seconds);
+      // The samples either side of the mark are as close together as they are
+      // going to get, so reading again would ask the same question twice.
+      if (next === offset) break;
+      offset = next;
     }
+    return offset;
+  }
+
+  /**
+   * The byte the timeline reaches `seconds` at, from what is known so far.
+   *
+   * With only the ends of the file for samples this is the average bitrate,
+   * which is where every seek starts; each probe replaces one end of the span
+   * being interpolated across with something nearer.
+   */
+  #byteFor(seconds: number): number {
+    const last = Math.max(0, this.#totalBytes! - MINIMUM_SEEK_TAIL_BYTES);
+    let before: Sample = { byte: 0, seconds: 0 };
+    let after: Sample = { byte: this.#totalBytes!, seconds: this.#duration! };
+    for (const sample of this.#index) {
+      if (sample.seconds <= seconds && sample.seconds >= before.seconds)
+        before = sample;
+      if (sample.seconds > seconds && sample.seconds <= after.seconds)
+        after = sample;
+    }
+    const span = after.seconds - before.seconds;
+    const bytesPerSecond = span > 0 ? (after.byte - before.byte) / span : 0;
+    const byte = before.byte + (seconds - before.seconds) * bytesPerSecond;
+    return Math.min(Math.max(0, Math.round(byte)), last);
+  }
+
+  /** Keep a probe, in byte order, replacing whatever it supersedes. */
+  #record(sample: Sample): void {
+    const at = this.#index.findIndex((known) => known.byte >= sample.byte);
+    if (at >= 0 && this.#index[at]!.byte === sample.byte)
+      this.#index[at] = sample;
+    else this.#index.splice(at < 0 ? this.#index.length : at, 0, sample);
   }
 
   setCurrentTime(currentTime: number): void {
@@ -345,22 +429,17 @@ class Playback {
     return leg === this.#legNumber && this.#command.id === current;
   }
 
-  /**
-   * Read the input from `offset` to the end of the file.
-   *
-   * `target` is the time a seek asked for, when overshooting it is still worth
-   * another request; a leg with none delivers whatever it finds.
-   */
-  async #run(offset: number, target: number | null): Promise<Outcome> {
+  /** Read the input from `offset` to the end of the file. */
+  async #run(offset: number): Promise<void> {
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
     const id = this.#command.id;
     try {
       await loadWasm(this.#command.wasmUrl);
-      if (!this.#running(leg)) return { kind: "stale" };
+      if (!this.#running(leg)) return;
       mark(id, "wasm");
       const source = await openSource(this.#command.url, signal, offset);
-      if (!this.#running(leg)) return { kind: "stale" };
+      if (!this.#running(leg)) return;
       mark(id, "response");
       this.#totalBytes ??= source.totalBytes;
       // An input whose length the server will not state is a live one: it has
@@ -377,12 +456,11 @@ class Playback {
       });
       const converter = new Transcoder(this.#command.oversample, this.#origin);
       this.#transcoder = converter;
-      return await this.#convert(leg, source, converter, target);
+      await this.#convert(leg, source, converter);
     } catch (error) {
-      if (!this.#running(leg) || signal.aborted) return { kind: "stale" };
+      if (!this.#running(leg) || signal.aborted) return;
       post({ type: "error", id: this.#command.id, message: describe(error) });
       abandon();
-      return { kind: "stale" };
     }
   }
 
@@ -390,13 +468,10 @@ class Playback {
     leg: number,
     source: Source,
     converter: Transcoder,
-    target: number | null,
-  ): Promise<Outcome> {
+  ): Promise<void> {
     const id = this.#command.id;
     const reader = source.stream.getReader();
     let bytesRead = source.offset;
-    /** Whether this leg has yet to decide that it landed where it should. */
-    let placing = target !== null;
     let read = 0;
     let converted = false;
     for (;;) {
@@ -408,11 +483,11 @@ class Playback {
       await breathe();
       await this.#sink.ready();
       this.#waitingMs += performance.now() - waitStarted;
-      if (!this.#running(leg)) return { kind: "stale" };
+      if (!this.#running(leg)) return;
       const readStarted = performance.now();
       const result = await reader.read();
       this.#readingMs += performance.now() - readStarted;
-      if (!this.#running(leg)) return { kind: "stale" };
+      if (!this.#running(leg)) return;
       if (result.done) break;
       if (read++ === 0) mark(id, "first-byte");
       bytesRead += result.value.byteLength;
@@ -421,33 +496,24 @@ class Playback {
       if (!converted && fragments.length > 0) {
         converted = true;
         mark(id, "first-fragment");
-      }
-      if (placing) {
+        // Where the leg actually opened, which is a better sample of the file
+        // than the probe that aimed it: this is the group of pictures the
+        // conversion begins at, not the byte the search stopped on.
         const first = fragments.find((fragment) => fragment.kind === "media");
-        if (first) {
-          placing = false;
-          if (first.start > target! + SEEK_OVERSHOOT_TOLERANCE_SECONDS) {
-            // Nothing has been appended yet, so this leg can be forgotten
-            // whole and asked for again from further back.
-            await reader.cancel().catch(() => {});
-            return { kind: "overshoot", start: first.start };
-          }
-        }
+        if (first) this.#record({ byte: source.offset, seconds: first.start });
       }
-      if (!(await this.#deliver(leg, fragments))) return { kind: "stale" };
+      if (!(await this.#deliver(leg, fragments))) return;
       this.#place(converter);
       this.#report(converter);
     }
-    if (!(await this.#deliver(leg, converter.finish())))
-      return { kind: "stale" };
+    if (!(await this.#deliver(leg, converter.finish()))) return;
     this.#place(converter);
     this.#report(converter);
     await this.#sink.finish();
-    if (!this.#running(leg)) return { kind: "stale" };
+    if (!this.#running(leg)) return;
     post({ type: "completed", id });
     converter.free();
     this.#transcoder = null;
-    return { kind: "done" };
   }
 
   /**
