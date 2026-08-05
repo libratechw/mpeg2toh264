@@ -1,0 +1,15 @@
+{
+  "name": "mpeg2toh264",
+  "version": "0.0.1",
+  "description": "MPEG-2 to H.264 bitstream-domain transcoder (no IDCT, no motion compensation)",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

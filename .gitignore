@@ -1,0 +1,7 @@
+node_modules/
+
+# ITU-T specifications. Large third-party binaries, fetched separately from
+# itu.int. analysis/annexB.txt holds the extracted text that the VLC table
+# generator actually reads, and that file *is* tracked so the build reproduces
+# without needing the PDFs.
+*.pdf
