@@ -4,7 +4,7 @@
 //! mono and dual-mono SCE payloads are repackaged as a CPE containing two copies
 //! of the primary channel, then the ADTS header is removed for fragmented MP4.
 
-use super::aac::sce_end;
+use super::aac::{cpe_end, sce_end, single_channel_end};
 use crate::error::{bail, Result};
 
 /// `sampling_frequency_index` to sample rate (ISO/IEC 14496-3 Table 1.16).
@@ -46,6 +46,11 @@ pub fn aac_frame_count_through_video_time(video_time: i64, sample_rate: u32) -> 
 pub struct AdtsStream {
     pending: Vec<u8>,
     current_config: Option<AacConfig>,
+    /// The channel elements of the last frame that walked, by id and instance
+    /// tag. Until one has, a walk that fails says nothing about the frame;
+    /// after one has, it says the frame is damaged -- and so does a frame that
+    /// walks but names elements the last one did not.
+    chain: Option<Vec<(u8, u8)>>,
 }
 
 fn bit(data: &[u8], at: usize) -> u8 {
@@ -132,6 +137,54 @@ fn raw_data_block_end(data: &[u8], mut at: usize) -> Result<usize> {
             7 => return Ok(at + 3),
             6 => at = fill_element_end(data, at),
             id => bail!("unsupported AAC element {id} after the channel element"),
+        }
+    }
+}
+
+/// Whether every element of a raw_data_block can be walked to its end.
+///
+/// A broadcast recording carries the odd damaged access unit, and one handed to
+/// a decoder is not a frame it skips: it is an error that stops the stream. The
+/// video path drops a picture whose slices will not decode, and this is the
+/// same decision made on the same grounds -- what cannot be walked here is what
+/// a decoder cannot read either, which is how the frame that prompted this was
+/// found: the fourth element of an otherwise ordinary 5.1 frame read as a
+/// single channel element with prediction, which AAC-LC does not have.
+///
+/// Only the sample rates the element walker handles can be judged. At anything
+/// else the frame goes out unexamined, as it always did.
+fn raw_data_block_chain(data: &[u8], frequency_index: u8) -> Option<Vec<(u8, u8)>> {
+    if frequency_index != 3 && frequency_index != 4 {
+        return Some(Vec::new());
+    }
+    let mut chain = Vec::new();
+    let mut at = 0;
+    loop {
+        if at + 3 > data.len() * 8 {
+            return None;
+        }
+        let id = (bit(data, at) << 2) | (bit(data, at + 1) << 1) | bit(data, at + 2);
+        if matches!(id, 0 | 1 | 3) {
+            if at + 7 > data.len() * 8 {
+                return None;
+            }
+            let tag = (bit(data, at + 3) << 3)
+                | (bit(data, at + 4) << 2)
+                | (bit(data, at + 5) << 1)
+                | bit(data, at + 6);
+            chain.push((id, tag));
+        }
+        let next = match id {
+            7 => return Some(chain),
+            0 | 3 => single_channel_end(data, at, frequency_index, id as u32),
+            1 => cpe_end(data, at, frequency_index),
+            5 => parse_pce(data, at).map(|pce| pce.end),
+            6 => Ok(fill_element_end(data, at)),
+            _ => return None,
+        };
+        match next {
+            Ok(end) if end > at => at = end,
+            _ => return None,
         }
     }
 }
@@ -293,11 +346,32 @@ impl AdtsStream {
                 break;
             }
 
+            let raw_data = &self.pending[at + header_length..at + frame_length];
+            // Damaged. A stream this walker has read once it can read, so a
+            // frame it cannot is one a decoder cannot either -- and one whose
+            // elements are not the ones the stream has been carrying will be
+            // refused just the same, since a decoder only has room for the
+            // elements its configuration named. Handing either over does not
+            // cost a frame, it stops the stream.
+            match raw_data_block_chain(raw_data, sampling_frequency_index) {
+                Some(chain) if self.chain.as_ref().is_none_or(|last| *last == chain) => {
+                    self.chain = Some(chain);
+                }
+                // A mono or dual-mono service is rebuilt from its primary
+                // element alone and switches between the two as the broadcast
+                // does, so its chain is not fixed and is not judged by this.
+                _ if channel_count != 0 && channel_count <= 2 => {}
+                _ if self.chain.is_none() => {}
+                _ => {
+                    at += frame_length;
+                    continue;
+                }
+            }
+
             // A mono service and ARIB dual-mono both use SCEs. Repackage the
             // primary SCE as both independent streams of a CPE, so every mode
             // has the same channel_configuration=2 ASC. Genuine stereo CPEs
             // pass through unchanged.
-            let raw_data = &self.pending[at + header_length..at + frame_length];
             let (first_element, channel_start, pces, pce) = first_channel_element(raw_data)?;
             let input_channels = if channel_count != 0 {
                 channel_count

@@ -168,6 +168,69 @@ fn takes_a_channel_pair_with_no_channel_configuration() {
     assert_eq!(frames[0].config.audio_specific_config, [0x11, 0x90]);
 }
 
+/// Packet loss leaves a recording with the odd unreadable access unit, and one
+/// handed to a decoder is not a frame it skips -- it is an error that stops the
+/// stream. A frame whose elements cannot be walked, or which names elements the
+/// stream has not been carrying, is dropped the way a damaged picture is.
+#[test]
+fn drops_a_frame_packet_loss_made_unreadable() {
+    // Two 5.1 frames the walker can read, then one whose second element is not
+    // there at all, then another good one.
+    let good = adts_frame_with_payload(3, 6, &five_point_one_payload(0));
+    let damaged = adts_frame_with_payload(3, 6, &packed_bits("000 0000 111"));
+    let mut stream = good.clone();
+    stream.extend_from_slice(&good);
+    stream.extend_from_slice(&damaged);
+    stream.extend_from_slice(&good);
+
+    let mut adts = AdtsStream::new();
+    let mut frames = adts.push(&stream).expect("the readable frames decode");
+    frames.extend(adts.finish().expect("nothing is left over"));
+    assert_eq!(frames.len(), 3, "the damaged frame is not passed on");
+}
+
+/// A frame that walks but names an element the stream has not carried is
+/// damage as well: a decoder has room only for the elements its configuration
+/// named, and refuses the frame that mentions another.
+#[test]
+fn drops_a_frame_whose_elements_are_not_the_streams() {
+    let good = adts_frame_with_payload(3, 6, &five_point_one_payload(0));
+    let renamed = adts_frame_with_payload(3, 6, &five_point_one_payload(12));
+    let mut stream = good.clone();
+    stream.extend_from_slice(&renamed);
+    stream.extend_from_slice(&good);
+
+    let mut adts = AdtsStream::new();
+    let mut frames = adts.push(&stream).expect("decodes");
+    frames.extend(adts.finish().expect("nothing is left over"));
+    assert_eq!(frames.len(), 2, "the frame with a stray element tag goes");
+}
+
+/// An empty 5.1 raw_data_block: a centre SCE, a front pair, a back pair and an
+/// LFE, every one of them carrying no spectral data. `tag` names the first
+/// element, so that a frame can be made to disagree with its neighbours.
+fn five_point_one_payload(tag: u8) -> Vec<u8> {
+    // global_gain, then an ics_info with a long window and max_sfb 0, then the
+    // three absent-tool flags. Twenty-two zeroes, and no spectral data at all.
+    let empty_ics = "0".repeat(22);
+    let mut bits = String::new();
+    bits.push_str("000"); // ID_SCE
+    bits.push_str(&format!("{:04b}", tag));
+    bits.push_str(&empty_ics);
+    for pair in 0..2 {
+        bits.push_str("001"); // ID_CPE
+        bits.push_str(&format!("{:04b}", pair));
+        bits.push('0'); // common_window: each channel carries its own ics_info
+        bits.push_str(&empty_ics);
+        bits.push_str(&empty_ics);
+    }
+    bits.push_str("011"); // ID_LFE
+    bits.push_str("0000");
+    bits.push_str(&empty_ics);
+    bits.push_str("111"); // ID_END
+    packed_bits(&bits.replace(' ', ""))
+}
+
 #[test]
 fn reassembles_frames_split_across_chunks() {
     let stream = adts_stream(8, 3, 2);

@@ -213,36 +213,94 @@ fn spectral(r: &mut BitReader<'_>, info: &IcsInfo, groups: &[Vec<Section>]) -> R
     Ok(())
 }
 
-fn skip_ics(r: &mut BitReader<'_>) -> Result<()> {
+/// One `individual_channel_stream`. A channel pair whose `common_window` is set
+/// shares one `ics_info` between its two channels, and passes it in here rather
+/// than letting each read its own.
+fn skip_ics_sharing(r: &mut BitReader<'_>, shared: Option<&IcsInfo>) -> Result<()> {
     r.skip(8); // global_gain
-    let info = ics_info(r)?;
-    let sections = sections(r, &info)?;
-    scale_factors(r, &info, &sections)?;
+    let owned;
+    let info = match shared {
+        Some(info) => info,
+        None => {
+            owned = ics_info(r)?;
+            &owned
+        }
+    };
+    let sections = sections(r, info)?;
+    scale_factors(r, info, &sections)?;
     if r.flag() {
         let pulses = r.u(2) + 1;
         r.skip(6 + pulses * 9);
     }
     if r.flag() {
-        tns(r, &info);
+        tns(r, info);
     }
     if r.flag() {
         bail!("AAC-LC gain_control_data is unsupported");
     }
-    spectral(r, &info, &sections)
+    spectral(r, info, &sections)
 }
 
-pub fn sce_end(data: &[u8], start: usize, frequency_index: u8) -> Result<usize> {
+fn skip_ics(r: &mut BitReader<'_>) -> Result<()> {
+    skip_ics_sharing(r, None)
+}
+
+/// Bit position just past a one-channel element -- `single_channel_element` or
+/// the `lfe_channel_element` that shares its syntax -- starting at `start`.
+pub fn single_channel_end(
+    data: &[u8],
+    start: usize,
+    frequency_index: u8,
+    id: u32,
+) -> Result<usize> {
     if frequency_index != 3 && frequency_index != 4 {
-        bail!("AAC SCE rewriting currently requires 44.1 or 48 kHz");
+        bail!("AAC channel element walking currently requires 44.1 or 48 kHz");
     }
     let mut r = BitReader::at_bit(data, start);
-    if r.u(3) != 0 {
-        bail!("expected AAC SCE at bit {start}");
+    if r.u(3) != id {
+        bail!("expected AAC element {id} at bit {start}");
     }
     r.skip(4); // element_instance_tag
     skip_ics(&mut r)?;
     if r.bits_left() < 0 {
-        bail!("AAC SCE overruns its raw_data_block");
+        bail!("AAC element {id} overruns its raw_data_block");
+    }
+    Ok(r.bit_pos())
+}
+
+pub fn sce_end(data: &[u8], start: usize, frequency_index: u8) -> Result<usize> {
+    single_channel_end(data, start, frequency_index, 0)
+}
+
+/// Bit position just past the `channel_pair_element` starting at `start`.
+pub fn cpe_end(data: &[u8], start: usize, frequency_index: u8) -> Result<usize> {
+    if frequency_index != 3 && frequency_index != 4 {
+        bail!("AAC CPE walking currently requires 44.1 or 48 kHz");
+    }
+    let mut r = BitReader::at_bit(data, start);
+    if r.u(3) != 1 {
+        bail!("expected AAC CPE at bit {start}");
+    }
+    r.skip(4); // element_instance_tag
+    let shared = if r.flag() {
+        // common_window: one ics_info for both channels, and the mid/side mask
+        // that only a shared window can carry.
+        let info = ics_info(&mut r)?;
+        match r.u(2) {
+            0 | 2 => {}
+            1 => {
+                r.skip((info.group_len.len() * info.max_sfb) as u32);
+            }
+            _ => bail!("reserved AAC ms_mask_present at bit {}", r.bit_pos()),
+        }
+        Some(info)
+    } else {
+        None
+    };
+    skip_ics_sharing(&mut r, shared.as_ref())?;
+    skip_ics_sharing(&mut r, shared.as_ref())?;
+    if r.bits_left() < 0 {
+        bail!("AAC CPE overruns its raw_data_block");
     }
     Ok(r.bit_pos())
 }
