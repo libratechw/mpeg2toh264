@@ -301,7 +301,7 @@ export function decodeSlice(
     // Everything between the previous macroblock and this one is skipped.
     for (let k = 1; k < increment; k++) {
       address++;
-      out.push(makeSkipped(address, state, type));
+      out.push(makeSkipped(address, state, type, frame));
     }
     address++;
 
@@ -322,6 +322,7 @@ function makeSkipped(
   address: number,
   state: SliceState,
   pictureType: number,
+  framePicture: boolean,
 ): Macroblock {
   const skipped: Macroblock = {
     address,
@@ -341,14 +342,31 @@ function makeSkipped(
   } else if (state.prev) {
     skipped.flags =
       state.prev.flags & (MBFlag.MOTION_FORWARD | MBFlag.MOTION_BACKWARD);
-    // A skipped B macroblock reuses the previous macroblock's complete motion
-    // prediction, including whether its two vectors are field-formatted.
-    // Dropping motionType made the transcoder interpret field-line vertical
-    // components as frame-line vectors throughout a skipped run.
-    skipped.motionType = state.prev.motionType;
-    skipped.mv.set(state.prev.mv);
-    skipped.fieldSelect.set(state.prev.fieldSelect);
-    skipped.mvCount = state.prev.mvCount;
+    if (framePicture) {
+      // H.262 7.6.6.4: a skipped B macroblock in a frame picture is always
+      // frame-based. Its direction comes from the previous macroblock, while
+      // its vectors come directly from the corresponding PMV[0] predictors.
+      skipped.motionType = MotionType.FRAME_OR_16X8;
+      for (let direction = 0; direction < 2; direction++) {
+        const directionFlag =
+          direction === 0 ? MBFlag.MOTION_FORWARD : MBFlag.MOTION_BACKWARD;
+        if ((skipped.flags & directionFlag) === 0) {
+          continue;
+        }
+        const base = direction * 2;
+        skipped.mv[base] = state.pmv[base]!;
+        skipped.mv[base + 1] = state.pmv[base + 1]!;
+      }
+    } else {
+      // Field pictures use same-parity field prediction (7.6.6.3). Keep the
+      // decoded predictor values here; field pictures are rejected later by
+      // this transcoder, but the elementary-stream decoder remains coherent.
+      skipped.motionType = MotionType.FIELD;
+      skipped.mv[0] = state.pmv[0]!;
+      skipped.mv[1] = state.pmv[1]!;
+      skipped.mv[2] = state.pmv[2]!;
+      skipped.mv[3] = state.pmv[3]!;
+    }
   }
   // A skipped macroblock has no coded blocks, so the DC predictors reset.
   state.dcPred.fill(state.dcPredReset);
@@ -447,6 +465,21 @@ function decodeMacroblock(
   if (flags & MBFlag.MOTION_FORWARD || (intra && conceal)) readVectors(0);
   if (flags & MBFlag.MOTION_BACKWARD) readVectors(1);
   if (intra && conceal) r.skip(1); // marker_bit
+
+  if (frame && motionType !== MotionType.FIELD) {
+    // H.262 Table 7-23: frame-based (and dual-prime) motion carries one vector
+    // per direction, so the second predictor must track the first. Without
+    // this copy a following field-based macroblock predicts its bottom-field
+    // vector from stale state.
+    if (flags & MBFlag.MOTION_FORWARD || (intra && conceal)) {
+      state.pmv[4] = state.pmv[0]!;
+      state.pmv[5] = state.pmv[1]!;
+    }
+    if (flags & MBFlag.MOTION_BACKWARD) {
+      state.pmv[6] = state.pmv[2]!;
+      state.pmv[7] = state.pmv[3]!;
+    }
+  }
 
   let cbp = 0;
   if (flags & MBFlag.PATTERN) {

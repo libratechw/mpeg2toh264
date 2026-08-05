@@ -38,19 +38,26 @@ describe("interlaced frame-picture transcoding", () => {
     expect(result.bitstream.length).toBeGreaterThan(0);
   });
 
-  it("retains field motion across skipped B macroblocks", () => {
+  it("derives skipped B macroblocks as frame-based PMV predictions", () => {
     const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));
     const pictures = parseElementaryStream(source);
     const reader = new BitReader(source);
-    const skippedFieldMbs = pictures.flatMap((picture) =>
+    const skippedB = pictures.flatMap((picture) =>
       picture.slices.flatMap((slice) =>
         decodeSlice(reader, picture, slice, 90).filter(
-          (mb) => mb.skipped && mb.motionType === MotionType.FIELD,
+          (mb) =>
+            mb.skipped && picture.header.pictureCodingType === PictureType.B,
         ),
       ),
     );
 
-    expect(skippedFieldMbs.length).toBeGreaterThan(0);
+    expect(skippedB.length).toBeGreaterThan(0);
+    expect(
+      skippedB.every((mb) => mb.motionType === MotionType.FRAME_OR_16X8),
+    ).toBe(true);
+    expect(
+      skippedB.some((mb) => mb.mv.some((component) => component !== 0)),
+    ).toBe(true);
   });
 
   it("covers mixed frame/field inter macroblock pairs", () => {
