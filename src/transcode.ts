@@ -12,13 +12,22 @@
  * available in B slices. See h264/mvmap.ts.
  */
 import { BitReader } from "./bitreader.ts";
-import { MBFlag, PictureType, QUANTISER_SCALE } from "./mpeg2/constants.ts";
+import {
+  MBFlag,
+  PictureStructure,
+  PictureType,
+  QUANTISER_SCALE,
+} from "./mpeg2/constants.ts";
 import {
   parseElementaryStream,
   pictureGeometry,
   type Picture,
 } from "./mpeg2/headers.ts";
-import { decodeSlice, type Macroblock } from "./mpeg2/macroblock.ts";
+import {
+  MotionType,
+  decodeSlice,
+  type Macroblock,
+} from "./mpeg2/macroblock.ts";
 import { BitWriter, NalType, toNalUnit } from "./h264/bitwriter.ts";
 import {
   chromaQp,
@@ -116,6 +125,27 @@ export function transcode(
 
   const width = first.sequence.horizontalSize;
   const height = first.sequence.verticalSize;
+
+  // Interlaced coding is not handled. A field-DCT macroblock builds its 8x8
+  // blocks from alternate lines and field motion predicts each field
+  // separately; representing either in H.264 needs macroblock-adaptive
+  // frame/field coding, which the macroblock layer here does not emit. Refusing
+  // beats silently producing a picture assembled from the wrong lines.
+  //
+  // Field pictures are ruled out here; field DCT and field motion are caught per
+  // macroblock instead, because clearing frame_pred_frame_dct only *permits*
+  // them and progressive content often carries that flag without a single
+  // field-coded macroblock in the stream.
+  const fieldPicture = pics.find(
+    (p) => p.coding.pictureStructure !== PictureStructure.FRAME,
+  );
+  if (fieldPicture) {
+    throw new Error(
+      "field pictures: this needs PAFF or MBAFF, which is not implemented " +
+        `(picture_structure=${fieldPicture.coding.pictureStructure})`,
+    );
+  }
+
   const g = frameGeometry(width, height, true);
   const scaling = first.quant.nonIntra;
 
@@ -403,6 +433,16 @@ function writePicture(
   for (let mbY = 0; mbY < g.mbHeight; mbY++) {
     for (let mbX = 0; mbX < g.mbWidth; mbX++) {
       const source = byAddress.get(mbY * g.mbWidth + mbX);
+      if (
+        source &&
+        (source.dctType === 1 || source.motionType === MotionType.FIELD)
+      ) {
+        throw new Error(
+          `field-coded macroblock at ${mbX},${mbY}: representing one in H.264 needs ` +
+            `MBAFF, which is not implemented (dct_type=${source.dctType}, ` +
+            `motion_type=${source.motionType})`,
+        );
+      }
       const intra =
         !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
       const luma: (Int32Array | null)[] = [null, null, null, null];

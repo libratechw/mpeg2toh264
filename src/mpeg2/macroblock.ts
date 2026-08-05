@@ -157,6 +157,13 @@ function decodeMotionComponent(
   fCode: number,
   pmv: Int32Array,
   pmvIndex: number,
+  /**
+   * True for the vertical component of a field motion vector in a frame
+   * picture. Such a vector counts in field lines while the predictor is kept in
+   * frame lines, so the predictor is halved on the way in and doubled on the
+   * way out (clause 7.6.3.1).
+   */
+  fieldVerticalInFrame = false,
 ): number {
   const code = V_MOTION.decode(r);
   const rSize = fCode - 1;
@@ -172,10 +179,15 @@ function decodeMotionComponent(
   const high = 16 * f - 1;
   const low = -16 * f;
   const range = 32 * f;
-  let vector = pmv[pmvIndex]! + delta;
+  // DIV is division rounding toward minus infinity, which an arithmetic shift
+  // gives directly.
+  const prediction = fieldVerticalInFrame
+    ? pmv[pmvIndex]! >> 1
+    : pmv[pmvIndex]!;
+  let vector = prediction + delta;
   if (vector < low) vector += range;
   else if (vector > high) vector -= range;
-  pmv[pmvIndex] = vector;
+  pmv[pmvIndex] = fieldVerticalInFrame ? vector * 2 : vector;
   return vector;
 }
 
@@ -413,9 +425,16 @@ function decodeMacroblock(
         fieldSelect[vec * 2 + s] = r.u(1);
       }
       const base = vec * 4 + s * 2;
+      const fieldVerticalInFrame = spec.fieldFormat && frame;
       mv[base] = decodeMotionComponent(r, fCodeH, state.pmv, base);
       if (spec.dmv) V_DMV.decode(r); // dmvector[0]
-      mv[base + 1] = decodeMotionComponent(r, fCodeV, state.pmv, base + 1);
+      mv[base + 1] = decodeMotionComponent(
+        r,
+        fCodeV,
+        state.pmv,
+        base + 1,
+        fieldVerticalInFrame,
+      );
       if (spec.dmv) V_DMV.decode(r); // dmvector[1]
     }
   };
