@@ -1,4 +1,5 @@
 node_modules/
+dist/
 
 # ITU-T specifications. Large third-party binaries, fetched separately from
 # itu.int. analysis/annexB.txt holds the extracted text that the VLC table

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MPEG-2 TS → H.264 MSE Player</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">BITSTREAM TRANSCODER</p>
+        <h1>MPEG-2 TSを<br />ブラウザで再生</h1>
+        <p class="lead">映像をH.264へ変換し、fragmented MP4としてMedia Source Extensionsへ渡します。</p>
+      </header>
+      <section class="player">
+        <video id="video" controls playsinline></video>
+        <div class="controls">
+          <label class="pick">
+            <span>TSファイルを選択</span>
+            <input id="file" type="file" accept=".ts,.m2t,.mts,video/mp2t" />
+          </label>
+          <div class="state">
+            <p id="status">MPEG-2 TSファイルを選択してください。</p>
+            <p id="details"></p>
+          </div>
+        </div>
+      </section>
+      <p class="note">映像のみ · 処理はWeb Worker内で完結 · サーバーへのアップロードなし</p>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
