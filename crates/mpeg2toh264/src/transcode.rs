@@ -25,11 +25,12 @@ use crate::h264::chroma::{
 use crate::h264::intra_pcm::reconstruct_intra_pcm;
 use crate::h264::mb::{
     b16x8_mb_type, b_mb_type, make_luma_counts, mark_no_chroma_coefficients, mark_no_coefficients,
-    to_zigzag_8x8, write_inter_macroblock, write_pcm_macroblock, ChromaCounts, CoeffCountMap,
-    InterMacroblock, MotionPartition, PcmMacroblockSamples, PcmSliceType, PredictionMode,
+    write_inter_macroblock, write_pcm_macroblock, ChromaCounts, CoeffCountMap, InterMacroblock,
+    MotionPartition, PcmMacroblockSamples, PcmSliceType, PredictionMode, FIELD_SCAN_8X8,
 };
 use crate::h264::mvmap::{map_vector, native_position, VectorKind};
 use crate::h264::mvpred::{MbMotion, MotionField};
+use crate::h264::params::ZIGZAG_8X8;
 use crate::h264::params::{
     frame_geometry, write_pps, write_sps, FrameGeometry, PpsConfig, SpsConfig,
 };
@@ -894,7 +895,6 @@ fn write_picture(
 
     let mut targets = [[0.0f32; 64]; 4];
     let mut field_targets = [[0.0f32; 64]; 4];
-    let mut raster = [0i32; 64];
     let mut luma_scratch = [[0i32; 64]; 4];
     let mut chroma_scratch: [ChromaBlockLevels; 2] =
         std::array::from_fn(|_| ChromaBlockLevels::default());
@@ -1081,8 +1081,12 @@ fn write_picture(
                         );
                     }
                     for b in 0..4 {
-                        quant.levels_for(&targets[b], qp, &mut raster);
-                        luma_active[b] = to_zigzag_8x8(&raster, &mut luma_scratch[b], false);
+                        luma_active[b] = quant.scanned_levels_for(
+                            &targets[b],
+                            qp,
+                            &ZIGZAG_8X8,
+                            &mut luma_scratch[b],
+                        );
                     }
 
                     let qp_c = chroma_qp(qp, CHROMA_QP_OFFSET);
@@ -1179,8 +1183,8 @@ fn write_picture(
                 } else {
                     &pair_raw_targets[b / 2][source_index]
                 };
-                quant.levels_for(selected, qp, &mut raster);
-                luma_active[b] = to_zigzag_8x8(&raster, &mut luma_scratch[b], true);
+                luma_active[b] =
+                    quant.scanned_levels_for(selected, qp, &FIELD_SCAN_8X8, &mut luma_scratch[b]);
             }
             has_chroma =
                 !pair_field_chroma[field][0].is_empty() || !pair_field_chroma[field][1].is_empty();

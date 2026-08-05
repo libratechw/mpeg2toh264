@@ -85,17 +85,29 @@ impl Quantiser8x8 {
         round_half_up_i32(target / self.gain[qp as usize * 64 + pos])
     }
 
-    /// [`Self::level_for`] across a whole block, with the QP's reciprocal gains
-    /// found once rather than per position.
+    /// Quantise a whole block directly into the scan order the residual coder
+    /// consumes. This avoids first writing raster levels and then copying all
+    /// 64 of them through a separate scan pass.
     #[inline]
-    pub fn levels_for(&self, targets: &[f32; 64], qp: i32, out: &mut [i32; 64]) {
+    pub fn scanned_levels_for(
+        &self,
+        targets: &[f32; 64],
+        qp: i32,
+        scan: &[usize; 64],
+        out: &mut [i32; 64],
+    ) -> bool {
         let base = qp as usize * 64;
         let reciprocal_gains: &[f32; 64] = self.reciprocal_gain[base..base + 64]
             .try_into()
             .expect("64 reciprocal gains");
-        for pos in 0..64 {
-            out[pos] = round_half_up_i32(targets[pos] * reciprocal_gains[pos]);
+        let mut any = false;
+        for k in 0..64 {
+            let pos = scan[k];
+            let level = round_half_up_i32(targets[pos] * reciprocal_gains[pos]);
+            out[k] = level;
+            any |= level != 0;
         }
+        any
     }
 
     /// Pick the QP whose step is `oversample` times finer than the MPEG-2 step.
