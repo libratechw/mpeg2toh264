@@ -1,11 +1,14 @@
 //! Packaging this transcoder's Annex B output as a fragmented MP4.
 
+use crate::bitreader::BitReader;
 use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
-use crate::mpeg2::constants::{PictureType, FRAME_RATE};
+use crate::mpeg2::constants::{PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
-    parse_elementary_stream, sequence_sample_aspect_ratio, SampleAspectRatio,
+    parse_elementary_stream, picture_geometry, sequence_sample_aspect_ratio, Picture,
+    SampleAspectRatio,
 };
+use crate::mpeg2::macroblock::{decode_slice, MacroblockGrid};
 use crate::round_half_up;
 
 const TIMESCALE: u32 = 90_000;
@@ -123,6 +126,24 @@ pub struct Mpeg2VideoTimeline {
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
 }
 
+/// Whether every slice in a source picture reaches its end cleanly. The
+/// transcoder drops a picture when any of its independently decodable slices
+/// is damaged or truncated; the MP4 timeline must make the identical decision
+/// or it will reserve a sample that the H.264 stream does not contain.
+fn picture_is_decodable(
+    reader: &mut BitReader<'_>,
+    picture: &Picture,
+    grid: &mut MacroblockGrid,
+) -> bool {
+    let geometry = picture_geometry(picture);
+    grid.reset(geometry.mb_width * geometry.mb_height);
+    !picture.slices.is_empty()
+        && picture
+            .slices
+            .iter()
+            .all(|slice| decode_slice(reader, picture, slice, geometry.mb_width, grid).is_ok())
+}
+
 /// Reproduce the transcoder's accepted-picture timeline in MP4 timescale units.
 ///
 /// `has_references` is set when the unit continues an already-populated decoded
@@ -149,7 +170,31 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
     let mut seen_picture = false;
     let mut max_tr_in_gop: u32 = 0;
     let mut presentation_indices = Vec::new();
-    for picture in &pictures {
+    let mut reader = BitReader::new(data);
+    let mut grid = MacroblockGrid::new();
+    let mut picture_index = 0;
+    while picture_index < pictures.len() {
+        let picture = &pictures[picture_index];
+        let mut mate = None;
+        if picture.coding.picture_structure != PictureStructure::Frame {
+            let Some(field_mate) = pictures.get(picture_index + 1) else {
+                bail!("unpaired MPEG-2 field picture in MP4 timeline");
+            };
+            if field_mate.coding.picture_structure == PictureStructure::Frame
+                || field_mate.coding.picture_structure == picture.coding.picture_structure
+                || field_mate.header.temporal_reference != picture.header.temporal_reference
+                || field_mate.header.picture_coding_type != picture.header.picture_coding_type
+            {
+                bail!("MPEG-2 field picture timeline has no complementary field");
+            }
+            // The transcoder combines complementary fields into one MBAFF
+            // frame, so they occupy one MP4 sample and advance reference state
+            // only once as well.
+            mate = Some(field_mate);
+            picture_index += 2;
+        } else {
+            picture_index += 1;
+        }
         let picture_type = picture.header.picture_coding_type;
         if !picture_type.is_ipb() {
             continue;
@@ -161,6 +206,11 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
         }
         seen_picture = true;
         max_tr_in_gop = max_tr_in_gop.max(tr);
+        if !picture_is_decodable(&mut reader, picture, &mut grid)
+            || mate.is_some_and(|field| !picture_is_decodable(&mut reader, field, &mut grid))
+        {
+            continue;
+        }
         if picture_type == PictureType::B && references < 2 {
             continue;
         }
