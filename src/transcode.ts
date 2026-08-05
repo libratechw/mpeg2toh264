@@ -96,6 +96,21 @@ export interface TranscodeOptions {
   oversample?: number;
   /** Convert only MPEG-2 I pictures; P and B pictures are counted as skipped. */
   iFramesOnly?: boolean;
+  /**
+   * Code an interlaced source as progressive frames.
+   *
+   * Field-DCT macroblocks cost nothing: their blocks convert to frame DCT
+   * exactly, in the coefficient domain. Field motion does cost something,
+   * because a field-motion macroblock carries a vector per field and a frame
+   * macroblock has room for one, so the two are averaged and the prediction is
+   * approximate wherever the fields moved differently.
+   *
+   * What it buys is a stream without macroblock-adaptive frame/field coding,
+   * which some hardware decoders refuse outright -- Apple's VideoToolbox will
+   * not create a decoder for frame_mbs_only_flag equal to 0 at all, whoever
+   * produced the stream.
+   */
+  progressive?: boolean;
 }
 
 export interface TranscodeResult {
@@ -182,7 +197,8 @@ export class IncrementalTranscoder {
 
     const width = first.sequence.horizontalSize;
     const height = first.sequence.verticalSize;
-    const mbaff = !first.sequenceExt.progressiveSequence;
+    const mbaff =
+      !first.sequenceExt.progressiveSequence && !options.progressive;
     if (
       this.initialized &&
       (width !== this.width || height !== this.height || mbaff !== this.mbaff)

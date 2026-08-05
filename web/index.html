@@ -18,6 +18,10 @@
             <span>TSファイルを選択</span>
             <input id="file" type="file" accept=".ts,.m2ts,.m2t,.mts,video/mp2t" />
           </label>
+          <label>
+            <input id="progressive" type="checkbox" />
+            <span>インターレース素材をprogressiveとして出力（ハードウェアデコードが使えるようになりますが、フィールド単位の動きベクトルが平均に丸められます）</span>
+          </label>
           <div>
             <p id="status">MPEG-2 TSファイルを選択してください。</p>
             <p id="details"></p>

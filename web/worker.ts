@@ -35,7 +35,7 @@ let timelinesAligned: boolean;
 const RANDOM_ACCESS_GOP_INTERVAL = 24;
 const TIMESCALE = 90_000;
 
-function reset() {
+function reset(progressive = false) {
   demuxer = new MpegTsAvDemuxer();
   gops = new Mpeg2GopStream();
   adts = new AdtsStream();
@@ -43,7 +43,7 @@ function reset() {
   videoPresentationStart = 0;
   audioFramesEmitted = 0;
   initialized = false;
-  transcoder = new IncrementalTranscoder();
+  transcoder = new IncrementalTranscoder({ progressive });
   pendingGops = [];
   pendingAudio = [];
   audioConfig = null;
@@ -209,11 +209,15 @@ function consumeElementary(parts: MpegTsElementaryPacket[]) {
 
 reset();
 self.onmessage = (
-  event: MessageEvent<{ type: string; data?: ArrayBuffer }>,
+  event: MessageEvent<{
+    type: string;
+    data?: ArrayBuffer;
+    progressive?: boolean;
+  }>,
 ) => {
   try {
     if (event.data.type === "start") {
-      reset();
+      reset(event.data.progressive);
       self.postMessage({ type: "pull" });
     } else if (event.data.type === "chunk") {
       consumeElementary(demuxer.push(new Uint8Array(event.data.data!)));

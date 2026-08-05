@@ -20,6 +20,7 @@ Arguments:
 Options:
   -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
       --i-frames-only       Convert MPEG-2 I pictures only
+      --progressive         Code interlaced sources as progressive frames
   -q, --quiet               Do not print the conversion summary
   -h, --help                Show this help
 `;
@@ -41,6 +42,7 @@ export function parseArgs(args: string[]): CliOptions {
   const positional: string[] = [];
   let oversample = 2;
   let iFramesOnly = false;
+  let progressive = false;
   let quiet = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -51,6 +53,10 @@ export function parseArgs(args: string[]): CliOptions {
     }
     if (arg === "--i-frames-only") {
       iFramesOnly = true;
+      continue;
+    }
+    if (arg === "--progressive") {
+      progressive = true;
       continue;
     }
     if (arg === "-q" || arg === "--quiet") {
@@ -82,7 +88,7 @@ export function parseArgs(args: string[]): CliOptions {
   const input = resolve(positional[0]!);
   const output = resolve(positional[1]!);
   if (input === output) fail("input and output must be different files");
-  return { input, output, oversample, iFramesOnly, quiet };
+  return { input, output, oversample, iFramesOnly, progressive, quiet };
 }
 
 function main(): void {
