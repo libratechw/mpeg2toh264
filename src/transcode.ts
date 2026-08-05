@@ -21,6 +21,7 @@ import {
 import {
   parseElementaryStream,
   pictureGeometry,
+  sequenceSampleAspectRatio,
   type Picture,
 } from "./mpeg2/headers.ts";
 import {
@@ -208,6 +209,7 @@ export class IncrementalTranscoder {
             // display ahead of it, so one picture has to be held back.
             maxNumReorderFrames: 1,
             maxDecFrameBuffering: 4,
+            sampleAspectRatio: sequenceSampleAspectRatio(first.sequence),
           }),
           writePps({
             initQp: PPS_INIT_QP,

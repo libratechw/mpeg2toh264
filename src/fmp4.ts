@@ -1,5 +1,9 @@
 import { PictureType } from "./mpeg2/constants.ts";
-import { parseElementaryStream } from "./mpeg2/headers.ts";
+import {
+  parseElementaryStream,
+  sequenceSampleAspectRatio,
+  type SampleAspectRatio,
+} from "./mpeg2/headers.ts";
 import type { AacConfig } from "./aac/adts.ts";
 
 const TIMESCALE = 90_000;
@@ -88,6 +92,7 @@ export interface Mpeg2VideoTimeline {
   sampleDuration: number;
   /** Presentation index for each coded picture, after the leading grey IDR. */
   presentationIndices: number[];
+  sampleAspectRatio?: SampleAspectRatio;
 }
 
 /** Reproduce the transcoder's accepted-picture timeline in MP4 timescale units. */
@@ -136,6 +141,7 @@ export function mpeg2VideoTimeline(
     height: first.sequence.verticalSize,
     sampleDuration,
     presentationIndices,
+    sampleAspectRatio: sequenceSampleAspectRatio(first.sequence),
   };
 }
 
@@ -188,6 +194,7 @@ function makeInitSegment(
   sps: Uint8Array,
   pps: Uint8Array,
   audio?: AacConfig,
+  sampleAspectRatio?: SampleAspectRatio,
 ) {
   const ftyp = box(
     "ftyp",
@@ -285,6 +292,15 @@ function makeInitSegment(
     u16(0x18),
     u16(0xffff),
     makeAvcC(sps, pps),
+    ...(sampleAspectRatio
+      ? [
+          box(
+            "pasp",
+            u32(sampleAspectRatio.width),
+            u32(sampleAspectRatio.height),
+          ),
+        ]
+      : []),
   );
   const stsd = fullBox("stsd", 0, 0, u32(1), avc1);
   const stbl = box(
@@ -542,7 +558,14 @@ export function h264ToFmp4(
     .map((v) => v.toString(16).padStart(2, "0"))
     .join("");
   return {
-    initSegment: makeInitSegment(timeline.width, timeline.height, sps, pps),
+    initSegment: makeInitSegment(
+      timeline.width,
+      timeline.height,
+      sps,
+      pps,
+      undefined,
+      timeline.sampleAspectRatio,
+    ),
     mediaSegment: makeMediaSegment(
       samples,
       samples.map(() => timeline.sampleDuration),
@@ -617,7 +640,14 @@ export function h264GopToFmp4(
   return {
     initSegment:
       sps && pps
-        ? makeInitSegment(timeline.width, timeline.height, sps, pps, audio)
+        ? makeInitSegment(
+            timeline.width,
+            timeline.height,
+            sps,
+            pps,
+            audio,
+            timeline.sampleAspectRatio,
+          )
         : new Uint8Array(0),
     mediaSegment: audioTrack
       ? makeAvMediaSegment(

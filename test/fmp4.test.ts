@@ -9,6 +9,7 @@ import {
   mpeg2VideoTimeline,
 } from "../src/fmp4.ts";
 import { IncrementalTranscoder, transcode } from "../src/transcode.ts";
+import { sequenceSampleAspectRatio } from "../src/mpeg2/headers.ts";
 
 function fixture(name: string) {
   return new Uint8Array(
@@ -21,6 +22,16 @@ function text(data: Uint8Array) {
 }
 
 describe("fragmented MP4 muxing", () => {
+  it("derives 4:3 SAR for 1440x1080 MPEG-2 signalled as 16:9", () => {
+    expect(
+      sequenceSampleAspectRatio({
+        horizontalSize: 1440,
+        verticalSize: 1080,
+        aspectRatioInformation: 3,
+      }),
+    ).toEqual({ width: 4, height: 3 });
+  });
+
   it("packages SPS/PPS and every H.264 access unit for MSE", () => {
     const mpeg2 = fixture("ibbp.m2v");
     const result = transcode(mpeg2);
@@ -32,6 +43,17 @@ describe("fragmented MP4 muxing", () => {
     expect(text(mp4.initSegment)).toContain("avcC");
     expect(text(mp4.mediaSegment)).toContain("moof");
     expect(text(mp4.mediaSegment)).toContain("mdat");
+  });
+
+  it("writes pixel aspect ratio into the MP4 sample entry", () => {
+    const mpeg2 = fixture("ibbp.m2v");
+    const result = transcode(mpeg2);
+    const timeline = {
+      ...mpeg2VideoTimeline(mpeg2),
+      sampleAspectRatio: { width: 4, height: 3 },
+    };
+    const mp4 = h264ToFmp4(result.bitstream, timeline);
+    expect(text(mp4.initSegment)).toContain("pasp");
   });
 
   it("derives 30000/1001 timing in the 90 kHz media timescale", () => {

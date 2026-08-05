@@ -40,6 +40,41 @@ export interface SequenceExtension {
   frameRateExtensionD: number;
 }
 
+export interface SampleAspectRatio {
+  width: number;
+  height: number;
+}
+
+function gcd(a: number, b: number): number {
+  while (b !== 0) [a, b] = [b, a % b];
+  return a;
+}
+
+/** Convert MPEG-2 display aspect ratio signalling to a pixel aspect ratio. */
+export function sequenceSampleAspectRatio(
+  sequence: Pick<
+    SequenceHeader,
+    "horizontalSize" | "verticalSize" | "aspectRatioInformation"
+  >,
+): SampleAspectRatio | undefined {
+  if (sequence.aspectRatioInformation === 1) return { width: 1, height: 1 };
+  const display =
+    sequence.aspectRatioInformation === 2
+      ? [4, 3]
+      : sequence.aspectRatioInformation === 3
+        ? [16, 9]
+        : sequence.aspectRatioInformation === 4
+          ? [221, 100]
+          : undefined;
+  if (!display) return undefined;
+  let width = display[0]! * sequence.verticalSize;
+  let height = display[1]! * sequence.horizontalSize;
+  const divisor = gcd(width, height);
+  width /= divisor;
+  height /= divisor;
+  return { width, height };
+}
+
 /** All four quantiser matrices, held in raster order. */
 export interface QuantMatrices {
   intra: number[];
