@@ -1,7 +1,13 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { h264GopToFmp4, h264ToFmp4, mpeg2VideoTimeline } from "../src/fmp4.ts";
+import {
+  aacFmp4Init,
+  aacToFmp4Fragment,
+  h264GopToFmp4,
+  h264ToFmp4,
+  mpeg2VideoTimeline,
+} from "../src/fmp4.ts";
 import { IncrementalTranscoder, transcode } from "../src/transcode.ts";
 
 function fixture(name: string) {
@@ -55,5 +61,41 @@ describe("fragmented MP4 muxing", () => {
     expect(first.initSegment.length).toBeGreaterThan(0);
     expect(second.initSegment.length).toBe(0);
     expect(second.sampleCount).toBe(secondTimeline.presentationIndices.length);
+  });
+
+  it("packages raw AAC-LC frames in an audio track without ADTS headers", () => {
+    const config = {
+      audioObjectType: 2,
+      sampleRate: 48_000,
+      samplingFrequencyIndex: 3,
+      channelCount: 2,
+      audioSpecificConfig: Uint8Array.of(0x11, 0x90),
+    };
+    const init = aacFmp4Init(config);
+    const samples = [Uint8Array.of(1, 2, 3), Uint8Array.of(4, 5)];
+    const fragment = aacToFmp4Fragment(samples, 1, 0);
+    expect(init.mimeCodec).toBe('audio/mp4; codecs="mp4a.40.2"');
+    expect(text(init.initSegment)).toContain("mp4a");
+    expect(text(init.initSegment)).toContain("esds");
+    expect(fragment.sampleCount).toBe(2);
+    expect(fragment.duration).toBe(2048);
+    expect(fragment.mediaSegment.subarray(-5)).toEqual(
+      Uint8Array.of(1, 2, 3, 4, 5),
+    );
+
+    const mpeg2 = fixture("ibbp.m2v");
+    const h264 = transcode(mpeg2);
+    const combined = h264GopToFmp4(
+      h264.bitstream,
+      mpeg2VideoTimeline(mpeg2),
+      1,
+      0,
+      0,
+      config,
+      { config, samples, baseDecodeTime: 0 },
+    );
+    expect(combined.mimeCodec).toContain("mp4a.40.2");
+    expect(text(combined.initSegment).match(/trak/g)).toHaveLength(2);
+    expect(text(combined.mediaSegment).match(/traf/g)).toHaveLength(2);
   });
 });

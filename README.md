@@ -17,7 +17,7 @@ npm run web:dev
 4. Media Source Extensionsの`SourceBuffer`へ順次append
 5. MSE quota到達時はTS読み込みとappendを停止し、再生済み範囲を削除後に再開
 
-音声にはまだ対応していません。プロダクションビルドは次のコマンドで`dist/`へ生成できます。
+AAC-LC音声は再エンコードせず、ADTSヘッダーだけを外してfMP4音声トラックへmuxします。プロダクションビルドは次のコマンドで`dist/`へ生成できます。
 
 ```bash
 npm run web:build

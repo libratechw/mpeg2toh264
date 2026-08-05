@@ -1,5 +1,6 @@
 import { PictureType } from "./mpeg2/constants.ts";
 import { parseElementaryStream } from "./mpeg2/headers.ts";
+import type { AacConfig } from "./aac/adts.ts";
 
 const TIMESCALE = 90_000;
 
@@ -151,11 +152,42 @@ function makeAvcC(sps: Uint8Array, pps: Uint8Array): Uint8Array {
   );
 }
 
+function makeEsds(config: AacConfig): Uint8Array {
+  const descriptor = (tag: number, payload: Uint8Array) =>
+    concat([
+      Uint8Array.of(
+        tag,
+        0x80 | ((payload.length >>> 21) & 0x7f),
+        0x80 | ((payload.length >>> 14) & 0x7f),
+        0x80 | ((payload.length >>> 7) & 0x7f),
+        payload.length & 0x7f,
+      ),
+      payload,
+    ]);
+  const decoderSpecific = descriptor(0x05, config.audioSpecificConfig);
+  const decoderConfig = descriptor(
+    0x04,
+    concat([
+      Uint8Array.of(0x40, 0x15, 0, 0, 0),
+      u32(0),
+      u32(0),
+      decoderSpecific,
+    ]),
+  );
+  const slConfig = descriptor(0x06, Uint8Array.of(0x02));
+  const esDescriptor = descriptor(
+    0x03,
+    concat([u16(2), Uint8Array.of(0), decoderConfig, slConfig]),
+  );
+  return fullBox("esds", 0, 0, esDescriptor);
+}
+
 function makeInitSegment(
   width: number,
   height: number,
   sps: Uint8Array,
   pps: Uint8Array,
+  audio?: AacConfig,
 ) {
   const ftyp = box(
     "ftyp",
@@ -185,7 +217,7 @@ function makeInitSegment(
     u32(0),
     u32(0x40000000),
     zeros(24),
-    u32(2),
+    u32(audio ? 3 : 2),
   );
   const tkhd = fullBox(
     "tkhd",
@@ -267,7 +299,87 @@ function makeInitSegment(
   const mdia = box("mdia", mdhd, hdlr, minf);
   const trak = box("trak", tkhd, mdia);
   const trex = fullBox("trex", 0, 0, u32(1), u32(1), u32(0), u32(0), u32(0));
-  return concat([ftyp, box("moov", mvhd, trak, box("mvex", trex))]);
+  let audioTrak: Uint8Array = new Uint8Array(0);
+  let audioTrex: Uint8Array = new Uint8Array(0);
+  if (audio) {
+    const audioTkhd = fullBox(
+      "tkhd",
+      0,
+      7,
+      u32(0),
+      u32(0),
+      u32(2),
+      u32(0),
+      u32(0),
+      zeros(8),
+      u16(0),
+      u16(0),
+      u16(0x0100),
+      u16(0),
+      u32(0x00010000),
+      u32(0),
+      u32(0),
+      u32(0),
+      u32(0x00010000),
+      u32(0),
+      u32(0),
+      u32(0),
+      u32(0x40000000),
+      u32(0),
+      u32(0),
+    );
+    const audioMdhd = fullBox(
+      "mdhd",
+      0,
+      0,
+      u32(0),
+      u32(0),
+      u32(audio.sampleRate),
+      u32(0),
+      u16(0x55c4),
+      u16(0),
+    );
+    const audioHdlr = fullBox(
+      "hdlr",
+      0,
+      0,
+      u32(0),
+      ascii("soun"),
+      zeros(12),
+      ascii("SoundHandler\0"),
+    );
+    const smhd = fullBox("smhd", 0, 0, u16(0), u16(0));
+    const mp4a = box(
+      "mp4a",
+      zeros(6),
+      u16(1),
+      zeros(8),
+      u16(audio.channelCount),
+      u16(16),
+      u16(0),
+      u16(0),
+      u32(audio.sampleRate << 16),
+      makeEsds(audio),
+    );
+    const audioStbl = box(
+      "stbl",
+      fullBox("stsd", 0, 0, u32(1), mp4a),
+      fullBox("stts", 0, 0, u32(0)),
+      fullBox("stsc", 0, 0, u32(0)),
+      fullBox("stsz", 0, 0, u32(0), u32(0)),
+      fullBox("stco", 0, 0, u32(0)),
+    );
+    audioTrak = box(
+      "trak",
+      audioTkhd,
+      box("mdia", audioMdhd, audioHdlr, box("minf", smhd, dinf, audioStbl)),
+    );
+    audioTrex = fullBox("trex", 0, 0, u32(2), u32(1), u32(0), u32(0), u32(0));
+  }
+  return concat([
+    ftyp,
+    box("moov", mvhd, trak, audioTrak, box("mvex", trex, audioTrex)),
+  ]);
 }
 
 function lengthPrefixed(nal: Uint8Array): Uint8Array {
@@ -309,6 +421,95 @@ function makeMediaSegment(
   let moof = makeMoof(0);
   moof = makeMoof(moof.length + 8);
   return concat([moof, box("mdat", ...payloads)]);
+}
+
+function makeAudioMediaSegment(
+  samples: Uint8Array[],
+  sequenceNumber: number,
+  baseDecodeTime: number,
+) {
+  const entries = samples.flatMap((sample) => [u32(1024), u32(sample.length)]);
+  const makeMoof = (dataOffset: number) => {
+    const mfhd = fullBox("mfhd", 0, 0, u32(sequenceNumber));
+    const tfhd = fullBox("tfhd", 0, 0x020000, u32(1));
+    const tfdt = fullBox("tfdt", 0, 0, u32(baseDecodeTime));
+    const trun = fullBox(
+      "trun",
+      0,
+      0x000301,
+      u32(samples.length),
+      u32(dataOffset),
+      ...entries,
+    );
+    return box("moof", mfhd, box("traf", tfhd, tfdt, trun));
+  };
+  let moof = makeMoof(0);
+  moof = makeMoof(moof.length + 8);
+  return concat([moof, box("mdat", ...samples)]);
+}
+
+function makeAvMediaSegment(
+  videoSamples: Uint8Array[],
+  videoDurations: number[],
+  videoCompositions: number[],
+  audioSamples: Uint8Array[],
+  sequenceNumber: number,
+  videoBaseDecodeTime: number,
+  audioBaseDecodeTime: number,
+) {
+  const videoPayloads = videoSamples.map(lengthPrefixed);
+  const videoEntries: Uint8Array[] = [];
+  for (let index = 0; index < videoSamples.length; index++) {
+    const sync = (videoSamples[index]![0]! & 0x1f) === 5;
+    videoEntries.push(
+      u32(videoDurations[index]!),
+      u32(videoPayloads[index]!.length),
+      u32(sync ? 0x02000000 : 0x01010000),
+      u32(videoCompositions[index]!),
+    );
+  }
+  const audioEntries = audioSamples.flatMap((sample) => [
+    u32(1024),
+    u32(sample.length),
+  ]);
+  const videoBytes = videoPayloads.reduce(
+    (sum, sample) => sum + sample.length,
+    0,
+  );
+  const makeMoof = (videoOffset: number, audioOffset: number) => {
+    const mfhd = fullBox("mfhd", 0, 0, u32(sequenceNumber));
+    const videoTraf = box(
+      "traf",
+      fullBox("tfhd", 0, 0x020000, u32(1)),
+      fullBox("tfdt", 0, 0, u32(videoBaseDecodeTime)),
+      fullBox(
+        "trun",
+        1,
+        0x000f01,
+        u32(videoSamples.length),
+        u32(videoOffset),
+        ...videoEntries,
+      ),
+    );
+    const audioTraf = box(
+      "traf",
+      fullBox("tfhd", 0, 0x020000, u32(2)),
+      fullBox("tfdt", 0, 0, u32(audioBaseDecodeTime)),
+      fullBox(
+        "trun",
+        0,
+        0x000301,
+        u32(audioSamples.length),
+        u32(audioOffset),
+        ...audioEntries,
+      ),
+    );
+    return box("moof", mfhd, videoTraf, audioTraf);
+  };
+  let moof = makeMoof(0, 0);
+  const payloadStart = moof.length + 8;
+  moof = makeMoof(payloadStart, payloadStart + videoBytes);
+  return concat([moof, box("mdat", ...videoPayloads, ...audioSamples)]);
 }
 
 export interface Fmp4Output {
@@ -359,6 +560,12 @@ export interface Fmp4FragmentOutput extends Fmp4Output {
   duration: number;
 }
 
+export interface Fmp4AudioSamples {
+  config: AacConfig;
+  samples: Uint8Array[];
+  baseDecodeTime: number;
+}
+
 /** Package one independently transcoded GOP for incremental MSE appending. */
 export function h264GopToFmp4(
   h264: Uint8Array,
@@ -366,6 +573,8 @@ export function h264GopToFmp4(
   sequenceNumber: number,
   baseDecodeTime: number,
   presentationBase = 0,
+  audio?: AacConfig,
+  audioTrack?: Fmp4AudioSamples,
 ): Fmp4FragmentOutput {
   const nals = splitAnnexB(h264);
   const sps = nals.find((nal) => (nal[0]! & 0x1f) === 7);
@@ -408,17 +617,167 @@ export function h264GopToFmp4(
   return {
     initSegment:
       sps && pps
-        ? makeInitSegment(timeline.width, timeline.height, sps, pps)
+        ? makeInitSegment(timeline.width, timeline.height, sps, pps, audio)
         : new Uint8Array(0),
-    mediaSegment: makeMediaSegment(
+    mediaSegment: audioTrack
+      ? makeAvMediaSegment(
+          samples,
+          durations,
+          compositions,
+          audioTrack.samples,
+          sequenceNumber,
+          baseDecodeTime,
+          audioTrack.baseDecodeTime,
+        )
+      : makeMediaSegment(
+          samples,
+          durations,
+          compositions,
+          sequenceNumber,
+          baseDecodeTime,
+        ),
+    mimeCodec: codec
+      ? `video/mp4; codecs="avc1.${codec}${audio ? ",mp4a.40.2" : ""}"`
+      : "",
+    sampleCount: samples.length,
+    duration: durations.reduce((sum, value) => sum + value, 0),
+  };
+}
+
+export interface AacFmp4Fragment {
+  mediaSegment: Uint8Array;
+  duration: number;
+  sampleCount: number;
+}
+
+/** Build an audio-only fragmented MP4 initialization segment for one AAC-LC track. */
+export function aacFmp4Init(config: AacConfig): {
+  initSegment: Uint8Array;
+  mimeCodec: string;
+} {
+  const ftyp = box("ftyp", ascii("isom"), u32(0x200), ascii("isomiso6mp41"));
+  const mvhd = fullBox(
+    "mvhd",
+    0,
+    0,
+    u32(0),
+    u32(0),
+    u32(TIMESCALE),
+    u32(0),
+    u32(0x00010000),
+    u16(0x0100),
+    u16(0),
+    zeros(8),
+    u32(0x00010000),
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(0x00010000),
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(0x40000000),
+    zeros(24),
+    u32(2),
+  );
+  const tkhd = fullBox(
+    "tkhd",
+    0,
+    7,
+    u32(0),
+    u32(0),
+    u32(1),
+    u32(0),
+    u32(0),
+    zeros(8),
+    u16(0),
+    u16(0),
+    u16(0x0100),
+    u16(0),
+    u32(0x00010000),
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(0x00010000),
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(0x40000000),
+    u32(0),
+    u32(0),
+  );
+  const mdhd = fullBox(
+    "mdhd",
+    0,
+    0,
+    u32(0),
+    u32(0),
+    u32(config.sampleRate),
+    u32(0),
+    u16(0x55c4),
+    u16(0),
+  );
+  const hdlr = fullBox(
+    "hdlr",
+    0,
+    0,
+    u32(0),
+    ascii("soun"),
+    zeros(12),
+    ascii("SoundHandler\0"),
+  );
+  const url = fullBox("url ", 0, 1);
+  const dinf = box("dinf", fullBox("dref", 0, 0, u32(1), url));
+  const mp4a = box(
+    "mp4a",
+    zeros(6),
+    u16(1),
+    zeros(8),
+    u16(config.channelCount),
+    u16(16),
+    u16(0),
+    u16(0),
+    u32(config.sampleRate << 16),
+    makeEsds(config),
+  );
+  const stbl = box(
+    "stbl",
+    fullBox("stsd", 0, 0, u32(1), mp4a),
+    fullBox("stts", 0, 0, u32(0)),
+    fullBox("stsc", 0, 0, u32(0)),
+    fullBox("stsz", 0, 0, u32(0), u32(0)),
+    fullBox("stco", 0, 0, u32(0)),
+  );
+  const trak = box(
+    "trak",
+    tkhd,
+    box(
+      "mdia",
+      mdhd,
+      hdlr,
+      box("minf", fullBox("smhd", 0, 0, u16(0), u16(0)), dinf, stbl),
+    ),
+  );
+  const trex = fullBox("trex", 0, 0, u32(1), u32(1), u32(0), u32(0), u32(0));
+  return {
+    initSegment: concat([ftyp, box("moov", mvhd, trak, box("mvex", trex))]),
+    mimeCodec: 'audio/mp4; codecs="mp4a.40.2"',
+  };
+}
+
+/** Package raw AAC access units (ADTS headers already removed) for an audio SourceBuffer. */
+export function aacToFmp4Fragment(
+  samples: Uint8Array[],
+  sequenceNumber: number,
+  baseDecodeTime: number,
+): AacFmp4Fragment {
+  return {
+    mediaSegment: makeAudioMediaSegment(
       samples,
-      durations,
-      compositions,
       sequenceNumber,
       baseDecodeTime,
     ),
-    mimeCodec: codec ? `video/mp4; codecs="avc1.${codec}"` : "",
+    duration: samples.length * 1024,
     sampleCount: samples.length,
-    duration: durations.reduce((sum, value) => sum + value, 0),
   };
 }

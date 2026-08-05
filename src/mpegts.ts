@@ -3,6 +3,7 @@
 const TS_PACKET_SIZE = 188;
 const SYNC_BYTE = 0x47;
 const STREAM_TYPE_MPEG2_VIDEO = 0x02;
+const STREAM_TYPE_AAC_ADTS = 0x0f;
 
 interface TsPayload {
   pid: number;
@@ -108,18 +109,25 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
-function pesPayload(packet: Uint8Array): Uint8Array {
+function pesPayload(
+  packet: Uint8Array,
+  kind: "video" | "audio" = "video",
+): Uint8Array {
   if (
     packet.length < 9 ||
     packet[0] !== 0 ||
     packet[1] !== 0 ||
     packet[2] !== 1
   ) {
-    throw new Error("invalid MPEG-TS video PES start code");
+    throw new Error(`invalid MPEG-TS ${kind} PES start code`);
   }
   const streamId = packet[3]!;
-  if (streamId < 0xe0 || streamId > 0xef)
-    throw new Error(`unexpected video stream_id 0x${streamId.toString(16)}`);
+  const validStreamId =
+    kind === "video"
+      ? streamId >= 0xe0 && streamId <= 0xef
+      : streamId >= 0xc0 && streamId <= 0xdf;
+  if (!validStreamId)
+    throw new Error(`unexpected ${kind} stream_id 0x${streamId.toString(16)}`);
   const pesLength = (packet[4]! << 8) | packet[5]!;
   let start: number;
   if ((packet[6]! & 0xc0) === 0x80) {
@@ -141,15 +149,18 @@ function pesPayload(packet: Uint8Array): Uint8Array {
   return packet.subarray(start, end);
 }
 
-function isVideoPesStart(packet: Uint8Array): boolean {
-  return (
-    packet.length >= 4 &&
-    packet[0] === 0 &&
-    packet[1] === 0 &&
-    packet[2] === 1 &&
-    packet[3]! >= 0xe0 &&
-    packet[3]! <= 0xef
-  );
+function isPesStart(packet: Uint8Array, kind: "video" | "audio"): boolean {
+  if (
+    packet.length < 4 ||
+    packet[0] !== 0 ||
+    packet[1] !== 0 ||
+    packet[2] !== 1
+  )
+    return false;
+  const streamId = packet[3]!;
+  return kind === "video"
+    ? streamId >= 0xe0 && streamId <= 0xef
+    : streamId >= 0xc0 && streamId <= 0xdf;
 }
 
 /** Extract the first ISO/IEC 13818-2 video stream advertised by PAT/PMT. */
@@ -226,8 +237,18 @@ export function extractMpeg2VideoEs(data: Uint8Array): Uint8Array {
   return concat(elementaryParts);
 }
 
-/** Stateful TS demuxer for bounded-memory browser/file streaming. */
-export class MpegTsVideoDemuxer {
+export interface MpegTsElementaryPacket {
+  kind: "video" | "audio";
+  data: Uint8Array;
+}
+
+interface PesState {
+  parts: Uint8Array[];
+  collecting: boolean;
+}
+
+/** Stateful MPEG-2-video/AAC demuxer for bounded-memory browser streaming. */
+export class MpegTsAvDemuxer {
   private pending: Uint8Array = new Uint8Array(0);
   private synced = false;
   private readonly pmtPids = new Set<number>();
@@ -235,10 +256,15 @@ export class MpegTsVideoDemuxer {
     [0, new SectionAssembler()],
   ]);
   private videoPid = -1;
-  private pesParts: Uint8Array[] = [];
-  private collectingPes = false;
+  private audioPid = -1;
+  private readonly video: PesState = { parts: [], collecting: false };
+  private readonly audio: PesState = { parts: [], collecting: false };
 
-  push(chunk: Uint8Array): Uint8Array[] {
+  get hasAacAudio(): boolean {
+    return this.audioPid >= 0;
+  }
+
+  push(chunk: Uint8Array): MpegTsElementaryPacket[] {
     const input = concat([this.pending, chunk]);
     let at = 0;
     if (!this.synced) {
@@ -250,32 +276,40 @@ export class MpegTsVideoDemuxer {
       at = offset;
       this.synced = true;
     }
-    const output: Uint8Array[] = [];
+    const output: MpegTsElementaryPacket[] = [];
     for (; at + TS_PACKET_SIZE <= input.length; at += TS_PACKET_SIZE) {
       const packet = payloadAt(input, at);
       if (!packet) continue;
       if (packet.pid === 0 || this.pmtPids.has(packet.pid))
         this.pushPsi(packet);
-      if (packet.pid !== this.videoPid) continue;
+      const kind =
+        packet.pid === this.videoPid
+          ? "video"
+          : packet.pid === this.audioPid
+            ? "audio"
+            : null;
+      if (!kind) continue;
+      const state = kind === "video" ? this.video : this.audio;
       if (packet.payloadUnitStart) {
-        this.flushPes(output);
-        this.collectingPes = isVideoPesStart(packet.data);
+        this.flushPes(kind, state, output);
+        state.collecting = isPesStart(packet.data, kind);
       }
-      if (this.collectingPes) this.pesParts.push(packet.data);
+      if (state.collecting) state.parts.push(packet.data);
     }
     this.pending = input.slice(at);
     return output;
   }
 
-  finish(): Uint8Array[] {
+  finish(): MpegTsElementaryPacket[] {
     if (!this.synced)
       throw new Error("input is not a 188-byte MPEG transport stream");
     if (this.videoPid < 0)
       throw new Error(
         "MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)",
       );
-    const output: Uint8Array[] = [];
-    this.flushPes(output);
+    const output: MpegTsElementaryPacket[] = [];
+    this.flushPes("video", this.video, output);
+    this.flushPes("audio", this.audio, output);
     return output;
   }
 
@@ -301,16 +335,41 @@ export class MpegTsVideoDemuxer {
           const length = ((section[i + 3]! & 0x0f) << 8) | section[i + 4]!;
           if (this.videoPid < 0 && streamType === STREAM_TYPE_MPEG2_VIDEO)
             this.videoPid = pid;
+          if (this.audioPid < 0 && streamType === STREAM_TYPE_AAC_ADTS)
+            this.audioPid = pid;
           i += 5 + length;
         }
       }
     });
   }
 
-  private flushPes(output: Uint8Array[]) {
-    if (this.pesParts.length === 0) return;
-    output.push(pesPayload(concat(this.pesParts)));
-    this.pesParts = [];
-    this.collectingPes = false;
+  private flushPes(
+    kind: "video" | "audio",
+    state: PesState,
+    output: MpegTsElementaryPacket[],
+  ) {
+    if (state.parts.length === 0) return;
+    output.push({ kind, data: pesPayload(concat(state.parts), kind) });
+    state.parts = [];
+    state.collecting = false;
+  }
+}
+
+/** Video-only compatibility facade over the A/V streaming demuxer. */
+export class MpegTsVideoDemuxer {
+  private readonly demuxer = new MpegTsAvDemuxer();
+
+  push(chunk: Uint8Array): Uint8Array[] {
+    return this.demuxer
+      .push(chunk)
+      .filter((packet) => packet.kind === "video")
+      .map((packet) => packet.data);
+  }
+
+  finish(): Uint8Array[] {
+    return this.demuxer
+      .finish()
+      .filter((packet) => packet.kind === "video")
+      .map((packet) => packet.data);
   }
 }

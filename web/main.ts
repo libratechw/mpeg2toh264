@@ -22,6 +22,7 @@ let operation: "init" | "append" | "remove" | null = null;
 let quotaBlocked = false;
 let objectUrl: string | null = null;
 let sampleCount = 0;
+let audioSampleCount = 0;
 
 function setStatus(message: string, error = false) {
   status.textContent = message;
@@ -43,6 +44,7 @@ function resetState() {
   operation = null;
   quotaBlocked = false;
   sampleCount = 0;
+  audioSampleCount = 0;
   if (objectUrl) URL.revokeObjectURL(objectUrl);
   objectUrl = null;
   video.removeAttribute("src");
@@ -106,9 +108,8 @@ function pump() {
     if (error instanceof DOMException && error.name === "QuotaExceededError") {
       quotaBlocked = true;
       setStatus("MSEバッファが満杯です。再生が進むまで変換を停止しています…");
-    } else {
+    } else
       setStatus(error instanceof Error ? error.message : String(error), true);
-    }
   }
 }
 
@@ -186,15 +187,16 @@ input.addEventListener("change", () => {
     } else if (message.type === "fragment") {
       fragments.push(message.data);
       queuedBytes += message.data.byteLength;
-      sampleCount += message.samples;
-      details.textContent = `${file!.name} · ${sampleCount} frames · queue ${(queuedBytes / 1024 / 1024).toFixed(1)} MiB`;
+      sampleCount += message.samples ?? 0;
+      audioSampleCount += message.audioSamples ?? 0;
+      const audio =
+        audioSampleCount > 0 ? ` · ${audioSampleCount} AAC frames` : "";
+      details.textContent = `${file!.name} · ${sampleCount} video frames${audio} · queue ${(queuedBytes / 1024 / 1024).toFixed(1)} MiB`;
       pump();
     } else if (message.type === "done") {
       workerDone = true;
       maybeFinish();
-    } else if (message.type === "error") {
-      setStatus(message.message, true);
-    }
+    } else if (message.type === "error") setStatus(message.message, true);
   };
   setStatus("ストリーミング変換を開始します…");
   worker.postMessage({ type: "start" });
