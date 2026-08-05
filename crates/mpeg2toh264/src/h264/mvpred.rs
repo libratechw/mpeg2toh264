@@ -23,22 +23,16 @@ pub struct MbMotion {
 #[derive(Clone, Copy)]
 struct Neighbour {
     available: bool,
-    ref_idx_l0: i32,
-    ref_idx_l1: i32,
-    mv_l0x: i32,
-    mv_l0y: i32,
-    mv_l1x: i32,
-    mv_l1y: i32,
+    ref_idx: i32,
+    mv_x: i32,
+    mv_y: i32,
 }
 
 const UNAVAILABLE: Neighbour = Neighbour {
     available: false,
-    ref_idx_l0: -1,
-    ref_idx_l1: -1,
-    mv_l0x: 0,
-    mv_l0y: 0,
-    mv_l1x: 0,
-    mv_l1y: 0,
+    ref_idx: -1,
+    mv_x: 0,
+    mv_y: 0,
 };
 
 fn median(a: i32, b: i32, c: i32) -> i32 {
@@ -106,7 +100,7 @@ impl MotionField {
         self.coded[i] = 1;
     }
 
-    fn at(&self, bx: isize, by: isize) -> Neighbour {
+    fn at(&self, bx: isize, by: isize, list: usize) -> Neighbour {
         if bx < 0 || by < 0 || bx >= self.blk_w as isize || by >= self.blk_h as isize {
             return UNAVAILABLE;
         }
@@ -114,14 +108,12 @@ impl MotionField {
         if self.coded[i] == 0 {
             return UNAVAILABLE;
         }
+        let list_offset = list * 2;
         Neighbour {
             available: true,
-            ref_idx_l0: self.ref_idx[i * 2] as i32,
-            ref_idx_l1: self.ref_idx[i * 2 + 1] as i32,
-            mv_l0x: self.mv[i * 4],
-            mv_l0y: self.mv[i * 4 + 1],
-            mv_l1x: self.mv[i * 4 + 2],
-            mv_l1y: self.mv[i * 4 + 3],
+            ref_idx: self.ref_idx[i * 2 + list] as i32,
+            mv_x: self.mv[i * 4 + list_offset],
+            mv_y: self.mv[i * 4 + list_offset + 1],
         }
     }
 
@@ -146,23 +138,16 @@ impl MotionField {
     ) -> [i32; 2] {
         let bx = mb_x as isize * 4;
         let by = mb_y as isize * 4 + part as isize * 2;
-        let a = self.at(bx - 1, by);
-        let b = self.at(bx, by - 1);
-        let same_ref = |n: &Neighbour| {
-            n.available
-                && (if list == 0 {
-                    n.ref_idx_l0
-                } else {
-                    n.ref_idx_l1
-                }) == ref_idx
-        };
+        let a = self.at(bx - 1, by, list);
+        let b = self.at(bx, by - 1, list);
+        let same_ref = |n: &Neighbour| n.available && n.ref_idx == ref_idx;
         // Clause 8.4.1.3: 16x8 top prefers B and bottom prefers A before the
         // general median/reference-match process.
         if part == 0 && same_ref(&b) {
-            return vector_of(&b, list);
+            return vector_of(&b);
         }
         if part == 1 && same_ref(&a) {
-            return vector_of(&a, list);
+            return vector_of(&a);
         }
         self.predict_at(bx, by, 4, list, ref_idx)
     }
@@ -175,24 +160,16 @@ impl MotionField {
         list: usize,
         ref_idx: i32,
     ) -> [i32; 2] {
-        let a = self.at(bx - 1, by);
-        let b = self.at(bx, by - 1);
-        let mut c = self.at(bx + width, by - 1);
+        let a = self.at(bx - 1, by, list);
+        let b = self.at(bx, by - 1, list);
+        let mut c = self.at(bx + width, by - 1, list);
         if !c.available {
-            c = self.at(bx - 1, by - 1);
+            c = self.at(bx - 1, by - 1, list);
         }
 
-        let pick = |m: &Neighbour| -> (i32, i32, i32) {
-            if list == 0 {
-                (m.ref_idx_l0, m.mv_l0x, m.mv_l0y)
-            } else {
-                (m.ref_idx_l1, m.mv_l1x, m.mv_l1y)
-            }
-        };
-
-        let (r_a, x_a, y_a) = pick(&a);
-        let (mut r_b, mut x_b, mut y_b) = pick(&b);
-        let (mut r_c, mut x_c, mut y_c) = pick(&c);
+        let (r_a, x_a, y_a) = (a.ref_idx, a.mv_x, a.mv_y);
+        let (mut r_b, mut x_b, mut y_b) = (b.ref_idx, b.mv_x, b.mv_y);
+        let (mut r_c, mut x_c, mut y_c) = (c.ref_idx, c.mv_x, c.mv_y);
 
         // With nothing above, the left neighbour stands in for all three.
         if !b.available && !c.available && a.available {
@@ -219,12 +196,8 @@ impl MotionField {
     }
 }
 
-fn vector_of(n: &Neighbour, list: usize) -> [i32; 2] {
-    if list == 0 {
-        [n.mv_l0x, n.mv_l0y]
-    } else {
-        [n.mv_l1x, n.mv_l1y]
-    }
+fn vector_of(n: &Neighbour) -> [i32; 2] {
+    [n.mv_x, n.mv_y]
 }
 
 #[cfg(test)]
