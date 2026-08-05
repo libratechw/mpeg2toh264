@@ -25,5 +25,8 @@ RUN npm run web:build
 
 FROM nginx:1.30.4-alpine
 COPY --from=web-builder /src/dist /usr/share/nginx/html
+COPY docker/nginx.conf.template /etc/nginx/templates/default.conf.template
+
+ENV STREAM_UPSTREAM=http://127.0.0.1:8080
 
 EXPOSE 80

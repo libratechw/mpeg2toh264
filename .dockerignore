@@ -1,5 +1,7 @@
 .git
 .claude
+.agents
+.codex
 node_modules
 target
 dist
