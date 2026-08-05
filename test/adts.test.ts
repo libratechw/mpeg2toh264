@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AdtsStream } from "../src/aac/adts.ts";
+import { aacFrameCountThroughVideoTime, AdtsStream } from "../src/aac/adts.ts";
 
 function adts(
   payload: number[],
@@ -20,6 +20,11 @@ function adts(
 }
 
 describe("ADTS passthrough", () => {
+  it("allocates AAC frames from cumulative video time without per-GOP drift", () => {
+    const thirtySeconds = 30 * 90_000;
+    expect(aacFrameCountThroughVideoTime(thirtySeconds, 48_000)).toBe(1406);
+  });
+
   it("strips headers across arbitrary input boundaries", () => {
     const input = new Uint8Array([...adts([1, 2, 3]), ...adts([4, 5])]);
     const parser = new AdtsStream();

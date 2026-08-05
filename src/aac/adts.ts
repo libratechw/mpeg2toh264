@@ -23,6 +23,14 @@ export interface AacFrame {
   config: AacConfig;
 }
 
+/** AAC access units needed through an absolute 90 kHz video decode time. */
+export function aacFrameCountThroughVideoTime(
+  videoTime: number,
+  sampleRate: number,
+): number {
+  return Math.round((videoTime * sampleRate) / (90_000 * 1024));
+}
+
 /** Incrementally remove ADTS headers without touching AAC payload bits. */
 export class AdtsStream {
   private pending: Uint8Array = new Uint8Array(0);

@@ -1,5 +1,10 @@
 import { h264GopToFmp4, mpeg2VideoTimeline } from "../src/fmp4.ts";
-import { AdtsStream, type AacConfig, type AacFrame } from "../src/aac/adts.ts";
+import {
+  aacFrameCountThroughVideoTime,
+  AdtsStream,
+  type AacConfig,
+  type AacFrame,
+} from "../src/aac/adts.ts";
 import { Mpeg2GopStream } from "../src/mpeg2/gop-stream.ts";
 import { MpegTsAvDemuxer, type MpegTsElementaryPacket } from "../src/mpegts.ts";
 import { IncrementalTranscoder } from "../src/transcode.ts";
@@ -90,14 +95,18 @@ function flushPending(final = false) {
     audioConfig &&
     (final || pendingAudio.length > 0)
   ) {
-    const gop = pendingGops.shift()!;
+    const gop = pendingGops[0]!;
     const timeline = mpeg2VideoTimeline(gop, { hasReferences: initialized });
     const videoDuration =
-      timeline.presentationIndices.length * timeline.sampleDuration;
-    const wanted = Math.max(
-      1,
-      Math.round((videoDuration * audioConfig.sampleRate) / (90_000 * 1024)),
+      (timeline.presentationIndices.length + (initialized ? 0 : 1)) *
+      timeline.sampleDuration;
+    const desiredAudioFrames = aacFrameCountThroughVideoTime(
+      videoBaseDecodeTime + videoDuration,
+      audioConfig.sampleRate,
     );
+    const wanted = Math.max(0, desiredAudioFrames - audioBaseDecodeTime / 1024);
+    if (!final && pendingAudio.length < wanted) break;
+    pendingGops.shift();
     const take =
       final && pendingGops.length === 0
         ? pendingAudio.length

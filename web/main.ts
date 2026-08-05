@@ -162,6 +162,8 @@ function openMediaSource(mimeCodec: string) {
 }
 
 video.addEventListener("timeupdate", relieveQuota);
+video.addEventListener("waiting", relieveQuota);
+video.addEventListener("stalled", relieveQuota);
 
 input.addEventListener("change", () => {
   const selected = input.files?.[0];
