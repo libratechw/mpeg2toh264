@@ -330,6 +330,17 @@ fn decode_motion_component(
     Ok(vector)
 }
 
+fn mirror_single_vector_predictors(pmv: &mut [i32; 8], forward: bool, backward: bool) {
+    if forward {
+        pmv[4] = pmv[0];
+        pmv[5] = pmv[1];
+    }
+    if backward {
+        pmv[6] = pmv[2];
+        pmv[7] = pmv[3];
+    }
+}
+
 /// Decode the block layer: run/level pairs into an 8x8 array of levels.
 fn decode_block(
     r: &mut BitReader<'_>,
@@ -609,19 +620,12 @@ fn decode_macroblock(
         r.skip(1); // marker_bit
     }
 
-    if frame && motion != motion_type::FIELD {
-        // H.262 Table 7-23: frame-based (and dual-prime) motion carries one
-        // vector per direction, so the second predictor must track the first.
-        // Without this copy a following field-based macroblock predicts its
-        // bottom-field vector from stale state.
-        if read_forward {
-            state.pmv[4] = state.pmv[0];
-            state.pmv[5] = state.pmv[1];
-        }
-        if read_backward {
-            state.pmv[6] = state.pmv[2];
-            state.pmv[7] = state.pmv[3];
-        }
+    if motion_spec(pic.coding.picture_structure, motion).count == 1 {
+        // H.262 Table 7-23: every one-vector mode updates both r predictors.
+        // This includes frame motion in a frame picture and field motion in a
+        // field picture. Without the latter copy, a following 16x8 macroblock
+        // reconstructs its second vector from stale PMV[1] state.
+        mirror_single_vector_predictors(&mut state.pmv, read_forward, read_backward);
     }
 
     let mut cbp = 0;
@@ -656,4 +660,16 @@ fn decode_macroblock(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mirror_single_vector_predictors;
+
+    #[test]
+    fn one_vector_motion_updates_both_r_predictors() {
+        let mut pmv = [11, -12, 21, -22, 99, 99, 99, 99];
+        mirror_single_vector_predictors(&mut pmv, true, true);
+        assert_eq!(pmv, [11, -12, 21, -22, 11, -12, 21, -22]);
+    }
 }
