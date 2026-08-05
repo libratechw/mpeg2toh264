@@ -891,8 +891,6 @@ fn write_picture(
         field_chroma_counts,
         field_motion,
     } = scratch;
-    let mut nal_parts: Vec<Vec<u8>> = Vec::new();
-
     let mut targets = [[0.0f32; 64]; 4];
     let mut field_targets = [[0.0f32; 64]; 4];
     let mut luma_scratch = [[0i32; 64]; 4];
@@ -1015,8 +1013,7 @@ fn write_picture(
             write_pcm_macroblock(writer, PcmSliceType::I, &samples);
             if mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1 {
                 writer.rbsp_trailing_bits();
-                nal_parts.push(to_nal_unit(writer.bytes(), 3, nal_type::SLICE_IDR));
-                slice_open = false;
+                return Ok(to_nal_unit(writer.bytes(), 3, nal_type::SLICE_IDR));
             }
             continue;
         }
@@ -1468,7 +1465,7 @@ fn write_picture(
         }
         if mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1 {
             writer.rbsp_trailing_bits();
-            nal_parts.push(to_nal_unit(
+            return Ok(to_nal_unit(
                 writer.bytes(),
                 if ctx.real_idr {
                     3
@@ -1483,14 +1480,8 @@ fn write_picture(
                     nal_type::SLICE_NON_IDR
                 },
             ));
-            slice_open = false;
         }
     }
 
-    let total: usize = nal_parts.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(total);
-    for part in &nal_parts {
-        out.extend_from_slice(part);
-    }
-    Ok(out)
+    unreachable!("a picture geometry always contains a final macroblock")
 }
