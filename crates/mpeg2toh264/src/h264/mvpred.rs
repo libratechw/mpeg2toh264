@@ -149,7 +149,11 @@ impl MotionField {
         if part == 1 && same_ref(&a) {
             return vector_of(&a);
         }
-        self.predict_at(bx, by, 4, list, ref_idx)
+        let mut c = self.at(bx + 4, by - 1, list);
+        if !c.available {
+            c = self.at(bx - 1, by - 1, list);
+        }
+        predict_from_neighbours(a, b, c, ref_idx)
     }
 
     fn predict_at(
@@ -167,33 +171,36 @@ impl MotionField {
             c = self.at(bx - 1, by - 1, list);
         }
 
-        let (r_a, x_a, y_a) = (a.ref_idx, a.mv_x, a.mv_y);
-        let (mut r_b, mut x_b, mut y_b) = (b.ref_idx, b.mv_x, b.mv_y);
-        let (mut r_c, mut x_c, mut y_c) = (c.ref_idx, c.mv_x, c.mv_y);
-
-        // With nothing above, the left neighbour stands in for all three.
-        if !b.available && !c.available && a.available {
-            r_b = r_a;
-            x_b = x_a;
-            y_b = y_a;
-            r_c = r_a;
-            x_c = x_a;
-            y_c = y_a;
-        }
-
-        let matches =
-            i32::from(r_a == ref_idx) + i32::from(r_b == ref_idx) + i32::from(r_c == ref_idx);
-        if matches == 1 {
-            if r_a == ref_idx {
-                return [x_a, y_a];
-            }
-            if r_b == ref_idx {
-                return [x_b, y_b];
-            }
-            return [x_c, y_c];
-        }
-        [median(x_a, x_b, x_c), median(y_a, y_b, y_c)]
+        predict_from_neighbours(a, b, c, ref_idx)
     }
+}
+
+fn predict_from_neighbours(a: Neighbour, b: Neighbour, c: Neighbour, ref_idx: i32) -> [i32; 2] {
+    let (r_a, x_a, y_a) = (a.ref_idx, a.mv_x, a.mv_y);
+    let (mut r_b, mut x_b, mut y_b) = (b.ref_idx, b.mv_x, b.mv_y);
+    let (mut r_c, mut x_c, mut y_c) = (c.ref_idx, c.mv_x, c.mv_y);
+
+    // With nothing above, the left neighbour stands in for all three.
+    if !b.available && !c.available && a.available {
+        r_b = r_a;
+        x_b = x_a;
+        y_b = y_a;
+        r_c = r_a;
+        x_c = x_a;
+        y_c = y_a;
+    }
+
+    let matches = i32::from(r_a == ref_idx) + i32::from(r_b == ref_idx) + i32::from(r_c == ref_idx);
+    if matches == 1 {
+        if r_a == ref_idx {
+            return [x_a, y_a];
+        }
+        if r_b == ref_idx {
+            return [x_b, y_b];
+        }
+        return [x_c, y_c];
+    }
+    [median(x_a, x_b, x_c), median(y_a, y_b, y_c)]
 }
 
 fn vector_of(n: &Neighbour) -> [i32; 2] {
