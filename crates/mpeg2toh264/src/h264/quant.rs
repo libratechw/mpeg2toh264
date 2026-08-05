@@ -249,6 +249,7 @@ pub fn field_dct_to_frame_targets(
 /// macroblock pair must be field-coded because either source macroblock uses
 /// field motion: frame-DCT neighbours in the same pair then have to be expressed
 /// in the field transform basis as well.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn frame_dct_to_field_targets(
     upper: &[f32; 64],
     lower: &[f32; 64],
@@ -283,6 +284,88 @@ pub fn frame_dct_to_field_targets(
                     coefficient += samples[y * 2 + field] * dct[y * 8 + vertical_frequency];
                 }
                 out[vertical_frequency * 8 + horizontal_frequency] = coefficient;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub fn frame_dct_to_field_targets(
+    upper: &[f32; 64],
+    lower: &[f32; 64],
+    first_field: &mut [f32; 64],
+    second_field: &mut [f32; 64],
+) {
+    use core::arch::wasm32::{f32x4, f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_splat, v128};
+
+    #[inline]
+    fn load4(values: &[f32; 64], pos: usize) -> v128 {
+        f32x4(
+            values[pos],
+            values[pos + 1],
+            values[pos + 2],
+            values[pos + 3],
+        )
+    }
+
+    #[inline]
+    fn store4(values: &mut [f32; 64], pos: usize, lanes: v128) {
+        values[pos] = f32x4_extract_lane::<0>(lanes);
+        values[pos + 1] = f32x4_extract_lane::<1>(lanes);
+        values[pos + 2] = f32x4_extract_lane::<2>(lanes);
+        values[pos + 3] = f32x4_extract_lane::<3>(lanes);
+    }
+
+    let dct = &*DCT8_BASIS;
+    let mut upper_samples = [0.0f32; 64];
+    let mut lower_samples = [0.0f32; 64];
+
+    // Transform four horizontal frequencies together. Each MPEG-2 coefficient
+    // row is contiguous, so no lane gathers or shuffles are needed.
+    for horizontal_frequency in (0..8).step_by(4) {
+        for y in 0..8 {
+            let mut upper_sum = f32x4_splat(0.0);
+            let mut lower_sum = f32x4_splat(0.0);
+            for vertical_frequency in 0..8 {
+                let basis = f32x4_splat(dct[y * 8 + vertical_frequency]);
+                let pos = vertical_frequency * 8 + horizontal_frequency;
+                upper_sum = f32x4_add(upper_sum, f32x4_mul(basis, load4(upper, pos)));
+                lower_sum = f32x4_add(lower_sum, f32x4_mul(basis, load4(lower, pos)));
+            }
+            store4(&mut upper_samples, y * 8 + horizontal_frequency, upper_sum);
+            store4(&mut lower_samples, y * 8 + horizontal_frequency, lower_sum);
+        }
+
+        for field in 0..2 {
+            let out = if field == 0 {
+                &mut *first_field
+            } else {
+                &mut *second_field
+            };
+            for vertical_frequency in 0..8 {
+                let mut coefficient = f32x4_splat(0.0);
+                for y in 0..8 {
+                    let spatial_y = y * 2 + field;
+                    let samples = if spatial_y < 8 {
+                        &upper_samples
+                    } else {
+                        &lower_samples
+                    };
+                    let source_y = spatial_y & 7;
+                    coefficient = f32x4_add(
+                        coefficient,
+                        f32x4_mul(
+                            f32x4_splat(dct[y * 8 + vertical_frequency]),
+                            load4(samples, source_y * 8 + horizontal_frequency),
+                        ),
+                    );
+                }
+                store4(
+                    out,
+                    vertical_frequency * 8 + horizontal_frequency,
+                    coefficient,
+                );
             }
         }
     }
