@@ -57,6 +57,7 @@ import {
   DEFAULT_QUANTISER_OPTIONS,
   Quantiser8x8,
   fieldDctToFrameTargets,
+  frameDctToFieldTargets,
   interTargets,
   intraTargets,
 } from "./h264/quant.ts";
@@ -422,6 +423,67 @@ function predictionFor(
   };
 }
 
+/** Prediction for one field of an MPEG-2 field-motion macroblock. */
+function predictionForField(
+  mb: Macroblock,
+  field: 0 | 1,
+  layout: RefLayout,
+): Prediction {
+  const hasBackward =
+    layout.bwdL0 >= 0 && (mb.flags & MBFlag.MOTION_BACKWARD) !== 0;
+  const hasForward = (mb.flags & MBFlag.MOTION_FORWARD) !== 0 || !hasBackward;
+  const fieldRef = (frameRef: number, direction: 0 | 1) => {
+    const refParity = mb.fieldSelect[field * 2 + direction]!;
+    // MBAFF field lists expand each frame entry into same-parity then
+    // opposite-parity fields for the current macroblock.
+    return frameRef * 2 + (refParity === field ? 0 : 1);
+  };
+  const vector = (direction: 0 | 1): [number, number] => {
+    const base = field * 4 + direction * 2;
+    return [mb.mv[base]!, mb.mv[base + 1]!];
+  };
+
+  if (hasForward && hasBackward) {
+    return {
+      mbType: BMbType.BI_16X16,
+      refIdxL0: fieldRef(layout.fwdL0, 0),
+      refIdxL1: fieldRef(layout.bwdL1, 1),
+      mvL0: nativePosition(...vector(0)),
+      mvL1: nativePosition(...vector(1)),
+    };
+  }
+
+  const useBackward = hasBackward;
+  const direction = useBackward ? 1 : 0;
+  const mapped = mapVector(...vector(direction));
+  const primaryFrame = useBackward ? layout.bwdL0 : layout.fwdL0;
+  const secondaryFrame = useBackward ? layout.bwdL1 : layout.fwdL1;
+  if (mapped.b === null) {
+    return useBackward
+      ? {
+          mbType: BMbType.L1_16X16,
+          refIdxL0: -1,
+          refIdxL1: fieldRef(layout.bwdL1, 1),
+          mvL0: [0, 0],
+          mvL1: mapped.a,
+        }
+      : {
+          mbType: BMbType.L0_16X16,
+          refIdxL0: fieldRef(layout.fwdL0, 0),
+          refIdxL1: -1,
+          mvL0: mapped.a,
+          mvL1: [0, 0],
+        };
+  }
+  return {
+    mbType: BMbType.BI_16X16,
+    refIdxL0: fieldRef(primaryFrame, direction),
+    refIdxL1: fieldRef(secondaryFrame, direction),
+    mvL0: mapped.a,
+    mvL1: mapped.b,
+  };
+}
+
 function writePicture(
   reader: BitReader,
   pic: Picture,
@@ -448,6 +510,10 @@ function writePicture(
   const chromaScratch: [ChromaBlockLevels, ChromaBlockLevels] = [
     makeChromaBlockLevels(),
     makeChromaBlockLevels(),
+  ];
+  const fieldMotion: [MotionField, MotionField] = [
+    new MotionField(1, 1),
+    new MotionField(1, 1),
   ];
   let prevQp = PPS_INIT_QP;
   let w: BitWriter | null = null;
@@ -476,6 +542,8 @@ function writePicture(
       chromaCounts.cb.reset();
       chromaCounts.cr.reset();
       motion.reset();
+      fieldMotion[0].reset();
+      fieldMotion[1].reset();
       prevQp = PPS_INIT_QP;
       w = new BitWriter(ctx.mbaff ? 4096 : 1 << 18);
       writeSliceHeader(w, {
@@ -502,6 +570,19 @@ function writePicture(
     }
     const writer = w!;
     const source = byAddress.get(mbY * g.mbWidth + mbX);
+    const pairTop = byAddress.get((mbY & ~1) * g.mbWidth + mbX);
+    const pairBottom = byAddress.get(((mbY & ~1) + 1) * g.mbWidth + mbX);
+    const hasNoChromaResidual = (mb: Macroblock | undefined) =>
+      !!mb &&
+      (mb.flags & MBFlag.INTRA) === 0 &&
+      mb.blocks[4] === null &&
+      mb.blocks[5] === null;
+    const fieldPair =
+      ctx.mbaff &&
+      pairTop?.motionType === MotionType.FIELD &&
+      pairBottom?.motionType === MotionType.FIELD &&
+      hasNoChromaResidual(pairTop) &&
+      hasNoChromaResidual(pairBottom);
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
     const luma: (Int32Array | null)[] = [null, null, null, null];
@@ -591,6 +672,57 @@ function writePicture(
       }
     }
 
+    if (fieldPair) {
+      const sourceFieldTargets = (fieldSource: Macroblock) => {
+        const raw = Array.from({ length: 4 }, () => new Float64Array(64));
+        const converted = Array.from({ length: 4 }, () => new Float64Array(64));
+        const quantiserScale =
+          QUANTISER_SCALE[pic.coding.qScaleType]![
+            fieldSource.quantiserScaleCode
+          ]!;
+        for (let b = 0; b < 4; b++) {
+          const block = fieldSource.blocks[b];
+          if (block)
+            interTargets(block, pic.quant.nonIntra, quantiserScale, raw[b]!);
+        }
+        if (fieldSource.dctType === 1) return raw;
+        frameDctToFieldTargets(raw[0]!, raw[2]!, converted[0]!, converted[2]!);
+        frameDctToFieldTargets(raw[1]!, raw[3]!, converted[1]!, converted[3]!);
+        return converted;
+      };
+      const topTargets = sourceFieldTargets(pairTop!);
+      const bottomTargets = sourceFieldTargets(pairBottom!);
+      const sourceQp = (fieldSource: Macroblock) => {
+        const scale =
+          QUANTISER_SCALE[pic.coding.qScaleType]![
+            fieldSource.quantiserScaleCode
+          ]!;
+        return quant.chooseQp(
+          scale,
+          ctx.options.oversample ?? DEFAULT_QUANTISER_OPTIONS.oversample,
+        );
+      };
+      // One H.264 field MB combines eight field lines from each of the two
+      // vertically adjacent MPEG-2 MBs. Use the finer source QP for both.
+      qp = Math.min(sourceQp(pairTop!), sourceQp(pairBottom!));
+      luma.fill(null);
+      const field = (mbY & 1) as 0 | 1;
+      const selected = [
+        topTargets[field * 2]!,
+        topTargets[field * 2 + 1]!,
+        bottomTargets[field * 2]!,
+        bottomTargets[field * 2 + 1]!,
+      ];
+      for (let b = 0; b < 4; b++) {
+        for (let pos = 0; pos < 64; pos++) {
+          raster[pos] = quant.levelFor(selected[b]![pos]!, qp, pos);
+        }
+        const out = new Int32Array(64);
+        if (toZigzag8x8(raster, out)) luma[b] = out;
+      }
+      chroma = null;
+    }
+
     if (intra) ctx.stats.intraMacroblocks++;
     else ctx.stats.interMacroblocks++;
     const pred = predictionFor(source, intra, ctx.layout, ctx.stats);
@@ -604,7 +736,7 @@ function writePicture(
       ? motion.predict(mbX, mbY, 1, pred.refIdxL1)
       : ([0, 0] as [number, number]);
 
-    const splitFrameMb = ctx.mbaff && !ctx.options.iFramesOnly;
+    const splitFrameMb = ctx.mbaff && !ctx.options.iFramesOnly && !fieldPair;
     const mode =
       pred.mbType === BMbType.L0_16X16
         ? ("L0" as const)
@@ -638,13 +770,73 @@ function writePicture(
             mvdL1y: usesL1 ? pred.mvL1[1] - pL1[1] : 0,
           };
         }) as GrayRefMacroblock["partitions"])
+      : fieldPair
+        ? ([pairTop!, pairBottom!].map((partSource, partNumber) => {
+            const field = (mbY & 1) as 0 | 1;
+            const part = partNumber as 0 | 1;
+            const fieldPred = predictionForField(partSource, field, ctx.layout);
+            const usesFieldL0 = fieldPred.refIdxL0 >= 0;
+            const usesFieldL1 = fieldPred.refIdxL1 >= 0;
+            const pL0 = usesFieldL0
+              ? fieldMotion[field].predict16x8(
+                  0,
+                  0,
+                  part,
+                  0,
+                  fieldPred.refIdxL0,
+                )
+              : ([0, 0] as [number, number]);
+            const pL1 = usesFieldL1
+              ? fieldMotion[field].predict16x8(
+                  0,
+                  0,
+                  part,
+                  1,
+                  fieldPred.refIdxL1,
+                )
+              : ([0, 0] as [number, number]);
+            fieldMotion[field].set16x8(0, 0, part, {
+              refIdxL0: fieldPred.refIdxL0,
+              refIdxL1: fieldPred.refIdxL1,
+              mvL0x: usesFieldL0 ? fieldPred.mvL0[0] : 0,
+              mvL0y: usesFieldL0 ? fieldPred.mvL0[1] : 0,
+              mvL1x: usesFieldL1 ? fieldPred.mvL1[0] : 0,
+              mvL1y: usesFieldL1 ? fieldPred.mvL1[1] : 0,
+            });
+            return {
+              refIdxL0: fieldPred.refIdxL0,
+              refIdxL1: fieldPred.refIdxL1,
+              mvdL0x: usesFieldL0 ? fieldPred.mvL0[0] - pL0[0] : 0,
+              mvdL0y: usesFieldL0 ? fieldPred.mvL0[1] - pL0[1] : 0,
+              mvdL1x: usesFieldL1 ? fieldPred.mvL1[0] - pL1[0] : 0,
+              mvdL1y: usesFieldL1 ? fieldPred.mvL1[1] - pL1[1] : 0,
+            };
+          }) as GrayRefMacroblock["partitions"])
+        : undefined;
+    const fieldModes = fieldPair
+      ? ([pairTop!, pairBottom!].map((partSource) => {
+          const p = predictionForField(
+            partSource,
+            (mbY & 1) as 0 | 1,
+            ctx.layout,
+          );
+          return p.mbType === BMbType.L0_16X16
+            ? ("L0" as const)
+            : p.mbType === BMbType.L1_16X16
+              ? ("L1" as const)
+              : ("BI" as const);
+        }) as ["L0" | "L1" | "BI", "L0" | "L1" | "BI"])
       : undefined;
 
     const mb: GrayRefMacroblock = {
       mbX,
       mbY,
       pSlice: ctx.options.iFramesOnly ?? false,
-      mbType: splitFrameMb ? b16x8MbType(mode, mode) : pred.mbType,
+      mbType: splitFrameMb
+        ? b16x8MbType(mode, mode)
+        : fieldModes
+          ? b16x8MbType(fieldModes[0], fieldModes[1])
+          : pred.mbType,
       refIdxL0: pred.refIdxL0,
       refIdxL1: pred.refIdxL1,
       mvdL0x: usesL0 ? pred.mvL0[0] - predL0[0] : 0,
@@ -652,8 +844,12 @@ function writePicture(
       mvdL1x: usesL1 ? pred.mvL1[0] - predL1[0] : 0,
       mvdL1y: usesL1 ? pred.mvL1[1] - predL1[1] : 0,
       partitions,
-      numRefIdxL0Minus1: ctx.layout.count - 1,
-      numRefIdxL1Minus1: ctx.layout.count - 1,
+      numRefIdxL0Minus1: fieldPair
+        ? ctx.layout.count * 2 - 1
+        : ctx.layout.count - 1,
+      numRefIdxL1Minus1: fieldPair
+        ? ctx.layout.count * 2 - 1
+        : ctx.layout.count - 1,
       luma,
       chroma,
       qp,
@@ -677,7 +873,15 @@ function writePicture(
     if (ctx.mbaff && mbY % 2 === 0) {
       // In P/B slices mb_field_decoding_flag follows mb_skip_run, unlike the
       // I-slice grey frame where it immediately precedes mb_type.
-      writer.flag(0); // frame-coded pair for now
+      writer.flag(fieldPair);
+    }
+    if (fieldPair && mbY % 2 === 1) {
+      // The two field macroblocks occupy the same spatial area in opposite
+      // fields.  The top-field coefficients are therefore unavailable as
+      // CAVLC neighbours of the bottom-field macroblock.
+      counts.reset();
+      chromaCounts.cb.reset();
+      chromaCounts.cr.reset();
     }
     prevQp = writeGrayRefMacroblock(writer, counts, chromaCounts, mb);
     if (!luma[0] && !luma[1] && !luma[2] && !luma[3]) {
