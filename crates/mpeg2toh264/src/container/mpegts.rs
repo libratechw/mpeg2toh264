@@ -154,7 +154,6 @@ impl SectionAssembler {
 }
 
 /// The elementary stream PIDs a program advertises.
-#[derive(Default)]
 struct ProgramMap {
     pmt_pids: HashSet<u16>,
     /// Which service to take, when the caller has said. A recording can hold
@@ -162,14 +161,39 @@ struct ProgramMap {
     /// stream, with its own video and its own audio -- and without being told,
     /// whichever program map arrives first is the one that gets used.
     wanted_service: Option<u16>,
-    /// The service the streams below were taken from, once one has been.
+    /// The service the streams below were taken from, once one has been, and
+    /// where it sits in the program association table.
     service: Option<u16>,
+    rank: usize,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
     /// Every service seen in the program association table, in the order they
     /// were announced.
     services: Vec<u16>,
+    /// Whether the streams may still be changed, which they may until the
+    /// first of their packets has been handed on.
+    may_switch_streams: bool,
+    /// Set when a scan moved to a service with different streams, so that what
+    /// was gathered from the old ones can be thrown away.
+    changed_streams: bool,
     assemblers: HashMap<u16, SectionAssembler>,
+}
+
+impl Default for ProgramMap {
+    fn default() -> Self {
+        Self {
+            pmt_pids: HashSet::new(),
+            wanted_service: None,
+            service: None,
+            rank: usize::MAX,
+            video_pid: None,
+            audio_pid: None,
+            services: Vec::new(),
+            may_switch_streams: true,
+            changed_streams: false,
+            assemblers: HashMap::new(),
+        }
+    }
 }
 
 impl ProgramMap {
@@ -215,10 +239,21 @@ impl ProgramMap {
             // another would put a programme's picture against a different
             // programme's sound, so both come from here or neither does.
             let service = ((section[3] as u16) << 8) | section[4] as u16;
-            if self.service.is_some_and(|taken| taken != service) {
+            if self.wanted_service.is_some_and(|wanted| wanted != service) {
                 return;
             }
-            if self.wanted_service.is_some_and(|wanted| wanted != service) {
+            // Which map arrives first is the multiplexer's business, and the
+            // one in front is not always the programme anyone is watching: a
+            // data service sits alongside the television it belongs to and can
+            // be described first while naming the same streams. The order the
+            // program association table announces its services in is the
+            // broadcaster's own, so that is the order to prefer.
+            let rank = self
+                .services
+                .iter()
+                .position(|&announced| announced == service)
+                .unwrap_or(usize::MAX);
+            if self.service.is_some() && rank >= self.rank {
                 return;
             }
             let program_info_length = (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
@@ -244,9 +279,21 @@ impl ProgramMap {
             if video.is_none() && self.wanted_service.is_none() {
                 return;
             }
+            // Moving to a better-placed service is free while it names the
+            // streams already being read -- which is what an accompanying data
+            // service does -- and is only a matter of calling them by the right
+            // name. Where it names different ones, the packets gathered so far
+            // belong to the wrong programme and have to go, so it is only worth
+            // doing before any of them have been handed on.
+            let same_streams = self.video_pid == video && self.audio_pid == audio;
+            if self.service.is_some() && !same_streams && !self.may_switch_streams {
+                return;
+            }
+            self.changed_streams |= !same_streams && self.service.is_some();
             self.service = Some(service);
-            self.video_pid = self.video_pid.or(video);
-            self.audio_pid = self.audio_pid.or(audio);
+            self.rank = rank;
+            self.video_pid = video;
+            self.audio_pid = audio;
         }
     }
 }
@@ -416,6 +463,13 @@ impl MpegTsAvDemuxer {
             if let Some(packet) = payload_at(&input, at)? {
                 if self.program.wants(packet.pid) {
                     self.program.push(&packet, &mut sections);
+                    if std::mem::take(&mut self.program.changed_streams) {
+                        // The streams belong to a different programme now, and
+                        // what was gathered from the old ones is not the start
+                        // of anything.
+                        self.video = PesState::default();
+                        self.audio = PesState::default();
+                    }
                 }
                 let kind = if Some(packet.pid) == self.program.video_pid {
                     Some(ElementaryKind::Video)
@@ -435,6 +489,12 @@ impl MpegTsAvDemuxer {
                     }
                     if state.collecting {
                         state.parts.extend_from_slice(packet.data);
+                    }
+                    // Once a packet of these streams is on its way out, the
+                    // choice of service is made: switching would splice one
+                    // programme onto another.
+                    if !output.is_empty() {
+                        self.program.may_switch_streams = false;
                     }
                 }
             }

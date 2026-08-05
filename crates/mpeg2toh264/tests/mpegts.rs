@@ -94,27 +94,58 @@ fn takes_both_streams_from_one_service() {
         (0x200, STREAM_TYPE_MPEG2_VIDEO),
         (0x210, STREAM_TYPE_AAC_ADTS),
     ];
-    // The sub-channel is announced first, so an unguided demuxer takes it.
+    // The main service is announced first and its program map goes out last.
     let stream = mux_programs(
-        &[(102, 0x1f0, sub), (101, 0x1f1, main)],
+        &[(101, 0x1f0, main), (102, 0x1f1, sub)],
         &[PesUnit {
-            pid: 0x200,
+            pid: 0x100,
             stream_id: 0xe0,
             pts: Some(9000),
             payload: &[0, 0, 1, 0xb3],
         }],
     );
 
-    let mut first = MpegTsAvDemuxer::new();
-    first.push(&stream).expect("demuxes");
-    assert_eq!(first.service_id(), Some(102), "the service that came first");
-    assert_eq!(first.service_ids(), &[102, 101]);
+    let mut unguided = MpegTsAvDemuxer::new();
+    unguided.push(&stream).expect("demuxes");
+    assert_eq!(
+        unguided.service_id(),
+        Some(101),
+        "the service announced first, not the map that arrived first"
+    );
+    assert_eq!(unguided.service_ids(), &[101, 102]);
 
-    let mut named = MpegTsAvDemuxer::for_service(Some(101));
+    let mut named = MpegTsAvDemuxer::for_service(Some(102));
     named.push(&stream).expect("demuxes");
     assert_eq!(
         named.service_id(),
-        Some(101),
+        Some(102),
         "the service that was asked for"
     );
+}
+
+/// A data service sits alongside the television it belongs to and names the
+/// same streams. Which of the two program maps a multiplexer sends first is
+/// its own business, and the announcement order is what settles it.
+#[test]
+fn prefers_the_service_the_announcement_puts_first() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO};
+
+    let shared: &[(u16, u8)] = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO),
+        (0x110, STREAM_TYPE_AAC_ADTS),
+    ];
+    let stream = mux_programs(
+        &[(101, 0x1f0, shared), (700, 0x1f1, shared)],
+        &[PesUnit {
+            pid: 0x100,
+            stream_id: 0xe0,
+            pts: Some(9000),
+            payload: &[0, 0, 1, 0xb3],
+        }],
+    );
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&stream).expect("demuxes");
+    assert_eq!(demuxer.service_id(), Some(101));
 }

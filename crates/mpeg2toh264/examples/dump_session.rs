@@ -55,6 +55,7 @@ fn run(input: &str, output: &str, service: Option<u16>) -> Result<(), Box<dyn st
     let mut source = File::open(input)?;
     let mut sink = BufWriter::new(File::create(output)?);
     let mut session = Session::for_service(Default::default(), None, service);
+    let mut announced = false;
     let mut totals = Totals::default();
 
     // A megabyte at a time, matching what the browser player reads per slice.
@@ -66,6 +67,14 @@ fn run(input: &str, output: &str, service: Option<u16>) -> Result<(), Box<dyn st
         }
         for fragment in session.push(&slice[..read])? {
             report(&fragment, &mut sink, &mut totals)?;
+        }
+        if !announced && !session.service_ids().is_empty() {
+            announced = true;
+            println!(
+                "services {:?}, converting {:?}",
+                session.service_ids(),
+                session.service_id()
+            );
         }
     }
     for fragment in session.finish()? {

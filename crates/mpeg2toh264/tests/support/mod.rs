@@ -169,6 +169,11 @@ pub type Program<'a> = (u16, u16, &'a [(u16, u8)]);
 
 /// As [`mux_transport_stream`], but for a transport stream carrying more than
 /// one service.
+///
+/// The program association table announces them in the order given, and the
+/// program maps go out in the opposite order. Which map a multiplexer sends
+/// first says nothing about which service anyone is watching, and putting the
+/// two orders at odds here is what keeps that from being assumed.
 pub fn mux_programs(programs: &[Program<'_>], units: &[PesUnit<'_>]) -> Vec<u8> {
     let mut pat_section = vec![0x00, 0xb0, 0x00, 0x00, 0x01, 0xc1, 0x00, 0x00];
     for &(program, pmt_pid, _) in programs {
@@ -183,7 +188,7 @@ pub fn mux_programs(programs: &[Program<'_>], units: &[PesUnit<'_>]) -> Vec<u8> 
     pat_section[2] = (pat_section.len() - 3) as u8;
     let mut out = psi_packet(0, &pat_section);
 
-    for &(program, pmt_pid, streams) in programs {
+    for &(program, pmt_pid, streams) in programs.iter().rev() {
         let pcr_pid = streams.first().map_or(0x100, |&(pid, _)| pid);
         let mut pmt_section = vec![
             0x02,
