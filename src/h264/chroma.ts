@@ -40,9 +40,12 @@ export function chromaQp(lumaQp: number, offset: number): number {
 }
 
 /** Inverse 8x8 DCT, orthonormal, into `out` in raster order. */
-export function idct8(coeff: Float64Array, out: Float64Array): void {
+export function idct8(
+  coeff: Float64Array,
+  out: Float64Array,
+  tmp: Float64Array = new Float64Array(64),
+): void {
   // Columns first: tmp = C8^T * coeff
-  const tmp = new Float64Array(64);
   for (let x = 0; x < 8; x++) {
     for (let v = 0; v < 8; v++) {
       let s = 0;
@@ -64,6 +67,8 @@ export function idct8(coeff: Float64Array, out: Float64Array): void {
  * H.264's forward 4x4 core transform, W = Cf * X * Cf^T, applied to the 4x4
  * sub-block at (bx, by) of an 8x8 sample block.
  */
+const forwardTemp = new Float64Array(16);
+
 function forward4x4(
   block: Float64Array,
   bx: number,
@@ -71,7 +76,7 @@ function forward4x4(
   out: Float64Array,
 ): void {
   // Cf rows are [1,1,1,1], [2,1,-1,-2], [1,-1,-1,1], [1,-2,2,-1].
-  const t = new Float64Array(16);
+  const t = forwardTemp;
   for (let i = 0; i < 4; i++) {
     const r = (by + i) * 8 + bx;
     const a = block[r]!;
@@ -115,6 +120,7 @@ export interface ChromaBlockLevels {
 const spatial = new Float64Array(64);
 const dequant = new Float64Array(64);
 const coeff4 = new Float64Array(16);
+const dcTarget = new Float64Array(4);
 
 /** H.264 Table 8-14: 4x4 field scan for field-coded macroblocks. */
 export const FIELD_SCAN_4X4: readonly number[] = [
@@ -131,7 +137,6 @@ function spatialToChromaLevels(
   const shift = 2 ** Math.floor(qpC / 6);
   const dcGain = CHROMA_DC_GAIN[qpC % 6]! * shift;
 
-  const dcTarget = new Float64Array(4);
   out.anyAc = false;
   for (let b = 0; b < 4; b++) {
     forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, coeff4);
@@ -194,6 +199,26 @@ export interface FieldChromaSource {
   intra: boolean;
 }
 
+export interface FieldChromaScratch {
+  upperCoeff: Float64Array;
+  lowerCoeff: Float64Array;
+  upperSpatial: Float64Array;
+  lowerSpatial: Float64Array;
+  fieldSpatial: Float64Array;
+  idctTemp: Float64Array;
+}
+
+export function makeFieldChromaScratch(): FieldChromaScratch {
+  return {
+    upperCoeff: new Float64Array(64),
+    lowerCoeff: new Float64Array(64),
+    upperSpatial: new Float64Array(64),
+    lowerSpatial: new Float64Array(64),
+    fieldSpatial: new Float64Array(64),
+    idctTemp: new Float64Array(64),
+  };
+}
+
 /** Combine two vertically adjacent MPEG-2 chroma residuals into one field MB. */
 export function convertFieldChromaBlocks(
   upper: FieldChromaSource,
@@ -201,30 +226,42 @@ export function convertFieldChromaBlocks(
   field: 0 | 1,
   qpC: number,
   out: ChromaBlockLevels,
+  scratch = makeFieldChromaScratch(),
 ): void {
-  const upperCoeff = new Float64Array(64);
-  const lowerCoeff = new Float64Array(64);
-  const upperSpatial = new Float64Array(64);
-  const lowerSpatial = new Float64Array(64);
-  const fieldSpatial = new Float64Array(64);
-  dequantChroma(
-    upper.levels,
-    upper.weightScale,
-    upper.quantiserScale,
-    upper.intraDcPrecision,
-    upper.intra,
+  const {
     upperCoeff,
-  );
-  dequantChroma(
-    lower.levels,
-    lower.weightScale,
-    lower.quantiserScale,
-    lower.intraDcPrecision,
-    lower.intra,
     lowerCoeff,
-  );
-  idct8(upperCoeff, upperSpatial);
-  idct8(lowerCoeff, lowerSpatial);
+    upperSpatial,
+    lowerSpatial,
+    fieldSpatial,
+    idctTemp,
+  } = scratch;
+  if (upper.levels) {
+    dequantChroma(
+      upper.levels,
+      upper.weightScale,
+      upper.quantiserScale,
+      upper.intraDcPrecision,
+      upper.intra,
+      upperCoeff,
+    );
+    idct8(upperCoeff, upperSpatial, idctTemp);
+  } else {
+    upperSpatial.fill(0);
+  }
+  if (lower.levels) {
+    dequantChroma(
+      lower.levels,
+      lower.weightScale,
+      lower.quantiserScale,
+      lower.intraDcPrecision,
+      lower.intra,
+      lowerCoeff,
+    );
+    idct8(lowerCoeff, lowerSpatial, idctTemp);
+  } else {
+    lowerSpatial.fill(0);
+  }
   for (let y = 0; y < 4; y++) {
     for (let x = 0; x < 8; x++) {
       fieldSpatial[y * 8 + x] = upperSpatial[(y * 2 + field) * 8 + x]!;

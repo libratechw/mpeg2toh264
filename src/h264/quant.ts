@@ -146,6 +146,19 @@ export function interTargets(
   }
 }
 
+/** Orthonormal 8-point DCT basis, indexed by sample then frequency. */
+const DCT8_BASIS = (() => {
+  const basis = new Float64Array(64);
+  for (let y = 0; y < 8; y++) {
+    for (let k = 0; k < 8; k++) {
+      const scale = k === 0 ? 1 / Math.sqrt(8) : 0.5;
+      basis[y * 8 + k] = scale * Math.cos(((2 * y + 1) * k * Math.PI) / 16);
+    }
+  }
+  return basis;
+})();
+const fieldFrameSamples = new Float64Array(16);
+
 /**
  * Convert the two vertically interleaved MPEG-2 field-DCT blocks on one side
  * of a macroblock into the two spatially stacked frame-DCT blocks expected by
@@ -162,8 +175,7 @@ export function fieldDctToFrameTargets(
   upper: Float64Array,
   lower: Float64Array,
 ): void {
-  const samples = new Float64Array(16);
-  const scale = (k: number) => (k === 0 ? 1 / Math.sqrt(8) : 0.5);
+  const samples = fieldFrameSamples;
 
   for (
     let horizontalFrequency = 0;
@@ -178,9 +190,7 @@ export function fieldDctToFrameTargets(
         verticalFrequency < 8;
         verticalFrequency++
       ) {
-        const basis =
-          scale(verticalFrequency) *
-          Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16);
+        const basis = DCT8_BASIS[y * 8 + verticalFrequency]!;
         const pos = verticalFrequency * 8 + horizontalFrequency;
         even += basis * firstField[pos]!;
         odd += basis * secondField[pos]!;
@@ -199,9 +209,7 @@ export function fieldDctToFrameTargets(
         let coefficient = 0;
         for (let y = 0; y < 8; y++) {
           coefficient +=
-            samples[half * 8 + y]! *
-            scale(verticalFrequency) *
-            Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16);
+            samples[half * 8 + y]! * DCT8_BASIS[y * 8 + verticalFrequency]!;
         }
         out[verticalFrequency * 8 + horizontalFrequency] = coefficient;
       }
@@ -221,8 +229,7 @@ export function frameDctToFieldTargets(
   firstField: Float64Array,
   secondField: Float64Array,
 ): void {
-  const samples = new Float64Array(16);
-  const scale = (k: number) => (k === 0 ? 1 / Math.sqrt(8) : 0.5);
+  const samples = fieldFrameSamples;
 
   for (
     let horizontalFrequency = 0;
@@ -239,8 +246,7 @@ export function frameDctToFieldTargets(
           verticalFrequency++
         ) {
           sample +=
-            scale(verticalFrequency) *
-            Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16) *
+            DCT8_BASIS[y * 8 + verticalFrequency]! *
             input[verticalFrequency * 8 + horizontalFrequency]!;
         }
         samples[half * 8 + y] = sample;
@@ -257,9 +263,7 @@ export function frameDctToFieldTargets(
         let coefficient = 0;
         for (let y = 0; y < 8; y++) {
           coefficient +=
-            samples[y * 2 + field]! *
-            scale(verticalFrequency) *
-            Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16);
+            samples[y * 2 + field]! * DCT8_BASIS[y * 8 + verticalFrequency]!;
         }
         out[verticalFrequency * 8 + horizontalFrequency] = coefficient;
       }

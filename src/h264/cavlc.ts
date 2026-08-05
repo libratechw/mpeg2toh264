@@ -16,13 +16,28 @@ import {
   levelPrefixCode,
 } from "./cavlc-tables.ts";
 
+const codeValues = new Map<string, number>();
+
 function writeCode(w: BitWriter, code: string): void {
-  // Codewords are short; writing them a chunk at a time keeps u() within 32 bits.
+  if (code.length <= 32) {
+    let value = codeValues.get(code);
+    if (value === undefined) {
+      value = parseInt(code, 2);
+      codeValues.set(code, value);
+    }
+    w.u(code.length, value);
+    return;
+  }
+  // Escape codewords can exceed the writer's 32-bit limit.
   for (let i = 0; i < code.length; i += 24) {
     const part = code.slice(i, i + 24);
     w.u(part.length, parseInt(part, 2));
   }
 }
+
+// Residual coding is synchronous, so one scan-position workspace can serve
+// every block without allocating a fresh JavaScript array for each call.
+const nonZeroPositions = new Int8Array(16);
 
 /** Which total_zeros table applies, given the block size being coded. */
 function totalZerosCode(
@@ -116,11 +131,11 @@ export function writeResidualBlock(w: BitWriter, block: ResidualBlock): number {
   const { levels, maxNumCoeff, nC } = block;
 
   // Positions of the non-zero levels, lowest frequency first.
-  const positions: number[] = [];
+  const positions = nonZeroPositions;
+  let totalCoeff = 0;
   for (let i = 0; i < maxNumCoeff; i++) {
-    if (levels[i] !== 0) positions.push(i);
+    if (levels[i] !== 0) positions[totalCoeff++] = i;
   }
-  const totalCoeff = positions.length;
 
   // Trailing ones are the run of +/-1 at the high frequency end, at most three.
   let trailingOnes = 0;
