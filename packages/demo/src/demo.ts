@@ -286,6 +286,7 @@ function play(
   url: string,
   sourceLabel: string,
   ownedUrl: string | null = null,
+  autoplay = false,
 ) {
   playing = { url, label: sourceLabel };
   if (fileUrl && fileUrl !== ownedUrl) URL.revokeObjectURL(fileUrl);
@@ -304,9 +305,9 @@ function play(
   syncPlayPause();
   // Failures already arrive as an error event, which is what writes the
   // message; the rejection here is the same one and needs no second report.
-  void createPlayer()
-    .load(url)
-    .catch(() => {});
+  const loading = createPlayer().load(url);
+  if (autoplay) void loading.then(() => video.play()).catch(() => {});
+  else void loading.catch(() => {});
 }
 
 /** How far playback can be moved: the whole input, or as much as there is. */
@@ -543,7 +544,7 @@ service.addEventListener("change", () => {
   const chosen = Number(service.value);
   if (!Number.isFinite(chosen) || chosen === wantedService) return;
   wantedService = chosen;
-  if (playing) play(playing.url, playing.label, fileUrl);
+  if (playing) play(playing.url, playing.label, fileUrl, true);
 });
 
 deinterlace.addEventListener("change", applyDeinterlace);
@@ -554,7 +555,7 @@ urlForm.addEventListener("submit", (event) => {
   const url = urlInput.value.trim();
   if (url) {
     forgetService();
-    play(url, url);
+    play(url, url, null, true);
   }
 });
 
