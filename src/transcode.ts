@@ -875,17 +875,11 @@ function writePicture(
     const fieldPair = pictureFieldPairs;
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
-    const pairHasIntra =
-      ctx.mbaff &&
-      [pairTop, pairBottom].some(
-        (part) => part && !part.skipped && (part.flags & MBFlag.INTRA) !== 0,
-      );
-    // MBAFF carries coding mode at pair granularity. If either half needs
-    // I_PCM, code both halves as I_PCM so the bottom MB cannot be parsed with
-    // stale pair state.
-    const pcm = Boolean(
-      ctx.options.pcmIntra && (ctx.realIdr || pairHasIntra || intra),
-    );
+    // I_PCM is reserved for the initial all-intra content IDR. Forcing both
+    // halves of a later mixed MBAFF pair to I_PCM required inventing pixels
+    // for the inter half; the old 128-valued fallback produced visible grey
+    // blocks and polluted subsequent reference pictures.
+    const pcm = Boolean(ctx.options.pcmIntra && ctx.realIdr);
 
     if (pcm) {
       ctx.stats.intraMacroblocks++;
