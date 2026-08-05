@@ -169,6 +169,12 @@ pub struct IncrementalTranscoder {
     /// change while a transcoder is alive.
     scratch: Option<PictureScratch>,
     initialized: bool,
+    /// Whether the decoded picture buffer is still waiting to be opened, which
+    /// only an intra picture can do. True at the start and again at every
+    /// restart, and false only once a picture has actually been coded -- a unit
+    /// that opens part way through a group of pictures, as a seek does, may
+    /// hold nothing that can open one.
+    awaiting_idr: bool,
     width: u32,
     height: u32,
     mbaff: bool,
@@ -189,6 +195,7 @@ impl IncrementalTranscoder {
             options,
             scratch: None,
             initialized: false,
+            awaiting_idr: true,
             width: 0,
             height: 0,
             mbaff: false,
@@ -208,7 +215,15 @@ impl IncrementalTranscoder {
     pub fn request_random_access_point(&mut self) {
         if self.initialized {
             self.random_access_pending = true;
+            self.awaiting_idr = true;
         }
+    }
+
+    /// Whether the next picture coded has to be one that opens the decoded
+    /// picture buffer. The MP4 timeline has to reach the same verdict on the
+    /// same pictures, so it asks.
+    pub fn awaiting_random_access(&self) -> bool {
+        self.awaiting_idr
     }
 
     pub fn push(&mut self, data: &[u8]) -> Result<TranscodeResult> {
@@ -312,7 +327,7 @@ impl IncrementalTranscoder {
         // A fresh stream, and a stream restarting at a random access point, has
         // an empty decoded picture buffer and so cannot code anything that
         // predicts.
-        let mut awaiting_idr = !self.initialized || random_access;
+        let mut awaiting_idr = self.awaiting_idr || random_access;
 
         let mut logical_pictures = Vec::with_capacity(pics.len());
         let mut source_index = 0;
@@ -371,7 +386,6 @@ impl IncrementalTranscoder {
                 pictures_skipped += 1;
                 continue;
             }
-            awaiting_idr = false;
             // In I-only mode every content picture depends solely on the
             // long-term picture. Keeping content pictures as references only
             // makes that picture move through the default reference list, and
@@ -457,6 +471,10 @@ impl IncrementalTranscoder {
                     continue 'pictures;
                 }
             }
+            // The wait for a picture to open the buffer with ends here rather
+            // than above, because a picture whose slices will not decode has
+            // not opened anything. The MP4 timeline waits on the same terms.
+            awaiting_idr = false;
             let ctx = PictureContext {
                 frame_num,
                 // The IDR displays first, so it takes the lowest POC in the segment.
@@ -509,6 +527,7 @@ impl IncrementalTranscoder {
         }
 
         self.initialized = true;
+        self.awaiting_idr = awaiting_idr;
         self.width = width;
         self.height = height;
         self.mbaff = mbaff;

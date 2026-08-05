@@ -229,6 +229,13 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
     let sample_duration = round_half_up(TIMESCALE as f64 * denominator / numerator) as u32;
 
     let mut references = if has_references { 2 } else { 0 };
+    // A unit that opens the decoded picture buffer can hold nothing until the
+    // picture that opens it arrives, and only an I picture can. One that starts
+    // part way through a group of pictures -- which is what a seek lands on --
+    // may have none, and then it holds nothing at all. The transcoder decides
+    // this the same way, and the two have to agree or the fragment claims
+    // samples the H.264 stream does not have.
+    let mut awaiting_intra = !has_references;
     let mut gop_base: u32 = 0;
     let mut seen_picture = false;
     let mut max_tr_in_gop: u32 = 0;
@@ -278,6 +285,12 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
             || mate.is_some_and(|field| !picture_is_decodable(&mut reader, field, &mut grid))
         {
             continue;
+        }
+        if awaiting_intra {
+            if picture_type != PictureType::I {
+                continue;
+            }
+            awaiting_intra = false;
         }
         if picture_type == PictureType::B && references < 2 {
             continue;

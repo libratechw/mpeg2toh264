@@ -220,7 +220,7 @@ impl Session {
     /// Whether the fragment about to be emitted opens at an IDR, which is both
     /// the first one and every restart point after it.
     fn starts_at_idr(&self) -> bool {
-        !self.initialized || self.is_random_access_point()
+        self.transcoder.awaiting_random_access() || self.is_random_access_point()
     }
 
     fn is_random_access_point(&self) -> bool {
@@ -349,7 +349,7 @@ impl Session {
         if random_access {
             self.transcoder.request_random_access_point();
         }
-        let starts_at_idr = !self.initialized || random_access;
+        let starts_at_idr = self.transcoder.awaiting_random_access();
         let timeline = match timeline {
             Some(timeline) => timeline,
             None => mpeg2_video_timeline(&gop.data, !starts_at_idr)?,
