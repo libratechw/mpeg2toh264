@@ -20,6 +20,7 @@ import {
   type Command,
   type LoadCommand,
   type Notification,
+  type TimingMark,
 } from "./protocol.js";
 import { openSource, readTail, type Source } from "./source.js";
 import {
@@ -60,9 +61,62 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Say that a step of the load has happened, and when.
+ *
+ * The page cannot read this worker's clock -- `performance.now()` counts from
+ * whenever each context was created -- so the moment goes over as an epoch
+ * milliseconds, which is the one reading both sides agree on.
+ */
+function mark(id: number, name: TimingMark): void {
+  post({
+    type: "mark",
+    id,
+    name,
+    at: performance.timeOrigin + performance.now(),
+  });
+}
+
 /** Ticks from `origin` to `ticks`, across however many wraps lie between. */
 function ticksSince(origin: number, ticks: number): number {
   return (((ticks - origin) % PTS_MODULUS) + PTS_MODULUS) % PTS_MODULUS;
+}
+
+/**
+ * One channel for `breathe`, rather than one per slice of input.
+ *
+ * A message to oneself is the shortest task there is: no clamping, unlike a
+ * zero timeout, and it goes behind everything already queued, which is the
+ * whole point.
+ */
+const breather = new MessageChannel();
+let breathing: (() => void)[] = [];
+breather.port1.onmessage = () => {
+  const waiting = breathing;
+  breathing = [];
+  for (const resume of waiting) resume();
+};
+
+/**
+ * Let the event loop run the tasks waiting on it.
+ *
+ * The read loop is made of promises, and awaiting one that is already settled
+ * resumes on the microtask queue -- which runs to exhaustion before a single
+ * task does. An input that arrives faster than it converts settles every read
+ * immediately, so the loop can spin from beginning to end of the file without
+ * the worker ever reaching its task queue.
+ *
+ * Where this worker also holds the MediaSource, that starves exactly what the
+ * conversion is waiting for: `updateend`, which is what appends the fragment
+ * after the one just appended, and the playhead the page posts over, which is
+ * what lets a full buffer evict. One task per slice keeps both moving, and it
+ * costs nothing on the path where the page holds the MediaSource instead.
+ */
+function breathe(): Promise<void> {
+  return new Promise((resolve) => {
+    breathing.push(resolve);
+    breather.port2.postMessage(0);
+  });
 }
 
 /**
@@ -120,6 +174,7 @@ function createWorkerSink(command: LoadCommand): MseSink {
     queueHighWaterMark: command.queueHighWaterMark,
     keepBehindSeconds: command.keepBehindSeconds,
     seek: (time) => post({ type: "seek", id, time }),
+    onMark: (name) => mark(id, name),
     onBlocked: (blocked) => post({ type: "blocked", id, blocked }),
     onError: (error) => post({ type: "error", id, message: error.message }),
   });
@@ -152,6 +207,9 @@ class Playback {
   /** Which leg is current. Anything from an older one is dropped. */
   #legNumber = 0;
   #transcoder: Transcoder | null = null;
+  /** Wall time the read loop spent on each of the two things it waits for. */
+  #readingMs = 0;
+  #waitingMs = 0;
 
   #totalBytes: number | null = null;
   /** Whether the end of the file has been asked for; see `#measure`. */
@@ -194,6 +252,7 @@ class Playback {
   async seek(time: number): Promise<void> {
     const bytesPerSecond = this.#bytesPerSecond();
     if (bytesPerSecond === null || this.#totalBytes === null) return;
+    mark(this.#command.id, "seek");
     this.#sink.reset();
     const last = Math.max(0, this.#totalBytes - MINIMUM_SEEK_TAIL_BYTES);
     let offset = Math.min(Math.round(Math.max(0, time) * bytesPerSecond), last);
@@ -240,6 +299,7 @@ class Playback {
       if (!tail || this.#command.id !== current) return;
       this.#totalBytes = tail.totalBytes;
       this.#endTicks = lastTimestamp(tail.data);
+      mark(this.#command.id, "measured");
       this.#announceDuration();
     } catch {
       // An input that cannot be measured is one to play as it comes.
@@ -294,11 +354,14 @@ class Playback {
   async #run(offset: number, target: number | null): Promise<Outcome> {
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
+    const id = this.#command.id;
     try {
       await loadWasm(this.#command.wasmUrl);
       if (!this.#running(leg)) return { kind: "stale" };
+      mark(id, "wasm");
       const source = await openSource(this.#command.url, signal, offset);
       if (!this.#running(leg)) return { kind: "stale" };
+      mark(id, "response");
       this.#totalBytes ??= source.totalBytes;
       // An input whose length the server will not state is a live one: it has
       // no end to read, and nothing to work a seek out of.
@@ -334,15 +397,31 @@ class Playback {
     let bytesRead = source.offset;
     /** Whether this leg has yet to decide that it landed where it should. */
     let placing = target !== null;
+    let read = 0;
+    let converted = false;
     for (;;) {
+      // What the loop is doing when it is not converting: letting the events
+      // it depends on through, waiting for the sink to take more, and waiting
+      // for the input to arrive. Reported with the conversion time so that one
+      // line accounts for all of the wall clock.
+      const waitStarted = performance.now();
+      await breathe();
       await this.#sink.ready();
+      this.#waitingMs += performance.now() - waitStarted;
       if (!this.#running(leg)) return { kind: "stale" };
+      const readStarted = performance.now();
       const result = await reader.read();
+      this.#readingMs += performance.now() - readStarted;
       if (!this.#running(leg)) return { kind: "stale" };
       if (result.done) break;
+      if (read++ === 0) mark(id, "first-byte");
       bytesRead += result.value.byteLength;
       post({ type: "progress", id, bytesRead, totalBytes: this.#totalBytes });
       const fragments = converter.push(result.value);
+      if (!converted && fragments.length > 0) {
+        converted = true;
+        mark(id, "first-fragment");
+      }
       if (placing) {
         const first = fragments.find((fragment) => fragment.kind === "media");
         if (first) {
@@ -381,6 +460,7 @@ class Playback {
       if (fragment.kind === "init") {
         await this.#sink.open(fragment.mimeCodec, detach(fragment));
         if (!this.#running(leg)) return false;
+        mark(this.#command.id, "opened");
         post({ type: "opened", id: this.#command.id });
       } else {
         this.#sink.push(
@@ -406,8 +486,14 @@ class Playback {
   }
 
   #report(converter: Transcoder): void {
-    const stats = converter.takeStats();
-    if (stats) post({ type: "stats", id: this.#command.id, stats });
+    const stats = converter.takeStats({
+      readingMs: this.#readingMs,
+      waitingMs: this.#waitingMs,
+    });
+    if (!stats) return;
+    this.#readingMs = 0;
+    this.#waitingMs = 0;
+    post({ type: "stats", id: this.#command.id, stats });
   }
 }
 
@@ -421,6 +507,7 @@ function abandon(): void {
 function load(command: LoadCommand): void {
   abandon();
   current = command.id;
+  mark(command.id, "load");
   const started = new Playback(command);
   playback = started;
   void started.start();

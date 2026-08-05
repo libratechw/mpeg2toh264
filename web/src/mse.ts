@@ -7,6 +7,7 @@
  * and reading it, go through `seek` and `setCurrentTime` -- so the same buffer
  * management runs whether MSE is on the page or in the worker.
  */
+import { QUEUE_HIGH_WATER_FRAGMENTS } from "./protocol.js";
 
 /** Where a producer hands fragments, and how it learns to slow down. */
 export interface FragmentSink {
@@ -73,6 +74,12 @@ export interface MseSinkOptions {
   onReadyChange?(ready: boolean): void;
   /** Whether the media buffer is full and conversion has to wait. */
   onBlocked?(blocked: boolean): void;
+  /**
+   * A step worth timing: `sourceopen` when the media element has taken the
+   * MediaSource, and `appended` when the first media segment is in the buffer.
+   * The two bracket everything MSE does before playback can begin.
+   */
+  onMark?(name: "sourceopen" | "appended"): void;
   onError?(error: Error): void;
 }
 
@@ -121,9 +128,14 @@ export class MseSink implements FragmentSink {
   constructor(options: MseSinkOptions) {
     this.#options = options;
     this.#opened = new Promise((resolve) => {
-      this.mediaSource.addEventListener("sourceopen", () => resolve(), {
-        once: true,
-      });
+      this.mediaSource.addEventListener(
+        "sourceopen",
+        () => {
+          options.onMark?.("sourceopen");
+          resolve();
+        },
+        { once: true },
+      );
     });
   }
 
@@ -343,6 +355,7 @@ export class MseSink implements FragmentSink {
     const buffered = this.#sourceBuffer?.buffered;
     if (this.#playheadPlaced || !buffered || buffered.length === 0) return;
     this.#playheadPlaced = true;
+    this.#options.onMark?.("appended");
     this.#options.seek(buffered.start(0));
   }
 
@@ -408,7 +421,8 @@ export class MseSink implements FragmentSink {
   #updateRoom(): void {
     const room =
       !this.#quotaBlocked &&
-      this.#queuedBytes < this.#options.queueHighWaterMark;
+      this.#queuedBytes < this.#options.queueHighWaterMark &&
+      this.#queue.length < QUEUE_HIGH_WATER_FRAGMENTS;
     if (this.#room.set(room)) this.#options.onReadyChange?.(room);
   }
 

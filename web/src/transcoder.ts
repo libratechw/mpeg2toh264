@@ -78,14 +78,21 @@ export class Transcoder {
   /**
    * The rate since the last call, and overall. Null until a frame has been
    * converted, because before that there is nothing to divide by.
+   *
+   * `loop` is the caller's own account of the time it spent around the calls
+   * to this object, which goes out with the rate so that one report says where
+   * all of the wall time went.
    */
-  takeStats(): Stats | null {
+  takeStats(loop: { readingMs: number; waitingMs: number }): Stats | null {
     if (this.#intervalFrames === 0 || this.#totalMs === 0) return null;
     const stats: Stats = {
       instantFps: (this.#intervalFrames * 1000) / this.#intervalMs,
       totalFps: (this.#totalFrames * 1000) / this.#totalMs,
       videoFrames: this.#videoFrames,
       audioFrames: this.#audioFrames,
+      convertingMs: this.#intervalMs,
+      readingMs: loop.readingMs,
+      waitingMs: loop.waitingMs,
     };
     this.#intervalMs = 0;
     this.#intervalFrames = 0;

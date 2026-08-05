@@ -17,7 +17,25 @@ import {
   type Progress,
   type SinkKind,
   type Stats,
+  type Timing,
+  type TimingMark,
 } from "./protocol.js";
+
+/**
+ * The media element events worth timing, in the order they normally arrive.
+ *
+ * These are the second half of the picture: everything before `opened` is what
+ * this library did, and these are what the browser made of it. `waiting` is
+ * the odd one out -- it says playback ran dry, which is the same measurement
+ * read from the other end.
+ */
+const TIMED_EVENTS: TimingMark[] = [
+  "loadedmetadata",
+  "loadeddata",
+  "canplay",
+  "playing",
+  "waiting",
+];
 
 export interface Mpeg2TsPlayerOptions {
   /** Where the `.wasm` is. Defaults to the copy sitting beside the worker. */
@@ -45,6 +63,13 @@ export interface Mpeg2TsPlayerEventMap {
    * element has only what has been converted so far to offer a viewer.
    */
   seekable: CustomEvent<{ duration: number }>;
+  /**
+   * A step of the load happened, and this is how long it took to get there.
+   * Every mark of one load is measured from the `load()` that started it, so
+   * listening to this is enough to see where the time before the first frame
+   * went. See `TimingMark` for the steps.
+   */
+  timing: CustomEvent<Timing>;
   /** Every failure, including the one that rejects a pending `load`. */
   error: CustomEvent<{ error: Error }>;
 }
@@ -66,6 +91,11 @@ export function supportsWorkerMediaSource(): boolean {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+/** The one clock reading the page and the worker both understand. */
+function now(): number {
+  return performance.timeOrigin + performance.now();
 }
 
 /**
@@ -105,6 +135,10 @@ export class Mpeg2TsPlayer extends EventTarget {
     null;
   /** How long the input is, when it turned out to be one that can be seeked. */
   #duration: number | null = null;
+  /** When `load()` was called, as epoch milliseconds; every mark counts from it. */
+  #loadedAt = 0;
+  /** When the last mark was, so each one can say what it cost on its own. */
+  #markedAt = 0;
   #destroyed = false;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
@@ -119,6 +153,8 @@ export class Mpeg2TsPlayer extends EventTarget {
           : "main"
         : preference;
     this.video.addEventListener("seeking", this.#onSeeking);
+    for (const name of TIMED_EVENTS)
+      this.video.addEventListener(name, this.#onTimedEvent);
   }
 
   get state(): PlayerState {
@@ -149,6 +185,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.stop();
     const id = this.#generation;
     this.#duration = null;
+    this.#loadedAt = now();
+    this.#markedAt = this.#loadedAt;
     const worker = this.#ensureWorker();
     const promise = new Promise<void>((resolve, reject) => {
       this.#pending = { resolve, reject };
@@ -189,6 +227,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.stop();
     this.#destroyed = true;
     this.video.removeEventListener("seeking", this.#onSeeking);
+    for (const name of TIMED_EVENTS)
+      this.video.removeEventListener(name, this.#onTimedEvent);
     this.#worker?.terminate();
     this.#worker = null;
   }
@@ -251,6 +291,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         // still does not list MediaSourceHandle. This assignment is the entire
         // point of the handle.
         this.video.srcObject = notification.handle as unknown as MediaProvider;
+        this.#mark("attached", now());
         break;
       case "open":
         this.#openSink(notification.mimeCodec, notification.data);
@@ -273,6 +314,9 @@ export class Mpeg2TsPlayer extends EventTarget {
         break;
       case "reset":
         this.#sink?.reset();
+        break;
+      case "mark":
+        this.#mark(notification.name, notification.at);
         break;
       case "seek":
         if (this.video.currentTime < notification.time)
@@ -336,6 +380,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       seek: (time) => {
         if (this.video.currentTime < time) this.video.currentTime = time;
       },
+      onMark: (name) => this.#mark(name, now()),
       onReadyChange: (ready) => this.#report(id, { type: "flow", id, ready }),
       onBlocked: (blocked) => {
         if (id === this.#generation)
@@ -348,6 +393,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#sink = sink;
     this.#objectUrl = URL.createObjectURL(sink.mediaSource);
     this.video.src = this.#objectUrl;
+    this.#mark("attached", now());
     if (this.#duration !== null) sink.setDuration(this.#duration);
     return sink;
   }
@@ -389,6 +435,28 @@ export class Mpeg2TsPlayer extends EventTarget {
       time,
     } satisfies Command);
   };
+
+  #onTimedEvent = (event: Event): void => {
+    if (this.#state === "idle") return;
+    this.#mark(event.type as TimingMark, now());
+  };
+
+  /**
+   * Report where a step of the load fell on the clock `load()` started.
+   *
+   * The worker's marks arrive as epoch milliseconds because that is the only
+   * reading the two contexts share; what a caller wants is how long it waited,
+   * which is measured from here.
+   */
+  #mark(name: TimingMark, at: number): void {
+    if (this.#loadedAt === 0) return;
+    const sinceLoad = at - this.#loadedAt;
+    // A mark can only be behind the one before it when the two clocks disagree
+    // over the last fraction of a millisecond, which is not worth reporting.
+    const sincePrevious = Math.max(0, at - this.#markedAt);
+    this.#markedAt = Math.max(this.#markedAt, at);
+    this.#emit("timing", { name, sinceLoad, sincePrevious });
+  }
 
   #isBuffered(time: number): boolean {
     const buffered = this.video.buffered;

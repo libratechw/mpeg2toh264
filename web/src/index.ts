@@ -17,4 +17,6 @@ export {
   type Progress,
   type SinkKind,
   type Stats,
+  type Timing,
+  type TimingMark,
 } from "./protocol.js";

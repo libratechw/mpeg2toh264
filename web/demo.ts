@@ -84,13 +84,26 @@ function createPlayer(): Mpeg2TsPlayer {
     if (created.state === "converting")
       setStatus(`${STATES.converting}${progress}`);
   });
+  // Where the time before the first frame went. The console is the right place
+  // for it: it is a measurement, not something a viewer is meant to read.
+  created.addEventListener("timing", (event) => {
+    const { name, sinceLoad, sincePrevious } = event.detail;
+    console.log(
+      `[timing] ${sinceLoad.toFixed(0).padStart(6)}ms  ${name.padEnd(14)} ` +
+        `(+${sincePrevious.toFixed(0)}ms)`,
+    );
+  });
   created.addEventListener("seekable", (event) => {
     length = `${formatDuration(event.detail.duration)}（シーク可能）`;
     setDetails();
   });
   created.addEventListener("stats", (event) => {
     const { instantFps, totalFps, videoFrames, audioFrames } = event.detail;
-    fps.textContent = `変換FPS: 瞬間 ${instantFps.toFixed(1)} · トータル ${totalFps.toFixed(1)}`;
+    const { convertingMs, readingMs, waitingMs } = event.detail;
+    fps.textContent =
+      `変換FPS: 瞬間 ${instantFps.toFixed(1)} · トータル ${totalFps.toFixed(1)}` +
+      ` · 変換 ${convertingMs.toFixed(0)}ms / 読み込み ${readingMs.toFixed(0)}ms` +
+      ` / MSE待ち ${waitingMs.toFixed(0)}ms`;
     counts = `${videoFrames} video frames`;
     if (audioFrames > 0) counts += ` · ${audioFrames} AAC frames`;
     setDetails();
