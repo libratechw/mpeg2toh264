@@ -1489,6 +1489,7 @@ fn write_picture(
     for position in 0..position_count {
         let field_size = position_count >> 1;
         let second_output_field = direct_field_pair && position >= field_size;
+        let second_field_of_reference_pair = second_output_field && ctx.is_reference;
         let source_field = usize::from(second_output_field);
         let first_parity =
             usize::from(pic.coding.picture_structure == PictureStructure::BottomField);
@@ -1559,33 +1560,33 @@ fn write_picture(
                     slice_qp: PPS_INIT_QP,
                     pps_init_qp: PPS_INIT_QP,
                     disable_deblocking_filter_idc: 1,
+                    // A field picture indexes fields, so a buffer of `count`
+                    // frames offers twice as many. The second field of a
+                    // reference pair sees a different set: its own first field
+                    // was marked before it, which by clause 8.2.5.3 both put
+                    // that frame into the buffer and pushed the oldest one out,
+                    // so one whole frame has become a single field.
                     num_ref_idx_l0_active: Some(if direct_field_pair {
-                        if second_output_field && ctx.is_reference {
-                            6
-                        } else {
-                            ctx.layout.count * 2
-                        }
+                        ctx.layout.count * 2 - u32::from(second_field_of_reference_pair)
                     } else {
                         ctx.layout.count
                     }),
                     num_ref_idx_l1_active: Some(if direct_field_pair {
-                        if second_output_field && ctx.is_reference {
-                            6
-                        } else {
-                            ctx.layout.count * 2
-                        }
+                        ctx.layout.count * 2 - u32::from(second_field_of_reference_pair)
                     } else {
                         ctx.layout.count
                     }),
                     l1_first_short_term_delta: (!direct_field_pair
                         && ctx.layout.force_l1_short_term)
                         .then_some(1),
+                    // Long-term fields follow every short-term one, and both
+                    // runs start with the parity of the field being coded, so
+                    // the anchor's own field leads them whichever parity that
+                    // is. One short-term field fewer stands in front of it in
+                    // the second field of a reference pair, for the reason
+                    // above.
                     flat_pred_ref_idx: Some(if direct_field_pair {
-                        if second_output_field && ctx.is_reference {
-                            4
-                        } else {
-                            (ctx.layout.flat * 2 + field as i32) as u32
-                        }
+                        (ctx.layout.flat * 2) as u32 - u32::from(second_field_of_reference_pair)
                     } else {
                         ctx.layout.flat as u32
                     }),
