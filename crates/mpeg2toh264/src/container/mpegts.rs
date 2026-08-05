@@ -10,6 +10,34 @@ const SYNC_BYTE: u8 = 0x47;
 const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
 
+/// The component tag carried by an ARIB stream_identifier_descriptor.
+fn component_tag(descriptors: &[u8]) -> Option<u8> {
+    let mut at = 0;
+    while at + 2 <= descriptors.len() {
+        let length = descriptors[at + 1] as usize;
+        let end = at + 2 + length;
+        if end > descriptors.len() {
+            return None;
+        }
+        if descriptors[at] == 0x52 && length == 1 {
+            return Some(descriptors[at + 2]);
+        }
+        at = end;
+    }
+    None
+}
+
+/// ARIB assigns 0x30..=0x37 to captions and 0x38..=0x3f to character
+/// superimpose. Their low three bits name the video component they accompany.
+fn private_stream_matches_video(private_tag: Option<u8>, video_tag: Option<u8>) -> bool {
+    match (private_tag, video_tag) {
+        (Some(private @ 0x30..=0x3f), Some(video @ 0x00..=0x0f)) => private & 0x07 == video & 0x07,
+        // Keep accepting streams without ARIB component metadata. This is
+        // common in remuxed files and was the demuxer's historical behaviour.
+        _ => true,
+    }
+}
+
 /// Which elementary stream a packet belongs to. The two differ in the
 /// `stream_id` range their PES headers may use (Table 2-22).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -281,6 +309,7 @@ impl ProgramMap {
             let end = section.len() - 4;
             let mut i = 12 + program_info_length;
             let mut video = None;
+            let mut video_tag = None;
             let mut audio = None;
             let mut private = Vec::new();
             while i + 4 < end {
@@ -288,17 +317,30 @@ impl ProgramMap {
                 let stream_pid = (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
                 let info_length =
                     (((section[i + 3] & 0x0f) as usize) << 8) | section[i + 4] as usize;
+                let info_start = i + 5;
+                let info_end = info_start + info_length;
+                if info_end > end {
+                    break;
+                }
+                let tag = component_tag(&section[info_start..info_end]);
                 if video.is_none() && stream_type == STREAM_TYPE_MPEG2_VIDEO {
                     video = Some(stream_pid);
+                    video_tag = tag;
                 }
                 if audio.is_none() && stream_type == STREAM_TYPE_AAC_ADTS {
                     audio = Some(stream_pid);
                 }
                 if stream_type == 0x06 {
-                    private.push(stream_pid);
+                    private.push((stream_pid, tag));
                 }
                 i += 5 + info_length;
             }
+            let private = private
+                .into_iter()
+                .filter_map(|(pid, tag)| {
+                    private_stream_matches_video(tag, video_tag).then_some(pid)
+                })
+                .collect();
             // A service with no picture in it is not the one being watched,
             // unless the caller named it.
             if video.is_none() && self.wanted_service.is_none() {

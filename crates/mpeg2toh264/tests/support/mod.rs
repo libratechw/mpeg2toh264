@@ -163,6 +163,50 @@ pub fn mux_transport_stream(streams: &[(u16, u8)], units: &[PesUnit<'_>]) -> Vec
     mux_programs(&[(1, 0x100, streams)], units)
 }
 
+/// Build a single-program stream whose elementary streams carry explicit PMT
+/// descriptors. This is used for relationships such as ARIB component tags.
+pub fn mux_transport_stream_with_descriptors(
+    streams: &[(u16, u8, &[u8])],
+    units: &[PesUnit<'_>],
+) -> Vec<u8> {
+    let pat = [
+        0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00, 0, 0, 0, 0,
+    ];
+    let pcr_pid = streams.first().map_or(0x100, |&(pid, _, _)| pid);
+    let entries_length: usize = streams
+        .iter()
+        .map(|(_, _, descriptors)| 5 + descriptors.len())
+        .sum();
+    let mut pmt = vec![
+        0x02,
+        0xb0,
+        (13 + entries_length) as u8,
+        0x00,
+        0x01,
+        0xc1,
+        0x00,
+        0x00,
+        0xe0 | (pcr_pid >> 8) as u8,
+        (pcr_pid & 0xff) as u8,
+        0xf0,
+        0x00,
+    ];
+    for &(pid, stream_type, descriptors) in streams {
+        pmt.extend_from_slice(&[
+            stream_type,
+            0xe0 | (pid >> 8) as u8,
+            (pid & 0xff) as u8,
+            0xf0 | ((descriptors.len() >> 8) & 0x0f) as u8,
+            descriptors.len() as u8,
+        ]);
+        pmt.extend_from_slice(descriptors);
+    }
+    pmt.extend_from_slice(&[0, 0, 0, 0]);
+    let mut out = psi_packet(0, &pat);
+    out.extend_from_slice(&psi_packet(0x100, &pmt));
+    mux_payloads(out, units)
+}
+
 /// One service of a transport stream: its program number, the PID its program
 /// map rides on, and the elementary streams it advertises.
 pub type Program<'a> = (u16, u16, &'a [(u16, u8)]);

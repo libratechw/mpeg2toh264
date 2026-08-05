@@ -304,3 +304,87 @@ fn emits_private_stream_pes_from_the_selected_service() {
     assert_eq!(private2.pts, Some(135_000));
     assert_eq!(private2.data, superimpose);
 }
+
+#[test]
+fn emits_only_private_streams_for_the_selected_video_component() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
+        STREAM_TYPE_MPEG2_VIDEO, STREAM_TYPE_PRIVATE_DATA,
+    };
+
+    let component = |tag| [0x52, 0x01, tag];
+    let main_video = component(0x00);
+    let secondary_video = component(0x01);
+    let main_caption = component(0x30);
+    let secondary_caption = component(0x31);
+    let main_superimpose = component(0x38);
+    let secondary_superimpose = component(0x39);
+    let streams = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO, main_video.as_slice()),
+        (0x101, STREAM_TYPE_MPEG2_VIDEO, secondary_video.as_slice()),
+        (0x110, STREAM_TYPE_AAC_ADTS, &[][..]),
+        (0x130, STREAM_TYPE_PRIVATE_DATA, main_caption.as_slice()),
+        (
+            0x131,
+            STREAM_TYPE_PRIVATE_DATA,
+            secondary_caption.as_slice(),
+        ),
+        (0x138, STREAM_TYPE_PRIVATE_DATA, main_superimpose.as_slice()),
+        (
+            0x139,
+            STREAM_TYPE_PRIVATE_DATA,
+            secondary_superimpose.as_slice(),
+        ),
+    ];
+    let units = [
+        PesUnit {
+            pid: 0x130,
+            stream_id: 0xbd,
+            pts: Some(90_000),
+            payload: &[0x80],
+        },
+        PesUnit {
+            pid: 0x131,
+            stream_id: 0xbd,
+            pts: Some(90_000),
+            payload: &[0x81],
+        },
+        PesUnit {
+            pid: 0x138,
+            stream_id: 0xbf,
+            pts: None,
+            payload: &[0x82; 3],
+        },
+        PesUnit {
+            pid: 0x139,
+            stream_id: 0xbf,
+            pts: None,
+            payload: &[0x83; 3],
+        },
+        PesUnit {
+            pid: 0x100,
+            stream_id: 0xe0,
+            pts: Some(90_000),
+            payload: &[0, 0, 1, 0xb3],
+        },
+    ];
+    let ts = mux_transport_stream_with_descriptors(streams, &units);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&ts).expect("demuxes component-tagged streams");
+    packets.extend(demuxer.finish().expect("flushes component-tagged streams"));
+
+    let mut private_pids: Vec<_> = packets
+        .iter()
+        .filter(|packet| {
+            matches!(
+                packet.kind,
+                ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2
+            )
+        })
+        .map(|packet| packet.pid)
+        .collect();
+    private_pids.sort_unstable();
+    assert_eq!(private_pids, [0x130, 0x138]);
+}
