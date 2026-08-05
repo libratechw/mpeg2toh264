@@ -55,6 +55,7 @@ import { frameGeometry, writePps, writeSps } from "./h264/params.ts";
 import {
   DEFAULT_QUANTISER_OPTIONS,
   Quantiser8x8,
+  fieldDctToFrameTargets,
   interTargets,
   intraTargets,
 } from "./h264/quant.ts";
@@ -324,6 +325,21 @@ function predictionFor(
     layout.bwdL0 >= 0 && (mb.flags & MBFlag.MOTION_BACKWARD) !== 0;
   const hasForward = (mb.flags & MBFlag.MOTION_FORWARD) !== 0 || !hasBackward;
 
+  // A frame-picture field prediction carries one vector for each field.  The
+  // current H.264 macroblock writer emits a single 16x16 partition, so use the
+  // centre of the two predictions. MPEG-2 vertical field vectors count field
+  // lines and therefore become twice as large in frame-line coordinates.
+  const vector = (backward: boolean): [number, number] => {
+    const base = backward ? 2 : 0;
+    if (mb.motionType !== MotionType.FIELD || mb.mvCount < 2) {
+      return [mb.mv[base]!, mb.mv[base + 1]!];
+    }
+    return [
+      Math.round((mb.mv[base]! + mb.mv[base + 4]!) / 2),
+      Math.round(mb.mv[base + 1]! + mb.mv[base + 5]!),
+    ];
+  };
+
   if (hasForward && hasBackward) {
     // Both slots go to the two directions, leaving none for the bilinear pair,
     // so H.264 interpolates each side itself. The averaging structure still
@@ -335,14 +351,13 @@ function predictionFor(
       // The backward picture's index in list 1, not its index in list 0: the
       // two lists hold the same pictures in opposite orders.
       refIdxL1: layout.bwdL1,
-      mvL0: nativePosition(mb.mv[0]!, mb.mv[1]!),
-      mvL1: nativePosition(mb.mv[2]!, mb.mv[3]!),
+      mvL0: nativePosition(...vector(false)),
+      mvL1: nativePosition(...vector(true)),
     };
   }
 
   const useBackward = hasBackward;
-  const mvx = useBackward ? mb.mv[2]! : mb.mv[0]!;
-  const mvy = useBackward ? mb.mv[3]! : mb.mv[1]!;
+  const [mvx, mvy] = vector(useBackward);
   const mapped = mapVector(mvx, mvy);
 
   if (mapped.kind === VectorKind.INTEGER) stats.integerVectors++;
@@ -422,7 +437,8 @@ function writePicture(
     }
   }
 
-  const targets = new Float64Array(64);
+  const targets = Array.from({ length: 4 }, () => new Float64Array(64));
+  const fieldTargets = Array.from({ length: 4 }, () => new Float64Array(64));
   const raster = new Int32Array(64);
   const chromaScratch: [ChromaBlockLevels, ChromaBlockLevels] = [
     makeChromaBlockLevels(),
@@ -433,16 +449,6 @@ function writePicture(
   for (let mbY = 0; mbY < g.mbHeight; mbY++) {
     for (let mbX = 0; mbX < g.mbWidth; mbX++) {
       const source = byAddress.get(mbY * g.mbWidth + mbX);
-      if (
-        source &&
-        (source.dctType === 1 || source.motionType === MotionType.FIELD)
-      ) {
-        throw new Error(
-          `field-coded macroblock at ${mbX},${mbY}: representing one in H.264 needs ` +
-            `MBAFF, which is not implemented (dct_type=${source.dctType}, ` +
-            `motion_type=${source.motionType})`,
-        );
-      }
       const intra =
         !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
       const luma: (Int32Array | null)[] = [null, null, null, null];
@@ -464,6 +470,8 @@ function writePicture(
 
         for (let b = 0; b < 4; b++) {
           const block = source.blocks[b];
+          const target = source.dctType === 1 ? fieldTargets[b]! : targets[b]!;
+          target.fill(0);
           if (!block) continue;
           if (intra) {
             intraTargets(
@@ -471,13 +479,30 @@ function writePicture(
               matrix,
               quantiserScale,
               pic.coding.intraDcPrecision,
-              targets,
+              target,
             );
           } else {
-            interTargets(block, matrix, quantiserScale, targets);
+            interTargets(block, matrix, quantiserScale, target);
           }
+        }
+        if (source.dctType === 1) {
+          fieldDctToFrameTargets(
+            fieldTargets[0]!,
+            fieldTargets[2]!,
+            targets[0]!,
+            targets[2]!,
+          );
+          fieldDctToFrameTargets(
+            fieldTargets[1]!,
+            fieldTargets[3]!,
+            targets[1]!,
+            targets[3]!,
+          );
+        }
+        for (let b = 0; b < 4; b++) {
+          const target = targets[b]!;
           for (let pos = 0; pos < 64; pos++) {
-            raster[pos] = quant.levelFor(targets[pos]!, qp, pos);
+            raster[pos] = quant.levelFor(target[pos]!, qp, pos);
           }
           const out = new Int32Array(64);
           if (toZigzag8x8(raster, out)) luma[b] = out;

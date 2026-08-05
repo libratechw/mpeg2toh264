@@ -145,3 +145,66 @@ export function interTargets(
     );
   }
 }
+
+/**
+ * Convert the two vertically interleaved MPEG-2 field-DCT blocks on one side
+ * of a macroblock into the two spatially stacked frame-DCT blocks expected by
+ * an H.264 frame macroblock.
+ *
+ * This is a change of transform basis, not a pixel-domain decode: horizontal
+ * frequencies are unchanged and each column of eight vertical coefficients is
+ * multiplied by the orthonormal DCT basis. `firstField`
+ * supplies lines 0,2,...,14 and `secondField` lines 1,3,...,15.
+ */
+export function fieldDctToFrameTargets(
+  firstField: Float64Array,
+  secondField: Float64Array,
+  upper: Float64Array,
+  lower: Float64Array,
+): void {
+  const samples = new Float64Array(16);
+  const scale = (k: number) => (k === 0 ? 1 / Math.sqrt(8) : 0.5);
+
+  for (
+    let horizontalFrequency = 0;
+    horizontalFrequency < 8;
+    horizontalFrequency++
+  ) {
+    for (let y = 0; y < 8; y++) {
+      let even = 0;
+      let odd = 0;
+      for (
+        let verticalFrequency = 0;
+        verticalFrequency < 8;
+        verticalFrequency++
+      ) {
+        const basis =
+          scale(verticalFrequency) *
+          Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16);
+        const pos = verticalFrequency * 8 + horizontalFrequency;
+        even += basis * firstField[pos]!;
+        odd += basis * secondField[pos]!;
+      }
+      samples[y * 2] = even;
+      samples[y * 2 + 1] = odd;
+    }
+
+    for (let half = 0; half < 2; half++) {
+      const out = half === 0 ? upper : lower;
+      for (
+        let verticalFrequency = 0;
+        verticalFrequency < 8;
+        verticalFrequency++
+      ) {
+        let coefficient = 0;
+        for (let y = 0; y < 8; y++) {
+          coefficient +=
+            samples[half * 8 + y]! *
+            scale(verticalFrequency) *
+            Math.cos(((2 * y + 1) * verticalFrequency * Math.PI) / 16);
+        }
+        out[verticalFrequency * 8 + horizontalFrequency] = coefficient;
+      }
+    }
+  }
+}
