@@ -23,6 +23,8 @@
     "src/index.ts",
     "src/player.ts",
     "src/mse.ts",
-    "src/protocol.ts"
+    "src/protocol.ts",
+    "src/deinterlace.ts",
+    "src/yadif/shader.ts"
   ]
 }

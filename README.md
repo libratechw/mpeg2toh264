@@ -13,6 +13,7 @@ crates/
 testdata/             # 合成MPEG-2テストストリーム
 tools/                # テーブル生成・解析スクリプト（Python）
 web/                  # ブラウザプレイヤー（src/がライブラリ、demo.tsが利用例）
+  src/yadif/          #   FFmpeg由来のyadifシェーダーだけLGPL-2.1-or-later
 ```
 
 ## CLI
@@ -113,7 +114,18 @@ await player.load('https://example.com/video.ts');
 
 `load()`はソースが要素に付いて最初のバイトが入った時点でresolveします。変換はその先も続き、`progress`・`stats`・`statechange`・`seekable`で報告されます。失敗は必ず`error`イベントになり、まだresolveしていない`load()`はあわせてrejectされます。`stop()`で現在のロードを中断（プレイヤーは再利用可）、`destroy()`でWorkerごと破棄します。
 
-オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds`。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`web/demo.ts`がそうしています）。ファイルはページの外へ出ません。
+オプションは`wasmUrl` / `mediaSource` / `oversample` / `queueHighWaterMark` / `keepBehindSeconds` / `deinterlace`。ローカルファイルを再生したいときは`URL.createObjectURL(file)`で得たblob URLを渡します（`web/demo.ts`がそうしています）。ファイルはページの外へ出ません。
+
+### デインタレース
+
+放送のTSはインターレースで、変換後のH.264もそのままなので、`<video>`が出す絵は動いた場所が櫛状になります。`deinterlace`を有効にすると、要素の上に`<canvas>`を重ね、要素が出したフレームをWebGL2で**yadif**にかけて表示します。`player.deinterlace = true/false`で再生中に切り替えられるので、同じフレームで見比べられます。
+
+- フレームの取得は`requestVideoFrameCallback`です。yadifは前後1枚ずつを見るので、次のフレームが来るまで1枚分（約33 ms）遅れて表示されます。音より33 ms遅れる代わりに、動き検出の3つの尺度が全部揃います。シークやストリームの切り替わりは`mediaTime`の飛びで検知して履歴を捨てます。
+- 1フレームあたり1枚出力（`send_frame`相当）です。先に来たフィールドの行を残し、もう一方を補間します。トップフィールドファーストが既定で、`topFieldFirst`で変えられます。放送の情報から自動で決めてはいません（トランスコーダーがまだフレームごとのフィールド順を報告しないため）。
+- テクスチャは**コード化サイズ**（例: 1440x1080）で、canvasのCSS上の箱は**表示サイズ**（例: 16:9）に合わせて`#layout`が置きます。この引き伸ばしがSARの反映そのものです。`videoWidth`はSAR適用後の幅なので、これでテクスチャを確保すると右端が埋まらないまま残ります。アップロードされるのは`VideoFrameCallbackMetadata.width/height`のほうです。
+- canvasは要素の絵を覆うので、要素自身のコントロールも隠れます。デモページが再生ボタンとシークバーを自前で持っているのはそのためです。
+
+yadifそのもの（`web/src/yadif/shader.ts`）はFFmpegの`vf_yadif_cuda.cu`からの移植なので**LGPL-2.1-or-later**です。ディレクトリを分けてあるのはそのためで、混ぜないでください。WebGLの組み立て・テクスチャ・rVFCのループは`web/src/deinterlace.ts`で、こちらはMITです。
 
 ### シーク
 

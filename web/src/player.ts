@@ -6,6 +6,11 @@
  * attaching the source to the element, moving the playhead, and telling the
  * worker where playback has got to.
  */
+import {
+  Deinterlacer,
+  supportsDeinterlace,
+  type DeinterlacerOptions,
+} from "./deinterlace.js";
 import { MseSink } from "./mse.js";
 import {
   DEFAULT_KEEP_BEHIND_SECONDS,
@@ -51,6 +56,16 @@ export interface Mpeg2TsPlayerOptions {
   queueHighWaterMark?: number;
   /** Seconds of played media to keep behind the playhead when evicting. */
   keepBehindSeconds?: number;
+  /**
+   * Whether to deinterlace what the element shows, and how. A transport stream
+   * off the air is interlaced and stays that way through the conversion, so
+   * without this the picture is combed wherever anything moved.
+   *
+   * The deinterlacer covers the element with a canvas of its own, which means
+   * covering the element's own controls; see `Deinterlacer`. Off by default
+   * for that reason. It can be turned on and off while playing.
+   */
+  deinterlace?: boolean | DeinterlacerOptions;
 }
 
 export interface Mpeg2TsPlayerEventMap {
@@ -139,6 +154,8 @@ export class Mpeg2TsPlayer extends EventTarget {
   #loadedAt = 0;
   /** When the last mark was, so each one can say what it cost on its own. */
   #markedAt = 0;
+  /** Built the first time deinterlacing is turned on, and kept after that. */
+  #deinterlacer: Deinterlacer | null = null;
   #destroyed = false;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
@@ -155,6 +172,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.video.addEventListener("seeking", this.#onSeeking);
     for (const name of TIMED_EVENTS)
       this.video.addEventListener(name, this.#onTimedEvent);
+    if (options.deinterlace) this.deinterlace = true;
   }
 
   get state(): PlayerState {
@@ -172,6 +190,35 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Which side of the wire ended up owning the MediaSource. */
   get mediaSourceOwner(): SinkKind {
     return this.#sinkKind;
+  }
+
+  /**
+   * Whether the picture is being deinterlaced. Assigning to it turns the
+   * deinterlacer on or off where it stands, so the two can be compared on the
+   * frame; a browser that cannot run it stays false.
+   */
+  get deinterlace(): boolean {
+    return this.#deinterlacer?.running ?? false;
+  }
+
+  set deinterlace(enabled: boolean) {
+    if (!enabled) {
+      this.#deinterlacer?.stop();
+      return;
+    }
+    if (this.#destroyed || !supportsDeinterlace()) return;
+    const options = this.#options.deinterlace;
+    try {
+      this.#deinterlacer ??= new Deinterlacer(
+        this.video,
+        typeof options === "object" ? options : {},
+      );
+      this.#deinterlacer.start();
+    } catch (error) {
+      // Without it the element shows its own picture, which is worth saying
+      // and is not worth failing a load over.
+      this.#emit("error", { error: toError(error) });
+    }
   }
 
   load(url: string | URL): Promise<void> {
@@ -229,6 +276,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.video.removeEventListener("seeking", this.#onSeeking);
     for (const name of TIMED_EVENTS)
       this.video.removeEventListener(name, this.#onTimedEvent);
+    this.#deinterlacer?.destroy();
+    this.#deinterlacer = null;
     this.#worker?.terminate();
     this.#worker = null;
   }

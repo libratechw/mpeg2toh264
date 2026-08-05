@@ -4,6 +4,7 @@
  */
 import {
   Mpeg2TsPlayer,
+  supportsDeinterlace,
   supportsWorkerMediaSource,
   type PlayerState,
 } from "./src/index.js";
@@ -13,9 +14,16 @@ const urlForm = document.querySelector<HTMLFormElement>("#url-form")!;
 const urlInput = document.querySelector<HTMLInputElement>("#url")!;
 const fileInput = document.querySelector<HTMLInputElement>("#file")!;
 const placement = document.querySelector<HTMLSelectElement>("#placement")!;
+const playPause = document.querySelector<HTMLButtonElement>("#playpause")!;
+const seek = document.querySelector<HTMLInputElement>("#seek")!;
+const time = document.querySelector<HTMLElement>("#time")!;
+const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const details = document.querySelector<HTMLElement>("#details")!;
 const fps = document.querySelector<HTMLElement>("#fps")!;
+
+/** How many steps the seek bar divides the video into. */
+const SEEK_STEPS = 1000;
 
 const IDLE_FPS = "変換FPS: 瞬間 — · トータル —";
 
@@ -51,6 +59,10 @@ let label = "";
 let progress = "";
 let counts = "";
 let length = "";
+/** How long the input is, once it turns out to be one that can be seeked. */
+let duration: number | null = null;
+/** Whether the bar is being dragged, which owns the position until let go. */
+let scrubbing = false;
 
 function setStatus(message: string, error = false) {
   status.textContent = message;
@@ -70,7 +82,10 @@ function setDetails() {
 function createPlayer(): Mpeg2TsPlayer {
   player?.destroy();
   const mediaSource = placement.value as "auto" | "worker" | "main";
-  const created = new Mpeg2TsPlayer(video, { mediaSource });
+  const created = new Mpeg2TsPlayer(video, {
+    mediaSource,
+    deinterlace: deinterlace.checked,
+  });
   created.addEventListener("statechange", (event) => {
     const { state } = event.detail;
     if (state === "converting") setStatus(`${STATES.converting}${progress}`);
@@ -94,8 +109,11 @@ function createPlayer(): Mpeg2TsPlayer {
     );
   });
   created.addEventListener("seekable", (event) => {
-    length = `${formatDuration(event.detail.duration)}（シーク可能）`;
+    duration = event.detail.duration;
+    seek.disabled = false;
+    length = `${formatDuration(duration)}（シーク可能）`;
     setDetails();
+    setPlayhead();
   });
   created.addEventListener("stats", (event) => {
     const { instantFps, totalFps, videoFrames, audioFrames } = event.detail;
@@ -126,14 +144,59 @@ function play(
   progress = "";
   counts = "";
   length = "";
+  duration = null;
+  seek.disabled = true;
+  seek.value = "0";
   fps.textContent = IDLE_FPS;
   setDetails();
+  setPlayhead();
   // Failures already arrive as an error event, which is what writes the
   // message; the rejection here is the same one and needs no second report.
   void createPlayer()
     .load(url)
     .catch(() => {});
 }
+
+/** Where the bar is pointing, in seconds. Only ever called with a duration. */
+function scrubbedTime(): number {
+  return (Number(seek.value) / SEEK_STEPS) * (duration ?? 0);
+}
+
+function setPlayhead() {
+  const current = scrubbing ? scrubbedTime() : video.currentTime;
+  time.textContent =
+    duration === null
+      ? formatDuration(current)
+      : `${formatDuration(current)} / ${formatDuration(duration)}`;
+  if (!scrubbing && duration)
+    seek.value = String(Math.round((current / duration) * SEEK_STEPS));
+}
+
+playPause.addEventListener("click", () => {
+  if (video.paused) void video.play().catch(() => {});
+  else video.pause();
+});
+video.addEventListener("play", () => (playPause.textContent = "一時停止"));
+video.addEventListener("pause", () => (playPause.textContent = "再生"));
+video.addEventListener("loadeddata", () => (playPause.disabled = false));
+video.addEventListener("emptied", () => (playPause.disabled = true));
+video.addEventListener("timeupdate", setPlayhead);
+video.addEventListener("seeked", setPlayhead);
+
+// Dragging moves the label only. Seeking on every step of it would have the
+// worker reading the input again from a place the viewer has already left.
+seek.addEventListener("input", () => {
+  scrubbing = true;
+  setPlayhead();
+});
+seek.addEventListener("change", () => {
+  scrubbing = false;
+  if (duration !== null) video.currentTime = scrubbedTime();
+});
+
+deinterlace.addEventListener("change", () => {
+  if (player) player.deinterlace = deinterlace.checked;
+});
 
 urlForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -149,6 +212,12 @@ fileInput.addEventListener("change", () => {
   const url = URL.createObjectURL(selected);
   play(url, selected.name, url);
 });
+
+if (!supportsDeinterlace()) {
+  deinterlace.checked = false;
+  deinterlace.disabled = true;
+  deinterlace.labels?.[0]?.append("（このブラウザーでは使えません）");
+}
 
 if (!supportsWorkerMediaSource()) {
   const auto = placement.querySelector<HTMLOptionElement>(
