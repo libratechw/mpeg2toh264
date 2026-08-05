@@ -2,15 +2,19 @@
 //!
 //! Every MPEG-2 macroblock becomes an inter macroblock, including intra ones:
 //! see [`crate::h264::slice`] for why H.264 intra prediction is avoided
-//! entirely. An intra macroblock is coded as `P_L0_16x16` with a zero motion
-//! vector pointing at the flat-prediction reference index, so its prediction is
-//! a known constant and its residual is just the block with that constant
-//! removed.
+//! nearly everywhere. An intra macroblock is coded as `P_L0_16x16` with a zero
+//! motion vector pointing at the flat-prediction reference index, so its
+//! prediction is a known constant and its residual is just the block with that
+//! constant removed.
+//!
+//! The exception is the random access point, whose I slices have no reference
+//! list to hang that constant on. It uses `I_NxN` and real intra prediction;
+//! see [`write_intra_macroblock`].
 
 use crate::error::Result;
 use crate::h264::bitwriter::BitWriter;
 use crate::h264::cavlc::{write_masked_levels, write_residual_levels};
-use crate::h264::cavlc_tables::CBP_TO_CODE_NUM_INTER;
+use crate::h264::cavlc_tables::{CBP_TO_CODE_NUM_INTER, CBP_TO_CODE_NUM_INTRA};
 use crate::h264::chroma::ChromaBlockLevels;
 use crate::h264::params::ZIGZAG_8X8;
 
@@ -214,61 +218,6 @@ pub struct InterMacroblock {
     pub prev_qp: i32,
 }
 
-/// Sixteen raster-order luma rows of sixteen samples, then eight raster-order
-/// 4:2:0 chroma rows for each component.
-#[derive(Clone)]
-pub struct PcmMacroblockSamples {
-    pub luma: [u8; 256],
-    pub cb: [u8; 64],
-    pub cr: [u8; 64],
-}
-
-impl PcmMacroblockSamples {
-    /// Neutral grey, for a macroblock the source never coded.
-    pub fn grey() -> Self {
-        Self {
-            luma: [128; 256],
-            cb: [128; 64],
-            cr: [128; 64],
-        }
-    }
-}
-
-/// Which slice type the I_PCM macroblock is being written into, which shifts its
-/// `mb_type` past that slice's inter types.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PcmSliceType {
-    I,
-    P,
-    B,
-}
-
-/// Write an independently decodable I_PCM macroblock.
-pub fn write_pcm_macroblock(
-    w: &mut BitWriter,
-    slice_type: PcmSliceType,
-    samples: &PcmMacroblockSamples,
-) {
-    // I_PCM is mb_type 25 in an I slice, offset by the inter types in P and B.
-    w.ue(match slice_type {
-        PcmSliceType::I => 25,
-        PcmSliceType::P => 30,
-        PcmSliceType::B => 48,
-    });
-    while !w.is_byte_aligned() {
-        w.flag(false); // pcm_alignment_zero_bit
-    }
-    for &sample in samples.luma.iter() {
-        w.u(8, sample as u32);
-    }
-    for &sample in samples.cb.iter() {
-        w.u(8, sample as u32);
-    }
-    for &sample in samples.cr.iter() {
-        w.u(8, sample as u32);
-    }
-}
-
 /// Write one macroblock. Returns the QP in effect afterwards, which is the
 /// macroblock's own QP only if it actually carried a `mb_qp_delta`.
 ///
@@ -355,11 +304,11 @@ pub fn write_inter_macroblock(
         w.se(wrap_qp_delta(mb.qp - mb.prev_qp));
         qp_after = mb.qp;
         if cbp_luma > 0 {
-            write_luma_residual_8x8(w, counts, mb, luma, cbp_luma)?;
+            write_luma_residual_8x8(w, counts, mb.mb_x, mb.mb_y, luma, cbp_luma)?;
         } else {
             mark_no_coefficients(counts, mb.mb_x, mb.mb_y);
         }
-        write_chroma_residual(w, chroma_counts, mb, chroma, cbp_chroma)?;
+        write_chroma_residual(w, chroma_counts, mb.mb_x, mb.mb_y, chroma, cbp_chroma)?;
     } else {
         mark_no_coefficients(counts, mb.mb_x, mb.mb_y);
         mark_no_chroma_coefficients(chroma_counts, mb.mb_x, mb.mb_y);
@@ -367,17 +316,99 @@ pub fn write_inter_macroblock(
     Ok(qp_after)
 }
 
+/// Write an `I_NxN` macroblock whose four 8x8 blocks and chroma all predict in
+/// DC mode.
+///
+/// DC is the only mode used, so the predicted mode is DC as well -- a
+/// neighbouring block that is missing counts as DC, and every one that is there
+/// is DC -- and `prev_intra8x8_pred_mode_flag` is set for all four blocks
+/// without ever having to send a mode.
+///
+/// Everything from `coded_block_pattern` onwards is what an inter macroblock
+/// writes, apart from the intra ordering of the pattern's codewords.
+#[allow(clippy::too_many_arguments)]
+pub fn write_intra_macroblock(
+    w: &mut BitWriter,
+    counts: &mut CoeffCountMap,
+    chroma_counts: &mut ChromaCounts,
+    mb_x: usize,
+    mb_y: usize,
+    qp: i32,
+    prev_qp: i32,
+    luma: &[Option<&[i32; 64]>; 4],
+    chroma: Option<&[ChromaBlockLevels; 2]>,
+) -> Result<IntraMacroblock> {
+    w.ue(0); // mb_type: I_NxN
+             // For I_NxN this comes before the prediction modes rather than after the
+             // coded block pattern, and it is not repeated (clause 7.3.5).
+    w.flag(true); // transform_size_8x8_flag
+    for _ in 0..4 {
+        w.flag(true); // prev_intra8x8_pred_mode_flag
+    }
+    w.ue(0); // intra_chroma_pred_mode: DC
+
+    let mut cbp_luma = 0u32;
+    for (i8x8, block) in luma.iter().enumerate() {
+        if block.is_some() {
+            cbp_luma |= 1 << i8x8;
+        }
+    }
+    let mut cbp_chroma = 0u32;
+    if let Some([cb, cr]) = chroma {
+        if cb.any_ac || cr.any_ac {
+            cbp_chroma = 2;
+        } else if cb.any_dc || cr.any_dc {
+            cbp_chroma = 1;
+        }
+    }
+    let cbp = cbp_luma + 16 * cbp_chroma;
+    w.ue(CBP_TO_CODE_NUM_INTRA[cbp as usize]);
+
+    let mut qp_after = prev_qp;
+    if cbp != 0 {
+        w.se(wrap_qp_delta(qp - prev_qp));
+        qp_after = qp;
+        if cbp_luma > 0 {
+            write_luma_residual_8x8(w, counts, mb_x, mb_y, luma, cbp_luma)?;
+        } else {
+            mark_no_coefficients(counts, mb_x, mb_y);
+        }
+        write_chroma_residual(w, chroma_counts, mb_x, mb_y, chroma, cbp_chroma)?;
+    } else {
+        mark_no_coefficients(counts, mb_x, mb_y);
+        mark_no_chroma_coefficients(chroma_counts, mb_x, mb_y);
+    }
+    Ok(IntraMacroblock {
+        qp: qp_after,
+        cbp_luma,
+        cbp_chroma,
+    })
+}
+
+/// What an intra macroblock ended up sending, which is what the reconstruction
+/// it has to be predicted from is built out of. A block whose bit is clear
+/// carries no residual at all, and with `cbp_chroma` below 2 the chroma AC
+/// levels were not written whatever the conversion produced.
+pub struct IntraMacroblock {
+    /// QP in force after the macroblock, which is the one before it when
+    /// nothing was coded and `mb_qp_delta` never appeared.
+    pub qp: i32,
+    pub cbp_luma: u32,
+    pub cbp_chroma: u32,
+}
+
 /// Chroma residual: both DC blocks first, then every AC block (clause 7.3.5.3).
 /// The DC blocks use the dedicated chroma table, signalled by nC of -1.
 fn write_chroma_residual(
     w: &mut BitWriter,
     counts: &mut ChromaCounts,
-    mb: &InterMacroblock,
+    mb_x: usize,
+    mb_y: usize,
     chroma: Option<&[ChromaBlockLevels; 2]>,
     cbp_chroma: u32,
 ) -> Result<()> {
     let (Some(chroma), true) = (chroma, cbp_chroma != 0) else {
-        mark_no_chroma_coefficients(counts, mb.mb_x, mb.mb_y);
+        mark_no_chroma_coefficients(counts, mb_x, mb_y);
         return Ok(());
     };
 
@@ -392,8 +423,8 @@ fn write_chroma_residual(
             &mut counts.cr
         };
         for b in 0..4 {
-            let bx = mb.mb_x * 2 + (b & 1);
-            let by = mb.mb_y * 2 + (b >> 1);
+            let bx = mb_x * 2 + (b & 1);
+            let by = mb_y * 2 + (b >> 1);
             if cbp_chroma != 2 {
                 map.set(bx, by, 0);
                 continue;
@@ -442,7 +473,8 @@ pub fn wrap_qp_delta(delta: i32) -> i32 {
 fn write_luma_residual_8x8(
     w: &mut BitWriter,
     counts: &mut CoeffCountMap,
-    mb: &InterMacroblock,
+    mb_x: usize,
+    mb_y: usize,
     luma: &[Option<&[i32; 64]>; 4],
     cbp_luma: u32,
 ) -> Result<()> {
@@ -452,8 +484,8 @@ fn write_luma_residual_8x8(
         for i4x4 in 0..4 {
             let blk_idx = i8x8 * 4 + i4x4;
             let (x, y) = LUMA_4X4_XY[blk_idx];
-            let bx = mb.mb_x * 4 + x;
-            let by = mb.mb_y * 4 + y;
+            let bx = mb_x * 4 + x;
+            let by = mb_y * 4 + y;
 
             let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, block) else {
                 counts.set(bx, by, 0);

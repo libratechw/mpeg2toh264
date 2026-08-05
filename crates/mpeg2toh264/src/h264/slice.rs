@@ -67,11 +67,13 @@ pub struct SliceHeaderConfig {
     pub l1_first_short_term_delta: Option<u32>,
     /// The reference index intra macroblocks point at, in both lists.
     ///
-    /// H.264 has no "no prediction" macroblock mode short of I_PCM, so an MPEG-2
-    /// intra macroblock cannot be expressed directly: H.264 intra prediction
-    /// would subtract a neighbour-derived value that MPEG-2 never added, and
-    /// working out those neighbours means decoding pixels, which is exactly what
-    /// this transcoder exists to avoid.
+    /// H.264 has no "no prediction" macroblock mode, so an MPEG-2 intra
+    /// macroblock cannot be expressed directly: H.264 intra prediction would
+    /// subtract a neighbour-derived value that MPEG-2 never added, and working
+    /// out those neighbours means decoding pixels, which is exactly what this
+    /// transcoder exists to avoid. The picture opening a random access point
+    /// has no reference list and so has no choice; every other one comes
+    /// through here.
     ///
     /// The way out is explicit weighted prediction. This index gets weight 0 and
     /// offset [`FLAT_PREDICTION`], which makes its prediction that constant

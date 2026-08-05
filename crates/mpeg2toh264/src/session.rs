@@ -25,7 +25,7 @@ use crate::transcode::{IncrementalTranscoder, TranscodeOptions};
 ///
 /// A decoder can begin at any of them, which is what lets a player evict what
 /// it has already shown without cutting into what it is about to. They cost an
-/// I_PCM picture each, so they are kept far enough apart that the cost is
+/// intra-coded picture each, so they are kept far enough apart that the cost is
 /// negligible and close enough that eviction has somewhere to stop.
 const RANDOM_ACCESS_GOP_INTERVAL: usize = 24;
 

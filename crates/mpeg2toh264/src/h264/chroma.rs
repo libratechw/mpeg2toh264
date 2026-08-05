@@ -17,9 +17,7 @@ use std::sync::LazyLock;
 
 use crate::h264::cos_table::COS_PI_OVER_16;
 use crate::h264::params::ZIGZAG_4X4;
-#[cfg(test)]
-use crate::h264::quant::FLAT_PREDICTION_DC;
-use crate::h264::quant::{inter_targets, intra_targets};
+use crate::h264::quant::{inter_targets, intra_targets, FLAT_PREDICTION_DC};
 use crate::h264::quant_tables::{CHROMA_AC_GAIN_4X4, CHROMA_DC_GAIN, QPC_FROM_QPI};
 use crate::round_half_up_i32;
 
@@ -329,6 +327,42 @@ pub fn convert_chroma_block(
         &mut dequant,
     );
     idct8(&dequant, &mut spatial, &mut tmp);
+    spatial_to_chroma_levels(&spatial, qp_c, out, false);
+}
+
+/// As [`convert_chroma_block`], but for a block predicted the way H.264 itself
+/// predicts rather than from the flat reference index.
+///
+/// The random access point is coded with real intra prediction, which gives
+/// each of the component's four 4x4 blocks its own constant. Dequantisation has
+/// already taken the flat constant off every sample, so putting it back and
+/// removing the right one leaves the residual this block actually needs.
+pub fn convert_intra_chroma_block(
+    levels: &[i16; 64],
+    weight_scale: &[i32; 64],
+    quantiser_scale: i32,
+    intra_dc_precision: u32,
+    qp_c: i32,
+    prediction: &[i32; 4],
+    out: &mut ChromaBlockLevels,
+) {
+    let mut dequant = [0.0f32; 64];
+    let mut spatial = [0.0f32; 64];
+    let mut tmp = [0.0f32; 64];
+
+    dequant_chroma(
+        Some(levels),
+        weight_scale,
+        quantiser_scale,
+        intra_dc_precision,
+        true,
+        &mut dequant,
+    );
+    idct8(&dequant, &mut spatial, &mut tmp);
+    for (i, sample) in spatial.iter_mut().enumerate() {
+        let blk = ((i / 8) / 4) * 2 + (i % 8) / 4;
+        *sample += FLAT_PREDICTION_DC / 8.0 - prediction[blk] as f32;
+    }
     spatial_to_chroma_levels(&spatial, qp_c, out, false);
 }
 

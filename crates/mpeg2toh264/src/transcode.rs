@@ -6,10 +6,15 @@
 //! reference frame buffer. Chroma is the exception and is documented in
 //! [`crate::h264::chroma`].
 //!
-//! The one place pixels are unavoidable is the very first picture of a random
-//! access point, which has nothing to predict from: it is reconstructed and
-//! emitted as an I_PCM IDR. Every later picture predicts, so it goes back
-//! through the coefficient path.
+//! The exception is the picture that opens a random access point. Its slices
+//! are I slices, which carry no reference list, so there is nothing to hang the
+//! flat prediction's weights on and it has to be coded with H.264's own intra
+//! prediction. DC mode is used throughout, which keeps the prediction a single
+//! constant per block and lets the residual stay in the coefficient domain
+//! alongside everything else -- but the constant is read back from what a
+//! decoder will reconstruct, so that picture, and only that picture, is
+//! reconstructed here as well. See [`crate::h264::intra`] and
+//! [`crate::h264::reconstruct`].
 //!
 //! Every output picture is a B slice, even those that were I or P in the source,
 //! because the half-sample motion mapping needs bi-prediction and that is only
@@ -19,24 +24,27 @@ use crate::bitreader::BitReader;
 use crate::error::{bail, Result};
 use crate::h264::bitwriter::{nal_type, to_nal_unit, BitWriter};
 use crate::h264::chroma::{
-    chroma_qp, convert_chroma_block, convert_field_chroma_pair, ChromaBlockLevels,
-    FieldChromaScratch, FieldChromaSource,
+    chroma_qp, convert_chroma_block, convert_field_chroma_pair, convert_intra_chroma_block,
+    ChromaBlockLevels, FieldChromaScratch, FieldChromaSource,
 };
-use crate::h264::intra_pcm::reconstruct_intra_pcm;
+use crate::h264::intra::{chroma_dc, luma_8x8_dc, CodingOrder, ReconstructedPicture};
 use crate::h264::mb::{
     b16x8_mb_type, b_mb_type, make_luma_counts, mark_no_chroma_coefficients, mark_no_coefficients,
-    write_inter_macroblock, write_pcm_macroblock, ChromaCounts, CoeffCountMap, InterMacroblock,
-    MotionPartition, PcmMacroblockSamples, PcmSliceType, PredictionMode, FIELD_SCAN_8X8,
+    write_inter_macroblock, write_intra_macroblock, ChromaCounts, CoeffCountMap, InterMacroblock,
+    MotionPartition, PredictionMode, FIELD_SCAN_8X8,
 };
 use crate::h264::mvmap::{map_vector, native_position, VectorKind};
 use crate::h264::mvpred::{MbMotion, MotionField};
-use crate::h264::params::ZIGZAG_8X8;
 use crate::h264::params::{
     frame_geometry, write_pps, write_sps, FrameGeometry, PpsConfig, SpsConfig,
 };
+use crate::h264::params::{ZIGZAG_4X4, ZIGZAG_8X8};
 use crate::h264::quant::{
     field_dct_to_frame_targets, frame_dct_to_field_targets, inter_targets, intra_targets,
-    Quantiser8x8, DEFAULT_OVERSAMPLE,
+    Quantiser8x8, DEFAULT_OVERSAMPLE, FLAT_PREDICTION_DC,
+};
+use crate::h264::reconstruct::{
+    chroma_dc_terms, chroma_residual_4x4, residual_8x8, InverseScale8x8,
 };
 use crate::h264::slice::{write_slice_header, SliceHeaderConfig, SliceType};
 use crate::mpeg2::constants::{mb_flag, PictureStructure, PictureType, QUANTISER_SCALE};
@@ -1152,6 +1160,117 @@ fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
     to_nal_unit(w.bytes(), 2, nal_type::SLICE_NON_IDR)
 }
 
+/// What the random access point needs to carry that no other picture does.
+struct IntraState {
+    picture: ReconstructedPicture,
+    order: CodingOrder,
+}
+
+fn clip_sample(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+impl IntraState {
+    /// Clause 8.3.2.2.4 for one 8x8 luma block.
+    fn predict_luma(&self, mb_x: usize, mb_y: usize, blk: usize) -> i32 {
+        luma_8x8_dc(&self.picture, &self.order, mb_x, mb_y, blk)
+    }
+
+    /// Put the block back together the way a decoder will, so the blocks after
+    /// it -- the three that share this macroblock included -- predict from what
+    /// the decoder is going to have rather than from what the source held.
+    ///
+    /// Levels arrive in the scan order the residual syntax uses and the inverse
+    /// transform wants them in raster order, so they are unscanned on the way.
+    /// `None` is a block whose `coded_block_pattern` bit is clear, which carries
+    /// no residual and comes back as the prediction alone.
+    #[allow(clippy::too_many_arguments)]
+    fn store_luma(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        blk: usize,
+        prediction: i32,
+        levels: Option<&[i32; 64]>,
+        qp: i32,
+        scale: &InverseScale8x8,
+        scan: &[usize; 64],
+    ) {
+        let x0 = mb_x * 16 + (blk & 1) * 8;
+        let y0 = mb_y * 16 + (blk >> 1) * 8;
+        let width = self.picture.width;
+        let Some(levels) = levels else {
+            for y in 0..8 {
+                let row = (y0 + y) * width + x0;
+                self.picture.luma[row..row + 8].fill(clip_sample(prediction));
+            }
+            return;
+        };
+        let mut raster = [0i32; 64];
+        for (k, &pos) in scan.iter().enumerate() {
+            raster[pos] = levels[k];
+        }
+        let mut residual = [0i32; 64];
+        residual_8x8(&raster, qp, scale, &mut residual);
+        for y in 0..8 {
+            for x in 0..8 {
+                self.picture.luma[(y0 + y) * width + x0 + x] =
+                    clip_sample(prediction + residual[y * 8 + x]);
+            }
+        }
+    }
+
+    /// The same for both chroma components, which predict from neighbouring
+    /// macroblocks only and so can be done in one go at the end.
+    ///
+    /// `cbp_chroma` below 2 means the AC levels were never written, whatever
+    /// the conversion produced, and 0 means the DC ones were not either.
+    fn store_chroma(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        prediction: &[[i32; 4]; 2],
+        levels: &[ChromaBlockLevels; 2],
+        qp_c: i32,
+        cbp_chroma: u32,
+    ) {
+        let width = self.picture.chroma_width();
+        for c in 0..2 {
+            let dc = if cbp_chroma > 0 {
+                chroma_dc_terms(&levels[c].dc, qp_c)
+            } else {
+                [0; 4]
+            };
+            let plane = if c == 0 {
+                &mut self.picture.cb
+            } else {
+                &mut self.picture.cr
+            };
+            let mut ac = [0i32; 16];
+            let mut residual = [0i32; 16];
+            for blk in 0..4 {
+                ac.fill(0);
+                if cbp_chroma == 2 {
+                    // Chroma conversion always writes the frame scan, whatever
+                    // the luma blocks use, so this reads it back the same way.
+                    for k in 1..16 {
+                        ac[ZIGZAG_4X4[k]] = levels[c].ac[blk][k - 1];
+                    }
+                }
+                chroma_residual_4x4(&ac, dc[blk], qp_c, &mut residual);
+                let x0 = mb_x * 8 + (blk & 1) * 4;
+                let y0 = mb_y * 8 + (blk >> 1) * 4;
+                for y in 0..4 {
+                    for x in 0..4 {
+                        plane[(y0 + y) * width + x0 + x] =
+                            clip_sample(prediction[c][blk] + residual[y * 4 + x]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Access-unit delimiter used by the MP4 wrapper to keep the two NAL units of
 /// a PAFF complementary field pair in one video sample.
 fn write_access_unit_delimiter() -> Vec<u8> {
@@ -1313,6 +1432,23 @@ fn write_picture(
     let mut prev_qp = PPS_INIT_QP;
     let mut slice_open = false;
     let mut picture_nals = Vec::new();
+    // The random access point is the only picture that predicts from itself, so
+    // it is the only one that has to carry the samples a decoder will make of
+    // it. A field pair is two coded pictures and gets a plane each, which the
+    // reset at the head of every slice takes care of.
+    let mut intra_state = ctx.real_idr.then(|| IntraState {
+        picture: ReconstructedPicture::new(
+            g.mb_width * 16,
+            g.mb_height * 16 / if paired_field.is_some() { 2 } else { 1 },
+        ),
+        order: CodingOrder {
+            mb_width: g.mb_width,
+            mb_height: g.mb_height / if paired_field.is_some() { 2 } else { 1 },
+            // A field picture is not macroblock-adaptive whatever the sequence
+            // says, because field_pic_flag already settled it.
+            mbaff: ctx.mbaff && paired_field.is_none(),
+        },
+    });
     let output_slice_type = if ctx.real_idr {
         SliceType::I
     } else if ctx.options.i_frames_only {
@@ -1331,7 +1467,6 @@ fn write_picture(
     let mut qp_by_scale = [-1i16; 256];
     let mut pair_raw_targets = [[[0.0f32; 64]; 4]; 2];
     let mut pair_converted_targets = [[[0.0f32; 64]; 4]; 2];
-    let concealment = PcmMacroblockSamples::grey();
     let oversample = ctx.options.oversample;
 
     // MBAFF addresses macroblocks pair-by-pair: top then bottom at one X,
@@ -1372,6 +1507,9 @@ fn write_picture(
         };
 
         if !slice_open {
+            if let Some(state) = intra_state.as_mut() {
+                state.picture.clear();
+            }
             counts.reset();
             chroma_counts.reset();
             motion.reset();
@@ -1481,39 +1619,32 @@ fn write_picture(
             _ => false,
         };
 
-        // The IDR opening a random access point has nothing to predict from, so
-        // it is the one picture reconstructed in the pixel domain. Its slice is
-        // I_PCM throughout, which leaves no neighbour coefficient counts, motion
-        // vectors or QP for anything to read back.
-        if ctx.real_idr {
-            stats.intra_macroblocks += 1;
-            if ctx.mbaff && !direct_field_pair && mb_y % 2 == 0 {
-                writer.flag(direct_field_pair); // field-coded for paired field pictures
-            }
-            let samples = match source {
-                Some(mb) if intra => reconstruct_intra_pcm(mb, pic)?,
-                _ => concealment.clone(),
-            };
-            write_pcm_macroblock(writer, PcmSliceType::I, &samples);
-            let end_of_field =
-                direct_field_pair && mb_x == g.mb_width - 1 && field_position == field_size - 1;
-            if end_of_field
-                || (!direct_field_pair && mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1)
-            {
-                writer.rbsp_trailing_bits();
-                picture_nals.extend_from_slice(&to_nal_unit(
-                    writer.bytes(),
-                    3,
-                    nal_type::SLICE_IDR,
-                ));
-                if direct_field_pair && !second_output_field {
-                    slice_open = false;
-                    continue;
-                }
-                return Ok(picture_nals);
-            }
-            continue;
-        }
+        // Position within the coded picture, which for a field picture counts
+        // that field's own rows rather than the frame's.
+        let coded_mb_y = if direct_field_pair { field_row } else { mb_y };
+        // The random access point is the one picture coded with H.264 intra
+        // prediction. Chroma predicts from neighbouring macroblocks only, so
+        // its constants can be worked out here; the luma blocks predict from
+        // each other and have to be taken one at a time, below.
+        let chroma_prediction = intra_state.as_ref().map(|state| {
+            [
+                chroma_dc(
+                    &state.picture.cb,
+                    state.picture.chroma_width(),
+                    &state.order,
+                    mb_x,
+                    coded_mb_y,
+                ),
+                chroma_dc(
+                    &state.picture.cr,
+                    state.picture.chroma_width(),
+                    &state.order,
+                    mb_x,
+                    coded_mb_y,
+                ),
+            ]
+        });
+        let mut intra_luma_coded = false;
 
         let mut luma_active = [false; 4];
         let mut has_chroma = false;
@@ -1574,23 +1705,65 @@ fn write_picture(
                             &mut lower[1],
                         );
                     }
+                    let scan: &[usize; 64] = if direct_field_pair {
+                        &FIELD_SCAN_8X8
+                    } else {
+                        &ZIGZAG_8X8
+                    };
                     for b in 0..4 {
-                        luma_active[b] = quant.scanned_levels_for(
-                            &targets[b],
+                        let Some(state) = intra_state.as_mut().filter(|_| intra) else {
+                            luma_active[b] = quant.scanned_levels_for(
+                                &targets[b],
+                                qp,
+                                scan,
+                                &mut luma_scratch[b],
+                            );
+                            continue;
+                        };
+                        // A block predicts from the ones already coded, its own
+                        // neighbours in the same macroblock included, so the
+                        // four have to be taken in turn: predict, quantise, and
+                        // put back what the decoder will make of it before
+                        // moving on.
+                        //
+                        // Dequantisation took the flat constant off every
+                        // sample. Putting it back and removing what this block
+                        // predicts from leaves the residual intra prediction
+                        // wants. A constant subtracted from every sample comes
+                        // through the field-to-frame line shuffle unchanged, so
+                        // doing it here rather than before that is the same.
+                        let pred = state.predict_luma(mb_x, coded_mb_y, b);
+                        targets[b][0] += FLAT_PREDICTION_DC - 8.0 * pred as f32;
+                        luma_active[b] =
+                            quant.scanned_levels_for(&targets[b], qp, scan, &mut luma_scratch[b]);
+                        state.store_luma(
+                            mb_x,
+                            coded_mb_y,
+                            b,
+                            pred,
+                            luma_active[b].then_some(&luma_scratch[b]),
                             qp,
-                            if direct_field_pair {
-                                &FIELD_SCAN_8X8
-                            } else {
-                                &ZIGZAG_8X8
-                            },
-                            &mut luma_scratch[b],
+                            quant.inverse(),
+                            scan,
                         );
+                        intra_luma_coded = true;
                     }
 
                     let qp_c = chroma_qp(qp, CHROMA_QP_OFFSET);
                     for c in 0..2 {
-                        match source.block(4 + c) {
-                            Some(block) => convert_chroma_block(
+                        let prediction =
+                            chroma_prediction.as_ref().filter(|_| intra).map(|p| &p[c]);
+                        match (source.block(4 + c), prediction) {
+                            (Some(block), Some(prediction)) => convert_intra_chroma_block(
+                                block,
+                                chroma_matrix,
+                                quantiser_scale,
+                                pic.coding.intra_dc_precision,
+                                qp_c,
+                                prediction,
+                                &mut chroma_scratch[c],
+                            ),
+                            (Some(block), None) => convert_chroma_block(
                                 block,
                                 chroma_matrix,
                                 quantiser_scale,
@@ -1599,12 +1772,91 @@ fn write_picture(
                                 &mut chroma_scratch[c],
                                 intra,
                             ),
-                            None => chroma_scratch[c].clear(),
+                            (None, _) => chroma_scratch[c].clear(),
                         }
                     }
                     has_chroma = !chroma_scratch[0].is_empty() || !chroma_scratch[1].is_empty();
                 }
             }
+        }
+
+        if let Some(state) = intra_state.as_mut() {
+            stats.intra_macroblocks += 1;
+            if ctx.mbaff && !direct_field_pair && mb_y % 2 == 0 {
+                // In an I slice this precedes mb_type directly; there is no
+                // mb_skip_run in front of it. Frame-coded, like every pair in
+                // an MBAFF picture here.
+                writer.flag(false); // mb_field_decoding_flag
+            }
+            if !intra_luma_coded {
+                // A macroblock the source never coded, or coded as something
+                // other than intra. It carries no residual, so every block is
+                // the constant its neighbours predict -- which continues them
+                // rather than showing grey, and is as good a concealment as
+                // this has to offer.
+                for b in 0..4 {
+                    let pred = state.predict_luma(mb_x, coded_mb_y, b);
+                    state.store_luma(
+                        mb_x,
+                        coded_mb_y,
+                        b,
+                        pred,
+                        None,
+                        qp,
+                        quant.inverse(),
+                        &ZIGZAG_8X8,
+                    );
+                }
+                luma_active = [false; 4];
+            }
+            let luma: [Option<&[i32; 64]>; 4] =
+                std::array::from_fn(|i| luma_active[i].then_some(&luma_scratch[i]));
+            let written = write_intra_macroblock(
+                writer,
+                if direct_field_pair {
+                    &mut field_counts[field]
+                } else {
+                    &mut *counts
+                },
+                if direct_field_pair {
+                    &mut field_chroma_counts[field]
+                } else {
+                    &mut *chroma_counts
+                },
+                mb_x,
+                coded_mb_y,
+                qp,
+                prev_qp,
+                &luma,
+                has_chroma.then_some(&chroma_scratch),
+            )?;
+            prev_qp = written.qp;
+            state.store_chroma(
+                mb_x,
+                coded_mb_y,
+                &chroma_prediction.expect("the intra picture predicts every macroblock"),
+                &chroma_scratch,
+                chroma_qp(written.qp, CHROMA_QP_OFFSET),
+                written.cbp_chroma,
+            );
+            let end_of_field =
+                direct_field_pair && mb_x == g.mb_width - 1 && field_position == field_size - 1;
+            if end_of_field
+                || (!direct_field_pair && mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1)
+            {
+                writer.rbsp_trailing_bits();
+                picture_nals.extend_from_slice(&to_nal_unit(
+                    writer.bytes(),
+                    3,
+                    nal_type::SLICE_IDR,
+                ));
+                if direct_field_pair && !second_output_field {
+                    slice_open = false;
+                    continue;
+                }
+                return Ok(picture_nals);
+            }
+            continue;
         }
 
         if field_pair && !direct_field_pair {
@@ -2041,7 +2293,7 @@ fn write_picture(
         writer.ue(0); // mb_skip_run
         if ctx.mbaff && !direct_field_pair && mb_y % 2 == 0 {
             // In P/B slices mb_field_decoding_flag follows mb_skip_run, unlike
-            // the I_PCM IDR slice where it immediately precedes mb_type.
+            // an I slice where it immediately precedes mb_type.
             writer.flag(field_pair);
         }
         let field = mb_y & 1;

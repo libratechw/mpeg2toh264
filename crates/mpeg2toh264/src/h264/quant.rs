@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 
 use crate::h264::cos_table::COS_PI_OVER_16;
 use crate::h264::quant_tables::BASE_GAIN_8X8;
+use crate::h264::reconstruct::InverseScale8x8;
 use crate::round_half_up_i32;
 
 /// How much finer than the source the H.264 quantiser is made.
@@ -46,6 +47,9 @@ pub struct Quantiser8x8 {
     /// precision: [`Self::choose_qp`] compares QPs whose steps are 12% apart and
     /// runs once per quantiser scale, so it has no reason to narrow.
     mean_ratio: [f64; 52],
+    /// The same scaling list read the other way, for the one picture that has
+    /// to know what a decoder will make of the levels it just wrote.
+    inverse: InverseScale8x8,
 }
 
 impl Quantiser8x8 {
@@ -70,7 +74,12 @@ impl Quantiser8x8 {
             gain,
             reciprocal_gain,
             mean_ratio,
+            inverse: InverseScale8x8::new(weight_scale),
         }
+    }
+
+    pub fn inverse(&self) -> &InverseScale8x8 {
+        &self.inverse
     }
 
     /// Orthonormal-DCT value reconstructed per unit of coefficient level.
