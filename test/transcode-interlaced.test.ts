@@ -12,7 +12,7 @@ import { parseElementaryStream } from "../src/mpeg2/headers.ts";
 import { transcode } from "../src/transcode.ts";
 
 describe("interlaced frame-picture transcoding", () => {
-  it("converts field-DCT and field-motion macroblocks instead of rejecting them", () => {
+  it("converts field-DCT and field-motion macroblocks in one slice per picture", () => {
     const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));
     resetDecodeStats();
 
@@ -22,7 +22,21 @@ describe("interlaced frame-picture transcoding", () => {
     expect(result.bitstream.length).toBeGreaterThan(0);
     expect(decodeStats.dctTypeField).toBeGreaterThan(0);
     expect(decodeStats.motionField).toBeGreaterThan(0);
-  });
+    const nalTypes: number[] = [];
+    for (let i = 0; i + 3 < result.bitstream.length; i++) {
+      if (
+        result.bitstream[i] === 0 &&
+        result.bitstream[i + 1] === 0 &&
+        result.bitstream[i + 2] === 1
+      ) {
+        nalTypes.push(result.bitstream[i + 3]! & 0x1f);
+      }
+    }
+    expect(nalTypes.filter((type) => type === 1)).toHaveLength(
+      result.picturesConverted,
+    );
+    expect(nalTypes.filter((type) => type === 5)).toHaveLength(1);
+  }, 15_000);
 
   it("can emit only source I pictures", () => {
     const source = new Uint8Array(readFileSync("test/fixtures/hd1080i.m2v"));

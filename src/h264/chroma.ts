@@ -158,10 +158,12 @@ function spatialToChromaLevels(
     out.dc[0] !== 0 || out.dc[1] !== 0 || out.dc[2] !== 0 || out.dc[3] !== 0;
 }
 
-function dequantInterChroma(
+function dequantChroma(
   levels: Int16Array | null,
   weightScale: readonly number[],
   quantiserScale: number,
+  intraDcPrecision: number,
+  intra: boolean,
   out: Float64Array,
 ): void {
   if (!levels) {
@@ -170,23 +172,32 @@ function dequantInterChroma(
   }
   for (let pos = 0; pos < 64; pos++) {
     const level = levels[pos]!;
-    if (level === 0) out[pos] = 0;
+    if (intra && pos === 0) {
+      out[pos] = (8 >> intraDcPrecision) * level - GRAY_DC;
+    } else if (level === 0) out[pos] = 0;
     else {
       const sign = level < 0 ? -1 : 1;
-      out[pos] = Math.trunc(
-        ((2 * level + sign) * weightScale[pos]! * quantiserScale) / 32,
-      );
+      out[pos] = intra
+        ? Math.trunc((2 * level * weightScale[pos]! * quantiserScale) / 32)
+        : Math.trunc(
+            ((2 * level + sign) * weightScale[pos]! * quantiserScale) / 32,
+          );
     }
   }
 }
 
+export interface FieldChromaSource {
+  levels: Int16Array | null;
+  weightScale: readonly number[];
+  quantiserScale: number;
+  intraDcPrecision: number;
+  intra: boolean;
+}
+
 /** Combine two vertically adjacent MPEG-2 chroma residuals into one field MB. */
-export function convertInterFieldChromaBlocks(
-  upper: Int16Array | null,
-  lower: Int16Array | null,
-  weightScale: readonly number[],
-  upperQuantiserScale: number,
-  lowerQuantiserScale: number,
+export function convertFieldChromaBlocks(
+  upper: FieldChromaSource,
+  lower: FieldChromaSource,
   field: 0 | 1,
   qpC: number,
   out: ChromaBlockLevels,
@@ -196,8 +207,22 @@ export function convertInterFieldChromaBlocks(
   const upperSpatial = new Float64Array(64);
   const lowerSpatial = new Float64Array(64);
   const fieldSpatial = new Float64Array(64);
-  dequantInterChroma(upper, weightScale, upperQuantiserScale, upperCoeff);
-  dequantInterChroma(lower, weightScale, lowerQuantiserScale, lowerCoeff);
+  dequantChroma(
+    upper.levels,
+    upper.weightScale,
+    upper.quantiserScale,
+    upper.intraDcPrecision,
+    upper.intra,
+    upperCoeff,
+  );
+  dequantChroma(
+    lower.levels,
+    lower.weightScale,
+    lower.quantiserScale,
+    lower.intraDcPrecision,
+    lower.intra,
+    lowerCoeff,
+  );
   idct8(upperCoeff, upperSpatial);
   idct8(lowerCoeff, lowerSpatial);
   for (let y = 0; y < 4; y++) {

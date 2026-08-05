@@ -32,7 +32,7 @@ import { BitWriter, NalType, toNalUnit } from "./h264/bitwriter.ts";
 import {
   chromaQp,
   clearChromaBlockLevels,
-  convertInterFieldChromaBlocks,
+  convertFieldChromaBlocks,
   convertIntraChromaBlock,
   makeChromaBlockLevels,
   type ChromaBlockLevels,
@@ -429,7 +429,17 @@ function predictionForField(
   mb: Macroblock,
   field: 0 | 1,
   layout: RefLayout,
+  intra = false,
 ): Prediction {
+  if (intra) {
+    return {
+      mbType: BMbType.L0_16X16,
+      refIdxL0: layout.gray * 2,
+      refIdxL1: -1,
+      mvL0: [0, 0],
+      mvL1: [0, 0],
+    };
+  }
   const hasBackward =
     layout.bwdL0 >= 0 && (mb.flags & MBFlag.MOTION_BACKWARD) !== 0;
   const hasForward = (mb.flags & MBFlag.MOTION_FORWARD) !== 0 || !hasBackward;
@@ -540,8 +550,16 @@ function writePicture(
     makeChromaBlockLevels(),
   ];
   const fieldMotion: [MotionField, MotionField] = [
-    new MotionField(1, 1),
-    new MotionField(1, 1),
+    new MotionField(g.mbWidth, g.mbHeight >> 1),
+    new MotionField(g.mbWidth, g.mbHeight >> 1),
+  ];
+  const fieldCounts: [CoeffCountMap, CoeffCountMap] = [
+    makeLumaCounts(g.mbWidth, g.mbHeight >> 1),
+    makeLumaCounts(g.mbWidth, g.mbHeight >> 1),
+  ];
+  const fieldChromaCounts: [ChromaCounts, ChromaCounts] = [
+    makeChromaCounts(g.mbWidth, g.mbHeight >> 1),
+    makeChromaCounts(g.mbWidth, g.mbHeight >> 1),
   ];
   let prevQp = PPS_INIT_QP;
   let w: BitWriter | null = null;
@@ -564,7 +582,7 @@ function writePicture(
   }
 
   for (const [mbX, mbY] of positions) {
-    const startsSlice = !ctx.mbaff ? w === null : mbY % 2 === 0;
+    const startsSlice = w === null;
     if (startsSlice) {
       counts.reset();
       chromaCounts.cb.reset();
@@ -572,10 +590,15 @@ function writePicture(
       motion.reset();
       fieldMotion[0].reset();
       fieldMotion[1].reset();
+      for (const map of fieldCounts) map.reset();
+      for (const maps of fieldChromaCounts) {
+        maps.cb.reset();
+        maps.cr.reset();
+      }
       prevQp = PPS_INIT_QP;
-      w = new BitWriter(ctx.mbaff ? 4096 : 1 << 18);
+      w = new BitWriter(1 << 22);
       writeSliceHeader(w, {
-        firstMbInSlice: ctx.mbaff ? (mbY >> 1) * g.mbWidth + mbX : 0,
+        firstMbInSlice: 0,
         // I-only pictures need no bi-prediction. P slices are simpler and much
         // more widely handled than a stream consisting solely of reference-less B
         // pictures, while still predicting every source intra MB from grey.
@@ -600,14 +623,13 @@ function writePicture(
     const source = byAddress.get(mbY * g.mbWidth + mbX);
     const pairTop = byAddress.get((mbY & ~1) * g.mbWidth + mbX);
     const pairBottom = byAddress.get(((mbY & ~1) + 1) * g.mbWidth + mbX);
-    const isInter = (mb: Macroblock | undefined) =>
-      !!mb && (mb.flags & MBFlag.INTRA) === 0;
+    // Use a uniform coding mode across an MBAFF picture. This makes every
+    // horizontal and vertical neighbour live in the same field coordinate
+    // system, so thousands of pair-isolating slices are unnecessary.
     const fieldPair =
       ctx.mbaff &&
-      (pairTop?.motionType === MotionType.FIELD ||
-        pairBottom?.motionType === MotionType.FIELD) &&
-      isInter(pairTop) &&
-      isInter(pairBottom);
+      !ctx.options.iFramesOnly &&
+      pic.header.pictureCodingType !== PictureType.I;
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
     const luma: (Int32Array | null)[] = [null, null, null, null];
@@ -701,14 +723,27 @@ function writePicture(
       const sourceFieldTargets = (fieldSource: Macroblock) => {
         const raw = Array.from({ length: 4 }, () => new Float64Array(64));
         const converted = Array.from({ length: 4 }, () => new Float64Array(64));
+        if (fieldSource.skipped) return raw;
         const quantiserScale =
           QUANTISER_SCALE[pic.coding.qScaleType]![
             fieldSource.quantiserScaleCode
           ]!;
+        const sourceIntra = (fieldSource.flags & MBFlag.INTRA) !== 0;
+        const matrix = sourceIntra ? pic.quant.intra : pic.quant.nonIntra;
         for (let b = 0; b < 4; b++) {
           const block = fieldSource.blocks[b];
-          if (block)
-            interTargets(block, pic.quant.nonIntra, quantiserScale, raw[b]!);
+          if (!block) continue;
+          if (sourceIntra) {
+            intraTargets(
+              block,
+              matrix,
+              quantiserScale,
+              pic.coding.intraDcPrecision,
+              raw[b]!,
+            );
+          } else {
+            interTargets(block, matrix, quantiserScale, raw[b]!);
+          }
         }
         if (fieldSource.dctType === 1) return raw;
         frameDctToFieldTargets(raw[0]!, raw[2]!, converted[0]!, converted[2]!);
@@ -747,14 +782,24 @@ function writePicture(
       }
       for (let c = 0; c < 2; c++) {
         clearChromaBlockLevels(chromaScratch[c]!);
-        convertInterFieldChromaBlocks(
-          pairTop!.blocks[4 + c] ?? null,
-          pairBottom!.blocks[4 + c] ?? null,
-          pic.quant.chromaNonIntra,
-          QUANTISER_SCALE[pic.coding.qScaleType]![pairTop!.quantiserScaleCode]!,
-          QUANTISER_SCALE[pic.coding.qScaleType]![
-            pairBottom!.quantiserScaleCode
-          ]!,
+        const chromaSource = (pairSource: Macroblock) => {
+          const sourceIntra = (pairSource.flags & MBFlag.INTRA) !== 0;
+          return {
+            levels: pairSource.blocks[4 + c] ?? null,
+            weightScale: sourceIntra
+              ? pic.quant.chromaIntra
+              : pic.quant.chromaNonIntra,
+            quantiserScale:
+              QUANTISER_SCALE[pic.coding.qScaleType]![
+                pairSource.quantiserScaleCode
+              ]!,
+            intraDcPrecision: pic.coding.intraDcPrecision,
+            intra: sourceIntra,
+          };
+        };
+        convertFieldChromaBlocks(
+          chromaSource(pairTop!),
+          chromaSource(pairBottom!),
           field,
           chromaQp(qp, CHROMA_QP_OFFSET),
           chromaScratch[c]!,
@@ -820,13 +865,18 @@ function writePicture(
         ? ([pairTop!, pairBottom!].map((partSource, partNumber) => {
             const field = (mbY & 1) as 0 | 1;
             const part = partNumber as 0 | 1;
-            const fieldPred = predictionForField(partSource, field, ctx.layout);
+            const fieldPred = predictionForField(
+              partSource,
+              field,
+              ctx.layout,
+              (partSource.flags & MBFlag.INTRA) !== 0,
+            );
             const usesFieldL0 = fieldPred.refIdxL0 >= 0;
             const usesFieldL1 = fieldPred.refIdxL1 >= 0;
             const pL0 = usesFieldL0
               ? fieldMotion[field].predict16x8(
-                  0,
-                  0,
+                  mbX,
+                  mbY >> 1,
                   part,
                   0,
                   fieldPred.refIdxL0,
@@ -834,14 +884,14 @@ function writePicture(
               : ([0, 0] as [number, number]);
             const pL1 = usesFieldL1
               ? fieldMotion[field].predict16x8(
-                  0,
-                  0,
+                  mbX,
+                  mbY >> 1,
                   part,
                   1,
                   fieldPred.refIdxL1,
                 )
               : ([0, 0] as [number, number]);
-            fieldMotion[field].set16x8(0, 0, part, {
+            fieldMotion[field].set16x8(mbX, mbY >> 1, part, {
               refIdxL0: fieldPred.refIdxL0,
               refIdxL1: fieldPred.refIdxL1,
               mvL0x: usesFieldL0 ? fieldPred.mvL0[0] : 0,
@@ -865,6 +915,7 @@ function writePicture(
             partSource,
             (mbY & 1) as 0 | 1,
             ctx.layout,
+            (partSource.flags & MBFlag.INTRA) !== 0,
           );
           return p.mbType === BMbType.L0_16X16
             ? ("L0" as const)
@@ -876,7 +927,7 @@ function writePicture(
 
     const mb: GrayRefMacroblock = {
       mbX,
-      mbY,
+      mbY: fieldPair ? mbY >> 1 : mbY,
       pSlice: ctx.options.iFramesOnly ?? false,
       mbType: splitFrameMb
         ? b16x8MbType(mode, mode)
@@ -921,22 +972,23 @@ function writePicture(
       // I-slice grey frame where it immediately precedes mb_type.
       writer.flag(fieldPair);
     }
-    if (fieldPair && mbY % 2 === 1) {
-      // The two field macroblocks occupy the same spatial area in opposite
-      // fields.  The top-field coefficients are therefore unavailable as
-      // CAVLC neighbours of the bottom-field macroblock.
-      counts.reset();
-      chromaCounts.cb.reset();
-      chromaCounts.cr.reset();
-    }
-    prevQp = writeGrayRefMacroblock(writer, counts, chromaCounts, mb);
+    const activeCounts = fieldPair ? fieldCounts[(mbY & 1) as 0 | 1] : counts;
+    const activeChromaCounts = fieldPair
+      ? fieldChromaCounts[(mbY & 1) as 0 | 1]
+      : chromaCounts;
+    prevQp = writeGrayRefMacroblock(
+      writer,
+      activeCounts,
+      activeChromaCounts,
+      mb,
+    );
     if (!luma[0] && !luma[1] && !luma[2] && !luma[3]) {
-      markNoCoefficients(counts, mbX, mbY);
+      markNoCoefficients(activeCounts, mb.mbX, mb.mbY);
     }
-    if (!chroma) markNoChromaCoefficients(chromaCounts, mbX, mbY);
-    const endsSlice = !ctx.mbaff
-      ? mbX === g.mbWidth - 1 && mbY === g.mbHeight - 1
-      : mbY % 2 === 1;
+    if (!chroma) {
+      markNoChromaCoefficients(activeChromaCounts, mb.mbX, mb.mbY);
+    }
+    const endsSlice = mbX === g.mbWidth - 1 && mbY === g.mbHeight - 1;
     if (endsSlice) {
       writer.rbspTrailingBits();
       nalParts.push(

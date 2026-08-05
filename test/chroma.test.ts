@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  convertInterFieldChromaBlocks,
+  convertFieldChromaBlocks,
   convertIntraChromaBlock,
   FIELD_SCAN_4X4,
   makeChromaBlockLevels,
@@ -20,28 +20,17 @@ describe("field chroma conversion", () => {
     const expected = makeChromaBlockLevels();
     const topField = makeChromaBlockLevels();
     const bottomField = makeChromaBlockLevels();
+    const source = {
+      levels,
+      weightScale: matrix,
+      quantiserScale: 4,
+      intraDcPrecision: 0,
+      intra: false,
+    };
 
     convertIntraChromaBlock(levels, matrix, 4, 0, 24, expected, false);
-    convertInterFieldChromaBlocks(
-      levels,
-      levels,
-      matrix,
-      4,
-      4,
-      0,
-      24,
-      topField,
-    );
-    convertInterFieldChromaBlocks(
-      levels,
-      levels,
-      matrix,
-      4,
-      4,
-      1,
-      24,
-      bottomField,
-    );
+    convertFieldChromaBlocks(source, source, 0, 24, topField);
+    convertFieldChromaBlocks(source, source, 1, 24, bottomField);
 
     expect(topField).toEqual(expected);
     expect(bottomField).toEqual(expected);
@@ -49,16 +38,14 @@ describe("field chroma conversion", () => {
 
   it("emits no coefficients for absent source residuals", () => {
     const out = makeChromaBlockLevels();
-    convertInterFieldChromaBlocks(
-      null,
-      null,
-      new Array<number>(64).fill(16),
-      4,
-      4,
-      0,
-      24,
-      out,
-    );
+    const source = {
+      levels: null,
+      weightScale: new Array<number>(64).fill(16),
+      quantiserScale: 4,
+      intraDcPrecision: 0,
+      intra: false,
+    };
+    convertFieldChromaBlocks(source, source, 0, 24, out);
 
     expect(out.anyDc).toBe(false);
     expect(out.anyAc).toBe(false);
