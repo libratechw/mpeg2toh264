@@ -137,6 +137,22 @@ describe("NAL unit wrapping", () => {
     const nal = toNalUnit(new Uint8Array([0x00, 0x00, 0x00, 0x00]), 0, 1);
     expect([...nal.slice(5)]).toEqual([0x00, 0x00, 0x03, 0x00, 0x00]);
   });
+
+  it("does not truncate a long zero-filled payload", () => {
+    const rbsp = new Uint8Array(4096);
+    const nal = toNalUnit(rbsp, 3, 5);
+    expect(nal.length).toBe(
+      5 + rbsp.length + Math.floor((rbsp.length - 1) / 2),
+    );
+
+    const decoded: number[] = [];
+    for (let i = 5; i < nal.length; i++) {
+      if (nal[i] === 3 && decoded.at(-1) === 0 && decoded.at(-2) === 0)
+        continue;
+      decoded.push(nal[i]!);
+    }
+    expect(decoded).toEqual(Array.from(rbsp));
+  });
 });
 
 describe("B-slice 16x8 macroblock types", () => {

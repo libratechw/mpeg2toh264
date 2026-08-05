@@ -67,7 +67,7 @@ describe("incremental transcoding", () => {
     );
   });
 
-  it("restarts the I_PCM path with a content IDR instead of a grey prefix", () => {
+  it("restarts the I_PCM path with a content IDR and identical reference clone", () => {
     const gop = new Uint8Array(
       readFileSync(resolve(import.meta.dirname, "fixtures/ibbp.m2v")),
     );
@@ -78,9 +78,9 @@ describe("incremental transcoding", () => {
     expect([...restarted.subarray(0, 5)]).toEqual([0, 0, 0, 1, 0x65]);
     const timeline = mpeg2VideoTimeline(gop, { hasReferences: false });
     const fragment = h264GopToFmp4(restarted, timeline, 2, 0, 0);
-    expect(fragment.sampleCount).toBe(timeline.presentationIndices.length);
+    expect(fragment.sampleCount).toBe(timeline.presentationIndices.length + 1);
     expect(fragment.duration).toBe(
-      timeline.presentationIndices.length * timeline.sampleDuration,
+      timeline.presentationIndices.length * timeline.sampleDuration + 1,
     );
   });
 });

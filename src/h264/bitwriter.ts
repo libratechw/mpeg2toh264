@@ -104,10 +104,10 @@ export function toNalUnit(
   nalRefIdc: number,
   nalUnitType: number,
 ): Uint8Array {
-  // At most one emulation-prevention byte can be inserted per three payload
-  // bytes. Reserve that upper bound and trim the view afterwards; this avoids
-  // growing and boxing a number[] for every picture.
-  const out = new Uint8Array(5 + rbsp.length + Math.ceil(rbsp.length / 3));
+  // A run of zeroes needs an emulation-prevention byte before every second
+  // input byte after the first two. Reserve one byte per two payload bytes;
+  // one per three is insufficient and silently truncates large I_PCM NALs.
+  const out = new Uint8Array(5 + rbsp.length + Math.ceil(rbsp.length / 2));
   out[3] = 0x01;
   out[4] = (nalRefIdc << 5) | nalUnitType;
   let length = 5;

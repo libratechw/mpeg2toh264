@@ -170,10 +170,7 @@ export class IncrementalTranscoder {
 
     const width = first.sequence.horizontalSize;
     const height = first.sequence.verticalSize;
-    // I_PCM inside MBAFF pairs has additional pair-state semantics. The
-    // expensive fallback emits ordinary frame macroblocks and uses the existing
-    // field-DCT/motion-to-frame conversion paths instead.
-    const mbaff = !first.sequenceExt.progressiveSequence && !options.pcmIntra;
+    const mbaff = !first.sequenceExt.progressiveSequence;
     if (
       this.initialized &&
       (width !== this.width || height !== this.height || mbaff !== this.mbaff)
@@ -217,13 +214,13 @@ export class IncrementalTranscoder {
             frameMbsOnly: !mbaff,
             // The grey frame plus the two most recent I or P pictures, which are what
             // a B picture predicts from.
-            maxNumRefFrames: 3,
+            maxNumRefFrames: options.pcmIntra ? 4 : 3,
             log2MaxFrameNumMinus4: LOG2_MAX_FRAME_NUM_MINUS4,
             log2MaxPocLsbMinus4: LOG2_MAX_POC_LSB_MINUS4,
             // An MPEG-2 stream codes its anchor picture before the B pictures that
             // display ahead of it, so one picture has to be held back.
             maxNumReorderFrames: 1,
-            maxDecFrameBuffering: 4,
+            maxDecFrameBuffering: options.pcmIntra ? 5 : 4,
             sampleAspectRatio: sequenceSampleAspectRatio(first.sequence),
           }),
           writePps({
@@ -266,6 +263,7 @@ export class IncrementalTranscoder {
     let seenPicture =
       options.pcmIntra && randomAccess ? false : this.seenPicture;
     let maxTrInGop = options.pcmIntra && randomAccess ? 0 : this.maxTrInGop;
+    let emittedRealIdr = false;
 
     for (const pic of pics) {
       const type = pic.header.pictureCodingType;
@@ -302,22 +300,22 @@ export class IncrementalTranscoder {
       const layout: RefLayout = options.pcmIntra
         ? type === PictureType.B
           ? {
-              count: 2,
+              count: 3,
               fwdL0: 0,
               fwdL1: 1,
               bwdL0: 1,
               bwdL1: 0,
-              gray: -1,
+              gray: 2,
               forceL1ShortTerm: false,
             }
           : {
-              count: Math.max(1, shortTermCount),
+              count: shortTermCount + 1,
               fwdL0: 0,
               fwdL1: 0,
               bwdL0: -1,
               bwdL1: -1,
-              gray: -1,
-              forceL1ShortTerm: shortTermCount > 1,
+              gray: shortTermCount,
+              forceL1ShortTerm: shortTermCount > 0,
             }
         : options.iFramesOnly
           ? {
@@ -354,8 +352,10 @@ export class IncrementalTranscoder {
       const realIdr = Boolean(
         options.pcmIntra &&
         type === PictureType.I &&
-        (!this.initialized || randomAccess),
+        (!this.initialized || randomAccess) &&
+        !emittedRealIdr,
       );
+      if (realIdr) emittedRealIdr = true;
       const frameNum = realIdr ? 0 : (prevRefFrameNum + 1) % MAX_FRAME_NUM;
       parts.push(
         writePicture(reader, pic, g, quant, counts, chromaCounts, motion, {
@@ -370,7 +370,11 @@ export class IncrementalTranscoder {
           realIdr,
         }),
       );
-      if (isReference) {
+      if (realIdr) {
+        parts.push(writeReferenceClone(g, mbaff));
+        prevRefFrameNum = 1;
+        shortTermCount = 1;
+      } else if (isReference) {
         prevRefFrameNum = frameNum;
         shortTermCount = Math.min(2, shortTermCount + 1);
       }
@@ -651,6 +655,36 @@ function predictionForField(
   };
 }
 
+/**
+ * Copy the content IDR into a second short-term reference without changing
+ * pixels. The one-tick prefix replaces the old grey DPB bootstrap but is
+ * visually identical to the first content frame.
+ */
+function writeReferenceClone(
+  g: ReturnType<typeof frameGeometry>,
+  mbaff: boolean,
+): Uint8Array {
+  const w = new BitWriter(64);
+  writeSliceHeader(w, {
+    firstMbInSlice: 0,
+    sliceType: SliceType.P,
+    frameNum: 1,
+    log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
+    picOrderCntLsb: 1,
+    log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
+    idr: false,
+    reference: true,
+    mbaff,
+    sliceQp: PPS_INIT_QP,
+    ppsInitQp: PPS_INIT_QP,
+    disableDeblockingFilterIdc: 1,
+    numRefIdxL0Active: 1,
+  });
+  w.ue(g.mbWidth * g.mbHeight); // mb_skip_run: copy the long-term IDR
+  w.rbspTrailingBits();
+  return toNalUnit(w.bytes(), 2, NalType.SLICE_NON_IDR);
+}
+
 function writePicture(
   reader: BitReader,
   pic: Picture,
@@ -841,8 +875,16 @@ function writePicture(
     const fieldPair = pictureFieldPairs;
     const intra =
       !source || source.skipped ? false : (source.flags & MBFlag.INTRA) !== 0;
+    const pairHasIntra =
+      ctx.mbaff &&
+      [pairTop, pairBottom].some(
+        (part) => part && !part.skipped && (part.flags & MBFlag.INTRA) !== 0,
+      );
+    // MBAFF carries coding mode at pair granularity. If either half needs
+    // I_PCM, code both halves as I_PCM so the bottom MB cannot be parsed with
+    // stale pair state.
     const pcm = Boolean(
-      ctx.options.pcmIntra && (intra || (ctx.realIdr && !source)),
+      ctx.options.pcmIntra && (ctx.realIdr || pairHasIntra || intra),
     );
 
     if (pcm) {
@@ -872,6 +914,23 @@ function writePicture(
             map.set(mbX * 2 + bx, mbY * 2 + by, 16);
         }
       }
+      if (ctx.mbaff) {
+        const fieldMbY = mbY >> 1;
+        for (const map of fieldCounts) {
+          for (let by = 0; by < 4; by++) {
+            for (let bx = 0; bx < 4; bx++)
+              map.set(mbX * 4 + bx, fieldMbY * 4 + by, 16);
+          }
+        }
+        for (const maps of fieldChromaCounts) {
+          for (const map of [maps.cb, maps.cr]) {
+            for (let by = 0; by < 2; by++) {
+              for (let bx = 0; bx < 2; bx++)
+                map.set(mbX * 2 + bx, fieldMbY * 2 + by, 16);
+            }
+          }
+        }
+      }
       motion.set(mbX, mbY, {
         refIdxL0: -1,
         refIdxL1: -1,
@@ -886,7 +945,7 @@ function writePicture(
         nalParts.push(
           toNalUnit(
             writer.bytes(),
-            3,
+            ctx.realIdr ? 3 : ctx.isReference ? 2 : 0,
             ctx.realIdr ? NalType.SLICE_IDR : NalType.SLICE_NON_IDR,
           ),
         );
