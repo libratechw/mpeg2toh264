@@ -136,7 +136,11 @@ function createPlayer(): Mpeg2TsPlayer {
     scan = interlaced
       ? `インターレース（${topFieldFirst ? "TFF" : "BFF"}）`
       : "プログレッシブ";
+    if (!interlaced && deinterlace.checked) scan += "（yadifは停止）";
     setDetails();
+    // A progressive source stops the filter, which uncovers the element and
+    // its controls with it.
+    syncControls();
   });
   created.addEventListener("seekable", (event) => {
     duration = event.detail.duration;

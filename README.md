@@ -144,6 +144,7 @@ await player.load('https://example.com/video.ts');
 - Rust側は`pictures_interlacing()`が`Interlacing { interlaced, top_field_first }`を返します。フィールドピクチャ（`picture_structure`が`TopField`/`BottomField`）なら構造的にインターレースで、先に符号化されたほうが先のフィールド。フレームピクチャなら`progressive_frame`が2つの瞬間かどうかを、`top_field_first`が順序を言います。1つのGOPに両方が混ざる（局が映画と生カメラを切り替えると起きます）場合は、どれか一つでもインターレースならインターレース扱いです
 - `Fragment::Media`に`interlacing`が付き、WASMでは`interlaced` / `topFieldFirst`として出ます。Workerは**変わったときだけ**`scan`通知を送り、プレイヤーが`scan`イベントとして中継しつつ、デインタレーサーの`topFieldFirst`を差し替えます。フィールド順だけは好みではなく事実なので、間違えると1行おきに半フィールドぶん逆へ動きます
 - 放送の途中で変わりうるので、1回きりではなく変化のたびに流れます
+- **プログレッシブと分かったらフィルターはその場で止まります**（そのフラグメントから。待ちや猶予は入れていません）。直す櫛が無い絵にかけても眠くするだけなので。インターレースに戻ればまたその場でかかります。`deinterlace`は「実際にかかっているか」、`deinterlaceWanted`は「かけろと言われているか」で、ソースが何か分かるまで（ロード直後）は言われたとおりに動きます — インターレースを素通しするほうが目に見える失敗なので
 
 検証は`crates/mpeg2toh264/tests/fixtures.rs`の`reads_the_field_order_of_every_fixture`が6フィクスチャ全部でffprobeの`field_order`と一致することを確認しています（`hd1080i`＝tt、`altscan`＝**bb**、残り4つはprogressive）。ブラウザでも同じ3ケースを通しで確認済みで、BFFのストリームでは`deinterlacer.topFieldFirst`が実際に`false`に切り替わります。
 

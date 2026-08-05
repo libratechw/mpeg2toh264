@@ -177,6 +177,8 @@ export class Mpeg2TsPlayer extends EventTarget {
   #markedAt = 0;
   /** Built the first time deinterlacing is turned on, and kept after that. */
   #deinterlacer: Deinterlacer | null = null;
+  /** Whether deinterlacing was asked for; whether it runs also needs `#scan`. */
+  #wanted = false;
   #destroyed = false;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
@@ -229,12 +231,19 @@ export class Mpeg2TsPlayer extends EventTarget {
   }
 
   /**
-   * Whether the picture is being deinterlaced. Assigning to it turns the
-   * deinterlacer on or off where it stands, so the two can be compared on the
+   * Whether the picture is being deinterlaced, which is not quite the same as
+   * having asked for it: a source that says it is progressive is left alone,
+   * and starts being filtered again the moment it says otherwise. Assigning
+   * turns it on or off where it stands, so the two can be compared on the
    * frame; a browser that cannot run it stays false.
    */
   get deinterlace(): boolean {
     return this.#deinterlacer?.running ?? false;
+  }
+
+  /** Whether deinterlacing was asked for, whatever the source turned out to be. */
+  get deinterlaceWanted(): boolean {
+    return this.#wanted;
   }
 
   /**
@@ -247,7 +256,22 @@ export class Mpeg2TsPlayer extends EventTarget {
   }
 
   set deinterlace(enabled: boolean) {
-    if (!enabled) {
+    this.#wanted = enabled;
+    this.#applyDeinterlace();
+  }
+
+  /**
+   * Run the filter where it is both wanted and called for.
+   *
+   * A progressive source has one moment per frame and nothing to rebuild, so
+   * filtering it can only soften it. Until the source has said which it is --
+   * before the first fragment of a load -- what was asked for is what happens,
+   * since an interlaced picture left unfiltered is the more visible mistake of
+   * the two.
+   */
+  #applyDeinterlace(): void {
+    const called = this.#scan?.interlaced ?? true;
+    if (!this.#wanted || !called) {
       this.#deinterlacer?.stop();
       return;
     }
@@ -283,7 +307,10 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.stop();
     const id = this.#generation;
     this.#duration = null;
+    // Nothing is known about this source yet, so it gets whatever was asked
+    // for until its first fragment says what it is.
     this.#scan = null;
+    this.#applyDeinterlace();
     this.#loadedAt = now();
     this.#markedAt = this.#loadedAt;
     const worker = this.#ensureWorker();
@@ -423,6 +450,10 @@ export class Mpeg2TsPlayer extends EventTarget {
         // wrong moves every other line half a field the wrong way.
         if (this.#deinterlacer)
           this.#deinterlacer.topFieldFirst = notification.scan.topFieldFirst;
+        // And where the source turns out to have nothing to deinterlace, stop
+        // deinterlacing it, from this fragment rather than from some later
+        // point that would need deciding on.
+        this.#applyDeinterlace();
         this.#emit("scan", notification.scan);
         break;
       case "mark":
