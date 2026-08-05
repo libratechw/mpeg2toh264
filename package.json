@@ -3,7 +3,11 @@
   "version": "0.0.1",
   "description": "MPEG-2 to H.264 bitstream-domain transcoder (no IDCT, no motion compensation)",
   "type": "module",
+  "bin": {
+    "mpeg2toh264": "tools/mpeg2toh264.ts"
+  },
   "scripts": {
+    "transcode": "node --experimental-strip-types tools/mpeg2toh264.ts",
     "test": "vitest run",
     "watch": "vitest",
     "typecheck": "tsc --noEmit"
