@@ -738,25 +738,34 @@ fn make_av_media_segment(
                 ]),
             )
         };
-        let video_traf = traf(
-            1,
-            video_base_decode_time,
-            video_offset,
-            &video_entries,
-            video_samples.len(),
-            1,
-            0x000f01,
-        );
-        let audio_traf = traf(
-            2,
-            audio_base_decode_time,
-            audio_offset,
-            &audio_entries,
-            audio_samples.len(),
-            0,
-            0x000301,
-        );
-        boxed("moof", &concat(&[&mfhd, &video_traf, &audio_traf]))
+        // A track with nothing in this fragment takes no traf: the audio of a
+        // recording runs out before its video does, and a trun describing no
+        // samples is not something to hand a parser.
+        let mut parts = vec![mfhd];
+        if !video_samples.is_empty() {
+            parts.push(traf(
+                1,
+                video_base_decode_time,
+                video_offset,
+                &video_entries,
+                video_samples.len(),
+                1,
+                0x000f01,
+            ));
+        }
+        if !audio_samples.is_empty() {
+            parts.push(traf(
+                2,
+                audio_base_decode_time,
+                audio_offset,
+                &audio_entries,
+                audio_samples.len(),
+                0,
+                0x000301,
+            ));
+        }
+        let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        boxed("moof", &concat(&parts))
     };
     let moof = make_moof(0, 0);
     let payload_start = moof.len() as u32 + 8;

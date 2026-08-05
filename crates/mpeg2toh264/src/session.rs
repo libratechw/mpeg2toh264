@@ -351,6 +351,14 @@ impl Session {
             config.as_ref(),
             audio_track.as_ref(),
         )?;
+        // A unit that yielded no picture, with no audio to carry alongside it,
+        // makes a moof describing no samples of anything. A recording cut mid
+        // group ends with one, and there is nothing in it for a SourceBuffer to
+        // play. The transcoder has already seen it, which is what the unit was
+        // worth.
+        if fragment.sample_count == 0 && audio_frames.is_empty() {
+            return Ok(());
+        }
         self.sequence_number += 1;
         self.video_presentation_start += fragment.duration;
         self.audio_frames_emitted += audio_frames.len() as u64;

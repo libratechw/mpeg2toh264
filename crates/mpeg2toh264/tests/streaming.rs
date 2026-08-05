@@ -551,6 +551,34 @@ fn carries_aac_audio_through_untouched() {
     );
 }
 
+/// The audio of a recording can run out before its video does, and a `trun`
+/// describing no samples is not something to hand a parser: the track with
+/// nothing in a fragment takes no `traf` in it.
+#[test]
+fn a_fragment_with_no_audio_leaves_the_audio_track_out_of_it() {
+    let fragments = run_session(&av_stream(4, 20), 64 * 1024);
+    let (_, media) = split_fragments(&fragments);
+    let mut silent = 0;
+    for fragment in &media {
+        let Fragment::Media {
+            data,
+            audio_samples,
+            ..
+        } = fragment
+        else {
+            unreachable!()
+        };
+        let trafs = data.windows(4).filter(|w| *w == b"traf").count();
+        if *audio_samples == 0 {
+            silent += 1;
+            assert_eq!(trafs, 1, "only the video track is in this fragment");
+        } else {
+            assert_eq!(trafs, 2, "both tracks are in this fragment");
+        }
+    }
+    assert!(silent > 0, "the audio ran out before the video did");
+}
+
 #[test]
 fn spreads_audio_across_the_fragments_it_belongs_to() {
     let fragments = run_session(&av_stream(4, 400), 64 * 1024);
