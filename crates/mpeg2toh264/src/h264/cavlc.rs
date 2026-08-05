@@ -84,8 +84,15 @@ fn write_level(w: &mut BitWriter, level_code: i32, suffix_length: u32) -> Result
         suffix = level_code - base;
     }
 
-    w.u(prefix + 1, 1);
-    if suffix_bits > 0 {
+    // The overwhelmingly common codewords fit in one write. Keeping prefix
+    // and suffix together avoids updating and testing BitWriter's accumulator
+    // twice for every non-zero coefficient. Only the largest escape codes can
+    // exceed its 32-bit input and need the split form.
+    let codeword_bits = prefix + 1 + suffix_bits;
+    if codeword_bits <= 32 {
+        w.u(codeword_bits, (1 << suffix_bits) | suffix);
+    } else {
+        w.u(prefix + 1, 1);
         w.u(suffix_bits, suffix);
     }
     Ok(())
@@ -138,12 +145,15 @@ pub fn write_masked_levels(
 
     // Trailing ones are the run of +/-1 at the high frequency end, at most three.
     let mut trailing_ones = 0usize;
+    let mut trailing_signs = 0u32;
     let mut rest = mask;
     while trailing_ones < 3 {
         let position = 31 - rest.leading_zeros() as usize;
-        if levels[position].abs() != 1 {
+        let level = levels[position];
+        if level != 1 && level != -1 {
             break;
         }
+        trailing_signs = (trailing_signs << 1) | u32::from(level < 0);
         trailing_ones += 1;
         rest ^= 1 << position;
         if rest == 0 {
@@ -157,13 +167,11 @@ pub fn write_masked_levels(
     };
     write_code(w, token);
 
-    // Signs of the trailing ones, highest frequency first.
-    let mut rest = mask;
-    for _ in 0..trailing_ones {
-        let position = 31 - rest.leading_zeros() as usize;
-        let level = levels[position];
-        w.flag(level < 0); // 1 means negative
-        rest ^= 1 << position;
+    // Signs of the trailing ones, highest frequency first. They were gathered
+    // while identifying the run, so emit them as one codeword and continue
+    // from the already-reduced mask.
+    if trailing_ones > 0 {
+        w.u(trailing_ones as u32, trailing_signs);
     }
 
     // Remaining levels, still highest frequency first.
