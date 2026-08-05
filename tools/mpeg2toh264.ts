@@ -3,14 +3,16 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import { extractMpeg2VideoEs, isMpegTransportStream } from "../src/mpegts.ts";
 import { transcode, type TranscodeOptions } from "../src/transcode.ts";
 
-const USAGE = `Usage: mpeg2toh264 [options] <input.m2v> <output.h264>
+const USAGE = `Usage: mpeg2toh264 [options] <input.ts|input.m2v> <output.h264>
 
-Transcode an MPEG-2 elementary stream to a raw Annex B H.264 bitstream.
+Transcode an MPEG transport stream or MPEG-2 video elementary stream to a raw
+Annex B H.264 bitstream. The first MPEG-2 video program in a TS is selected.
 
 Arguments:
-  input.m2v                 MPEG-2 video elementary stream
+  input.ts|input.m2v        MPEG-TS or MPEG-2 video elementary stream
   output.h264               Raw H.264/AVC Annex B bitstream
 
 Options:
@@ -83,7 +85,9 @@ export function parseArgs(args: string[]): CliOptions {
 
 function main(): void {
   const { input, output, quiet, ...options } = parseArgs(process.argv.slice(2));
-  const source = new Uint8Array(readFileSync(input));
+  const container = new Uint8Array(readFileSync(input));
+  const transportStream = isMpegTransportStream(container);
+  const source = transportStream ? extractMpeg2VideoEs(container) : container;
   const started = performance.now();
   const result = transcode(source, options);
   const elapsed = performance.now() - started;
@@ -92,7 +96,7 @@ function main(): void {
   if (!quiet) {
     const fps = (result.picturesConverted * 1000) / elapsed;
     process.stdout.write(
-      `${input} -> ${output}\n` +
+      `${input} (${transportStream ? "MPEG-TS" : "MPEG-2 ES"}) -> ${output}\n` +
         `${result.picturesConverted} pictures converted, ` +
         `${result.picturesSkipped} skipped, ${result.bitstream.length} bytes, ` +
         `${elapsed.toFixed(1)} ms (${fps.toFixed(2)} fps)\n`,

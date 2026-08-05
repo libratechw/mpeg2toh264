@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
+import { wrapMpeg2EsInTs } from "./ts-fixture.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const cli = join(root, "tools/mpeg2toh264.ts");
@@ -45,6 +46,21 @@ describe("mpeg2toh264 CLI", () => {
     ]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("pictures converted");
+    expect(Array.from(readFileSync(output).subarray(0, 4))).toEqual([
+      0, 0, 0, 1,
+    ]);
+  });
+
+  it("demuxes an MPEG transport stream before transcoding", () => {
+    const es = new Uint8Array(
+      readFileSync(join(root, "test/fixtures/i_only.m2v")),
+    );
+    const input = join(temp, "input.ts");
+    const output = join(temp, "transport-output.h264");
+    writeFileSync(input, wrapMpeg2EsInTs(es));
+    const result = run([input, output]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("(MPEG-TS)");
     expect(Array.from(readFileSync(output).subarray(0, 4))).toEqual([
       0, 0, 0, 1,
     ]);
