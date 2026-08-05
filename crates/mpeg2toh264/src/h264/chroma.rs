@@ -97,7 +97,7 @@ fn forward4x4(block: &[f64; 64], bx: usize, by: usize, out: &mut [f64; 16]) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ChromaBlockLevels {
     /// The four 2x2 DC block levels, in raster order of the 4x4 sub-blocks.
     pub dc: [i32; 4],
@@ -105,17 +105,6 @@ pub struct ChromaBlockLevels {
     pub ac: [[i32; 15]; 4],
     pub any_dc: bool,
     pub any_ac: bool,
-}
-
-impl Default for ChromaBlockLevels {
-    fn default() -> Self {
-        Self {
-            dc: [0; 4],
-            ac: [[0; 15]; 4],
-            any_dc: false,
-            any_ac: false,
-        }
-    }
 }
 
 impl ChromaBlockLevels {

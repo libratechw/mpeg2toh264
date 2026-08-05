@@ -59,7 +59,7 @@ impl Reader {
     fn se(&mut self) -> i32 {
         let k = self.ue();
         if k % 2 == 1 {
-            ((k + 1) / 2) as i32
+            k.div_ceil(2) as i32
         } else {
             -((k / 2) as i32)
         }

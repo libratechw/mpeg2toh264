@@ -14,6 +14,9 @@
 //! The index is `(2 * sample + 1) * frequency`, which reaches 105 for the 8-point
 //! transform.
 
+// The table naturally contains values clippy recognises as `FRAC_1_SQRT_2` and
+// friends; they are cosines that happen to coincide, not constants to swap in.
+#[allow(clippy::approx_constant)]
 pub static COS_PI_OVER_16: [f64; 106] = [
     1.0,
     0.9807852804032304,

@@ -7,6 +7,12 @@
 //! compensation and no reference frame buffer. See [`transcode`] for the whole
 //! picture, and [`h264::chroma`] for the one path that does reconstruct samples.
 
+// The transform, quantiser and residual paths index several arrays in step with
+// a position or block number taken straight from the specification's own
+// formulas. Rewriting those as iterator chains hides the correspondence that
+// makes them checkable against the text.
+#![allow(clippy::needless_range_loop)]
+
 mod error;
 
 pub mod bitreader;
