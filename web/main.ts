@@ -23,6 +23,8 @@ let quotaBlocked = false;
 let objectUrl: string | null = null;
 let sampleCount = 0;
 let audioSampleCount = 0;
+/** Media times a decoder can start from, in order; see relieveQuota. */
+let randomAccessPoints: number[] = [];
 
 function setStatus(message: string, error = false) {
   status.textContent = message;
@@ -45,6 +47,7 @@ function resetState() {
   quotaBlocked = false;
   sampleCount = 0;
   audioSampleCount = 0;
+  randomAccessPoints = [];
   if (objectUrl) URL.revokeObjectURL(objectUrl);
   objectUrl = null;
   video.removeAttribute("src");
@@ -108,6 +111,9 @@ function pump() {
     if (error instanceof DOMException && error.name === "QuotaExceededError") {
       quotaBlocked = true;
       setStatus("MSEバッファが満杯です。再生が進むまで変換を停止しています…");
+      // Try at once rather than waiting for playback to raise an event: if the
+      // buffer ahead runs out first, nothing will raise one.
+      relieveQuota();
     } else
       setStatus(error instanceof Error ? error.message : String(error), true);
   }
@@ -132,10 +138,25 @@ function onUpdateEnd() {
 function relieveQuota() {
   if (!quotaBlocked || !sourceBuffer || sourceBuffer.updating || operation)
     return;
-  const removeEnd = video.currentTime - KEEP_BEHIND_SECONDS;
-  if (removeEnd <= 0 || sourceBuffer.buffered.length === 0) return;
+  if (sourceBuffer.buffered.length === 0) return;
   const removeStart = sourceBuffer.buffered.start(0);
+  // Removing a range takes the frames after it as well, up to the next random
+  // access point, so that nothing is left behind depending on what went away.
+  // Restart points here are several times further apart than the margin kept
+  // behind the playhead, so ending a removal at currentTime - KEEP_BEHIND
+  // regularly reaches past the playhead and deletes the frames about to be
+  // shown -- playback then stalls until the viewer seeks over the hole. Ending
+  // exactly on a restart point removes nothing beyond it.
+  const limit = video.currentTime - KEEP_BEHIND_SECONDS;
+  let removeEnd = 0;
+  for (const at of randomAccessPoints) {
+    if (at > limit) break;
+    removeEnd = at;
+  }
   if (removeEnd <= removeStart) return;
+  while (randomAccessPoints.length > 0 && randomAccessPoints[0]! < removeEnd) {
+    randomAccessPoints.shift();
+  }
   operation = "remove";
   sourceBuffer.remove(removeStart, removeEnd);
 }
@@ -187,6 +208,7 @@ input.addEventListener("change", () => {
         setStatus(error instanceof Error ? error.message : String(error), true);
       }
     } else if (message.type === "fragment") {
+      if (message.randomAccess) randomAccessPoints.push(message.start);
       fragments.push(message.data);
       queuedBytes += message.data.byteLength;
       sampleCount += message.samples ?? 0;

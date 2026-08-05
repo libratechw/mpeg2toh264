@@ -101,10 +101,13 @@ function emitGop(gop: Mpeg2Gop, audioFrames: AacFrame[]) {
   if (randomAccess) {
     transcoder.requestRandomAccessPoint();
   }
+  const startsAtIdr = !initialized || randomAccess;
   const timeline = mpeg2VideoTimeline(gop.data, {
-    hasReferences: initialized && !randomAccess,
+    hasReferences: !startsAtIdr,
   });
+  // Aligning can still move the origin, so read the start after it.
   alignTimelines(gop, timeline);
+  const start = videoPresentationStart / TIMESCALE;
   const h264 = transcoder.push(gop.data);
   const config = audioFrames[0]?.config ?? audioConfig ?? undefined;
   const fragment = h264GopToFmp4(
@@ -141,6 +144,11 @@ function emitGop(gop: Mpeg2Gop, audioFrames: AacFrame[]) {
       data: fragment.mediaSegment.buffer,
       samples: fragment.sampleCount,
       audioSamples: audioFrames.length,
+      // Where this fragment starts, and whether it can be decoded from. The
+      // page needs both to evict buffered media without cutting into what is
+      // about to be played; see relieveQuota in main.ts.
+      start,
+      randomAccess: startsAtIdr,
     },
     [fragment.mediaSegment.buffer],
   );
