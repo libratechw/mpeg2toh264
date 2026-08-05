@@ -50,6 +50,8 @@ export interface SliceHeaderConfig {
   /** Number of active L0 references, when it differs from the PPS default. */
   numRefIdxL0Active?: number;
   numRefIdxL1Active?: number;
+  /** Put this long-term picture first in list 0. */
+  l0FirstLongTerm?: number;
   /**
    * Force list 1 to begin with a short-term picture, given as the difference
    * between the current frame_num and that picture's.
@@ -103,7 +105,13 @@ export function writeSliceHeader(w: BitWriter, cfg: SliceHeaderConfig): void {
   // ref_pic_list_modification. List 0's default order already puts the nearest
   // preceding reference first, so only list 1 needs correcting.
   if (!isIType(cfg.sliceType)) {
-    w.flag(0); // ref_pic_list_modification_flag_l0
+    const longTerm = cfg.l0FirstLongTerm;
+    w.flag(longTerm !== undefined);
+    if (longTerm !== undefined) {
+      w.ue(2); // modification_of_pic_nums_idc 2: select a long-term picture
+      w.ue(longTerm);
+      w.ue(3); // modification_of_pic_nums_idc 3: end of the list
+    }
   }
   if (isB) {
     const delta = cfg.l1FirstShortTermDelta;

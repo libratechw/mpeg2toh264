@@ -111,6 +111,8 @@ interface RefLayout {
    * list 1's default construction would swap its first two entries.
    */
   forceL1ShortTerm: boolean;
+  /** Long-term picture forced to list 0 index 0, used by I-only mode. */
+  l0FirstLongTerm?: number;
 }
 
 type Stats = Omit<
@@ -236,10 +238,23 @@ export function transcode(
       picturesSkipped++;
       continue;
     }
-    const isReference = type !== PictureType.B;
+    // In I-only mode every content picture depends solely on the long-term
+    // grey IDR. Keeping content pictures as references only makes the grey
+    // frame move through the default reference list, and serves no purpose.
+    const isReference = !options.iFramesOnly && type !== PictureType.B;
 
-    const layout: RefLayout =
-      type === PictureType.B
+    const layout: RefLayout = options.iFramesOnly
+      ? {
+          count: 1,
+          fwdL0: 0,
+          fwdL1: 0,
+          bwdL0: -1,
+          bwdL1: -1,
+          gray: 0,
+          forceL1ShortTerm: false,
+          l0FirstLongTerm: 0,
+        }
+      : type === PictureType.B
         ? {
             // A B picture sits between its two references, so list 0 defaults to
             // [forward, backward, grey] and list 1 to [backward, forward, grey].
@@ -434,6 +449,7 @@ function writePicture(
     numRefIdxL0Active: ctx.layout.count,
     numRefIdxL1Active: ctx.layout.count,
     l1FirstShortTermDelta: ctx.layout.forceL1ShortTerm ? 1 : undefined,
+    l0FirstLongTerm: ctx.layout.l0FirstLongTerm,
   });
 
   const byAddress = new Map<number, Macroblock>();
