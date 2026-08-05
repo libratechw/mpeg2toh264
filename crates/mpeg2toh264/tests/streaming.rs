@@ -229,6 +229,56 @@ fn reads_an_in_band_pce_when_adts_channel_configuration_is_zero() {
 }
 
 #[test]
+fn preserves_an_implicit_five_point_one_configuration() {
+    let frame = adts_frame(3, 6, 16);
+    let expected = frame[7..].to_vec();
+    let frames = AdtsStream::new().push(&frame).expect("5.1 frame decodes");
+    assert_eq!(frames[0].config.channel_count, 6);
+    assert_eq!(frames[0].config.audio_specific_config, [0x11, 0xb0]);
+    assert_eq!(frames[0].data, expected, "5.1 payload passes through");
+}
+
+#[test]
+fn moves_an_explicit_five_point_one_pce_into_the_asc() {
+    let payload = packed_bits(concat!(
+        "101", // ID_PCE
+        "0000",
+        "01",
+        "0011", // tag, AAC-LC, 48 kHz
+        "0010",
+        "0000",
+        "0001",
+        "01",
+        "000",
+        "0000", // 2 front, 1 back, 1 LFE
+        "0",
+        "0",
+        "0", // no mixdown metadata
+        "0",
+        "0000", // front centre SCE 0
+        "1",
+        "0000", // front left/right CPE 0
+        "1",
+        "0001",                          // back left/right CPE 1
+        "0000",                          // LFE tag 0
+        "00000000",                      // no PCE comment (already byte aligned)
+        "00000000000000000000000000000", // first SCE; rest is opaque here
+        "111",                           // ID_END
+    ));
+    let frame = adts_frame_with_payload(3, 0, &payload);
+    let frames = AdtsStream::new()
+        .push(&frame)
+        .expect("PCE 5.1 frame decodes");
+    assert_eq!(frames[0].config.channel_count, 6);
+    assert_eq!(&frames[0].config.audio_specific_config[..2], &[0x11, 0x80]);
+    assert!(frames[0].config.audio_specific_config.len() > 2);
+    assert_eq!(
+        frames[0].data, payload,
+        "multichannel payload passes through"
+    );
+}
+
+#[test]
 fn rejects_audio_that_is_not_aac_lc() {
     // The audio is carried through without being decoded, so anything but the
     // profile the muxer will claim in its esds has to be refused up front.

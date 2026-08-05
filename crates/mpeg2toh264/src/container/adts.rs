@@ -22,8 +22,9 @@ pub struct AacConfig {
     pub sample_rate: u32,
     pub sampling_frequency_index: u8,
     pub channel_count: u8,
-    /// The two-byte AudioSpecificConfig an `esds` box carries.
-    pub audio_specific_config: [u8; 2],
+    /// The AudioSpecificConfig an `esds` box carries. Explicit PCE layouts are
+    /// longer than the usual two-byte implicit configuration.
+    pub audio_specific_config: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +54,14 @@ fn bit(data: &[u8], at: usize) -> u8 {
 
 /// Return the first channel element, skipping any byte-counted fill elements
 /// an encoder placed before it.
-fn skip_pce(data: &[u8], start: usize) -> Result<usize> {
+struct PceInfo {
+    end: usize,
+    body_start: usize,
+    body_end: usize,
+    channels: u8,
+}
+
+fn parse_pce(data: &[u8], start: usize) -> Result<PceInfo> {
     let mut r = crate::bitreader::BitReader::at_bit(data, start + 3);
     r.skip(4 + 2 + 4); // tag, object_type, sampling_frequency_index
     let front = r.u(4);
@@ -71,31 +79,44 @@ fn skip_pce(data: &[u8], start: usize) -> Result<usize> {
     if r.flag() {
         r.skip(3);
     } // matrix_mixdown_idx, pseudo_surround_enable
-    r.skip((front + side + back) * 5 + (lfe + assoc) * 4 + cc * 5);
+    let mut channels = lfe as u8;
+    for _ in 0..front + side + back {
+        channels += if r.flag() { 2 } else { 1 };
+        r.skip(4);
+    }
+    r.skip((lfe + assoc) * 4 + cc * 5);
+    let body_end = r.bit_pos();
     r.align_to_byte();
     let comments = r.u(8);
     r.skip(comments * 8);
     if r.bits_left() < 0 {
         bail!("AAC program_config_element overruns the raw_data_block");
     }
-    Ok(r.bit_pos())
+    Ok(PceInfo {
+        end: r.bit_pos(),
+        body_start: start + 3,
+        body_end,
+        channels,
+    })
 }
 
-fn first_channel_element(data: &[u8]) -> Result<(u8, usize, Vec<(usize, usize)>)> {
+fn first_channel_element(data: &[u8]) -> Result<(u8, usize, Vec<(usize, usize)>, Option<PceInfo>)> {
     let mut at = 0;
     let mut pces = Vec::new();
+    let mut pce = None;
     loop {
         if at + 7 > data.len() * 8 {
             bail!("AAC raw_data_block ended before a channel element");
         }
         let id = (bit(data, at) << 2) | (bit(data, at + 1) << 1) | bit(data, at + 2);
         if id == 0 || id == 1 {
-            return Ok((id, at, pces));
+            return Ok((id, at, pces, pce));
         }
         if id == 5 {
-            let end = skip_pce(data, at)?;
-            pces.push((at, end));
-            at = end;
+            let info = parse_pce(data, at)?;
+            pces.push((at, info.end));
+            at = info.end;
+            pce = Some(info);
             continue;
         }
         if id != 6 {
@@ -141,6 +162,28 @@ impl Bits {
             self.push(bit(source, at));
         }
     }
+}
+
+fn pce_audio_specific_config(
+    data: &[u8],
+    pce: &PceInfo,
+    audio_object_type: u8,
+    frequency_index: u8,
+) -> Vec<u8> {
+    let mut out = Bits {
+        data: Vec::new(),
+        len: 0,
+    };
+    out.value(5, audio_object_type as u32);
+    out.value(4, frequency_index as u32);
+    out.value(4, 0); // channelConfiguration: use the following PCE
+    out.value(3, 0); // frameLengthFlag, dependsOnCoreCoder, extensionFlag
+    out.copy(data, pce.body_start, pce.body_end);
+    while out.len & 7 != 0 {
+        out.push(0);
+    }
+    out.value(8, 0); // comment_field_bytes
+    out.data
 }
 
 /// Turn SCE or SCE+SCE (dual mono) into a CPE with two identical independent
@@ -227,20 +270,39 @@ impl AdtsStream {
             // has the same channel_configuration=2 ASC. Genuine stereo CPEs
             // pass through unchanged.
             let raw_data = &self.pending[at + header_length..at + frame_length];
-            let (first_element, channel_start, pces) = first_channel_element(raw_data)?;
-            let sce_service = channel_count == 1 || first_element == 0;
-            let output_channels = if sce_service || channel_count == 0 {
-                2
-            } else {
+            let (first_element, channel_start, pces, pce) = first_channel_element(raw_data)?;
+            let input_channels = if channel_count != 0 {
                 channel_count
+            } else if let Some(pce) = &pce {
+                pce.channels
+            } else if let Some(current) = &self.current_config {
+                current.channel_count
+            } else {
+                bail!("ADTS channel_configuration=0 has no program_config_element");
             };
-            let audio_specific_config = if sce_service || channel_count == 0 {
-                [
+            let sce_service = input_channels <= 2 && (input_channels == 1 || first_element == 0);
+            let output_channels = if sce_service { 2 } else { input_channels };
+            let audio_specific_config = if sce_service {
+                vec![
                     (audio_object_type << 3) | (sampling_frequency_index >> 1),
                     ((sampling_frequency_index & 1) << 7) | (2 << 3),
                 ]
+            } else if channel_count == 0 {
+                if let Some(pce) = &pce {
+                    pce_audio_specific_config(
+                        raw_data,
+                        pce,
+                        audio_object_type,
+                        sampling_frequency_index,
+                    )
+                } else {
+                    self.current_config
+                        .as_ref()
+                        .map(|current| current.audio_specific_config.clone())
+                        .ok_or_else(|| crate::Error::new("missing AAC program configuration"))?
+                }
             } else {
-                [
+                vec![
                     (audio_object_type << 3) | (sampling_frequency_index >> 1),
                     ((sampling_frequency_index & 1) << 7) | (channel_count << 3),
                 ]
