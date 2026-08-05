@@ -12,7 +12,7 @@
     "web:build": "vite build web --outDir ../dist --emptyOutDir",
     "test": "vitest run",
     "watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p web && tsc --noEmit -p web/tsconfig.worker.json"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
