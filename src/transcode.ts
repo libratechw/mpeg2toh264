@@ -433,15 +433,24 @@ function predictionForField(
   const hasBackward =
     layout.bwdL0 >= 0 && (mb.flags & MBFlag.MOTION_BACKWARD) !== 0;
   const hasForward = (mb.flags & MBFlag.MOTION_FORWARD) !== 0 || !hasBackward;
+  const fieldMotion = mb.motionType === MotionType.FIELD;
   const fieldRef = (frameRef: number, direction: 0 | 1) => {
+    if (!fieldMotion) return frameRef * 2;
     const refParity = mb.fieldSelect[field * 2 + direction]!;
     // MBAFF field lists expand each frame entry into same-parity then
     // opposite-parity fields for the current macroblock.
     return frameRef * 2 + (refParity === field ? 0 : 1);
   };
   const vector = (direction: 0 | 1): [number, number] => {
-    const base = field * 4 + direction * 2;
+    const base = (fieldMotion ? field * 4 : 0) + direction * 2;
     return [mb.mv[base]!, mb.mv[base + 1]!];
+  };
+  const native = (direction: 0 | 1): [number, number] => {
+    const [x, y] = vector(direction);
+    // A frame vector's vertical half-sample unit is one quarter sample on the
+    // field grid. Field-format vectors have already been scaled by the MPEG
+    // decoder and use the ordinary mapping in MBAFF coordinates.
+    return fieldMotion ? nativePosition(x, y) : [x * 2, y];
   };
 
   if (hasForward && hasBackward) {
@@ -449,13 +458,31 @@ function predictionForField(
       mbType: BMbType.BI_16X16,
       refIdxL0: fieldRef(layout.fwdL0, 0),
       refIdxL1: fieldRef(layout.bwdL1, 1),
-      mvL0: nativePosition(...vector(0)),
-      mvL1: nativePosition(...vector(1)),
+      mvL0: native(0),
+      mvL1: native(1),
     };
   }
 
   const useBackward = hasBackward;
   const direction = useBackward ? 1 : 0;
+  if (!fieldMotion) {
+    const mv = native(direction);
+    return useBackward
+      ? {
+          mbType: BMbType.L1_16X16,
+          refIdxL0: -1,
+          refIdxL1: fieldRef(layout.bwdL1, 1),
+          mvL0: [0, 0],
+          mvL1: mv,
+        }
+      : {
+          mbType: BMbType.L0_16X16,
+          refIdxL0: fieldRef(layout.fwdL0, 0),
+          refIdxL1: -1,
+          mvL0: mv,
+          mvL1: [0, 0],
+        };
+  }
   const mapped = mapVector(...vector(direction));
   const primaryFrame = useBackward ? layout.bwdL0 : layout.fwdL0;
   const secondaryFrame = useBackward ? layout.bwdL1 : layout.fwdL1;
@@ -577,8 +604,8 @@ function writePicture(
       !!mb && (mb.flags & MBFlag.INTRA) === 0;
     const fieldPair =
       ctx.mbaff &&
-      pairTop?.motionType === MotionType.FIELD &&
-      pairBottom?.motionType === MotionType.FIELD &&
+      (pairTop?.motionType === MotionType.FIELD ||
+        pairBottom?.motionType === MotionType.FIELD) &&
       isInter(pairTop) &&
       isInter(pairBottom);
     const intra =
