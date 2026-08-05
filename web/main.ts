@@ -25,6 +25,8 @@ let sampleCount = 0;
 let audioSampleCount = 0;
 /** Media times a decoder can start from, in order; see relieveQuota. */
 let randomAccessPoints: number[] = [];
+/** Whether the playhead has been put where the media starts; see startAtMedia. */
+let playheadPlaced = false;
 
 function setStatus(message: string, error = false) {
   status.textContent = message;
@@ -48,6 +50,7 @@ function resetState() {
   sampleCount = 0;
   audioSampleCount = 0;
   randomAccessPoints = [];
+  playheadPlaced = false;
   if (objectUrl) URL.revokeObjectURL(objectUrl);
   objectUrl = null;
   video.removeAttribute("src");
@@ -119,6 +122,26 @@ function pump() {
   }
 }
 
+/**
+ * Put the playhead where the media begins, which is not zero.
+ *
+ * The timeline keeps the distance the transport stream put between the two
+ * tracks, so it opens with only the earlier one on it -- audio alone for over
+ * 0.7 s where a recording starts mid-GOP, and at least one frame even when
+ * they start together, because the muxer needs somewhere to put the first
+ * decode time. buffered is the intersection of the two track buffers, so it
+ * begins after that, and nothing is ever appended at zero. Chrome moves the
+ * playhead into the first buffered range by itself; Firefox waits at zero for
+ * data that is not coming.
+ */
+function startAtMedia() {
+  if (playheadPlaced || !sourceBuffer || sourceBuffer.buffered.length === 0)
+    return;
+  playheadPlaced = true;
+  const start = sourceBuffer.buffered.start(0);
+  if (video.currentTime < start) video.currentTime = start;
+}
+
 function onUpdateEnd() {
   if (operation === "init") {
     initAppended = true;
@@ -126,6 +149,7 @@ function onUpdateEnd() {
   } else if (operation === "append") {
     const appended = fragments.shift();
     if (appended) queuedBytes -= appended.byteLength;
+    startAtMedia();
   } else if (operation === "remove") {
     quotaBlocked = false;
     setStatus("バッファに空きができたため変換を再開します…");
