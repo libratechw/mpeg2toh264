@@ -338,6 +338,9 @@ export class IncrementalTranscoder {
           options,
           mbaff,
           stats,
+          pSlice:
+            options.iFramesOnly ||
+            (!this.initialized && picturesConverted === 0),
           markPreviousLongTerm: !this.initialized && picturesConverted === 0,
         }),
       );
@@ -392,6 +395,7 @@ interface PictureContext {
   options: TranscodeOptions;
   mbaff: boolean;
   stats: Stats;
+  pSlice: boolean;
   markPreviousLongTerm?: boolean;
 }
 
@@ -780,7 +784,7 @@ function writePicture(
         // I-only pictures need no bi-prediction. P slices are simpler and much
         // more widely handled than a stream consisting solely of reference-less B
         // pictures, while still predicting every source intra MB from grey.
-        sliceType: ctx.options.iFramesOnly ? SliceType.P : SliceType.B,
+        sliceType: ctx.pSlice ? SliceType.P : SliceType.B,
         frameNum: ctx.frameNum,
         log2MaxFrameNum: LOG2_MAX_FRAME_NUM_MINUS4 + 4,
         picOrderCntLsb: ctx.poc,
@@ -985,7 +989,7 @@ function writePicture(
         ? motion.predict(mbX, mbY, 1, pred.refIdxL1)
         : ([0, 0] as [number, number]);
 
-    const splitFrameMb = ctx.mbaff && !ctx.options.iFramesOnly && !fieldPair;
+    const splitFrameMb = ctx.mbaff && !ctx.pSlice && !fieldPair;
     const fieldPreds = fieldPair
       ? ([pairTop!, pairBottom!].map((partSource) =>
           predictionForField(
@@ -1088,7 +1092,7 @@ function writePicture(
     const mb: GrayRefMacroblock = {
       mbX,
       mbY: fieldPair ? mbY >> 1 : mbY,
-      pSlice: ctx.options.iFramesOnly ?? false,
+      pSlice: ctx.pSlice,
       mbType: splitFrameMb
         ? b16x8MbType(mode, mode)
         : fieldModes
