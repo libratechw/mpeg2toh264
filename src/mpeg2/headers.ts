@@ -86,6 +86,12 @@ export interface Slice {
 }
 
 export interface Picture {
+  /**
+   * True when a group_of_pictures_header preceded this picture, which is where
+   * temporal_reference restarts. Coded order alone cannot tell: within a group
+   * temporal_reference already runs backwards whenever B pictures are present.
+   */
+  startsGop: boolean;
   header: PictureHeader;
   coding: PictureCodingExtension;
   /** Sequence state in effect for this picture. */
@@ -305,6 +311,7 @@ export function parseElementaryStream(data: Uint8Array): Picture[] {
   let quant = defaultQuantMatrices();
   let current: Picture | null = null;
   let pendingHeader: PictureHeader | null = null;
+  let sawGopHeader = false;
 
   const finishSlice = (endBit: number) => {
     const slices = current?.slices;
@@ -347,6 +354,7 @@ export function parseElementaryStream(data: Uint8Array): Picture[] {
         throw new Error("picture_start_code before any sequence_header");
       pendingHeader = readPictureHeader(r);
       current = {
+        startsGop: sawGopHeader,
         header: pendingHeader,
         coding: defaultPictureCoding(pendingHeader),
         sequence: seq,
@@ -363,7 +371,10 @@ export function parseElementaryStream(data: Uint8Array): Picture[] {
         quant,
         slices: [],
       };
+      sawGopHeader = false;
       pictures.push(current);
+    } else if (sc.code === SC.GROUP) {
+      sawGopHeader = true;
     } else if (sc.code >= SC.SLICE_MIN && sc.code <= SC.SLICE_MAX && current) {
       let verticalPosition = sc.code;
       if (current.sequence.verticalSize > 2800) {

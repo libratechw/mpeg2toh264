@@ -43,6 +43,15 @@ export interface SpsConfig {
   maxNumRefFrames: number;
   log2MaxFrameNumMinus4: number;
   log2MaxPocLsbMinus4: number;
+  /**
+   * How many pictures may precede a picture in decoding order yet follow it in
+   * output order. Without this a decoder has no reason to hold pictures back
+   * and emits them in decoding order, which for a source with B pictures is not
+   * display order.
+   */
+  maxNumReorderFrames?: number;
+  /** Frames the decoder must be able to hold, at least maxNumReorderFrames. */
+  maxDecFrameBuffering?: number;
 }
 
 export interface PpsConfig {
@@ -166,7 +175,28 @@ export function writeSps(cfg: SpsConfig): Uint8Array {
     w.ue(0); // frame_crop_top_offset
     w.ue(g.cropBottom);
   }
-  w.flag(0); // vui_parameters_present_flag
+  const reorder = cfg.maxNumReorderFrames;
+  w.flag(reorder !== undefined); // vui_parameters_present_flag
+  if (reorder !== undefined) {
+    // Only the bitstream restriction fields matter here; everything before them
+    // is switched off.
+    w.flag(0); // aspect_ratio_info_present_flag
+    w.flag(0); // overscan_info_present_flag
+    w.flag(0); // video_signal_type_present_flag
+    w.flag(0); // chroma_loc_info_present_flag
+    w.flag(0); // timing_info_present_flag
+    w.flag(0); // nal_hrd_parameters_present_flag
+    w.flag(0); // vcl_hrd_parameters_present_flag
+    w.flag(0); // pic_struct_present_flag
+    w.flag(1); // bitstream_restriction_flag
+    w.flag(1); // motion_vectors_over_pic_boundaries_flag
+    w.ue(0); // max_bytes_per_pic_denom: unconstrained
+    w.ue(0); // max_bits_per_mb_denom: unconstrained
+    w.ue(16); // log2_max_mv_length_horizontal
+    w.ue(16); // log2_max_mv_length_vertical
+    w.ue(reorder);
+    w.ue(cfg.maxDecFrameBuffering ?? Math.max(reorder, cfg.maxNumRefFrames));
+  }
 
   w.rbspTrailingBits();
   return toNalUnit(w.bytes(), 3, NalType.SPS);

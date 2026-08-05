@@ -40,7 +40,7 @@ import {
   type ChromaCounts,
   type GrayRefMacroblock,
 } from "./h264/mb.ts";
-import { mapForwardVector } from "./h264/mvmap.ts";
+import { VectorKind, mapVector, nativePosition } from "./h264/mvmap.ts";
 import { MotionField } from "./h264/mvpred.ts";
 import { frameGeometry, writePps, writeSps } from "./h264/params.ts";
 import {
@@ -56,15 +56,14 @@ const LOG2_MAX_POC_LSB_MINUS4 = 12;
 const PPS_INIT_QP = 26;
 /**
  * Chroma is quantised finer than luma. Its conversion runs through an inverse
- * and a forward transform plus the 2x2 DC Hadamard, so it accumulates more
- * rounding than luma's direct coefficient mapping, and that error compounds
- * along a chain of predicted pictures.
+ * and a forward transform plus the 2x2 DC Hadamard, which is orthogonal but not
+ * orthonormal, so it accumulates more rounding than luma's direct coefficient
+ * mapping and that error compounds along a chain of predicted pictures.
  */
 const CHROMA_QP_OFFSET = -6;
 const MAX_FRAME_NUM = 1 << (LOG2_MAX_FRAME_NUM_MINUS4 + 4);
 
 export interface TranscodeOptions {
-  /** See QuantiserOptions.oversample. */
   oversample: number;
 }
 
@@ -74,23 +73,39 @@ export interface TranscodeResult {
   picturesSkipped: number;
   /** Inter macroblocks whose motion is reproduced exactly, luma and chroma. */
   integerVectors: number;
-  /**
-   * Inter macroblocks at a half sample on one axis. Luma is exact, but chroma
-   * lands a quarter of a chroma sample off: MPEG-2 truncates the halved vector
-   * (clause 7.6.3.7) while H.264 derives chroma motion at eighth-sample
-   * precision from the luma vector, and there is no way to set them apart.
-   */
+  /** Half sample on one axis: luma exact, chroma a quarter sample out. */
   singleAxisHalfVectors: number;
-  /** Inter macroblocks at a half sample on both axes, where luma is approximate too. */
+  /** Half sample on both axes, where luma is approximate as well. */
   bothAxisHalfVectors: number;
+  /** Bidirectional macroblocks, where both prediction slots are already used. */
+  bidirectionalVectors: number;
   intraMacroblocks: number;
   interMacroblocks: number;
 }
 
-/**
- * Convert the I and P pictures of an MPEG-2 elementary stream. B pictures need
- * two simultaneous references and are not handled yet.
- */
+/** Which reference index reaches which picture, per list. */
+interface RefLayout {
+  count: number;
+  /** The picture an MPEG-2 forward vector refers to. */
+  fwdL0: number;
+  fwdL1: number;
+  /** The picture an MPEG-2 backward vector refers to; -1 in I and P pictures. */
+  bwdL0: number;
+  bwdL1: number;
+  /** The all-grey frame, which intra macroblocks predict from. */
+  gray: number;
+  /**
+   * Set for I and P pictures, where both lists must reach the same picture and
+   * list 1's default construction would swap its first two entries.
+   */
+  forceL1ShortTerm: boolean;
+}
+
+type Stats = Omit<
+  TranscodeResult,
+  "bitstream" | "picturesConverted" | "picturesSkipped"
+>;
+
 export function transcode(
   data: Uint8Array,
   options: TranscodeOptions = DEFAULT_QUANTISER_OPTIONS,
@@ -102,11 +117,6 @@ export function transcode(
   const width = first.sequence.horizontalSize;
   const height = first.sequence.verticalSize;
   const g = frameGeometry(width, height, true);
-
-  // Both 8x8 scaling lists carry the MPEG-2 non-intra matrix. Every macroblock
-  // is coded as inter, so the inter list is the one the decoder applies; which
-  // matrix it holds affects only how efficiently levels are represented, since
-  // the mapping divides by the gain that same list produces.
   const scaling = first.quant.nonIntra;
 
   const parts: Uint8Array[] = [
@@ -115,10 +125,15 @@ export function transcode(
       height,
       levelIdc: width * height > 720 * 576 ? 40 : 30,
       frameMbsOnly: true,
-      // The grey frame plus the most recent I or P picture.
-      maxNumRefFrames: 2,
+      // The grey frame plus the two most recent I or P pictures, which are what
+      // a B picture predicts from.
+      maxNumRefFrames: 3,
       log2MaxFrameNumMinus4: LOG2_MAX_FRAME_NUM_MINUS4,
       log2MaxPocLsbMinus4: LOG2_MAX_POC_LSB_MINUS4,
+      // An MPEG-2 stream codes its anchor picture before the B pictures that
+      // display ahead of it, so one picture has to be held back.
+      maxNumReorderFrames: 1,
+      maxDecFrameBuffering: 4,
     }),
     writePps({
       initQp: PPS_INIT_QP,
@@ -142,41 +157,90 @@ export function transcode(
   const motion = new MotionField(g.mbWidth, g.mbHeight);
   const reader = new BitReader(data);
 
-  const stats = {
-    picturesConverted: 0,
-    picturesSkipped: 0,
+  const stats: Stats = {
     integerVectors: 0,
     singleAxisHalfVectors: 0,
     bothAxisHalfVectors: 0,
+    bidirectionalVectors: 0,
     intraMacroblocks: 0,
     interMacroblocks: 0,
   };
+  let picturesConverted = 0;
+  let picturesSkipped = 0;
 
-  // The grey IDR is frame_num 0; each converted picture is a reference and
-  // takes the next value.
-  let frameNum = 0;
-  let poc = 0;
-  let havePrevPicture = false;
+  let prevRefFrameNum = 0; // the grey IDR
+  let shortTermCount = 0;
+  // temporal_reference restarts at each group of pictures, so display order is
+  // recovered by accumulating a base as the counter wraps.
+  let gopBase = 0;
+  let seenPicture = false;
+  let maxTrInGop = 0;
 
   for (const pic of pics) {
     const type = pic.header.pictureCodingType;
-    if (type !== PictureType.I && type !== PictureType.P) {
-      stats.picturesSkipped++;
+    if (
+      type !== PictureType.I &&
+      type !== PictureType.P &&
+      type !== PictureType.B
+    ) {
+      picturesSkipped++;
       continue;
     }
-    frameNum = (frameNum + 1) % MAX_FRAME_NUM;
-    poc += 2;
+    const tr = pic.header.temporalReference;
+    if (pic.startsGop && seenPicture) {
+      gopBase += maxTrInGop + 1;
+      maxTrInGop = 0;
+    }
+    seenPicture = true;
+    maxTrInGop = Math.max(maxTrInGop, tr);
+
+    // A B picture needs both of its references present.
+    if (type === PictureType.B && shortTermCount < 2) {
+      picturesSkipped++;
+      continue;
+    }
+    const isReference = type !== PictureType.B;
+
+    const layout: RefLayout =
+      type === PictureType.B
+        ? {
+            // A B picture sits between its two references, so list 0 defaults to
+            // [forward, backward, grey] and list 1 to [backward, forward, grey].
+            count: 3,
+            fwdL0: 0,
+            fwdL1: 1,
+            bwdL0: 1,
+            bwdL1: 0,
+            gray: 2,
+            forceL1ShortTerm: false,
+          }
+        : {
+            count: shortTermCount + 1,
+            fwdL0: 0,
+            fwdL1: 0,
+            bwdL0: -1,
+            bwdL1: -1,
+            gray: shortTermCount,
+            forceL1ShortTerm: shortTermCount > 0,
+          };
+
+    const frameNum = (prevRefFrameNum + 1) % MAX_FRAME_NUM;
     parts.push(
       writePicture(reader, pic, g, quant, counts, chromaCounts, motion, {
         frameNum,
-        poc,
-        havePrevPicture,
+        // The grey frame is the IDR at POC 0, so content starts past it.
+        poc: 2 * (gopBase + tr) + 2,
+        isReference,
+        layout,
         options,
         stats,
       }),
     );
-    havePrevPicture = true;
-    stats.picturesConverted++;
+    if (isReference) {
+      prevRefFrameNum = frameNum;
+      shortTermCount = Math.min(2, shortTermCount + 1);
+    }
+    picturesConverted++;
   }
 
   let total = 0;
@@ -187,21 +251,100 @@ export function transcode(
     bitstream.set(p, at);
     at += p.length;
   }
-  return { bitstream, ...stats };
+  return { bitstream, picturesConverted, picturesSkipped, ...stats };
 }
 
 interface PictureContext {
   frameNum: number;
   poc: number;
-  /** False for the first converted picture, where only the grey frame exists. */
-  havePrevPicture: boolean;
+  isReference: boolean;
+  layout: RefLayout;
   options: TranscodeOptions;
-  stats: {
-    integerVectors: number;
-    singleAxisHalfVectors: number;
-    bothAxisHalfVectors: number;
-    intraMacroblocks: number;
-    interMacroblocks: number;
+  stats: Stats;
+}
+
+/** How one macroblock is predicted, once the source's motion has been mapped. */
+interface Prediction {
+  mbType: number;
+  refIdxL0: number;
+  refIdxL1: number;
+  mvL0: [number, number];
+  mvL1: [number, number];
+}
+
+function predictionFor(
+  mb: Macroblock | undefined,
+  intra: boolean,
+  layout: RefLayout,
+  stats: Stats,
+): Prediction {
+  if (intra || !mb) {
+    // Intra macroblocks predict from the grey frame, which stands in for H.264
+    // intra prediction; see h264/grayframe.ts.
+    return {
+      mbType: BMbType.L0_16X16,
+      refIdxL0: layout.gray,
+      refIdxL1: -1,
+      mvL0: [0, 0],
+      mvL1: [0, 0],
+    };
+  }
+
+  const hasBackward =
+    layout.bwdL0 >= 0 && (mb.flags & MBFlag.MOTION_BACKWARD) !== 0;
+  const hasForward = (mb.flags & MBFlag.MOTION_FORWARD) !== 0 || !hasBackward;
+
+  if (hasForward && hasBackward) {
+    // Both slots go to the two directions, leaving none for the bilinear pair,
+    // so H.264 interpolates each side itself. The averaging structure still
+    // matches MPEG-2's; only the sub-sample filter differs.
+    stats.bidirectionalVectors++;
+    return {
+      mbType: BMbType.BI_16X16,
+      refIdxL0: layout.fwdL0,
+      refIdxL1: layout.bwdL0,
+      mvL0: nativePosition(mb.mv[0]!, mb.mv[1]!),
+      mvL1: nativePosition(mb.mv[2]!, mb.mv[3]!),
+    };
+  }
+
+  const useBackward = hasBackward;
+  const mvx = useBackward ? mb.mv[2]! : mb.mv[0]!;
+  const mvy = useBackward ? mb.mv[3]! : mb.mv[1]!;
+  const mapped = mapVector(mvx, mvy);
+
+  if (mapped.kind === VectorKind.INTEGER) stats.integerVectors++;
+  else if (mapped.kind === VectorKind.HALF_ONE_AXIS)
+    stats.singleAxisHalfVectors++;
+  else stats.bothAxisHalfVectors++;
+
+  // The bilinear pair must reach the same picture through both lists.
+  const primary = useBackward ? layout.bwdL0 : layout.fwdL0;
+  const secondary = useBackward ? layout.bwdL1 : layout.fwdL1;
+
+  if (mapped.b === null) {
+    return useBackward
+      ? {
+          mbType: BMbType.L1_16X16,
+          refIdxL0: -1,
+          refIdxL1: layout.bwdL1,
+          mvL0: [0, 0],
+          mvL1: mapped.a,
+        }
+      : {
+          mbType: BMbType.L0_16X16,
+          refIdxL0: layout.fwdL0,
+          refIdxL1: -1,
+          mvL0: mapped.a,
+          mvL1: [0, 0],
+        };
+  }
+  return {
+    mbType: BMbType.BI_16X16,
+    refIdxL0: primary,
+    refIdxL1: secondary,
+    mvL0: mapped.a,
+    mvL1: mapped.b,
   };
 }
 
@@ -222,13 +365,6 @@ function writePicture(
   chromaCounts.cr.reset();
   motion.reset();
 
-  // Reference list layout. Without a previous picture only the grey frame is
-  // present; otherwise list 0 defaults to [previous, grey] and list 1 is forced
-  // to match, since its default construction would swap the two.
-  const refCount = ctx.havePrevPicture ? 2 : 1;
-  const grayIdx = ctx.havePrevPicture ? 1 : 0;
-  const prevIdx = 0;
-
   writeSliceHeader(w, {
     firstMbInSlice: 0,
     sliceType: SliceType.B,
@@ -237,14 +373,14 @@ function writePicture(
     picOrderCntLsb: ctx.poc,
     log2MaxPocLsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
     idr: false,
-    reference: true,
+    reference: ctx.isReference,
     mbaff: false,
     sliceQp: PPS_INIT_QP,
     ppsInitQp: PPS_INIT_QP,
     disableDeblockingFilterIdc: 1,
-    numRefIdxL0Active: refCount,
-    numRefIdxL1Active: refCount,
-    l1FirstShortTermDelta: ctx.havePrevPicture ? 1 : undefined,
+    numRefIdxL0Active: ctx.layout.count,
+    numRefIdxL1Active: ctx.layout.count,
+    l1FirstShortTermDelta: ctx.layout.forceL1ShortTerm ? 1 : undefined,
   });
 
   const byAddress = new Map<number, Macroblock>();
@@ -274,7 +410,7 @@ function writePicture(
       if (
         source &&
         !source.skipped &&
-        (source.flags & MBFlag.PATTERN || intra)
+        ((source.flags & MBFlag.PATTERN) !== 0 || intra)
       ) {
         const quantiserScale =
           QUANTISER_SCALE[pic.coding.qScaleType]![source.quantiserScaleCode]!;
@@ -332,46 +468,31 @@ function writePicture(
         }
       }
 
-      // Map the source's motion onto H.264 prediction.
-      const mapped = intra
-        ? {
-            mbType: BMbType.L0_16X16,
-            l0: [0, 0] as [number, number],
-            l1: null,
-            exact: true,
-          }
-        : mapForwardVector(source?.mv[0] ?? 0, source?.mv[1] ?? 0);
-      if (intra) {
-        ctx.stats.intraMacroblocks++;
-      } else {
-        ctx.stats.interMacroblocks++;
-        const fx = (source?.mv[0] ?? 0) & 1;
-        const fy = (source?.mv[1] ?? 0) & 1;
-        if (fx === 0 && fy === 0) ctx.stats.integerVectors++;
-        else if (fx === 1 && fy === 1) ctx.stats.bothAxisHalfVectors++;
-        else ctx.stats.singleAxisHalfVectors++;
-      }
+      if (intra) ctx.stats.intraMacroblocks++;
+      else ctx.stats.interMacroblocks++;
+      const pred = predictionFor(source, intra, ctx.layout, ctx.stats);
 
-      const refIdxL0 = intra ? grayIdx : prevIdx;
-      const refIdxL1 = intra ? -1 : prevIdx;
-      const predL0 = motion.predict(mbX, mbY, 0, refIdxL0);
-      const predL1 =
-        mapped.l1 !== null
-          ? motion.predict(mbX, mbY, 1, refIdxL1)
-          : ([0, 0] as [number, number]);
+      const usesL0 = pred.mbType !== BMbType.L1_16X16;
+      const usesL1 = pred.mbType !== BMbType.L0_16X16;
+      const predL0 = usesL0
+        ? motion.predict(mbX, mbY, 0, pred.refIdxL0)
+        : ([0, 0] as [number, number]);
+      const predL1 = usesL1
+        ? motion.predict(mbX, mbY, 1, pred.refIdxL1)
+        : ([0, 0] as [number, number]);
 
       const mb: GrayRefMacroblock = {
         mbX,
         mbY,
-        mbType: mapped.mbType,
-        refIdxL0,
-        refIdxL1: mapped.l1 !== null ? refIdxL1 : -1,
-        mvdL0x: mapped.l0[0] - predL0[0],
-        mvdL0y: mapped.l0[1] - predL0[1],
-        mvdL1x: mapped.l1 !== null ? mapped.l1[0] - predL1[0] : 0,
-        mvdL1y: mapped.l1 !== null ? mapped.l1[1] - predL1[1] : 0,
-        numRefIdxL0Minus1: refCount - 1,
-        numRefIdxL1Minus1: refCount - 1,
+        mbType: pred.mbType,
+        refIdxL0: pred.refIdxL0,
+        refIdxL1: pred.refIdxL1,
+        mvdL0x: usesL0 ? pred.mvL0[0] - predL0[0] : 0,
+        mvdL0y: usesL0 ? pred.mvL0[1] - predL0[1] : 0,
+        mvdL1x: usesL1 ? pred.mvL1[0] - predL1[0] : 0,
+        mvdL1y: usesL1 ? pred.mvL1[1] - predL1[1] : 0,
+        numRefIdxL0Minus1: ctx.layout.count - 1,
+        numRefIdxL1Minus1: ctx.layout.count - 1,
         luma,
         chroma,
         qp,
@@ -379,12 +500,12 @@ function writePicture(
       };
 
       motion.set(mbX, mbY, {
-        refIdxL0,
-        refIdxL1: mapped.l1 !== null ? refIdxL1 : -1,
-        mvL0x: mapped.l0[0],
-        mvL0y: mapped.l0[1],
-        mvL1x: mapped.l1 !== null ? mapped.l1[0] : 0,
-        mvL1y: mapped.l1 !== null ? mapped.l1[1] : 0,
+        refIdxL0: usesL0 ? pred.refIdxL0 : -1,
+        refIdxL1: usesL1 ? pred.refIdxL1 : -1,
+        mvL0x: usesL0 ? pred.mvL0[0] : 0,
+        mvL0y: usesL0 ? pred.mvL0[1] : 0,
+        mvL1x: usesL1 ? pred.mvL1[0] : 0,
+        mvL1y: usesL1 ? pred.mvL1[1] : 0,
       });
 
       // Every macroblock is coded explicitly. A B_Skip would mean direct mode,
@@ -399,5 +520,5 @@ function writePicture(
   }
 
   w.rbspTrailingBits();
-  return toNalUnit(w.bytes(), 2, NalType.SLICE_NON_IDR);
+  return toNalUnit(w.bytes(), ctx.isReference ? 2 : 0, NalType.SLICE_NON_IDR);
 }

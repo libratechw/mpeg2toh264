@@ -26,7 +26,7 @@ const elapsed = Date.now() - started;
 console.log(`source      : ${input}  ${width}x${height}`);
 console.log(
   `pictures    : ${result.picturesConverted} converted, ` +
-    `${result.picturesSkipped} skipped (B pictures, not yet handled)`,
+    `${result.picturesSkipped} skipped`,
 );
 const inter = result.interMacroblocks || 1;
 const pc = (n: number) => `${((100 * n) / inter).toFixed(1)}%`;
@@ -42,6 +42,9 @@ console.log(
 console.log(
   `  half sample, 2 axes  ${String(result.bothAxisHalfVectors).padStart(7)}  ${pc(result.bothAxisHalfVectors).padStart(6)}  both approximate`,
 );
+console.log(
+  `  bidirectional        ${String(result.bidirectionalVectors).padStart(7)}  ${pc(result.bidirectionalVectors).padStart(6)}  both slots used, H.264 interpolates`,
+);
 console.log(`oversample  : ${oversample}x`);
 console.log(`output      : ${result.bitstream.length} bytes in ${elapsed} ms`);
 
@@ -50,8 +53,7 @@ try {
   const h264 = join(dir, "out.h264");
   writeFileSync(h264, result.bitstream);
 
-  // Keep the same pictures on both sides: B pictures are not converted yet, so
-  // the source is filtered down to its I and P pictures to line the frames up.
+  // Both sides now carry every picture, in display order.
   const srcYuv = join(dir, "src.yuv");
   const outYuv = join(dir, "out.yuv");
   execFileSync(
@@ -61,10 +63,6 @@ try {
       "error",
       "-i",
       input,
-      "-vf",
-      "select='eq(pict_type\\,I)+eq(pict_type\\,P)'",
-      "-vsync",
-      "0",
       "-f",
       "rawvideo",
       "-pix_fmt",
