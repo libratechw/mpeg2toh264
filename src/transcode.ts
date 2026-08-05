@@ -39,6 +39,7 @@ import {
 import { writeGrayIdr } from "./h264/grayframe.ts";
 import {
   BMbType,
+  b16x8MbType,
   CoeffCountMap,
   makeChromaCounts,
   makeLumaCounts,
@@ -597,17 +598,54 @@ function writePicture(
       ? motion.predict(mbX, mbY, 1, pred.refIdxL1)
       : ([0, 0] as [number, number]);
 
+    const splitFrameMb = ctx.mbaff && !ctx.options.iFramesOnly;
+    const mode =
+      pred.mbType === BMbType.L0_16X16
+        ? ("L0" as const)
+        : pred.mbType === BMbType.L1_16X16
+          ? ("L1" as const)
+          : ("BI" as const);
+    const partitions: GrayRefMacroblock["partitions"] = splitFrameMb
+      ? ([0, 1].map((partNumber) => {
+          const part = partNumber as 0 | 1;
+          const pL0 = usesL0
+            ? motion.predict16x8(mbX, mbY, part, 0, pred.refIdxL0)
+            : ([0, 0] as [number, number]);
+          const pL1 = usesL1
+            ? motion.predict16x8(mbX, mbY, part, 1, pred.refIdxL1)
+            : ([0, 0] as [number, number]);
+          const state = {
+            refIdxL0: usesL0 ? pred.refIdxL0 : -1,
+            refIdxL1: usesL1 ? pred.refIdxL1 : -1,
+            mvL0x: usesL0 ? pred.mvL0[0] : 0,
+            mvL0y: usesL0 ? pred.mvL0[1] : 0,
+            mvL1x: usesL1 ? pred.mvL1[0] : 0,
+            mvL1y: usesL1 ? pred.mvL1[1] : 0,
+          };
+          motion.set16x8(mbX, mbY, part, state);
+          return {
+            refIdxL0: state.refIdxL0,
+            refIdxL1: state.refIdxL1,
+            mvdL0x: usesL0 ? pred.mvL0[0] - pL0[0] : 0,
+            mvdL0y: usesL0 ? pred.mvL0[1] - pL0[1] : 0,
+            mvdL1x: usesL1 ? pred.mvL1[0] - pL1[0] : 0,
+            mvdL1y: usesL1 ? pred.mvL1[1] - pL1[1] : 0,
+          };
+        }) as GrayRefMacroblock["partitions"])
+      : undefined;
+
     const mb: GrayRefMacroblock = {
       mbX,
       mbY,
       pSlice: ctx.options.iFramesOnly ?? false,
-      mbType: pred.mbType,
+      mbType: splitFrameMb ? b16x8MbType(mode, mode) : pred.mbType,
       refIdxL0: pred.refIdxL0,
       refIdxL1: pred.refIdxL1,
       mvdL0x: usesL0 ? pred.mvL0[0] - predL0[0] : 0,
       mvdL0y: usesL0 ? pred.mvL0[1] - predL0[1] : 0,
       mvdL1x: usesL1 ? pred.mvL1[0] - predL1[0] : 0,
       mvdL1y: usesL1 ? pred.mvL1[1] - predL1[1] : 0,
+      partitions,
       numRefIdxL0Minus1: ctx.layout.count - 1,
       numRefIdxL1Minus1: ctx.layout.count - 1,
       luma,
@@ -616,14 +654,16 @@ function writePicture(
       prevQp,
     };
 
-    motion.set(mbX, mbY, {
-      refIdxL0: usesL0 ? pred.refIdxL0 : -1,
-      refIdxL1: usesL1 ? pred.refIdxL1 : -1,
-      mvL0x: usesL0 ? pred.mvL0[0] : 0,
-      mvL0y: usesL0 ? pred.mvL0[1] : 0,
-      mvL1x: usesL1 ? pred.mvL1[0] : 0,
-      mvL1y: usesL1 ? pred.mvL1[1] : 0,
-    });
+    if (!splitFrameMb) {
+      motion.set(mbX, mbY, {
+        refIdxL0: usesL0 ? pred.refIdxL0 : -1,
+        refIdxL1: usesL1 ? pred.refIdxL1 : -1,
+        mvL0x: usesL0 ? pred.mvL0[0] : 0,
+        mvL0y: usesL0 ? pred.mvL0[1] : 0,
+        mvL1x: usesL1 ? pred.mvL1[0] : 0,
+        mvL1y: usesL1 ? pred.mvL1[1] : 0,
+      });
+    }
 
     // Every macroblock is coded explicitly. A B_Skip would mean direct mode,
     // whose derived vectors are not the ones the source used.

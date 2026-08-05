@@ -3,8 +3,9 @@
  *
  * Vectors are coded as differences from a prediction derived from the
  * neighbouring macroblocks, so the encoder has to reproduce that derivation
- * exactly to know what difference to send. Only 16x16 partitions are produced
- * here, which keeps this to the macroblock-level case.
+ * exactly to know what difference to send. State is stored per 4x4 luma block
+ * so both 16x16 and 16x8 macroblock partitions can use the same neighbour
+ * derivation.
  */
 
 /** Motion state of one macroblock, as neighbours need to see it. */
@@ -49,18 +50,18 @@ function median(a: number, b: number, c: number): number {
  * vectors from its neighbours.
  */
 export class MotionField {
-  private readonly mbW: number;
-  private readonly mbH: number;
+  private readonly blkW: number;
+  private readonly blkH: number;
   private readonly refIdx: Int8Array;
   private readonly mv: Int32Array;
   private readonly coded: Uint8Array;
 
   constructor(mbWidth: number, mbHeight: number) {
-    this.mbW = mbWidth;
-    this.mbH = mbHeight;
-    this.refIdx = new Int8Array(mbWidth * mbHeight * 2);
-    this.mv = new Int32Array(mbWidth * mbHeight * 4);
-    this.coded = new Uint8Array(mbWidth * mbHeight);
+    this.blkW = mbWidth * 4;
+    this.blkH = mbHeight * 4;
+    this.refIdx = new Int8Array(this.blkW * this.blkH * 2);
+    this.mv = new Int32Array(this.blkW * this.blkH * 4);
+    this.coded = new Uint8Array(this.blkW * this.blkH);
   }
 
   reset(): void {
@@ -70,7 +71,28 @@ export class MotionField {
   }
 
   set(mbX: number, mbY: number, m: MbMotion): void {
-    const i = mbY * this.mbW + mbX;
+    this.setRect(mbX * 4, mbY * 4, 4, 4, m);
+  }
+
+  /** Record one half of a 16x8-partitioned macroblock. */
+  set16x8(mbX: number, mbY: number, part: 0 | 1, m: MbMotion): void {
+    this.setRect(mbX * 4, mbY * 4 + part * 2, 4, 2, m);
+  }
+
+  private setRect(
+    bx: number,
+    by: number,
+    width: number,
+    height: number,
+    m: MbMotion,
+  ): void {
+    for (let y = by; y < by + height; y++) {
+      for (let x = bx; x < bx + width; x++) this.setBlock(x, y, m);
+    }
+  }
+
+  private setBlock(bx: number, by: number, m: MbMotion): void {
+    const i = by * this.blkW + bx;
     this.refIdx[i * 2] = m.refIdxL0;
     this.refIdx[i * 2 + 1] = m.refIdxL1;
     this.mv[i * 4] = m.mvL0x;
@@ -80,10 +102,10 @@ export class MotionField {
     this.coded[i] = 1;
   }
 
-  private at(mbX: number, mbY: number): Neighbour {
-    if (mbX < 0 || mbY < 0 || mbX >= this.mbW || mbY >= this.mbH)
+  private at(bx: number, by: number): Neighbour {
+    if (bx < 0 || by < 0 || bx >= this.blkW || by >= this.blkH)
       return UNAVAILABLE;
-    const i = mbY * this.mbW + mbX;
+    const i = by * this.blkW + bx;
     if (!this.coded[i]) return UNAVAILABLE;
     return {
       available: true,
@@ -110,10 +132,45 @@ export class MotionField {
     list: 0 | 1,
     refIdx: number,
   ): [number, number] {
-    const a = this.at(mbX - 1, mbY);
-    const b = this.at(mbX, mbY - 1);
-    let c = this.at(mbX + 1, mbY - 1);
-    if (!c.available) c = this.at(mbX - 1, mbY - 1);
+    return this.predictAt(mbX * 4, mbY * 4, 4, list, refIdx);
+  }
+
+  /** Predicted vector for the top or bottom partition of a 16x8 macroblock. */
+  predict16x8(
+    mbX: number,
+    mbY: number,
+    part: 0 | 1,
+    list: 0 | 1,
+    refIdx: number,
+  ): [number, number] {
+    const bx = mbX * 4;
+    const by = mbY * 4 + part * 2;
+    const a = this.at(bx - 1, by);
+    const b = this.at(bx, by - 1);
+    const sameRef = (n: Neighbour) =>
+      n.available && (list === 0 ? n.refIdxL0 : n.refIdxL1) === refIdx;
+    // Clause 8.4.1.3: 16x8 top prefers B and bottom prefers A before the
+    // general median/reference-match process.
+    if (part === 0 && sameRef(b)) return this.vectorOf(b, list);
+    if (part === 1 && sameRef(a)) return this.vectorOf(a, list);
+    return this.predictAt(bx, by, 4, list, refIdx);
+  }
+
+  private vectorOf(n: Neighbour, list: 0 | 1): [number, number] {
+    return list === 0 ? [n.mvL0x, n.mvL0y] : [n.mvL1x, n.mvL1y];
+  }
+
+  private predictAt(
+    bx: number,
+    by: number,
+    width: number,
+    list: 0 | 1,
+    refIdx: number,
+  ): [number, number] {
+    const a = this.at(bx - 1, by);
+    const b = this.at(bx, by - 1);
+    let c = this.at(bx + width, by - 1);
+    if (!c.available) c = this.at(bx - 1, by - 1);
 
     const pick = (m: Neighbour): [number, number, number] =>
       list === 0
