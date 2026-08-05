@@ -212,9 +212,10 @@ export class IncrementalTranscoder {
             maxNumRefFrames: 3,
             log2MaxFrameNumMinus4: LOG2_MAX_FRAME_NUM_MINUS4,
             log2MaxPocLsbMinus4: LOG2_MAX_POC_LSB_MINUS4,
-            // An MPEG-2 stream codes its anchor picture before the B pictures that
-            // display ahead of it, so one picture has to be held back.
-            maxNumReorderFrames: 1,
+            // A typical MPEG-2 coding group is I/P, next P, then the two B pictures
+            // displayed between them. The anchor can therefore have two later-coded
+            // pictures ahead of it in presentation order.
+            maxNumReorderFrames: 2,
             maxDecFrameBuffering: 4,
             sampleAspectRatio: sequenceSampleAspectRatio(first.sequence),
             gapsInFrameNumAllowed: true,
