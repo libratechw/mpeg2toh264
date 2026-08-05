@@ -1,18 +1,22 @@
 //! Splitting an MPEG-2 elementary stream into bounded, independently
 //! transcodable units.
 
+use std::ops::ControlFlow;
+
 use crate::mpeg2::constants::start_code;
 
-/// Offsets of every `00 00 01 <code>` start code in the buffer.
+/// Walk every `00 00 01 <code>` start code in `data` in order, handing each
+/// offset and its code byte to `visit`, and stop as soon as `visit` breaks.
 ///
-/// The whole buffer is walked for every group boundary the splitter looks for,
-/// and at broadcast bitrates that is megabytes per group, so the common case --
-/// coded data with no zero byte anywhere near -- is skipped eight bytes at a
-/// time rather than one.
-fn starts(data: &[u8], code: u8) -> Vec<usize> {
-    let mut out = Vec::new();
+/// One walk answers every question the splitter asks. Looking each kind of
+/// start code up on its own walked the buffer five times to cut one group,
+/// and at broadcast bitrates that is megabytes a group.
+///
+/// The common case -- coded data with no zero byte anywhere near -- is skipped
+/// eight bytes at a time rather than one.
+fn scan_start_codes(data: &[u8], mut visit: impl FnMut(usize, u8) -> ControlFlow<()>) {
     if data.len() < 4 {
-        return out;
+        return;
     }
     let last = data.len() - 4;
     let mut i = 0;
@@ -27,14 +31,52 @@ fn starts(data: &[u8], code: u8) -> Vec<usize> {
                 continue;
             }
         }
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == code {
-            out.push(i);
-            i += 4;
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if visit(i, data[i + 3]).is_break() {
+                return;
+            }
+            // The next start code cannot begin before the code byte, which is
+            // the first position after this one that is allowed to be zero.
+            i += 3;
         } else {
             i += 1;
         }
     }
-    out
+}
+
+/// Offsets of the sequence and group headers the splitter cuts on, up to and
+/// including the second group header. Nothing beyond that is read.
+fn boundaries(data: &[u8]) -> (Vec<usize>, Vec<usize>) {
+    let mut sequences = Vec::new();
+    let mut gops = Vec::new();
+    scan_start_codes(data, |at, code| {
+        match code {
+            start_code::SEQUENCE_HEADER => sequences.push(at),
+            start_code::GROUP => {
+                gops.push(at);
+                if gops.len() == 2 {
+                    return ControlFlow::Break(());
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    });
+    (sequences, gops)
+}
+
+/// Whether the buffer holds a coded picture at all.
+fn has_picture(data: &[u8]) -> bool {
+    let mut found = false;
+    scan_start_codes(data, |_, code| {
+        if code == start_code::PICTURE {
+            found = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    found
 }
 
 /// One GOP unit, and when its first coded picture is meant to be shown.
@@ -121,8 +163,7 @@ impl Mpeg2GopStream {
     fn extract(&mut self, final_flush: bool) -> Vec<Mpeg2Gop> {
         let mut output = Vec::new();
         loop {
-            let sequences = starts(&self.buffer, start_code::SEQUENCE_HEADER);
-            let gops = starts(&self.buffer, start_code::GROUP);
+            let (sequences, gops) = boundaries(&self.buffer);
             let Some(&first_gop) = gops.first() else {
                 // Nothing to cut on yet. Anything before the first sequence
                 // header cannot be transcoded, so it is dropped rather than
@@ -134,6 +175,9 @@ impl Mpeg2GopStream {
                 }
                 break;
             };
+            // Everything the offsets above name moves down by this much once
+            // the bytes ahead of the sequence header are dropped.
+            let mut dropped = 0;
             if first_gop > 0 {
                 // Remember the sequence header this group was coded under, so
                 // the units after it can be given a copy.
@@ -141,22 +185,22 @@ impl Mpeg2GopStream {
                     self.sequence_prefix = self.buffer[sequence..first_gop].to_vec();
                     if sequence > 0 {
                         self.consume(sequence);
+                        dropped = sequence;
                     }
                 }
             }
-            let current_gops = starts(&self.buffer, start_code::GROUP);
-            if current_gops.len() < 2 {
+            let Some(&second_gop) = gops.get(1) else {
                 break;
-            }
-            let second_gop = current_gops[1];
+            };
             // A sequence header of its own makes a better boundary than the
             // group header behind it, since the next unit then needs no
             // re-injected copy.
-            let next_sequence = starts(&self.buffer, start_code::SEQUENCE_HEADER)
-                .into_iter()
+            let next_sequence = sequences
+                .iter()
                 .rev()
-                .find(|&at| at > current_gops[0] && at < second_gop);
-            let boundary = next_sequence.unwrap_or(second_gop);
+                .find(|&&at| at > first_gop && at < second_gop)
+                .map(|&at| at - dropped);
+            let boundary = next_sequence.unwrap_or(second_gop - dropped);
             let pts = self.pts_at(self.base);
             output.push(Mpeg2Gop {
                 data: self.buffer[..boundary].to_vec(),
@@ -172,7 +216,7 @@ impl Mpeg2GopStream {
                 self.prefix_length += self.sequence_prefix.len();
             }
         }
-        if final_flush && !starts(&self.buffer, start_code::PICTURE).is_empty() {
+        if final_flush && has_picture(&self.buffer) {
             let pts = self.pts_at(self.base);
             output.push(Mpeg2Gop {
                 data: std::mem::take(&mut self.buffer),
