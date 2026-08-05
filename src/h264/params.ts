@@ -54,8 +54,6 @@ export interface SpsConfig {
   maxDecFrameBuffering?: number;
   /** Pixel width:height ratio carried in VUI. */
   sampleAspectRatio?: { width: number; height: number };
-  /** Permit decoders to synthesize non-existing mid-grey reference pictures. */
-  gapsInFrameNumAllowed?: boolean;
 }
 
 export interface PpsConfig {
@@ -162,7 +160,7 @@ export function writeSps(cfg: SpsConfig): Uint8Array {
   w.ue(0); // pic_order_cnt_type 0: explicit POC, needed for B picture reordering
   w.ue(cfg.log2MaxPocLsbMinus4);
   w.ue(cfg.maxNumRefFrames);
-  w.flag(cfg.gapsInFrameNumAllowed ?? false);
+  w.flag(0); // gaps_in_frame_num_value_allowed_flag
   w.ue(g.mbWidth - 1);
   w.ue(g.mapUnits - 1);
   w.flag(cfg.frameMbsOnly);

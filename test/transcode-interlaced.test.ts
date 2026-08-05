@@ -35,8 +35,7 @@ describe("interlaced frame-picture transcoding", () => {
     expect(nalTypes.filter((type) => type === 1)).toHaveLength(
       result.picturesConverted,
     );
-    expect(nalTypes.filter((type) => type === 5)).toHaveLength(0);
-    expect(nalTypes.filter((type) => type === 6)).toHaveLength(1);
+    expect(nalTypes.filter((type) => type === 5)).toHaveLength(1);
   }, 15_000);
 
   it("can emit only source I pictures", () => {

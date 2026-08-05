@@ -217,7 +217,6 @@ export class IncrementalTranscoder {
             maxNumReorderFrames: 1,
             maxDecFrameBuffering: 4,
             sampleAspectRatio: sequenceSampleAspectRatio(first.sequence),
-            gapsInFrameNumAllowed: true,
           }),
           writePps({
             initQp: PPS_INIT_QP,
@@ -225,12 +224,8 @@ export class IncrementalTranscoder {
             scaling8x8Inter: scaling,
             chromaQpIndexOffset: CHROMA_QP_OFFSET,
           }),
-          // recovery_point(recovery_frame_cnt=0, exact_match_flag=1). The first
-          // content picture is independently decodable through its synthesized gap
-          // reference even though it is not an IDR picture.
-          Uint8Array.of(0, 0, 0, 1, 0x06, 0x06, 0x01, 0xc0, 0x80),
         ];
-    if (randomAccess)
+    if (!this.initialized || randomAccess)
       parts.push(
         writeGrayIdr({
           mbWidth: g.mbWidth,
@@ -338,7 +333,6 @@ export class IncrementalTranscoder {
           options,
           mbaff,
           stats,
-          markPreviousLongTerm: !this.initialized && picturesConverted === 0,
         }),
       );
       if (isReference) {
@@ -392,7 +386,6 @@ interface PictureContext {
   options: TranscodeOptions;
   mbaff: boolean;
   stats: Stats;
-  markPreviousLongTerm?: boolean;
 }
 
 /** How one macroblock is predicted, once the source's motion has been mapped. */
@@ -795,7 +788,6 @@ function writePicture(
         numRefIdxL1Active: ctx.layout.count,
         l1FirstShortTermDelta: ctx.layout.forceL1ShortTerm ? 1 : undefined,
         l0FirstLongTerm: ctx.layout.l0FirstLongTerm,
-        markPreviousLongTerm: ctx.markPreviousLongTerm,
       });
     }
     const writer = w!;
