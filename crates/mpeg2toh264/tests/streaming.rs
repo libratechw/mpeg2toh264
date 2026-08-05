@@ -8,8 +8,8 @@ use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{Fragment, Session};
 use support::{
-    adts_frame, adts_stream, mux_transport_stream, read_fixture, PesUnit, AUDIO_PID,
-    STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+    adts_frame, adts_frame_with_payload, adts_stream, mux_transport_stream, read_fixture, PesUnit,
+    AUDIO_PID, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
 
 /// Offset of the first `00 00 01 B8` group header.
@@ -112,6 +112,16 @@ fn holds_an_unfinished_group_back() {
 
 // --------------------------------------------------------------- ADTS framing
 
+fn packed_bits(bits: &str) -> Vec<u8> {
+    let mut out = vec![0; bits.len().div_ceil(8)];
+    for (at, value) in bits.bytes().enumerate() {
+        if value == b'1' {
+            out[at / 8] |= 1 << (7 - at % 8);
+        }
+    }
+    out
+}
+
 #[test]
 fn strips_adts_headers_without_touching_the_payload() {
     let expected: Vec<Vec<u8>> = (0..4)
@@ -148,12 +158,74 @@ fn reassembles_frames_split_across_chunks() {
 fn derives_the_audio_specific_config_from_the_header() {
     // 48 kHz stereo: object type 2, frequency index 3, channel configuration 2.
     let mut adts = AdtsStream::new();
-    let frames = adts.push(&adts_frame(3, 2, 16)).expect("frame decodes");
+    let mut frame = adts_frame(3, 2, 16);
+    frame[7] = 0x20; // id_syn_ele=CPE
+    let frames = adts.push(&frame).expect("frame decodes");
     let config = &frames[0].config;
     assert_eq!(config.audio_object_type, 2);
     assert_eq!(config.sample_rate, 48_000);
     assert_eq!(config.channel_count, 2);
     assert_eq!(config.audio_specific_config, [0x11, 0x90]);
+}
+
+#[test]
+fn maps_mono_sce_to_primary_audio_on_both_stereo_channels() {
+    // max_sfb=0 gives a valid empty ICS: SCE/tag 0, global_gain, ics_info,
+    // three absent-tool flags, END and byte alignment.
+    let frame = adts_frame_with_payload(3, 1, &[0, 0, 0, 7]);
+    let frames = AdtsStream::new().push(&frame).expect("mono frame decodes");
+    let config = &frames[0].config;
+    assert_eq!(config.channel_count, 2);
+    assert_eq!(config.audio_specific_config, [0x11, 0x90]);
+    assert_eq!(frames[0].data[0] >> 5, 1, "SCE became a CPE");
+}
+
+#[test]
+fn accepts_mono_to_dual_mono_changes_when_the_primary_sce_is_stable() {
+    let mono = adts_frame_with_payload(3, 1, &[0, 0, 0, 7]);
+    // Two empty SCEs (tags 0 and 1) followed by END.
+    let dual = adts_frame_with_payload(3, 2, &[0, 0, 0, 0, 0x10, 0, 0, 0x38]);
+    let mut adts = AdtsStream::new();
+    let first = adts.push(&mono).expect("mono frame");
+    let second = adts.push(&dual).expect("dual-mono frame");
+    assert_eq!(first[0].config, second[0].config);
+    assert_eq!(second[0].config.channel_count, 2);
+    assert_eq!(second[0].data.len(), 8, "the secondary SCE is discarded");
+    for bit in 0..22 {
+        let left = (second[0].data[(8 + bit) / 8] >> (7 - ((8 + bit) & 7))) & 1;
+        let right = (second[0].data[(30 + bit) / 8] >> (7 - ((30 + bit) & 7))) & 1;
+        assert_eq!(left, right, "ICS bit {bit} is duplicated");
+    }
+}
+
+#[test]
+fn reads_an_in_band_pce_when_adts_channel_configuration_is_zero() {
+    let payload = packed_bits(concat!(
+        "101", // ID_PCE
+        "0000",
+        "01",
+        "0011", // tag, AAC-LC, 48 kHz
+        "0001",
+        "0000",
+        "0000",
+        "00",
+        "000",
+        "0000", // element counts
+        "0",
+        "0",
+        "0", // no mixdown metadata
+        "0",
+        "0000",                          // one front SCE, tag 0
+        "000000",                        // byte alignment
+        "00000000",                      // no PCE comment
+        "00000000000000000000000000000", // empty SCE/tag 0 and ICS
+        "111",                           // ID_END
+    ));
+    let frame = adts_frame_with_payload(3, 0, &payload);
+    let frames = AdtsStream::new().push(&frame).expect("PCE frame decodes");
+    assert_eq!(frames[0].config.channel_count, 2);
+    assert_eq!(frames[0].config.audio_specific_config, [0x11, 0x90]);
+    assert_eq!(frames[0].data[0] >> 5, 1, "the PCE/SCE became a CPE");
 }
 
 #[test]

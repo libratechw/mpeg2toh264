@@ -259,6 +259,19 @@ pub fn adts_frame(sampling_frequency_index: u8, channel_count: u8, payload_len: 
         0xfc,
     ];
     frame.extend((0..payload_len).map(|i| (i % 251) as u8));
+    if channel_count == 2 && payload_len != 0 {
+        frame[7] |= 0x20; // Treat synthetic payloads as an opaque CPE.
+    }
+    frame
+}
+
+pub fn adts_frame_with_payload(
+    sampling_frequency_index: u8,
+    channel_count: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = adts_frame(sampling_frequency_index, channel_count, payload.len());
+    frame[7..].copy_from_slice(payload);
     frame
 }
 

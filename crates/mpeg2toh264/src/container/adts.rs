@@ -1,9 +1,10 @@
 //! ADTS framing for AAC-LC.
 //!
-//! The audio is never re-encoded: the payload bits are carried across
-//! untouched, and only the ADTS header comes off, since fragmented MP4 carries
-//! the same configuration in an `esds` box instead.
+//! Spectral Huffman data is never re-encoded. Stereo CPE payloads pass through;
+//! mono and dual-mono SCE payloads are repackaged as a CPE containing two copies
+//! of the primary channel, then the ADTS header is removed for fragmented MP4.
 
+use super::aac::sce_end;
 use crate::error::{bail, Result};
 
 /// `sampling_frequency_index` to sample rate (ISO/IEC 14496-3 Table 1.16).
@@ -46,6 +47,139 @@ pub struct AdtsStream {
     current_config: Option<AacConfig>,
 }
 
+fn bit(data: &[u8], at: usize) -> u8 {
+    (data[at >> 3] >> (7 - (at & 7))) & 1
+}
+
+/// Return the first channel element, skipping any byte-counted fill elements
+/// an encoder placed before it.
+fn skip_pce(data: &[u8], start: usize) -> Result<usize> {
+    let mut r = crate::bitreader::BitReader::at_bit(data, start + 3);
+    r.skip(4 + 2 + 4); // tag, object_type, sampling_frequency_index
+    let front = r.u(4);
+    let side = r.u(4);
+    let back = r.u(4);
+    let lfe = r.u(2);
+    let assoc = r.u(3);
+    let cc = r.u(4);
+    if r.flag() {
+        r.skip(4);
+    } // mono_mixdown_element_number
+    if r.flag() {
+        r.skip(4);
+    } // stereo_mixdown_element_number
+    if r.flag() {
+        r.skip(3);
+    } // matrix_mixdown_idx, pseudo_surround_enable
+    r.skip((front + side + back) * 5 + (lfe + assoc) * 4 + cc * 5);
+    r.align_to_byte();
+    let comments = r.u(8);
+    r.skip(comments * 8);
+    if r.bits_left() < 0 {
+        bail!("AAC program_config_element overruns the raw_data_block");
+    }
+    Ok(r.bit_pos())
+}
+
+fn first_channel_element(data: &[u8]) -> Result<(u8, usize, Vec<(usize, usize)>)> {
+    let mut at = 0;
+    let mut pces = Vec::new();
+    loop {
+        if at + 7 > data.len() * 8 {
+            bail!("AAC raw_data_block ended before a channel element");
+        }
+        let id = (bit(data, at) << 2) | (bit(data, at + 1) << 1) | bit(data, at + 2);
+        if id == 0 || id == 1 {
+            return Ok((id, at, pces));
+        }
+        if id == 5 {
+            let end = skip_pce(data, at)?;
+            pces.push((at, end));
+            at = end;
+            continue;
+        }
+        if id != 6 {
+            bail!("unsupported AAC element {id} before the channel element");
+        }
+        at += 3;
+        let mut count = (0..4).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
+        at += 4;
+        if count == 15 {
+            let extra = (0..8).fold(0usize, |v, n| (v << 1) | bit(data, at + n) as usize);
+            at += 8;
+            count += extra.saturating_sub(1);
+        }
+        at += count * 8;
+        if at + 7 > data.len() * 8 {
+            bail!("AAC FIL element overruns the raw_data_block");
+        }
+    }
+}
+
+struct Bits {
+    data: Vec<u8>,
+    len: usize,
+}
+
+impl Bits {
+    fn push(&mut self, value: u8) {
+        if self.len & 7 == 0 {
+            self.data.push(0);
+        }
+        if value != 0 {
+            self.data[self.len >> 3] |= 1 << (7 - (self.len & 7));
+        }
+        self.len += 1;
+    }
+    fn value(&mut self, n: usize, value: u32) {
+        for shift in (0..n).rev() {
+            self.push(((value >> shift) & 1) as u8);
+        }
+    }
+    fn copy(&mut self, source: &[u8], start: usize, end: usize) {
+        for at in start..end {
+            self.push(bit(source, at));
+        }
+    }
+}
+
+/// Turn SCE or SCE+SCE (dual mono) into a CPE with two identical independent
+/// channel streams. The first SCE is the main service; no spectral value is
+/// decoded or re-encoded.
+fn primary_sce_to_cpe(
+    data: &[u8],
+    sce: usize,
+    frequency_index: u8,
+    pces: &[(usize, usize)],
+) -> Result<Vec<u8>> {
+    let primary_end = sce_end(data, sce, frequency_index)?;
+    let mut tail = primary_end;
+    if tail + 7 <= data.len() * 8
+        && bit(data, tail) == 0
+        && bit(data, tail + 1) == 0
+        && bit(data, tail + 2) == 0
+    {
+        tail = sce_end(data, tail, frequency_index)?; // discard the sub service
+    }
+    let mut out = Bits {
+        data: Vec::with_capacity(data.len()),
+        len: 0,
+    };
+    let mut prefix = 0;
+    for &(start, end) in pces {
+        out.copy(data, prefix, start);
+        prefix = end;
+    }
+    out.copy(data, prefix, sce);
+    out.value(3, 1); // ID_CPE
+    out.copy(data, sce + 3, sce + 7); // element_instance_tag
+    out.push(0); // common_window: each copy carries its own ics_info
+    out.copy(data, sce + 7, primary_end);
+    out.copy(data, sce + 7, primary_end);
+    out.copy(data, tail, data.len() * 8);
+    Ok(out.data)
+}
+
 impl AdtsStream {
     pub fn new() -> Self {
         Self::default()
@@ -78,9 +212,6 @@ impl AdtsStream {
             let Some(&sample_rate) = SAMPLE_RATES.get(sampling_frequency_index as usize) else {
                 bail!("unsupported ADTS sampling_frequency_index {sampling_frequency_index}");
             };
-            if channel_count == 0 {
-                bail!("ADTS program_config_element channel layout is unsupported");
-            }
             if raw_blocks != 0 {
                 bail!("ADTS frames with multiple raw data blocks are unsupported");
             }
@@ -91,24 +222,55 @@ impl AdtsStream {
                 break;
             }
 
+            // A mono service and ARIB dual-mono both use SCEs. Repackage the
+            // primary SCE as both independent streams of a CPE, so every mode
+            // has the same channel_configuration=2 ASC. Genuine stereo CPEs
+            // pass through unchanged.
+            let raw_data = &self.pending[at + header_length..at + frame_length];
+            let (first_element, channel_start, pces) = first_channel_element(raw_data)?;
+            let sce_service = channel_count == 1 || first_element == 0;
+            let output_channels = if sce_service || channel_count == 0 {
+                2
+            } else {
+                channel_count
+            };
+            let audio_specific_config = if sce_service || channel_count == 0 {
+                [
+                    (audio_object_type << 3) | (sampling_frequency_index >> 1),
+                    ((sampling_frequency_index & 1) << 7) | (2 << 3),
+                ]
+            } else {
+                [
+                    (audio_object_type << 3) | (sampling_frequency_index >> 1),
+                    ((sampling_frequency_index & 1) << 7) | (channel_count << 3),
+                ]
+            };
             let config = AacConfig {
                 audio_object_type,
                 sample_rate,
                 sampling_frequency_index,
-                channel_count,
-                audio_specific_config: [
-                    (audio_object_type << 3) | (sampling_frequency_index >> 1),
-                    ((sampling_frequency_index & 1) << 7) | (channel_count << 3),
-                ],
+                channel_count: output_channels,
+                audio_specific_config,
             };
             if let Some(current) = &self.current_config {
-                if current.sample_rate != sample_rate || current.channel_count != channel_count {
-                    bail!("ADTS configuration changed within the stream");
+                if current.sample_rate != sample_rate
+                    || current.audio_specific_config != config.audio_specific_config
+                {
+                    bail!(
+                        "ADTS configuration changed within the stream ({:?} -> {:?}, element {})",
+                        current.audio_specific_config,
+                        config.audio_specific_config,
+                        first_element
+                    );
                 }
             }
             self.current_config = Some(config.clone());
             output.push(AacFrame {
-                data: self.pending[at + header_length..at + frame_length].to_vec(),
+                data: if sce_service {
+                    primary_sce_to_cpe(raw_data, channel_start, sampling_frequency_index, &pces)?
+                } else {
+                    raw_data.to_vec()
+                },
                 config,
             });
             at += frame_length;
