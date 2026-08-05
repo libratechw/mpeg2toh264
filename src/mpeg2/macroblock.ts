@@ -341,6 +341,11 @@ function makeSkipped(
   } else if (state.prev) {
     skipped.flags =
       state.prev.flags & (MBFlag.MOTION_FORWARD | MBFlag.MOTION_BACKWARD);
+    // A skipped B macroblock reuses the previous macroblock's complete motion
+    // prediction, including whether its two vectors are field-formatted.
+    // Dropping motionType made the transcoder interpret field-line vertical
+    // components as frame-line vectors throughout a skipped run.
+    skipped.motionType = state.prev.motionType;
     skipped.mv.set(state.prev.mv);
     skipped.fieldSelect.set(state.prev.fieldSelect);
     skipped.mvCount = state.prev.mvCount;
