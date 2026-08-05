@@ -10,6 +10,7 @@ import {
   Deinterlacer,
   supportsDeinterlace,
   type DeinterlacerOptions,
+  type DeinterlaceStats,
 } from "./deinterlace.js";
 import { MseSink } from "./mse.js";
 import {
@@ -72,6 +73,11 @@ export interface Mpeg2TsPlayerEventMap {
   statechange: CustomEvent<{ state: PlayerState }>;
   progress: CustomEvent<Progress>;
   stats: CustomEvent<Stats>;
+  /**
+   * How the deinterlacer is getting on, about once a second while frames are
+   * arriving. Only while it is on, and only on a browser that can run it.
+   */
+  deinterlace: CustomEvent<DeinterlaceStats>;
   /**
    * The input turned out to be one that can be seeked in, and this is how long
    * it is. Until this arrives -- and for a live stream it never does -- the
@@ -207,12 +213,18 @@ export class Mpeg2TsPlayer extends EventTarget {
       return;
     }
     if (this.#destroyed || !supportsDeinterlace()) return;
-    const options = this.#options.deinterlace;
+    const options =
+      typeof this.#options.deinterlace === "object"
+        ? this.#options.deinterlace
+        : {};
     try {
-      this.#deinterlacer ??= new Deinterlacer(
-        this.video,
-        typeof options === "object" ? options : {},
-      );
+      this.#deinterlacer ??= new Deinterlacer(this.video, {
+        ...options,
+        onStats: (stats) => {
+          options.onStats?.(stats);
+          this.#emit("deinterlace", stats);
+        },
+      });
       this.#deinterlacer.start();
     } catch (error) {
       // Without it the element shows its own picture, which is worth saying

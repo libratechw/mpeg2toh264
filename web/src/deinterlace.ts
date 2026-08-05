@@ -27,6 +27,9 @@ const CONTINUOUS_SECONDS = 0.5;
 /** prev, cur and next: everything the filter reads. */
 const HISTORY = 3;
 
+/** How often the filter says how it is getting on, in milliseconds. */
+const STATS_INTERVAL_MS = 1000;
+
 const VERTEX_SHADER = `#version 300 es
 void main() {
   // One triangle over the whole viewport, from the vertex index alone. There
@@ -35,6 +38,53 @@ void main() {
   gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
 }
 `;
+
+/**
+ * How the filter is getting on, and where it is being let down.
+ *
+ * A deinterlacer is only as good as the frames it is given. yadif reads the
+ * frame either side of the one it is filtering, and every count here that is
+ * not `filtered` is a way of not having them: a frame the callback never saw
+ * leaves the two neighbours two frames apart, and one filtered against a copy
+ * of itself has no motion to measure at all. Both show up as combing that
+ * comes and goes, which is worth being able to point at rather than guess at.
+ */
+export interface DeinterlaceStats {
+  /** Frames filtered with a real frame on either side: the good case. */
+  filtered: number;
+  /**
+   * Frames the element presented that the filter never saw, counted from the
+   * gaps in `presentedFrames`. The neighbours of the frames either side of a
+   * gap are further apart in time than the filter believes, so its idea of
+   * what moved is wrong. A page that sees this climbing is asking the filter
+   * to keep up with more than it can.
+   */
+  missed: number;
+  /**
+   * Frames the browser decoded and threw away without presenting, as the
+   * element itself counts them. This is the machine being behind rather than
+   * this filter: it happens with the deinterlacer off as well.
+   */
+  dropped: number;
+  /**
+   * Frames filtered with a copy of themselves standing in for a neighbour,
+   * which is the start of a stream, the frame a seek lands on, and the last
+   * frame before playback stops. Expected in ones and twos; a stream of them
+   * means the held frames keep being thrown away.
+   */
+  degraded: number;
+  /** Times the held frames were dropped as stale: seeks, and stream changes. */
+  discontinuities: number;
+  /** Frames presented per second over the last report. */
+  fps: number;
+  /**
+   * What one frame costs, in milliseconds, averaged over the last report:
+   * uploading it and drawing the filtered one. This is the time on the page's
+   * own thread -- the GPU's part of the draw is not in it -- so it is the
+   * measure of what the deinterlacer takes away from everything else.
+   */
+  frameMs: number;
+}
 
 export interface DeinterlacerOptions {
   /**
@@ -48,6 +98,12 @@ export interface DeinterlacerOptions {
    * allows. This is yadif's default and its `nospatial` mode turns it off.
    */
   spatialCheck?: boolean;
+  /**
+   * Called about once a second while frames are arriving, and not at all while
+   * nothing is playing -- there is nothing to say about a filter that is not
+   * being asked for anything.
+   */
+  onStats?(stats: DeinterlaceStats): void;
 }
 
 /** Whether this browser has the two things the deinterlacer is built on. */
@@ -100,11 +156,22 @@ export class Deinterlacer {
   #handle: number | null = null;
   #running = false;
   #lost = false;
+  readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
+  /** Everything the next report is counted from. See DeinterlaceStats. */
+  #stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0 };
+  /** `presentedFrames` of the last frame the callback saw; 0 before any. */
+  #lastPresented = 0;
+  #reportedAt = 0;
+  /** When the last frame the filter took arrived, to see the gaps between. */
+  #lastFrameAt = 0;
+  #framesSinceReport = 0;
+  #msSinceReport = 0;
 
   constructor(video: HTMLVideoElement, options: DeinterlacerOptions = {}) {
     this.#video = video;
     this.#topFieldFirst = options.topFieldFirst ?? true;
     this.#spatialCheck = options.spatialCheck ?? true;
+    this.#onStats = options.onStats;
     this.canvas = document.createElement("canvas");
     // Where it goes is worked out in #layout; the element underneath keeps
     // every click, since all this does is cover it.
@@ -162,6 +229,7 @@ export class Deinterlacer {
   start(): void {
     if (this.#running || this.#lost) return;
     this.#running = true;
+    this.#resetStats();
     this.#mount();
     this.#request();
   }
@@ -219,13 +287,75 @@ export class Deinterlacer {
       // the neighbours are then further apart than they should be, which is
       // worth less than filtering nothing at all.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
-      if (elapsed < 0 || elapsed > CONTINUOUS_SECONDS) this.#frames = 0;
+      const stale = elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
+      if (stale) {
+        this.#frames = 0;
+        this.#stats.discontinuities++;
+      }
+      this.#count(metadata.presentedFrames, stale);
+      // The same picture presented again, which the compositor does whenever
+      // nothing new has been decoded: paused, stalled, or stopped at the end
+      // of a stream, and at the display's rate rather than the video's.
+      // Filtering it again would spend a frame's work on a canvas that
+      // already holds the answer, and taking it into the ring would leave the
+      // filter holding one moment twice over and calling it motion.
+      if (this.#frames > 0 && metadata.mediaTime === this.#lastMediaTime) {
+        this.#request();
+        return;
+      }
       this.#lastMediaTime = metadata.mediaTime;
+      const at = performance.now();
+      // Frames stopped arriving for a while -- a pause, a stall, a tab in the
+      // background -- and a rate averaged over time nothing was asked of the
+      // filter says nothing about it. Begin the interval at this frame.
+      if (at - this.#lastFrameAt > STATS_INTERVAL_MS) {
+        this.#reportedAt = at;
+        this.#framesSinceReport = 0;
+        this.#msSinceReport = 0;
+      }
+      this.#lastFrameAt = at;
       this.#push();
       this.#render(false);
+      this.#msSinceReport += performance.now() - at;
+      this.#framesSinceReport++;
+      this.#report(at);
     }
     this.#request();
   };
+
+  /**
+   * Account for the frames between this one and the last one seen.
+   *
+   * There is no event for a frame the callback was not run for; the only sign
+   * of one is that the count of frames the compositor has taken went up by
+   * more than one. Frames thrown away either side of a discontinuity are not
+   * counted: the held frames were being dropped anyway, and a seek presents
+   * what it passes over.
+   */
+  #count(presented: number, stale: boolean): void {
+    if (this.#lastPresented !== 0 && !stale) {
+      this.#stats.missed += Math.max(0, presented - this.#lastPresented - 1);
+    }
+    this.#lastPresented = presented;
+  }
+
+  #report(at: number): void {
+    if (!this.#onStats) return;
+    const elapsed = at - this.#reportedAt;
+    if (elapsed < STATS_INTERVAL_MS) return;
+    const frames = this.#framesSinceReport;
+    this.#onStats({
+      ...this.#stats,
+      // The element's own count of what its decoder could not keep up with,
+      // which is the machine being behind rather than this filter.
+      dropped: this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
+      fps: (frames * 1000) / elapsed,
+      frameMs: frames === 0 ? 0 : this.#msSinceReport / frames,
+    });
+    this.#reportedAt = at;
+    this.#framesSinceReport = 0;
+    this.#msSinceReport = 0;
+  }
 
   /** Take the newest frame into the ring. */
   #push(): void {
@@ -256,6 +386,8 @@ export class Deinterlacer {
    */
   #render(flush: boolean): void {
     if (this.#frames === 0 || this.#lost) return;
+    if (this.#frames === HISTORY && !flush) this.#stats.filtered++;
+    else this.#stats.degraded++;
     const gl = this.#gl;
     const newest = this.#head;
     const older = (this.#head + HISTORY - 1) % HISTORY;
@@ -404,8 +536,20 @@ export class Deinterlacer {
   #onEmptied = (): void => {
     this.#frames = 0;
     this.#lastMediaTime = 0;
+    // The counts belong to the stream that has just gone; the next one starts
+    // its own. The element resets its own dropped count for the same reason.
+    this.#resetStats();
     this.canvas.style.visibility = "hidden";
   };
+
+  #resetStats(): void {
+    this.#stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0 };
+    this.#lastPresented = 0;
+    this.#reportedAt = 0;
+    this.#lastFrameAt = 0;
+    this.#framesSinceReport = 0;
+    this.#msSinceReport = 0;
+  }
 
   #onFlush = (): void => {
     if (this.#running) this.#render(true);

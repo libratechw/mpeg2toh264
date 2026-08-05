@@ -11,7 +11,7 @@
 export { Mpeg2TsPlayer, supportsWorkerMediaSource } from "./player.js";
 export type { Mpeg2TsPlayerEventMap, Mpeg2TsPlayerOptions } from "./player.js";
 export { Deinterlacer, supportsDeinterlace } from "./deinterlace.js";
-export type { DeinterlacerOptions } from "./deinterlace.js";
+export type { DeinterlaceStats, DeinterlacerOptions } from "./deinterlace.js";
 export {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,

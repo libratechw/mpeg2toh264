@@ -21,11 +21,14 @@ const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const details = document.querySelector<HTMLElement>("#details")!;
 const fps = document.querySelector<HTMLElement>("#fps")!;
+const deinterlaceStats =
+  document.querySelector<HTMLElement>("#deinterlace-stats")!;
 
 /** How many steps the seek bar divides the video into. */
 const SEEK_STEPS = 1000;
 
 const IDLE_FPS = "変換FPS: 瞬間 — · トータル —";
+const IDLE_DEINTERLACE = "デインタレース: —";
 
 const STATES: Record<PlayerState, string> = {
   idle: "MPEG-2 TSのURLを指定するか、ファイルを選択してください。",
@@ -126,6 +129,18 @@ function createPlayer(): Mpeg2TsPlayer {
     if (audioFrames > 0) counts += ` · ${audioFrames} AAC frames`;
     setDetails();
   });
+  // The counts that are not `filtered` are the filter working on frames whose
+  // neighbours are not what it takes them for, which is what combing that
+  // comes and goes looks like from here.
+  created.addEventListener("deinterlace", (event) => {
+    const { filtered, missed, dropped, degraded, discontinuities } =
+      event.detail;
+    const { fps: rate, frameMs } = event.detail;
+    deinterlaceStats.textContent =
+      `デインタレース: ${rate.toFixed(1)}fps · ${frameMs.toFixed(1)}ms/フレーム` +
+      ` · 適用 ${filtered} · 取りこぼし ${missed} · 端 ${degraded}` +
+      ` · 不連続 ${discontinuities} · デコーダー落ち ${dropped}`;
+  });
   created.addEventListener("error", (event) =>
     setStatus(event.detail.error.message, true),
   );
@@ -148,6 +163,7 @@ function play(
   seek.disabled = true;
   seek.value = "0";
   fps.textContent = IDLE_FPS;
+  deinterlaceStats.textContent = IDLE_DEINTERLACE;
   setDetails();
   setPlayhead();
   // Failures already arrive as an error event, which is what writes the
