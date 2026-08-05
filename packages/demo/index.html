@@ -16,16 +16,21 @@
         align-items: center;
         gap: 0.5em;
       }
-      /* The bar and what is buffered under it cover the same seconds, so they
-         are the same width and one sits under the other. */
-      #timeline {
-        display: flex;
-        flex-direction: column;
+      #seek {
         flex: 1 1 20em;
+        min-width: 0;
       }
-      #seek,
-      #buffered {
-        width: 100%;
+      #playpause {
+        width: 3em;
+      }
+      #url-form {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5em;
+      }
+      #url {
+        flex: 1 1 30em;
       }
       /* On the screen, the controls keep their row at the bottom and the
          picture takes everything they leave. The first child is the element
@@ -63,14 +68,11 @@
         <div id="stage">
           <video id="video" controls playsinline></video>
           <div id="playback">
-            <button id="playpause" type="button" disabled>再生</button>
+            <button id="playpause" type="button" aria-label="再生" title="再生" disabled>▶</button>
             <button id="back" type="button" disabled>10秒戻る</button>
             <button id="forward" type="button" disabled>10秒進む</button>
-            <div id="timeline">
-              <input id="seek" type="range" min="0" max="1000" step="1" value="0" disabled
-                     aria-label="再生位置" />
-              <progress id="buffered" max="1000" value="0" aria-label="変換済みの範囲">0%</progress>
-            </div>
+            <input id="seek" type="range" min="0" max="1000" step="1" value="0" disabled
+                   aria-label="再生位置" />
             <output id="time" for="seek">0:00</output>
             <label for="volume">音量</label>
             <input id="volume" type="range" min="0" max="100" step="1" value="100" />
@@ -111,7 +113,7 @@
         <ul>
           <li>
             <label>
-              <input id="deinterlace" type="checkbox" checked />
+              <input id="deinterlace" type="checkbox" />
               デインタレース（yadif）
             </label>
           </li>

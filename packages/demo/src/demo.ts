@@ -22,7 +22,6 @@ const playPause = document.querySelector<HTMLButtonElement>("#playpause")!;
 const back = document.querySelector<HTMLButtonElement>("#back")!;
 const forward = document.querySelector<HTMLButtonElement>("#forward")!;
 const seek = document.querySelector<HTMLInputElement>("#seek")!;
-const bufferedBar = document.querySelector<HTMLProgressElement>("#buffered")!;
 const time = document.querySelector<HTMLElement>("#time")!;
 const volume = document.querySelector<HTMLInputElement>("#volume")!;
 const mute = document.querySelector<HTMLButtonElement>("#mute")!;
@@ -236,7 +235,6 @@ function play(
   scan = "";
   duration = null;
   seek.value = "0";
-  bufferedBar.value = 0;
   fps.textContent = IDLE_FPS;
   deinterlaceStats.textContent = IDLE_DEINTERLACE;
   setDetails();
@@ -277,17 +275,10 @@ function setPlayhead() {
   forward.disabled = !movable;
   if (!movable) {
     seek.value = "0";
-    bufferedBar.value = 0;
     return;
   }
   if (!scrubbing)
     seek.value = String(Math.round((current / total) * SEEK_STEPS));
-  const ranges = video.buffered;
-  const buffered = ranges.length ? ranges.end(ranges.length - 1) : 0;
-  bufferedBar.value = Math.min(
-    SEEK_STEPS,
-    Math.round((buffered / total) * SEEK_STEPS),
-  );
 }
 
 function togglePlay() {
@@ -319,7 +310,10 @@ function setVolume(level: number) {
  * already playing.
  */
 function syncPlayPause() {
-  playPause.textContent = video.paused ? "再生" : "一時停止";
+  const action = video.paused ? "再生" : "一時停止";
+  playPause.textContent = video.paused ? "▶" : "⏸";
+  playPause.ariaLabel = action;
+  playPause.title = action;
   playPause.disabled = video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA;
 }
 
@@ -341,8 +335,7 @@ video.addEventListener("emptied", setPlayhead);
 video.addEventListener("timeupdate", setPlayhead);
 video.addEventListener("seeked", setPlayhead);
 video.addEventListener("durationchange", setPlayhead);
-// What has been converted keeps growing behind the playhead, and this is the
-// event that says so.
+// A growing buffer can make a stream seekable before its duration is known.
 video.addEventListener("progress", setPlayhead);
 
 // Dragging moves the clock only. Seeking on every step of it would have the
@@ -519,12 +512,12 @@ if (!supportsDeinterlace()) {
       survives === null ? "測定不能" : `残存率 ${survives.toFixed(2)}`;
     const detail = `（${left} · ${tookMs.toFixed(0)}ms）`;
     if (error) {
-      probe.textContent = `判定できず: ${error}${detail} — yadifは有効のまま`;
+      probe.textContent = `判定できず: ${error}${detail} — yadifは無効のまま`;
     } else if (deinterlaces) {
       probe.textContent = `デコーダーが自動でデインタレース${detail} — yadifは無効`;
       disableDeinterlace("（デコーダーが自動でデインタレースします）");
     } else {
-      probe.textContent = `自動デインタレースなし${detail} — yadifを使います`;
+      probe.textContent = `自動デインタレースなし${detail} — 必要ならyadifを有効にできます`;
     }
   });
 }
