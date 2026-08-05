@@ -44,8 +44,12 @@
         background: black;
       }
       #stage:fullscreen > #picture {
-        width: 100%;
-        height: 100%;
+        position: absolute;
+        inset: 0;
+        width: min(100vw, var(--picture-width, 177.77778vh));
+        height: auto;
+        margin: auto;
+        aspect-ratio: var(--picture-aspect, 1.7777778);
       }
       #stage:fullscreen #picture > div {
         display: block !important;

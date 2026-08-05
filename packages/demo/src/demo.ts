@@ -345,6 +345,14 @@ function setPlayhead() {
     seek.value = String(Math.round((current / total) * SEEK_STEPS));
 }
 
+function syncPictureAspect(): void {
+  if (video.videoWidth > 0 && video.videoHeight > 0) {
+    const aspect = video.videoWidth / video.videoHeight;
+    picture.style.setProperty("--picture-aspect", String(aspect));
+    picture.style.setProperty("--picture-width", `${aspect * 100}vh`);
+  }
+}
+
 function togglePlay() {
   if (video.paused) void video.play().catch(() => {});
   else video.pause();
@@ -402,6 +410,7 @@ video.addEventListener("emptied", setPlayhead);
 video.addEventListener("timeupdate", setPlayhead);
 video.addEventListener("seeked", setPlayhead);
 video.addEventListener("durationchange", setPlayhead);
+video.addEventListener("resize", syncPictureAspect);
 // A growing buffer can make a stream seekable before its duration is known.
 video.addEventListener("progress", setPlayhead);
 
