@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mpeg2toh264", "crates/mpeg2toh264-cli"]
+members = ["crates/mpeg2toh264", "crates/mpeg2toh264-cli", "crates/mpeg2toh264-wasm"]
 
 [workspace.package]
 version = "0.1.0"

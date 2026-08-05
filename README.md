@@ -9,6 +9,7 @@ Cargo.toml            # Cargoワークスペース
 crates/
   mpeg2toh264/        # コアライブラリ（mpeg2 / h264 / container / session）
   mpeg2toh264-cli/    # CLI
+  mpeg2toh264-wasm/   # Sessionのwasm-bindgenラッパー
 testdata/             # 合成MPEG-2テストストリーム
 tools/                # テーブル生成・解析スクリプト（Python）
 web/                  # ブラウザMSEプレイヤー（後述、現状ビルド不可）
@@ -56,6 +57,28 @@ cargo run --release --example dump_session -- input.ts output.mp4
 ```
 
 AAC-LC音声は再エンコードせず、ADTSヘッダーだけを外して音声トラックへmuxします。映像と音声はPESのタイムスタンプが示す実際の間隔で配置されるので、放送でよくある数百ミリ秒のずれがそのまま保たれます。
+
+## WebAssembly
+
+`crates/mpeg2toh264-wasm`は`Session`をそのまま包んだだけの層です。フラグメントはプレーンなJSオブジェクトで返るので`free()`は要らず、`data`は転送可能な`Uint8Array`です。
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli
+./tools/build-wasm.sh            # web/wasm/ へ出力
+```
+
+```ts
+import init, { Session } from './wasm/mpeg2toh264_wasm.js';
+
+const session = new Session();
+for (const fragment of session.push(chunk)) {
+  if (fragment.kind === 'init') openSourceBuffer(fragment.mimeCodec, fragment.data);
+  else append(fragment.data, fragment.start, fragment.randomAccess);
+}
+```
+
+wasm-bindgen CLIのバージョンは`Cargo.lock`のcrateと一致している必要があります（ビルドスクリプトが確認します）。
 
 ## テスト
 

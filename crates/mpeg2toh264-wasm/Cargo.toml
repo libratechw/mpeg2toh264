@@ -1,0 +1,19 @@
+[package]
+name = "mpeg2toh264-wasm"
+description = "WebAssembly bindings for the mpeg2toh264 streaming transcoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+mpeg2toh264.workspace = true
+js-sys = "0.3"
+wasm-bindgen = "0.2"
