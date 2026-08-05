@@ -1,8 +1,8 @@
 # mpeg2toh264
 
-MPEG-2 Videoを完全にデコードせずH.264/AVCへトランスコードする実装
+MPEG-2を完全にデコードせずH.264/AVCへトランスコードする実装
 
-一般的なトランスコードはMPEG-2をデコード→H.264エンコーダーで動き補償からやり直す、という処理を行う一方で、この実装はMPEG-2がすでに持つ量子化係数、マクロブロック種別、動きベクトル、ピクチャ参照関係を読み取り、対応するH.264のビットストリームへ直接変換します。輝度の通常の変換処理には逆DCT、動き補償、参照フレームバッファの処理はありません。
+一般的なトランスコードはMPEG-2をデコード→H.264エンコーダーで動き補償からやり直す、という処理を行う一方で、この実装はMPEG-2がすでに持つ量子化係数、マクロブロック種別、動きベクトル、ピクチャ参照関係を読み取り、対応するH.264のビットストリームへ直接変換します。輝度の通常の変換処理にはIDCT、動き補償、参照フレームバッファの処理はありません。
 
 汎用H.264エンコーダーではなく、元の圧縮の構造を再利用しMPEG-2放送映像をブラウザーなどH.264デコーダーを前提とする環境で低い処理負荷で再生するための実装です。
 
@@ -91,39 +91,6 @@ AACのスペクトルデータは再符号化しません。通常のステレ�
 - 破損スライス、参照が揃わない先頭Bピクチャ、片方だけのフィールドピクチャは読み飛ばす
 - 出力は再量子化による非可逆変換であり、小数画素予測には上表の近似がある
 
-## Rust API
-
-一括変換には`transcode`、GOP単位の処理には`IncrementalTranscoder`を使います。
-
-```rust
-use mpeg2toh264::{transcode, TranscodeOptions};
-
-let result = transcode(&mpeg2_es, TranscodeOptions::default())?;
-std::fs::write("output.h264", result.bitstream)?;
-println!("converted: {}, skipped: {}",
-         result.pictures_converted, result.pictures_skipped);
-```
-
-`Session`はブラウザーとストリーミング処理向けのインターフェースです。TSのチャンクを渡すと、MSEの`SourceBuffer`へ追加できるinitセグメントとGOP単位のfMP4フラグメント、字幕などのprivate PESイベントを返します。demux、GOP分割、変換、AAC処理、mux、PTSのラップアラウンドを含むタイムライン調整は内部で行います。
-
-```rust
-let mut session = Session::default();
-for chunk in input.chunks(1 << 20) {
-    for fragment in session.push(chunk)? {
-        match fragment {
-            Fragment::Init { data, mime_codec } => open(&mime_codec, data),
-            Fragment::Media { data, start, random_access, interlacing, .. } =>
-                append(data, start, random_access, interlacing),
-            Fragment::PrivateStream { stream_id, pid, data, pts } =>
-                dispatch(stream_id, pid, data, pts),
-        }
-    }
-}
-for fragment in session.finish()? { /* 同様に処理 */ }
-```
-
-ファイルの途中から再開する場合は、最初のセッションの`origin_ticks()`を`Session::anchored`へ渡します。フラグメントの`start`がファイル全体の時刻を維持するため、バイト範囲から読み直したデータを同じMSEタイムラインへ追加できます。`first_pts()`と`last_pts()`は、TSの小さなバイト範囲からシーク位置と再生時間を見積もるためのヘルパーです。
-
 ## WebAssemblyとMSEプレイヤー
 
 `crates/mpeg2toh264-wasm`は`Session`の`wasm-bindgen`ラッパーです。`packages/player`は取得、Worker内変換、MSEバッファー管理、範囲指定シークをまとめたMSEプレイヤー、`packages/yadif`はインターレース映像用の差し替え可能なWebGLデインターレーサーです。
@@ -149,7 +116,7 @@ npm run web:dev
 
 プレイヤーは特定のデインターレーサーへ依存しません。デモは`@mpeg2toh264/yadif`を注入し、MPEG-2由来のインターレース情報に従って処理します。private PESはMP4へ入れずイベントとして公開し、デモでは`aribb24.js`へ渡して字幕・文字スーパーを重ねます。
 
-## 構成と検証
+## 構成
 
 ```text
 crates/mpeg2toh264/       MPEG-2解析、H.264出力、コンテナー、Session
@@ -162,11 +129,6 @@ testdata/                 テストデータ
 tools/                    テーブル生成、WASMビルド、テストデータ作成
 ```
 
-```bash
-cargo test --release
-npm run typecheck
-```
-
-E2Eは全テストデータのAnnex B出力をハッシュで固定し、SPS/PPSは出力側とは独立したパーサーで読み戻します。フィールド順、TS分離、AACチャンネル構成、フラグメントのタイムライン、途中から再開するセッションも個別に検証しています。
+各ライブラリのインターフェースは、それぞれのディレクトリにあるREADMEに記載しています。
 
 Rustクレート、CLI、プレイヤーはMITライセンスです。`packages/yadif`はFFmpeg由来部分を含むためLGPL-2.1-or-laterです。
