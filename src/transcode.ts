@@ -72,8 +72,17 @@ export interface TranscodeResult {
   bitstream: Uint8Array;
   picturesConverted: number;
   picturesSkipped: number;
-  /** Macroblocks whose half-sample position could not be mapped exactly. */
-  inexactVectors: number;
+  /** Inter macroblocks whose motion is reproduced exactly, luma and chroma. */
+  integerVectors: number;
+  /**
+   * Inter macroblocks at a half sample on one axis. Luma is exact, but chroma
+   * lands a quarter of a chroma sample off: MPEG-2 truncates the halved vector
+   * (clause 7.6.3.7) while H.264 derives chroma motion at eighth-sample
+   * precision from the luma vector, and there is no way to set them apart.
+   */
+  singleAxisHalfVectors: number;
+  /** Inter macroblocks at a half sample on both axes, where luma is approximate too. */
+  bothAxisHalfVectors: number;
   intraMacroblocks: number;
   interMacroblocks: number;
 }
@@ -136,7 +145,9 @@ export function transcode(
   const stats = {
     picturesConverted: 0,
     picturesSkipped: 0,
-    inexactVectors: 0,
+    integerVectors: 0,
+    singleAxisHalfVectors: 0,
+    bothAxisHalfVectors: 0,
     intraMacroblocks: 0,
     interMacroblocks: 0,
   };
@@ -186,7 +197,9 @@ interface PictureContext {
   havePrevPicture: boolean;
   options: TranscodeOptions;
   stats: {
-    inexactVectors: number;
+    integerVectors: number;
+    singleAxisHalfVectors: number;
+    bothAxisHalfVectors: number;
     intraMacroblocks: number;
     interMacroblocks: number;
   };
@@ -328,9 +341,16 @@ function writePicture(
             exact: true,
           }
         : mapForwardVector(source?.mv[0] ?? 0, source?.mv[1] ?? 0);
-      if (!mapped.exact) ctx.stats.inexactVectors++;
-      if (intra) ctx.stats.intraMacroblocks++;
-      else ctx.stats.interMacroblocks++;
+      if (intra) {
+        ctx.stats.intraMacroblocks++;
+      } else {
+        ctx.stats.interMacroblocks++;
+        const fx = (source?.mv[0] ?? 0) & 1;
+        const fy = (source?.mv[1] ?? 0) & 1;
+        if (fx === 0 && fy === 0) ctx.stats.integerVectors++;
+        else if (fx === 1 && fy === 1) ctx.stats.bothAxisHalfVectors++;
+        else ctx.stats.singleAxisHalfVectors++;
+      }
 
       const refIdxL0 = intra ? grayIdx : prevIdx;
       const refIdxL1 = intra ? -1 : prevIdx;

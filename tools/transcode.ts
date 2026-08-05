@@ -28,9 +28,19 @@ console.log(
   `pictures    : ${result.picturesConverted} converted, ` +
     `${result.picturesSkipped} skipped (B pictures, not yet handled)`,
 );
+const inter = result.interMacroblocks || 1;
+const pc = (n: number) => `${((100 * n) / inter).toFixed(1)}%`;
 console.log(
-  `macroblocks : ${result.intraMacroblocks} intra, ${result.interMacroblocks} inter, ` +
-    `${result.inexactVectors} vectors approximated`,
+  `macroblocks : ${result.intraMacroblocks} intra, ${result.interMacroblocks} inter`,
+);
+console.log(
+  `  integer vectors      ${String(result.integerVectors).padStart(7)}  ${pc(result.integerVectors).padStart(6)}  exact`,
+);
+console.log(
+  `  half sample, 1 axis  ${String(result.singleAxisHalfVectors).padStart(7)}  ${pc(result.singleAxisHalfVectors).padStart(6)}  luma exact, chroma a quarter sample off`,
+);
+console.log(
+  `  half sample, 2 axes  ${String(result.bothAxisHalfVectors).padStart(7)}  ${pc(result.bothAxisHalfVectors).padStart(6)}  both approximate`,
 );
 console.log(`oversample  : ${oversample}x`);
 console.log(`output      : ${result.bitstream.length} bytes in ${elapsed} ms`);
