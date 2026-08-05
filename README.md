@@ -68,6 +68,10 @@ cargo install wasm-bindgen-cli
 ./tools/build-wasm.sh            # web/wasm/ へ出力
 ```
 
+WASMビルドでは`.cargo/config.toml`により`nontrapping-fptoint`、`bulk-memory`、
+`simd128`を有効にしています。これらのWebAssembly機能に対応したブラウザーが必要です。
+この設定は`wasm32-unknown-unknown`だけに適用され、CLIなどのネイティブビルドには影響しません。
+
 ```ts
 import init, { Session } from './wasm/mpeg2toh264_wasm.js';
 
