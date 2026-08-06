@@ -85,6 +85,12 @@ pub struct TranscodeOptions {
     /// independently coded without flushing the decoded picture buffer, so an
     /// open GOP's leading B pictures remain available during continuous play.
     pub recovery_interval: usize,
+    /// Put the two coded fields of a complementary pair in separate access
+    /// units, and so in separate MP4 samples. Firefox on Windows freezes on
+    /// field pictures held in one sample; splitting them works around it, at
+    /// the cost of handing decoders a standalone field sample, which is the
+    /// less widely accepted of the two.
+    pub split_field_samples: bool,
 }
 
 impl Default for TranscodeOptions {
@@ -92,6 +98,7 @@ impl Default for TranscodeOptions {
         Self {
             oversample: DEFAULT_OVERSAMPLE,
             recovery_interval: 24,
+            split_field_samples: false,
         }
     }
 }
@@ -252,6 +259,13 @@ impl IncrementalTranscoder {
             pictures_skipped: 0,
             stats: Stats::default(),
         }
+    }
+
+    /// Whether complementary fields are being delimited into their own access
+    /// units. The MP4 timeline has to reserve a sample per access unit, so it
+    /// needs to know what this transcoder is emitting.
+    pub fn split_field_samples(&self) -> bool {
+        self.options.split_field_samples
     }
 
     /// Restart the H.264 DPB from an IDR at the next incremental unit.
@@ -1399,8 +1413,10 @@ impl IntraState {
     }
 }
 
-/// Access-unit delimiter used by the MP4 wrapper to keep the two NAL units of
-/// a PAFF complementary field pair in one video sample.
+/// Access-unit delimiter, which is what tells the MP4 wrapper where one video
+/// sample ends. One before each picture keeps the two NAL units of a PAFF
+/// complementary field pair in a single sample; `split_field_samples` adds one
+/// between them to make each field a sample of its own.
 fn write_access_unit_delimiter() -> Vec<u8> {
     let mut w = BitWriter::new();
     w.u(3, 7); // primary_pic_type: I, P, or B
@@ -1619,6 +1635,13 @@ fn write_picture(
     for position in 0..position_count {
         let field_size = position_count >> 1;
         let second_output_field = direct_field_pair && position >= field_size;
+        if ctx.options.split_field_samples && direct_field_pair && position == field_size {
+            // Either coded field is a primary coded picture in its own right,
+            // so a delimiter between them is legal H.264 whichever way round
+            // this option is set. It is what makes the muxer see two access
+            // units, and so give each field its own MP4 sample.
+            picture_nals.extend_from_slice(&write_access_unit_delimiter());
+        }
         let second_field_of_reference_pair = second_output_field && ctx.is_reference;
         // Only one of a pair's two coded fields can carry IdrPicFlag: an IDR
         // empties the decoded picture buffer, so a second one would throw out

@@ -140,6 +140,8 @@ export interface LoadCommand {
   wasmUrl: string | null;
   oversample: number | undefined;
   recoveryInterval: number | undefined;
+  /** Give each field of a complementary pair its own MP4 sample. */
+  splitFieldSamples: boolean | undefined;
   /**
    * Which service to convert, out of a transport stream that carries more than
    * one. Null takes the first that turns up with a picture in it, which is

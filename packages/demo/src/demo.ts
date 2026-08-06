@@ -40,6 +40,9 @@ const service = document.querySelector<HTMLSelectElement>("#service")!;
 const serviceLabel = document.querySelector<HTMLElement>("#service-label")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
+const splitFieldSamples = document.querySelector<HTMLInputElement>(
+  "#split-field-samples",
+)!;
 const status = document.querySelector<HTMLElement>("#status")!;
 const details = document.querySelector<HTMLElement>("#details")!;
 const fps = document.querySelector<HTMLElement>("#fps")!;
@@ -127,6 +130,7 @@ function createPlayer(): Mpeg2TsPlayer {
     mediaSource,
     oversample: Number(oversample.value),
     recoveryInterval: Number(recoveryInterval.value),
+    splitFieldSamples: splitFieldSamples.checked,
     serviceId: wantedService ?? undefined,
     deinterlace: deinterlace.checked,
     deinterlacer: (element) => {

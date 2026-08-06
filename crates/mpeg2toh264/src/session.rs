@@ -418,10 +418,15 @@ impl Session {
             self.transcoder.request_recovery_point();
         }
         let starts_at_idr = self.transcoder.awaiting_random_access();
-        let timeline = match timeline {
+        let mut timeline = match timeline {
             Some(timeline) => timeline,
             None => mpeg2_video_timeline(&gop.data, !starts_at_idr)?,
         };
+        // Only the transcoder knows how many access units a field pair became,
+        // and the timeline has to reserve a sample for each. The duration the
+        // caller measured before this point is the same either way, so a
+        // timeline that arrived from there needs no more than this.
+        timeline.split_field_samples = self.transcoder.split_field_samples();
         // Aligning can still move the origin, so read the start after it.
         self.align_timelines(gop, &timeline);
         let start = self.video_presentation_start as f64 / TIMESCALE as f64;

@@ -66,6 +66,13 @@ export interface Mpeg2TsPlayerOptions {
   /** Number of MPEG-2 GOPs between non-IDR recovery points. */
   recoveryInterval?: number;
   /**
+   * Give each field of a complementary pair its own MP4 sample. Firefox on
+   * Windows freezes on field pictures held in one sample; this works around
+   * that, at the cost of a standalone field sample, which fewer decoders
+   * accept. Off by default.
+   */
+  splitFieldSamples?: boolean;
+  /**
    * Which service to convert, out of a transport stream carrying more than
    * one. Left unset, the first that turns up with a picture in it. The
    * `services` event says what a given input is offering.
@@ -331,6 +338,7 @@ export class Mpeg2TsPlayer extends EventTarget {
           : String(this.#options.wasmUrl),
       oversample: this.#options.oversample,
       recoveryInterval: this.#options.recoveryInterval,
+      splitFieldSamples: this.#options.splitFieldSamples,
       serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
       queueHighWaterMark:

@@ -28,6 +28,8 @@ Options:
   -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
   -r, --recovery-interval <n>
                             GOPs between recovery points (default: 24)
+  -s, --split-field-samples Give each field of a complementary pair its own MP4
+                            sample, for decoders that freeze without it
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 ";
@@ -56,6 +58,7 @@ fn parse_args(args: &[String]) -> Invocation {
     let mut positional: Vec<&str> = Vec::new();
     let mut oversample: f64 = 2.0;
     let mut recovery_interval: usize = 24;
+    let mut split_field_samples = false;
     let mut quiet = false;
 
     let mut i = 0;
@@ -64,6 +67,7 @@ fn parse_args(args: &[String]) -> Invocation {
         match arg {
             "-h" | "--help" => return Invocation::Help,
             "-q" | "--quiet" => quiet = true,
+            "-s" | "--split-field-samples" => split_field_samples = true,
             "-o" | "--oversample" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
@@ -114,6 +118,7 @@ fn parse_args(args: &[String]) -> Invocation {
         transcode: TranscodeOptions {
             oversample,
             recovery_interval,
+            split_field_samples,
         },
     }))
 }
@@ -147,7 +152,8 @@ fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = started.elapsed();
 
     let (output_data, output_kind) = if !raw_h264 {
-        let timeline = mpeg2_video_timeline(&source, false)?;
+        let mut timeline = mpeg2_video_timeline(&source, false)?;
+        timeline.split_field_samples = options.transcode.split_field_samples;
         let mp4 = h264_to_fmp4(&result.bitstream, &timeline)?;
         let mut data = mp4.init_segment;
         data.extend_from_slice(&mp4.media_segment);

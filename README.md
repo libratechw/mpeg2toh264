@@ -80,6 +80,7 @@ cargo build --release
 ```text
 -o, --oversample <n>          H.264 quantization-step granularity (default: 2; positive)
 -r, --recovery-interval <n>   GOPs between non-IDR recovery points (default: 24)
+-s, --split-field-samples     Put each field of a pair in its own MP4 sample
 -q, --quiet                   Suppress progress and summary output
 -h, --help                    Show help
 ```
@@ -98,8 +99,9 @@ Interlaced-video limitations:
 
 - Chrome on Windows may fall back to software decoding.
   - This has been observed on at least Intel systems.
-- Firefox on Windows may freeze when frame and field pictures are mixed.
-  - A workaround that places top and bottom fields in separate samples is possible, but is not implemented because it may adversely affect other environments.
+- Firefox on Windows may freeze on field pictures.
+  - `splitFieldSamples` (CLI: `--split-field-samples`) enables a workaround that places the top and bottom fields in separate samples.
+  - A standalone field sample may adversely affect other environments, so it is off by default.
 - Chrome on macOS may fall back to software decoding.
 
 ## WebAssembly and MSE player
@@ -235,6 +237,7 @@ cargo build --release
 ```text
 -o, --oversample <n>          H.264量子化刻みの細かさ (既定: 2、正の数)
 -r, --recovery-interval <n>   non-IDRリカバリーポイントのGOP間隔 (既定: 24)
+-s, --split-field-samples     フィールドペアを1フィールドずつMP4サンプルに分割
 -q, --quiet                   進捗と概要を表示しない
 -h, --help                    ヘルプを表示
 ```
@@ -253,8 +256,9 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
 
 - WindowsのChromeではソフトウェアデコーダーにフォールバックされることがある
   - 少なくともIntel環境で確認
-- WindowsのFirefoxではフレームピクチャとフィールドピクチャが混合している場合映像がフリーズすることがある
-  - top/bottomを別サンプルにするワークアラウンドで回避可能だが他の環境に悪影響がありそうなのため未実装
+- WindowsのFirefoxではフィールドピクチャで映像がフリーズすることがある
+  - `splitFieldSamples` (CLIは`--split-field-samples`) でtop/bottomを別サンプルにするワークアラウンドを有効にできる
+  - 単独のフィールドサンプルは他の環境に悪影響がありそうなため既定では無効
 - MacのChromeではソフトウェアデコーダーにフォールバックされることがある
 
 ## WebAssemblyとMSEプレイヤー

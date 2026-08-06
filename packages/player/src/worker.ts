@@ -486,6 +486,7 @@ class Playback {
         this.#command.recoveryInterval,
         this.#origin,
         this.#command.serviceId,
+        this.#command.splitFieldSamples,
       );
       this.#transcoder = converter;
       await this.#convert(leg, source, converter);

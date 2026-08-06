@@ -70,12 +70,14 @@ export class Transcoder {
     recoveryInterval: number | undefined,
     originTicks: number | null,
     serviceId: number | null,
+    splitFieldSamples: boolean | undefined,
   ) {
     this.#session = new Session(
       oversample,
       originTicks,
       serviceId,
       recoveryInterval,
+      splitFieldSamples,
     );
   }
 

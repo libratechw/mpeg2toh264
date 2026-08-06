@@ -161,6 +161,16 @@ pub struct Mpeg2VideoTimeline {
     pub sample_duration: u32,
     /// Presentation index for each coded picture, excluding the IDR clone.
     pub presentation_indices: Vec<u32>,
+    /// Whether each coded picture is a complementary field pair rather than a
+    /// frame. Parallel with `presentation_indices`.
+    pub field_pairs: Vec<bool>,
+    /// Whether the transcoder gave each field of a pair its own access unit,
+    /// which makes such a picture occupy two MP4 samples instead of one. Set by
+    /// the caller from [`TranscodeOptions::split_field_samples`]; parsing the
+    /// source cannot tell.
+    ///
+    /// [`TranscodeOptions::split_field_samples`]: crate::TranscodeOptions::split_field_samples
+    pub split_field_samples: bool,
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
     /// What the source pictures said about their fields. Nothing in the MP4
     /// carries this -- H.264 could say it in a picture timing SEI, and the
@@ -168,6 +178,15 @@ pub struct Mpeg2VideoTimeline {
     /// reported alongside instead, for a player that filters the picture
     /// itself.
     pub interlacing: Interlacing,
+}
+
+impl Mpeg2VideoTimeline {
+    /// Whether the picture at this decode position is a complementary field
+    /// pair. A caller that filled in the indices but not `field_pairs` gets
+    /// what it would have got before the field ever existed: frames.
+    fn is_field_pair(&self, decode_index: usize) -> bool {
+        self.field_pairs.get(decode_index).copied().unwrap_or(false)
+    }
 }
 
 /// The field that pairs with `picture` to make a frame, if `candidate` is it.
@@ -255,6 +274,7 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
     let mut seen_picture = false;
     let mut max_tr_in_gop: u32 = 0;
     let mut presentation_indices = Vec::new();
+    let mut field_pairs = Vec::new();
     let mut reader = BitReader::new(data);
     let mut grid = MacroblockGrid::new();
     let mut picture_index = 0;
@@ -311,6 +331,7 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
             continue;
         }
         presentation_indices.push(gop_base + tr + 1);
+        field_pairs.push(mate.is_some());
         if picture_type != PictureType::B {
             references = (references + 1).min(2);
         }
@@ -320,9 +341,25 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
         height: first.sequence.vertical_size,
         sample_duration,
         presentation_indices,
+        field_pairs,
+        split_field_samples: false,
         sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
         interlacing: pictures_interlacing(&pictures),
     })
+}
+
+/// How many MP4 samples the timeline's pictures occupy, before the IDR clone.
+/// One each, unless split field pairs are taking two.
+fn content_sample_count(timeline: &Mpeg2VideoTimeline) -> usize {
+    let pictures = timeline.presentation_indices.len();
+    let split_pairs = if timeline.split_field_samples {
+        (0..pictures)
+            .filter(|&at| timeline.is_field_pair(at))
+            .count()
+    } else {
+        0
+    };
+    pictures + split_pairs
 }
 
 /// Sample durations and composition offsets for one unit of coded pictures.
@@ -356,13 +393,30 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, starts_at_idr: bool) -
     // it, and at a random access point those B pictures are missing entirely.
     let first_index = indices.iter().copied().min().unwrap_or(1) as i64;
     let duration = timeline.sample_duration as i64;
-    let offsets: Vec<i64> = indices
-        .iter()
-        .enumerate()
-        .map(|(decode_index, &presentation_index)| {
-            (presentation_index as i64 - first_index - decode_index as i64) * duration
-        })
-        .collect();
+    let mut offsets: Vec<i64> = Vec::with_capacity(indices.len());
+    let mut durations: Vec<u32> = Vec::with_capacity(indices.len());
+    let mut decode_time = 0i64;
+    for (decode_index, &presentation_index) in indices.iter().enumerate() {
+        let presentation_time = (presentation_index as i64 - first_index) * duration;
+        if timeline.split_field_samples && timeline.is_field_pair(decode_index) {
+            // Each field takes half the frame's slot, in the order it displays
+            // in. Splitting the duration rather than leaving the second sample
+            // at zero keeps every sample on an instant of its own, which is
+            // what the decoders this works around want to see.
+            let first_duration = timeline.sample_duration / 2;
+            let second_duration = timeline.sample_duration - first_duration;
+            offsets.push(presentation_time - decode_time);
+            durations.push(first_duration);
+            decode_time += i64::from(first_duration);
+            offsets.push(presentation_time + i64::from(first_duration) - decode_time);
+            durations.push(second_duration);
+            decode_time += i64::from(second_duration);
+        } else {
+            offsets.push(presentation_time - decode_time);
+            durations.push(timeline.sample_duration);
+            decode_time += duration;
+        }
+    }
     // An anchor picture is coded before the B pictures that display ahead of it,
     // so it reaches its display slot before its decode slot -- a negative
     // composition offset, which asks a decoder to show a picture it has not
@@ -370,7 +424,6 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, starts_at_idr: bool) -
     // lead keeps every offset at or above zero without moving a single picture
     // relative to the audio.
     let reorder_delay = -offsets.iter().copied().min().unwrap_or(0).min(0);
-    let mut durations: Vec<u32> = vec![timeline.sample_duration; indices.len()];
     let mut compositions: Vec<u32> = offsets
         .iter()
         .map(|offset| (offset + reorder_delay) as u32)
@@ -868,8 +921,9 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
     let (Some(sps), Some(pps)) = (sps, pps) else {
         bail!("H.264 stream lacks SPS or PPS");
     };
-    let has_idr_clone = samples.len() == timeline.presentation_indices.len() + 1;
-    let expected = timeline.presentation_indices.len() + usize::from(has_idr_clone);
+    let content_samples = content_sample_count(timeline);
+    let has_idr_clone = samples.len() == content_samples + 1;
+    let expected = content_samples + usize::from(has_idr_clone);
     if samples.len() != expected {
         bail!(
             "H.264 sample count {} does not match MPEG-2 timeline {expected}",
@@ -963,8 +1017,9 @@ pub fn h264_gop_to_fmp4(
     let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
     let samples = video_samples(&nals);
 
-    let has_idr_clone = samples.len() == timeline.presentation_indices.len() + 1;
-    let expected = timeline.presentation_indices.len() + usize::from(has_idr_clone);
+    let content_samples = content_sample_count(timeline);
+    let has_idr_clone = samples.len() == content_samples + 1;
+    let expected = content_samples + usize::from(has_idr_clone);
     if samples.len() != expected {
         bail!(
             "H.264 GOP sample count {} does not match MPEG-2 timeline {expected}",
@@ -1035,4 +1090,91 @@ pub fn h264_gop_to_fmp4(
         sample_count: samples.len(),
         duration: timing.durations.iter().map(|&d| d as u64).sum(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 29.97 fps, and deliberately odd so a halved field duration cannot be
+    /// exact: the two halves still have to add up to the frame.
+    const FRAME: u32 = 3003;
+
+    fn timeline(indices: &[u32], field_pairs: &[bool], split: bool) -> Mpeg2VideoTimeline {
+        Mpeg2VideoTimeline {
+            width: 720,
+            height: 480,
+            sample_duration: FRAME,
+            presentation_indices: indices.to_vec(),
+            field_pairs: field_pairs.to_vec(),
+            split_field_samples: split,
+            sample_aspect_ratio: None,
+            interlacing: Interlacing::default(),
+        }
+    }
+
+    /// Decode order I P B B, as an open group of pictures is coded.
+    const IPBB: [u32; 4] = [1, 4, 2, 3];
+
+    #[test]
+    fn field_pairs_kept_together_take_one_sample_each() {
+        let timing = mpeg2_sample_timing(&timeline(&IPBB, &[true; 4], false), false);
+        assert_eq!(timing.durations, vec![FRAME; 4]);
+        assert_eq!(timing.reorder_delay, FRAME as i64);
+        // The anchors lead their display slots; the B pictures catch up.
+        assert_eq!(timing.compositions, vec![FRAME, FRAME * 3, 0, 0]);
+    }
+
+    #[test]
+    fn split_field_pairs_take_two_samples_half_a_frame_apart() {
+        let timing = mpeg2_sample_timing(&timeline(&IPBB, &[true; 4], true), false);
+        assert_eq!(
+            timing.durations,
+            vec![1501, 1502, 1501, 1502, 1501, 1502, 1501, 1502]
+        );
+        // Every field lands where its frame would have, then half a frame on.
+        let mut decode_time = 0i64;
+        let presentations: Vec<i64> = timing
+            .durations
+            .iter()
+            .zip(&timing.compositions)
+            .map(|(&duration, &composition)| {
+                let at = decode_time + composition as i64;
+                decode_time += duration as i64;
+                at
+            })
+            .collect();
+        let delay = timing.reorder_delay;
+        assert_eq!(
+            presentations,
+            vec![
+                delay,
+                delay + 1501,
+                delay + FRAME as i64 * 3,
+                delay + FRAME as i64 * 3 + 1501,
+                delay + FRAME as i64,
+                delay + FRAME as i64 + 1501,
+                delay + FRAME as i64 * 2,
+                delay + FRAME as i64 * 2 + 1501,
+            ]
+        );
+    }
+
+    #[test]
+    fn splitting_leaves_frame_pictures_and_the_total_alone() {
+        let mixed = [true, false, true, false];
+        let split = mpeg2_sample_timing(&timeline(&IPBB, &mixed, true), false);
+        let whole = mpeg2_sample_timing(&timeline(&IPBB, &mixed, false), false);
+        assert_eq!(split.durations, vec![1501, 1502, FRAME, 1501, 1502, FRAME]);
+        let total = |timing: &SampleTiming| timing.durations.iter().map(|&d| d as u64).sum::<u64>();
+        assert_eq!(total(&split), total(&whole));
+        assert_eq!(split.reorder_delay, whole.reorder_delay);
+    }
+
+    #[test]
+    fn a_split_pair_counts_as_two_samples() {
+        let mixed = [true, false, true, false];
+        assert_eq!(content_sample_count(&timeline(&IPBB, &mixed, true)), 6);
+        assert_eq!(content_sample_count(&timeline(&IPBB, &mixed, false)), 4);
+    }
 }

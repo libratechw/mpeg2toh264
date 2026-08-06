@@ -100,12 +100,18 @@ impl Session {
     /// `serviceId` takes one named service out of a transport stream that
     /// carries several. `undefined` takes the first that turns up with a
     /// picture in it. See `serviceIds` for what a recording is offering.
+    ///
+    /// `splitFieldSamples` gives each field of a complementary pair its own MP4
+    /// sample, working around decoders that freeze on field pictures.
+    /// `undefined` leaves the pair in one sample, which is what more decoders
+    /// accept.
     #[wasm_bindgen(constructor)]
     pub fn new(
         oversample: Option<f64>,
         origin_ticks: Option<f64>,
         service_id: Option<u16>,
         recovery_interval: Option<u32>,
+        split_field_samples: Option<bool>,
     ) -> Result<Session, JsError> {
         let defaults = TranscodeOptions::default();
         let oversample = oversample.unwrap_or(defaults.oversample);
@@ -128,6 +134,8 @@ impl Session {
                 TranscodeOptions {
                     oversample,
                     recovery_interval: recovery_interval as usize,
+                    split_field_samples: split_field_samples
+                        .unwrap_or(defaults.split_field_samples),
                 },
                 origin,
                 service_id,
