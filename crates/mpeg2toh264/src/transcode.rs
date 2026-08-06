@@ -1408,11 +1408,13 @@ fn write_access_unit_delimiter() -> Vec<u8> {
     to_nal_unit(w.bytes(), 0, nal_type::AUD)
 }
 
-/// Recovery point SEI (D.2.7): recovery_frame_cnt 0, exact match, no broken
-/// link, and no changing slice groups. The payload is byte-aligned before the
-/// SEI RBSP's own trailing bit.
+/// Recovery point SEI (D.2.7): recovery_frame_cnt 0, exact match, a broken
+/// link for open-GOP leading pictures, and no changing slice groups. Continuous
+/// decoding still has their old references and displays them; a decoder that
+/// starts here knows not to display them when those references are absent. The
+/// payload is byte-aligned before the SEI RBSP's own trailing bit.
 fn write_recovery_point_sei() -> Vec<u8> {
-    to_nal_unit(&[6, 1, 0xc4, 0x80], 0, nal_type::SEI)
+    to_nal_unit(&[6, 1, 0xe4, 0x80], 0, nal_type::SEI)
 }
 
 /// Which of the two per-slot buffers a field macroblock's targets landed in, and
@@ -1631,7 +1633,11 @@ fn write_picture(
         // course, and H.264 intra prediction has nothing to make those inter
         // macroblocks from, so the second field goes through the same path
         // every content picture does.
-        let anchor_second_field = ctx.real_idr && second_output_field;
+        // A recovery point must be decodable without the pictures that came
+        // before it just like an IDR. Its second field therefore names only
+        // the independently reconstructed first field, even though a decoder
+        // doing continuous playback still has older pictures in its DPB.
+        let anchor_second_field = (ctx.real_idr || ctx.recovery_intra) && second_output_field;
         // Only the first field of an IDR or recovery picture is independently
         // reconstructed. The second field is a B slice and must use inter
         // macroblock syntax; carrying this state across would write I-slice

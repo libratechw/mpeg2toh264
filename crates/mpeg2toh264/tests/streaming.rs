@@ -650,7 +650,7 @@ fn continuous_playback_does_not_restart_at_an_open_gop() {
         assert_eq!(*random_access, index == 24);
         assert_eq!(
             data.windows(9)
-                .any(|bytes| bytes == [0, 0, 0, 5, 6, 6, 1, 0xc4, 0x80]),
+                .any(|bytes| bytes == [0, 0, 0, 5, 6, 6, 1, 0xe4, 0x80]),
             index == 24,
             "GOP {index} recovery-point SEI"
         );
