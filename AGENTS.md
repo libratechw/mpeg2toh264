@@ -27,6 +27,7 @@
 - For web changes, build WASM first with `./tools/build-wasm.sh`, then run `npm run typecheck` and the relevant package/web build. `packages/player/wasm` is generated and ignored.
 - `wasm-bindgen-cli` must match the crate version in `Cargo.lock`; the build script checks it.
 - Page and Worker TypeScript are separate programs. `packages/player/src/mse.ts` is shared, while Worker MSE declarations live in `worker-mse.d.ts`; avoid broadening tsconfig inputs in a way that merges conflicting DOM libraries.
+- ffmpeg decoding the output cleanly is not the whole story. Safari decodes through VideoToolbox, which has disagreed with ffmpeg about reference picture lists and about how long an IDR stays a reference; `tools/vtdec.swift` and `tools/vtdiff.py` measure that without a browser, and `tools/m2v-pictures.py` finds the sources that reach the awkward paths.
 
 ## Useful commands
 
