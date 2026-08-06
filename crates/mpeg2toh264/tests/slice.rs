@@ -227,6 +227,50 @@ fn a_frame_slice_names_one_entry_per_reference_frame() {
     assert_eq!(read[0], same);
 }
 
+/// `dec_ref_pic_marking` of an I slice, which is all an IDR carries.
+fn idr_marking(long_term: Option<u32>) -> (bool, bool) {
+    let mut w = BitWriter::with_capacity(32);
+    write_slice_header(
+        &mut w,
+        &SliceHeaderConfig {
+            slice_type: SliceType::I,
+            log2_max_frame_num: LOG2_MAX_FRAME_NUM,
+            log2_max_poc_lsb: LOG2_MAX_POC_LSB,
+            idr: true,
+            reference: true,
+            long_term_current: long_term,
+            ..Default::default()
+        },
+    );
+    w.rbsp_trailing_bits();
+    let mut r = Reader {
+        data: w.bytes().to_vec(),
+        pos: 0,
+    };
+    assert_eq!(r.ue(), 0, "first_mb_in_slice");
+    assert_eq!(r.ue(), SliceType::I.code(), "slice_type");
+    assert_eq!(r.ue(), 0, "pic_parameter_set_id");
+    r.u(LOG2_MAX_FRAME_NUM); // frame_num
+    assert_eq!(r.ue(), 0, "idr_pic_id");
+    r.u(LOG2_MAX_POC_LSB); // pic_order_cnt_lsb
+    (r.flag(), r.flag()) // no_output_of_prior_pics_flag, long_term_reference_flag
+}
+
+#[test]
+fn an_idr_marks_itself_long_term_with_the_flag_rather_than_a_command() {
+    // Clause 7.4.3.3 gives an IDR no memory management commands at all, so the
+    // flag is the only way it can take the long-term slot -- and it fixes
+    // LongTermFrameIdx at 0, which is why nothing else may be asked for.
+    assert_eq!(idr_marking(Some(0)), (false, true));
+    assert_eq!(idr_marking(None), (false, false));
+}
+
+#[test]
+#[should_panic(expected = "LongTermFrameIdx 0")]
+fn an_idr_cannot_ask_for_another_long_term_frame_index() {
+    idr_marking(Some(1));
+}
+
 #[test]
 fn a_slice_without_explicit_lists_leaves_both_modification_flags_clear() {
     let read = slice_lists(107, [RefPicList::default(), RefPicList::default()], true);

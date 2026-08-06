@@ -13,17 +13,18 @@ use mpeg2toh264::{
 use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
 
 /// fixture, converted pictures, output bytes, FNV-1a of the Annex B stream.
-/// Last moved when every P and B slice began naming its short-term reference
-/// list outright, which only lengthens the slice headers: each fixture decodes
-/// to the same frames as before, checked frame by frame with `ffmpeg -f
-/// framemd5`.
+/// Last moved when a frame IDR began taking the long-term slot itself, leaving
+/// the copy behind it short-term, and when every P and B slice began naming its
+/// short-term reference list outright. Both only move the slice headers: each
+/// fixture decodes to the same frames as before, checked frame by frame with
+/// `ffmpeg -f framemd5`.
 const GOLDEN: [(&str, usize, usize, u64); 6] = [
-    ("altscan.m2v", 8, 224013, 0x010e_15c1_223c_db4b),
-    ("escape.m2v", 6, 122608, 0xdfdc_2865_256a_077b),
-    ("hd1080i.m2v", 15, 2106384, 0x83f4_3466_1d58_cd74),
-    ("i_only.m2v", 3, 79516, 0x337a_4d1d_9eb5_2ef4),
-    ("ibbp.m2v", 15, 164467, 0x7a75_2afa_9f87_6f58),
-    ("ip.m2v", 10, 132315, 0x02b3_17b4_0c62_f30b),
+    ("altscan.m2v", 8, 224007, 0x4c98_4bed_dc31_53c5),
+    ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
+    ("hd1080i.m2v", 15, 2106380, 0xa903_55d8_0a1c_4d05),
+    ("i_only.m2v", 3, 79513, 0x31f6_0c7f_fb6b_b97a),
+    ("ibbp.m2v", 15, 164459, 0x183e_7cc0_f7ca_1a86),
+    ("ip.m2v", 10, 132314, 0x7f35_4fc6_a64f_829c),
 ];
 
 #[test]

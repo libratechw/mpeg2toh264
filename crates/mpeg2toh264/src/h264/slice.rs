@@ -81,10 +81,11 @@ pub struct SliceHeaderConfig {
     /// True for an IDR picture, which changes which header fields appear.
     pub idr: bool,
     pub idr_pic_id: u32,
-    /// Non-IDR reference pictures only. Marks this picture as a long-term
-    /// reference with the given `LongTermFrameIdx`, which is how the
-    /// flat-prediction reference is kept in the decoded picture buffer for the
-    /// rest of the stream.
+    /// Marks this picture as a long-term reference with the given
+    /// `LongTermFrameIdx`, which is how the flat-prediction reference is kept in
+    /// the decoded picture buffer for the rest of the stream. An IDR says so
+    /// with `long_term_reference_flag`, which fixes the index at 0; any other
+    /// reference picture says it with memory management commands.
     pub long_term_current: Option<u32>,
     /// Set when the source is interlaced, i.e. `frame_mbs_only_flag` is 0.
     pub mbaff: bool,
@@ -339,11 +340,11 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
     if cfg.reference {
         if cfg.idr {
             w.flag(false); // no_output_of_prior_pics_flag
-                           // long_term_reference_flag. The picture the flat prediction hangs
-                           // on is the copy behind the IDR, not the IDR: a field pair codes
-                           // its IDR as one field, and ffmpeg loses a long-term marking made
-                           // by a field. The copy is always a frame and has no such trouble.
-            w.flag(false);
+            assert!(
+                cfg.long_term_current.is_none_or(|frame_idx| frame_idx == 0),
+                "clause 8.2.5.1 gives an IDR marked long-term LongTermFrameIdx 0"
+            );
+            w.flag(cfg.long_term_current.is_some()); // long_term_reference_flag
         } else {
             w.flag(cfg.long_term_current.is_some()); // adaptive_ref_pic_marking_mode_flag
             if let Some(frame_idx) = cfg.long_term_current {

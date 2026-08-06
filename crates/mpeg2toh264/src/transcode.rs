@@ -640,19 +640,21 @@ impl IncrementalTranscoder {
             recovery_emitted |= recovery_intra;
 
             if real_idr {
-                // The copy follows and takes the long-term slot, leaving the
-                // IDR short-term.
+                // One of the pair takes the long-term slot and the other stays
+                // short-term for the content to predict from; the copy only has
+                // to take it when the IDR was coded as a field and could not.
+                let clone_long_term = paired_pic.is_some();
                 if has_field_pairs {
                     parts.push(write_access_unit_delimiter());
                 }
-                parts.push(write_reference_clone(&g, mbaff));
+                parts.push(write_reference_clone(&g, mbaff, clone_long_term));
                 prev_ref_frame_num = 1;
                 short_term_count = 1;
-                newest_short_term = frame_num;
-                // The IDR emptied the buffer and the copy that follows it takes
-                // the long-term slot, so the IDR is all the short-term chain has.
+                // The IDR emptied the buffer, so whichever of the two did not
+                // take the long-term slot is all the short-term chain has.
+                newest_short_term = if clone_long_term { frame_num } else { 1 };
                 short_term.clear();
-                short_term.push(frame_num);
+                short_term.push(newest_short_term);
             } else if is_reference {
                 prev_ref_frame_num = frame_num;
                 short_term_count = (short_term_count + 1).min(MAX_SHORT_TERM_FRAMES as u32);
@@ -1406,18 +1408,24 @@ fn short_term_ref_lists(
     lists
 }
 
-/// Copy the content IDR into the long-term reference without changing pixels.
+/// Copy the picture that opens a random access point, without changing pixels.
 ///
-/// Intra macroblocks need a reference index whose weights can force the flat
-/// prediction, and that index has to survive the sliding window for the rest of
-/// the stream, so some picture has to be long-term. It cannot be the IDR: a
-/// source field pair codes its IDR as a single field, and a long-term marking
-/// made by a field is one ffmpeg loses -- neither the `long_term_reference_flag`
-/// of clause 7.4.3.3 nor the command 3 it offers as the alternative reaches the
-/// other half of the pair. This all-skip P picture is always a frame, so it can
-/// say it plainly, and the IDR is left as an ordinary short-term reference for
-/// the content to predict from. Both hold the same samples either way.
-fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
+/// Two pictures are needed there. Intra macroblocks need a reference index whose
+/// weights can force the flat prediction, and that index has to survive the
+/// sliding window for the rest of the stream, so one of the two has to be
+/// long-term; the other stays short-term for the content to predict from. Both
+/// hold the same samples, so which is which does not change a single decoded
+/// sample -- but it does change which one a decoder has to keep.
+///
+/// The IDR takes the long-term mark when it can, because VideoToolbox stops
+/// honouring an IDR as a reference once the picture behind it marks itself
+/// long-term, and substitutes the most recently decoded reference wherever the
+/// IDR is named. A source field pair cannot: it codes its IDR as a single field,
+/// and a long-term marking made by a field is one ffmpeg loses -- neither the
+/// `long_term_reference_flag` of clause 7.4.3.3 nor the command 3 it offers as
+/// the alternative reaches the other half of the pair. There the copy carries
+/// the mark instead, as it always did, and `long_term` says so.
+fn write_reference_clone(g: &FrameGeometry, mbaff: bool, long_term: bool) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(64);
     write_slice_header(
         &mut w,
@@ -1431,7 +1439,7 @@ fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
             // The IDR is the only picture in the buffer, and a pair of coded
             // fields sharing a `frame_num` is one frame to a frame picture, so
             // index 0 finds it whichever way the source sent it.
-            long_term_current: Some(LONG_TERM_FRAME_IDX),
+            long_term_current: long_term.then_some(LONG_TERM_FRAME_IDX),
             mbaff,
             slice_qp: PPS_INIT_QP,
             pps_init_qp: PPS_INIT_QP,
@@ -1947,6 +1955,11 @@ fn write_picture(
                         },
                     log2_max_poc_lsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
                     idr: idr_field,
+                    // A frame IDR takes the long-term slot itself, which leaves
+                    // the copy behind it short-term for the content to predict
+                    // from. See `write_reference_clone`.
+                    long_term_current: (idr_field && !direct_field_pair)
+                        .then_some(LONG_TERM_FRAME_IDX),
                     reference: ctx.is_reference,
                     mbaff: ctx.mbaff,
                     field_picture: direct_field_pair.then_some(field != 0),
