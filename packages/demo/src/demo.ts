@@ -11,6 +11,7 @@ import {
   Deinterlacer,
   probeDecoder,
   supportsDeinterlace,
+  type DeinterlaceStats,
 } from "@mpeg2toh264/yadif";
 import { Controller, MPEGTSFeeder, SVGDOMRenderer } from "aribb24.js";
 
@@ -53,16 +54,16 @@ const ARROW_SECONDS = 5;
 const SKIP_SECONDS = 10;
 const DOUBLE_CLICK_DELAY_MS = 300;
 
-const IDLE_FPS = "瞬間 — · トータル —";
-const IDLE_DEINTERLACE = "—";
+const IDLE_FPS = "瞬間: - トータル: -";
+const IDLE_DEINTERLACE = "-";
 
 const STATES: Record<PlayerState, string> = {
-  idle: "MPEG-2 TSのURLを指定するか、ファイルを選択してください。",
+  idle: "MPEG-2 TSのURLを指定するかファイルを選択してください",
   loading: "入力を読み込んでいます…",
   converting: "変換中…",
   "buffer-full": "MSEバッファが満杯です。再生が進むまで変換を停止しています…",
   seeking: "シーク先を読み込んでいます…",
-  completed: "変換完了。",
+  completed: "変換完了",
   error: "",
 };
 
@@ -108,7 +109,7 @@ function setStatus(message: string, error = false) {
 function setDetails() {
   details.textContent = [label, length, scan, progress, counts]
     .filter(Boolean)
-    .join(" · ");
+    .join(" ");
 }
 
 /**
@@ -166,9 +167,9 @@ function createPlayer(): Mpeg2TsPlayer {
   created.addEventListener("scan", (event) => {
     const { interlaced, topFieldFirst } = event.detail;
     scan = interlaced
-      ? `インターレース（${topFieldFirst ? "TFF" : "BFF"}）`
+      ? `インターレース (${topFieldFirst ? "TFF" : "BFF"})`
       : "プログレッシブ";
-    if (!interlaced && deinterlace.checked) scan += "（yadifは停止）";
+    if (!interlaced && deinterlace.checked) scan += " (yadifは停止)";
     setDetails();
     // A progressive source stops the filter, which uncovers the element and
     // its controls with it.
@@ -199,7 +200,7 @@ function createPlayer(): Mpeg2TsPlayer {
   });
   created.addEventListener("seekable", (event) => {
     duration = event.detail.duration;
-    length = `${formatDuration(duration)}（シーク可能）`;
+    length = `${formatDuration(duration)} (シーク可能)`;
     setDetails();
     setPlayhead();
   });
@@ -215,12 +216,12 @@ function createPlayer(): Mpeg2TsPlayer {
     } = event.detail;
     const { convertingMs, readingMs, waitingMs } = event.detail;
     fps.textContent =
-      `瞬間 ${instantFps.toFixed(1)} · トータル ${totalFps.toFixed(1)}` +
-      ` · 変換 ${convertingMs.toFixed(0)}ms / 読み込み ${readingMs.toFixed(0)}ms` +
-      ` / MSE待ち ${waitingMs.toFixed(0)}ms`;
-    fps.textContent += ` · drop ${dropped} · scrambled ${scrambled} · error ${errors}`;
+      `瞬間: ${instantFps.toFixed(1)} トータル: ${totalFps.toFixed(1)}` +
+      ` 変換: ${convertingMs.toFixed(0)}ms 読み込み: ${readingMs.toFixed(0)}ms` +
+      ` MSE待ち: ${waitingMs.toFixed(0)}ms`;
+    fps.textContent += ` drop: ${dropped} scrambled: ${scrambled} error: ${errors}`;
     counts = `${videoFrames} video frames`;
-    if (audioFrames > 0) counts += ` · ${audioFrames} AAC frames`;
+    if (audioFrames > 0) counts += ` ${audioFrames} AAC frames`;
     setDetails();
   });
   created.addEventListener("error", (event) =>
@@ -289,15 +290,13 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): {
   };
 }
 
-function showDeinterlaceStats(
-  stats: import("@mpeg2toh264/yadif").DeinterlaceStats,
-): void {
+function showDeinterlaceStats(stats: DeinterlaceStats): void {
   const { filtered, missed, dropped, degraded, discontinuities } = stats;
   const { fps: presentedFps, frameMs } = stats;
   deinterlaceStats.textContent =
-    `${presentedFps.toFixed(1)}fps · ${frameMs.toFixed(1)}ms/フレーム` +
-    ` · 適用 ${filtered} · 取りこぼし ${missed} · 端 ${degraded}` +
-    ` · 不連続 ${discontinuities} · デコーダー落ち ${dropped}`;
+    `${presentedFps.toFixed(1)} FPS ${frameMs.toFixed(1)} ms/フレーム` +
+    ` 適用: ${filtered} 取りこぼし: ${missed} 端: ${degraded}` +
+    ` 不連続: ${discontinuities} ドロップ: ${dropped}`;
 }
 
 /** The service a viewer picked, which only a fresh load can act on. */
@@ -631,8 +630,8 @@ function disableDeinterlace(reason: string) {
 }
 
 if (!supportsDeinterlace()) {
-  probe.textContent = "判定せず（このブラウザーではデインタレースできません）";
-  disableDeinterlace("（このブラウザーでは使えません）");
+  probe.textContent = "判定せず (このブラウザーではデインタレースできません)";
+  disableDeinterlace(" (このブラウザーでは使えません)");
 } else {
   // Ask the machine before offering to do what it may already be doing. Some
   // hardware decoders -- Android's especially -- hand back frames that have
@@ -643,14 +642,14 @@ if (!supportsDeinterlace()) {
   void probeDecoder().then(({ deinterlaces, survives, tookMs, error }) => {
     const left =
       survives === null ? "測定不能" : `残存率 ${survives.toFixed(2)}`;
-    const detail = `（${left} · ${tookMs.toFixed(0)}ms）`;
+    const detail = ` (${left} ${tookMs.toFixed(0)}ms)`;
     if (error) {
-      probe.textContent = `判定できず: ${error}${detail} — yadifは無効のまま`;
+      probe.textContent = `判定できず: ${error}${detail} yadifは無効のまま`;
     } else if (deinterlaces) {
-      probe.textContent = `デコーダーが自動でデインタレース${detail} — yadifは無効`;
-      disableDeinterlace("（デコーダーが自動でデインタレースします）");
+      probe.textContent = `デコーダーが自動でデインタレース${detail} yadifは無効`;
+      disableDeinterlace(" (デコーダーが自動でデインタレースします)");
     } else {
-      probe.textContent = `自動デインタレースなし${detail} — 必要ならyadifを有効にできます`;
+      probe.textContent = `自動デインタレースなし${detail} 必要ならyadifを有効にできます`;
     }
   });
 }
@@ -659,7 +658,7 @@ if (!supportsWorkerMediaSource()) {
   const auto = placement.querySelector<HTMLOptionElement>(
     'option[value="auto"]',
   )!;
-  auto.textContent = `${auto.textContent} — このブラウザーはメインスレッド`;
+  auto.textContent = `${auto.textContent} このブラウザーはメインスレッド`;
   placement.querySelector<HTMLOptionElement>(
     'option[value="worker"]',
   )!.disabled = true;
