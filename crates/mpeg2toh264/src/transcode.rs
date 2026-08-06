@@ -640,19 +640,18 @@ impl IncrementalTranscoder {
             recovery_emitted |= recovery_intra;
 
             if real_idr {
-                // One of the pair takes the long-term slot and the other stays
-                // short-term for the content to predict from; the copy only has
-                // to take it when the IDR was coded as a field and could not.
-                let clone_long_term = paired_pic.is_some();
+                // A field pair cannot mark itself long-term, so the copy behind
+                // it marks the pair rather than marking itself.
+                let mark_from_clone = paired_pic.is_some();
                 if has_field_pairs {
                     parts.push(write_access_unit_delimiter());
                 }
-                parts.push(write_reference_clone(&g, mbaff, clone_long_term));
+                parts.push(write_reference_clone(&g, mbaff, mark_from_clone));
                 prev_ref_frame_num = 1;
                 short_term_count = 1;
-                // The IDR emptied the buffer, so whichever of the two did not
-                // take the long-term slot is all the short-term chain has.
-                newest_short_term = if clone_long_term { frame_num } else { 1 };
+                // The IDR emptied the buffer and took the long-term slot either
+                // way, so the copy is all the short-term chain has.
+                newest_short_term = 1;
                 short_term.clear();
                 short_term.push(newest_short_term);
             } else if is_reference {
@@ -1417,15 +1416,22 @@ fn short_term_ref_lists(
 /// hold the same samples, so which is which does not change a single decoded
 /// sample -- but it does change which one a decoder has to keep.
 ///
-/// The IDR takes the long-term mark when it can, because VideoToolbox stops
-/// honouring an IDR as a reference once the picture behind it marks itself
-/// long-term, and substitutes the most recently decoded reference wherever the
-/// IDR is named. A source field pair cannot: it codes its IDR as a single field,
-/// and a long-term marking made by a field is one ffmpeg loses -- neither the
-/// `long_term_reference_flag` of clause 7.4.3.3 nor the command 3 it offers as
-/// the alternative reaches the other half of the pair. There the copy carries
-/// the mark instead, as it always did, and `long_term` says so.
-fn write_reference_clone(g: &FrameGeometry, mbaff: bool, long_term: bool) -> Vec<u8> {
+/// The long-term slot goes to the random access picture, not to this copy,
+/// because VideoToolbox stops honouring an IDR as a reference once the picture
+/// behind it marks itself long-term, and substitutes the most recently decoded
+/// reference wherever the IDR is named. Content then predicts from this copy,
+/// which no marking has moved, and never names the IDR at all.
+///
+/// A frame IDR says so itself with `long_term_reference_flag`. A field pair
+/// cannot -- only its first half is the IDR, and marking one field leaves the
+/// pair half marked, which ffmpeg fails to resolve -- so with
+/// `mark_random_access_point` this copy hands the slot over from outside, where
+/// being a frame lets it name the pair as a whole.
+fn write_reference_clone(
+    g: &FrameGeometry,
+    mbaff: bool,
+    mark_random_access_point: bool,
+) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(64);
     write_slice_header(
         &mut w,
@@ -1436,10 +1442,11 @@ fn write_reference_clone(g: &FrameGeometry, mbaff: bool, long_term: bool) -> Vec
             pic_order_cnt_lsb: CLONE_POC,
             log2_max_poc_lsb: LOG2_MAX_POC_LSB_MINUS4 + 4,
             reference: true,
-            // The IDR is the only picture in the buffer, and a pair of coded
-            // fields sharing a `frame_num` is one frame to a frame picture, so
-            // index 0 finds it whichever way the source sent it.
-            long_term_current: long_term.then_some(LONG_TERM_FRAME_IDX),
+            // The random access picture is the only one in the buffer, and a
+            // pair of coded fields sharing a `frame_num` is one frame to a frame
+            // picture, so index 0 and one `frame_num` back both reach it
+            // whichever way the source sent it.
+            long_term_previous: mark_random_access_point.then_some((1, LONG_TERM_FRAME_IDX)),
             mbaff,
             slice_qp: PPS_INIT_QP,
             pps_init_qp: PPS_INIT_QP,

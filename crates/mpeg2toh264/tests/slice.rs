@@ -271,6 +271,89 @@ fn an_idr_cannot_ask_for_another_long_term_frame_index() {
     idr_marking(Some(1));
 }
 
+/// The memory management commands of a P slice, read in syntax order.
+fn p_slice_marking(cfg: SliceHeaderConfig) -> Vec<u32> {
+    let mut w = BitWriter::with_capacity(32);
+    let frame_num = cfg.frame_num;
+    write_slice_header(
+        &mut w,
+        &SliceHeaderConfig {
+            slice_type: SliceType::P,
+            log2_max_frame_num: LOG2_MAX_FRAME_NUM,
+            log2_max_poc_lsb: LOG2_MAX_POC_LSB,
+            reference: true,
+            num_ref_idx_l0_active: Some(1),
+            ..cfg
+        },
+    );
+    w.rbsp_trailing_bits();
+    let mut r = Reader {
+        data: w.bytes().to_vec(),
+        pos: 0,
+    };
+    assert_eq!(r.ue(), 0, "first_mb_in_slice");
+    assert_eq!(r.ue(), SliceType::P.code(), "slice_type");
+    assert_eq!(r.ue(), 0, "pic_parameter_set_id");
+    assert_eq!(r.u(LOG2_MAX_FRAME_NUM), frame_num, "frame_num");
+    r.u(LOG2_MAX_POC_LSB); // pic_order_cnt_lsb
+    assert!(r.flag(), "num_ref_idx_active_override_flag");
+    assert_eq!(r.ue(), 0, "num_ref_idx_l0_active_minus1");
+    assert!(!r.flag(), "ref_pic_list_modification_flag_l0");
+    assert_eq!(r.ue(), 0, "luma_log2_weight_denom");
+    assert_eq!(r.ue(), 0, "chroma_log2_weight_denom");
+    assert!(!r.flag(), "luma_weight_l0_flag[0]");
+    assert!(!r.flag(), "chroma_weight_l0_flag[0]");
+    if !r.flag() {
+        return Vec::new(); // adaptive_ref_pic_marking_mode_flag
+    }
+    let mut commands = Vec::new();
+    loop {
+        let operation = r.ue();
+        commands.push(operation);
+        match operation {
+            0 => return commands,
+            1 | 3 => commands.push(r.ue()), // difference_of_pic_nums_minus1
+            2 => commands.push(r.ue()),     // long_term_pic_num
+            4 => commands.push(r.ue()),     // max_long_term_frame_idx_plus1
+            5 => {}
+            6 => {}
+            _ => panic!("unknown memory_management_control_operation {operation}"),
+        }
+        if operation == 3 || operation == 6 {
+            commands.push(r.ue()); // long_term_frame_idx
+        }
+    }
+}
+
+#[test]
+fn a_copy_can_hand_the_long_term_slot_to_the_picture_in_front_of_it() {
+    // 4 to raise MaxLongTermFrameIdx, then 3 to give the index to the picture
+    // one frame_num back -- the pair this copy was made from, which a field of
+    // that pair could not have marked for itself.
+    assert_eq!(
+        p_slice_marking(SliceHeaderConfig {
+            frame_num: 1,
+            long_term_previous: Some((1, 0)),
+            ..Default::default()
+        }),
+        vec![4, 1, 3, 0, 0, 0]
+    );
+    // Marking itself instead keeps command 6, which names no picture.
+    assert_eq!(
+        p_slice_marking(SliceHeaderConfig {
+            frame_num: 1,
+            long_term_current: Some(0),
+            ..Default::default()
+        }),
+        vec![4, 1, 6, 0, 0]
+    );
+    assert!(p_slice_marking(SliceHeaderConfig {
+        frame_num: 1,
+        ..Default::default()
+    })
+    .is_empty());
+}
+
 #[test]
 fn a_slice_without_explicit_lists_leaves_both_modification_flags_clear() {
     let read = slice_lists(107, [RefPicList::default(), RefPicList::default()], true);

@@ -87,6 +87,15 @@ pub struct SliceHeaderConfig {
     /// with `long_term_reference_flag`, which fixes the index at 0; any other
     /// reference picture says it with memory management commands.
     pub long_term_current: Option<u32>,
+    /// Marks an earlier short-term reference picture long-term instead of this
+    /// one, naming it by how far back its frame sits in `frame_num` and giving
+    /// it that `LongTermFrameIdx`.
+    ///
+    /// A picture coded as a field pair cannot mark itself: only its first half
+    /// is the IDR, and a mark made by one field leaves the pair half marked,
+    /// which ffmpeg then fails to resolve at all. The copy behind it is a frame,
+    /// so it can name the pair as a whole and hand the slot over from outside.
+    pub long_term_previous: Option<(u32, u32)>,
     /// Set when the source is interlaced, i.e. `frame_mbs_only_flag` is 0.
     pub mbaff: bool,
     /// `Some(false)` for a top field picture and `Some(true)` for a bottom
@@ -165,6 +174,7 @@ impl Default for SliceHeaderConfig {
             idr: false,
             idr_pic_id: 0,
             long_term_current: None,
+            long_term_previous: None,
             mbaff: false,
             field_picture: None,
             reference: false,
@@ -346,17 +356,33 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
             );
             w.flag(cfg.long_term_current.is_some()); // long_term_reference_flag
         } else {
-            w.flag(cfg.long_term_current.is_some()); // adaptive_ref_pic_marking_mode_flag
-            if let Some(frame_idx) = cfg.long_term_current {
+            assert!(
+                cfg.long_term_current.is_none() || cfg.long_term_previous.is_none(),
+                "there is one long-term picture, so one picture to mark"
+            );
+            let marking = cfg.long_term_current.is_some() || cfg.long_term_previous.is_some();
+            w.flag(marking); // adaptive_ref_pic_marking_mode_flag
+            if marking {
+                let frame_idx = cfg
+                    .long_term_current
+                    .unwrap_or_else(|| cfg.long_term_previous.expect("one of the two").1);
                 // 4: raise MaxLongTermFrameIdx to the index about to be used.
                 // The IDR left it at "no long-term frame indices", and clause
-                // 7.4.3.3 lets the command below name nothing above it.
+                // 7.4.3.3 lets the commands below name nothing above it.
                 w.ue(4); // memory_management_control_operation
                 w.ue(frame_idx + 1); // max_long_term_frame_idx_plus1
-                                     // 6: mark the current picture long-term. Step 3 of clause
-                                     // 8.2.5.1 then leaves it out of the short-term chain, which is
-                                     // what the sliding window would otherwise have put it in.
-                w.ue(6); // memory_management_control_operation
+                if let Some((frames_back, _)) = cfg.long_term_previous {
+                    // 3: hand the index to a picture already decoded. Named from
+                    // a frame picture it reaches a whole frame or complementary
+                    // field pair (clause 8.2.5.4.3), which is what a pair needs.
+                    w.ue(3); // memory_management_control_operation
+                    w.ue(frames_back - 1); // difference_of_pic_nums_minus1
+                } else {
+                    // 6: mark the current picture long-term. Step 3 of clause
+                    // 8.2.5.1 then leaves it out of the short-term chain, which
+                    // is what the sliding window would otherwise have put it in.
+                    w.ue(6); // memory_management_control_operation
+                }
                 w.ue(frame_idx); // long_term_frame_idx
                 w.ue(0); // memory_management_control_operation: end of the list
             }
