@@ -22,12 +22,13 @@ impl SliceType {
     }
 }
 
-/// One short-term reference field of a list written out by name.
+/// One short-term reference picture of a list written out by name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RefPicListEntry {
-    /// How far back the field's frame sits in `frame_num`.
+    /// How far back the picture's frame sits in `frame_num`.
     pub frames_back: u32,
-    /// Whether the field has the parity of the field being coded.
+    /// Whether the field has the parity of the field being coded. Ignored by a
+    /// frame slice, where a reference frame takes one entry rather than two.
     pub same_parity: bool,
 }
 
@@ -105,18 +106,16 @@ pub struct SliceHeaderConfig {
     pub num_ref_idx_l1_active: Option<u32>,
     /// Put this long-term picture first in list 0.
     pub l0_first_long_term: Option<u32>,
-    /// Both reference lists written out in full, which replaces
-    /// `l0_first_long_term` and `l1_first_short_term_delta` for the slices that
-    /// use it.
+    /// The short-term run of both reference lists, written out entry by entry,
+    /// which replaces `l0_first_long_term` and `l1_first_short_term_delta` for
+    /// the slices that use it.
     ///
-    /// Field slices need it. Their lists are built by a rule that treats the
-    /// second field of a complementary pair differently depending on whether
-    /// the pair is a reference one (clause 8.2.4.2.5), and decoders do not
-    /// agree on where that leaves a non-reference pair: VideoToolbox shortens
-    /// the run of short-term fields by one there, which moves the long-term
-    /// entry the flat prediction weights sit on and hands every macroblock a
-    /// picture other than the one it was coded against. Naming every entry
-    /// leaves nothing for the initialisation to decide.
+    /// Decoders do not agree on what the initialisation produces here.
+    /// VideoToolbox shortens the run of short-term fields of a non-reference
+    /// field pair by one, which moves the long-term entry the flat prediction
+    /// weights sit on and hands every macroblock a picture other than the one
+    /// it was coded against; it builds a different list again for the first
+    /// frames behind an IDR. Naming the run leaves nothing there to decide.
     pub explicit_ref_lists: Option<[RefPicList; 2]>,
     /// Force list 1 to begin with a short-term picture, given as the difference
     /// between the current `frame_num` and that picture's.
@@ -216,12 +215,18 @@ fn write_pred_weight_table(w: &mut BitWriter, counts: &[u32], flat_pred_ref_idx:
 /// made of them, and the entries left over -- the long-term fields -- keep
 /// their order behind it.
 ///
-/// The numbering is the one a field picture uses: `CurrPicNum` is
-/// `2 * frame_num + 1`, and a field's `PicNum` is twice its frame's
-/// `FrameNumWrap`, plus one when the field has the parity of the field being
-/// coded. Each command carries the step from the field named before it, which
-/// is why the list is walked in order rather than by index.
-fn write_ref_pic_list_modification(w: &mut BitWriter, list: &RefPicList, frame_num: u32) {
+/// The numbering follows the picture being coded (clause 8.2.4.1): a frame's
+/// `CurrPicNum` is `frame_num` and a reference frame's `PicNum` is its
+/// `FrameNumWrap`, while a field doubles both and adds one to the `PicNum` of a
+/// field that has the parity of the field being coded. Each command carries the
+/// step from the picture named before it, which is why the list is walked in
+/// order rather than by index.
+fn write_ref_pic_list_modification(
+    w: &mut BitWriter,
+    list: &RefPicList,
+    frame_num: u32,
+    field: bool,
+) {
     w.flag(list.len() > 0); // ref_pic_list_modification_flag_lX
     if list.len() == 0 {
         return;
@@ -230,9 +235,11 @@ fn write_ref_pic_list_modification(w: &mut BitWriter, list: &RefPicList, frame_n
     // has a negative `FrameNumWrap`, and the differences below are what the
     // decoder adds back, so they have to be taken before any wrapping.
     let frame_num = i64::from(frame_num);
-    let mut predicted = 2 * frame_num + 1; // CurrPicNum
+    let per_frame = if field { 2 } else { 1 };
+    let mut predicted = per_frame * frame_num + i64::from(field); // CurrPicNum
     for entry in list.iter() {
-        let pic_num = 2 * (frame_num - i64::from(entry.frames_back)) + i64::from(entry.same_parity);
+        let pic_num = per_frame * (frame_num - i64::from(entry.frames_back))
+            + i64::from(field && entry.same_parity);
         if pic_num < predicted {
             w.ue(0); // subtract from the predicted picNum
             w.ue((predicted - pic_num - 1) as u32); // abs_diff_pic_num_minus1
@@ -290,9 +297,10 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
     // ref_pic_list_modification. List 0's default order already puts the nearest
     // preceding reference first, so only list 1 needs correcting -- except in
     // the field slices that name both lists outright.
+    let field = cfg.field_picture.is_some();
     if cfg.slice_type != SliceType::I {
         if let Some(lists) = &cfg.explicit_ref_lists {
-            write_ref_pic_list_modification(w, &lists[0], cfg.frame_num);
+            write_ref_pic_list_modification(w, &lists[0], cfg.frame_num, field);
         } else {
             w.flag(cfg.l0_first_long_term.is_some());
             if let Some(long_term) = cfg.l0_first_long_term {
@@ -304,7 +312,7 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
     }
     if is_b {
         if let Some(lists) = &cfg.explicit_ref_lists {
-            write_ref_pic_list_modification(w, &lists[1], cfg.frame_num);
+            write_ref_pic_list_modification(w, &lists[1], cfg.frame_num, field);
         } else {
             w.flag(cfg.l1_first_short_term_delta.is_some());
             if let Some(delta) = cfg.l1_first_short_term_delta {

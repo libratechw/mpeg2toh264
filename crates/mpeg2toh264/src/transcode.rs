@@ -1319,25 +1319,27 @@ fn field_picture_ref_index(
     frame_ref * 2 + i32::from(selected != current)
 }
 
-/// Name the short-term entries of a field slice's two reference lists.
+/// Name the short-term entries of a slice's two reference lists.
 ///
-/// The order is the one clause 8.2.4.2.5 builds for a field picture whose pair
-/// is not a reference pair: the frames in list order, each contributing the
-/// field with the parity of the one being coded and then its mate. Writing it
-/// out instead of leaving it to the decoder is what keeps
-/// [`field_picture_ref_index`]'s arithmetic true on decoders that count the
-/// short-term fields differently -- VideoToolbox is one, and puts the
-/// long-term picture two indices below where the slice header's weights are.
+/// The order is the one clause 8.2.4.2.3 builds for a frame and 8.2.4.2.5 for a
+/// field: the reference frames in list order, a field picture taking from each
+/// the field with the parity of the one being coded and then its mate. Writing
+/// it out instead of leaving it to the decoder is what keeps the index
+/// arithmetic of [`Prediction`] true on decoders that build the list
+/// differently -- VideoToolbox does, and puts the long-term picture an index
+/// below where the slice header's weights are.
 ///
-/// The long-term fields behind them are deliberately left unnamed. Reordering
+/// The long-term entries behind them are deliberately left unnamed. Reordering
 /// keeps the entries a slice does not name, in the order the initialisation put
-/// them, so the pair still lands right behind the run named here -- and naming
-/// it is not an option, because VideoToolbox rejects `long_term_pic_num` in a
-/// field slice outright and fails the picture with `kVTVideoDecoderBadDataErr`.
-fn field_ref_lists(
+/// them, so the long-term picture still lands right behind the run named here
+/// -- and naming it is not an option, because VideoToolbox rejects
+/// `long_term_pic_num` in a field slice outright and fails the picture with
+/// `kVTVideoDecoderBadDataErr`.
+fn short_term_ref_lists(
     short_term: &ShortTermFrames,
     frame_num: u32,
     backward: bool,
+    field: bool,
 ) -> [RefPicList; 2] {
     let mut newest_first = [0u32; MAX_SHORT_TERM_FRAMES];
     let mut count = 0;
@@ -1347,14 +1349,18 @@ fn field_ref_lists(
     }
     let newest_first = &newest_first[..count];
 
-    fn push_frame(list: &mut RefPicList, frames_back: u32) {
+    // A frame takes one entry; a field takes its own parity and then its mate.
+    let push_frame = |list: &mut RefPicList, frames_back: u32| {
         for same_parity in [true, false] {
             list.push(RefPicListEntry {
                 frames_back,
                 same_parity,
             });
+            if !field {
+                break;
+            }
         }
-    }
+    };
 
     let mut lists = [RefPicList::default(), RefPicList::default()];
     match newest_first.split_first() {
@@ -1373,17 +1379,23 @@ fn field_ref_lists(
         }
         // Without a following picture the two lists come out identical, and the
         // initialisation ends by exchanging the first two entries of list 1.
-        // The macroblock writer reaches the nearest reference through both, so
-        // reproduce that exchange rather than leaving the lists the same.
+        // For a field those two are the parities of one frame, and the
+        // macroblock writer reaches both through list 1, so reproduce the
+        // exchange; for a frame they are two different pictures and the writer
+        // wants the nearest reference first in both lists, so do not.
         Some((&nearest, rest)) => {
             for &frames_back in newest_first {
                 push_frame(&mut lists[0], frames_back);
             }
-            for same_parity in [false, true] {
-                lists[1].push(RefPicListEntry {
-                    frames_back: nearest,
-                    same_parity,
-                });
+            if field {
+                for same_parity in [false, true] {
+                    lists[1].push(RefPicListEntry {
+                        frames_back: nearest,
+                        same_parity,
+                    });
+                }
+            } else {
+                push_frame(&mut lists[1], nearest);
             }
             for &frames_back in rest {
                 push_frame(&mut lists[1], frames_back);
@@ -1834,23 +1846,36 @@ fn write_picture(
         // The long-term picture contributes both of its fields behind them,
         // except to the pair that has not reached it yet.
         let field_list_len = short_term_fields + if anchor_second_field { 0 } else { 2 };
-        // The short-term run a field slice would otherwise leave a decoder to
-        // work out. The second field of a reference pair is left alone: its
-        // first field stands in the list on its own, which decoders do agree
-        // about, and naming that list would mean naming a field of the picture
-        // being coded.
-        let explicit_ref_lists =
-            (direct_field_pair && !anchor_second_field && !second_field_of_reference_pair)
-                .then(|| field_ref_lists(&ctx.short_term, ctx.frame_num, layout.bwd_l0 >= 0));
-        debug_assert!(explicit_ref_lists.is_none_or(|lists| lists
-            .iter()
-            .all(|list| list.len() == short_term_fields as usize)));
         let output_slice_type = if intra_field {
             SliceType::I
         } else {
             // A B slice is the only one with a list 1 to put the flat weights in.
             SliceType::B
         };
+        // The short-term run the slice would otherwise leave a decoder to work
+        // out. Two slices keep the default lists: an I slice has none, and the
+        // second field of a reference pair has its own first field standing in
+        // its list, which decoders do agree about and which cannot be named
+        // without naming a field of the picture being coded.
+        let explicit_ref_lists = (output_slice_type != SliceType::I
+            && !anchor_second_field
+            && !second_field_of_reference_pair)
+            .then(|| {
+                short_term_ref_lists(
+                    &ctx.short_term,
+                    ctx.frame_num,
+                    layout.bwd_l0 >= 0,
+                    direct_field_pair,
+                )
+            });
+        debug_assert!(
+            explicit_ref_lists.is_none_or(|lists| lists.iter().all(|list| list.len()
+                == if direct_field_pair {
+                    short_term_fields as usize
+                } else {
+                    layout.flat as usize
+                }))
+        );
         let source_field = usize::from(second_output_field);
         let first_parity =
             usize::from(pic.coding.picture_structure == PictureStructure::BottomField);

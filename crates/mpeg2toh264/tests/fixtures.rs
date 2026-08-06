@@ -13,13 +13,17 @@ use mpeg2toh264::{
 use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
 
 /// fixture, converted pictures, output bytes, FNV-1a of the Annex B stream.
+/// Last moved when every P and B slice began naming its short-term reference
+/// list outright, which only lengthens the slice headers: each fixture decodes
+/// to the same frames as before, checked frame by frame with `ffmpeg -f
+/// framemd5`.
 const GOLDEN: [(&str, usize, usize, u64); 6] = [
-    ("altscan.m2v", 8, 223995, 0x60e5_ac43_bb5b_84d3),
-    ("escape.m2v", 6, 122597, 0xbedc_9012_9025_18a1),
-    ("hd1080i.m2v", 15, 2106341, 0x020e_86c6_7003_7cd0),
-    ("i_only.m2v", 3, 79516, 0x7158_d2c6_b843_799f),
-    ("ibbp.m2v", 15, 164427, 0x4c91_1934_64ff_cdbc),
-    ("ip.m2v", 10, 132295, 0x991b_74d5_3f7e_6924),
+    ("altscan.m2v", 8, 224013, 0x010e_15c1_223c_db4b),
+    ("escape.m2v", 6, 122608, 0xdfdc_2865_256a_077b),
+    ("hd1080i.m2v", 15, 2106384, 0x83f4_3466_1d58_cd74),
+    ("i_only.m2v", 3, 79516, 0x337a_4d1d_9eb5_2ef4),
+    ("ibbp.m2v", 15, 164467, 0x7a75_2afa_9f87_6f58),
+    ("ip.m2v", 10, 132315, 0x02b3_17b4_0c62_f30b),
 ];
 
 #[test]

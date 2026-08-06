@@ -1,6 +1,6 @@
-//! A field slice's reference list modification read back with a parser written
+//! A slice's reference list modification read back with a parser written
 //! against clause 8.2.4.3.1 rather than against the writer, so a shared
-//! misunderstanding of the field picture numbering cannot hide.
+//! misunderstanding of the picture numbering cannot hide.
 
 use mpeg2toh264::h264::bitwriter::BitWriter;
 use mpeg2toh264::h264::slice::{
@@ -42,12 +42,18 @@ impl Reader {
 
 const LOG2_MAX_FRAME_NUM: u32 = 8;
 const LOG2_MAX_POC_LSB: u32 = 16;
-const MAX_PIC_NUM: i64 = 2 * (1 << LOG2_MAX_FRAME_NUM);
+const MAX_FRAME_NUM: i64 = 1 << LOG2_MAX_FRAME_NUM;
 
 /// Run the reordering commands of one list and return the `PicNum` each one
 /// selects, in the order the list ends up in.
-fn read_modification(r: &mut Reader, frame_num: u32) -> Vec<i64> {
-    let curr_pic_num = 2 * i64::from(frame_num) + 1;
+fn read_modification(r: &mut Reader, frame_num: u32, field: bool) -> Vec<i64> {
+    let max_pic_num = if field {
+        2 * MAX_FRAME_NUM
+    } else {
+        MAX_FRAME_NUM
+    };
+    // CurrPicNum: frame_num for a frame, 2 * frame_num + 1 for a field.
+    let curr_pic_num = pic_num(frame_num, 0, true, field);
     let mut selected = Vec::new();
     if !r.flag() {
         return selected;
@@ -69,21 +75,21 @@ fn read_modification(r: &mut Reader, frame_num: u32) -> Vec<i64> {
             predicted + difference
         };
         if no_wrap < 0 {
-            no_wrap += MAX_PIC_NUM;
-        } else if no_wrap >= MAX_PIC_NUM {
-            no_wrap -= MAX_PIC_NUM;
+            no_wrap += max_pic_num;
+        } else if no_wrap >= max_pic_num {
+            no_wrap -= max_pic_num;
         }
         predicted = no_wrap;
         selected.push(if no_wrap > curr_pic_num {
-            no_wrap - MAX_PIC_NUM
+            no_wrap - max_pic_num
         } else {
             no_wrap
         });
     }
 }
 
-/// Both lists of a B field slice, as `PicNum` values.
-fn field_slice_lists(frame_num: u32, lists: [RefPicList; 2]) -> [Vec<i64>; 2] {
+/// Both lists of a B slice, as `PicNum` values.
+fn slice_lists(frame_num: u32, lists: [RefPicList; 2], field: bool) -> [Vec<i64>; 2] {
     let mut w = BitWriter::with_capacity(64);
     write_slice_header(
         &mut w,
@@ -93,7 +99,7 @@ fn field_slice_lists(frame_num: u32, lists: [RefPicList; 2]) -> [Vec<i64>; 2] {
             log2_max_frame_num: LOG2_MAX_FRAME_NUM,
             log2_max_poc_lsb: LOG2_MAX_POC_LSB,
             mbaff: true,
-            field_picture: Some(false),
+            field_picture: field.then_some(false),
             num_ref_idx_l0_active: Some(8),
             num_ref_idx_l1_active: Some(8),
             explicit_ref_lists: Some(lists),
@@ -111,15 +117,17 @@ fn field_slice_lists(frame_num: u32, lists: [RefPicList; 2]) -> [Vec<i64>; 2] {
     assert_eq!(r.ue(), SliceType::B.code(), "slice_type");
     assert_eq!(r.ue(), 0, "pic_parameter_set_id");
     assert_eq!(r.u(LOG2_MAX_FRAME_NUM), frame_num, "frame_num");
-    assert!(r.flag(), "field_pic_flag");
-    assert!(!r.flag(), "bottom_field_flag");
+    assert_eq!(r.flag(), field, "field_pic_flag");
+    if field {
+        assert!(!r.flag(), "bottom_field_flag");
+    }
     r.u(LOG2_MAX_POC_LSB); // pic_order_cnt_lsb
     assert!(r.flag(), "direct_spatial_mv_pred_flag");
     assert!(r.flag(), "num_ref_idx_active_override_flag");
     assert_eq!(r.ue(), 7, "num_ref_idx_l0_active_minus1");
     assert_eq!(r.ue(), 7, "num_ref_idx_l1_active_minus1");
-    let l0 = read_modification(&mut r, frame_num);
-    let l1 = read_modification(&mut r, frame_num);
+    let l0 = read_modification(&mut r, frame_num, field);
+    let l1 = read_modification(&mut r, frame_num, field);
     [l0, l1]
 }
 
@@ -134,10 +142,15 @@ fn list_of(entries: &[(u32, bool)]) -> RefPicList {
     list
 }
 
-/// A field's `PicNum` is twice its frame's `FrameNumWrap`, plus one when it has
-/// the parity of the field being coded (clause 8.2.4.1).
-fn pic_num(frame_num: u32, frames_back: u32, same_parity: bool) -> i64 {
-    2 * (i64::from(frame_num) - i64::from(frames_back)) + i64::from(same_parity)
+/// A frame's `PicNum` is its `FrameNumWrap`; a field's is twice that, plus one
+/// when it has the parity of the field being coded (clause 8.2.4.1).
+fn pic_num(frame_num: u32, frames_back: u32, same_parity: bool, field: bool) -> i64 {
+    let frame_num_wrap = i64::from(frame_num) - i64::from(frames_back);
+    if field {
+        2 * frame_num_wrap + i64::from(same_parity)
+    } else {
+        frame_num_wrap
+    }
 }
 
 #[test]
@@ -161,11 +174,11 @@ fn a_field_slice_names_every_short_term_field_of_both_lists() {
         (3, true),
         (3, false),
     ];
-    let read = field_slice_lists(frame_num, [list_of(&l0), list_of(&l1)]);
+    let read = slice_lists(frame_num, [list_of(&l0), list_of(&l1)], true);
     for (list, expected) in read.iter().zip([l0, l1]) {
         let expected: Vec<i64> = expected
             .iter()
-            .map(|&(back, same)| pic_num(frame_num, back, same))
+            .map(|&(back, same)| pic_num(frame_num, back, same, true))
             .collect();
         assert_eq!(*list, expected);
     }
@@ -180,10 +193,10 @@ fn a_field_slice_list_survives_the_frame_num_wrapping_to_zero() {
     // picture and its FrameNumWrap is negative.
     let frame_num = 1;
     let entries = [(2, true), (2, false), (3, true), (3, false)];
-    let read = field_slice_lists(frame_num, [list_of(&entries), list_of(&entries)]);
+    let read = slice_lists(frame_num, [list_of(&entries), list_of(&entries)], true);
     let expected: Vec<i64> = entries
         .iter()
-        .map(|&(back, same)| pic_num(frame_num, back, same))
+        .map(|&(back, same)| pic_num(frame_num, back, same, true))
         .collect();
     assert!(expected.iter().all(|&num| num < 0), "{expected:?}");
     assert_eq!(read[0], expected);
@@ -191,8 +204,32 @@ fn a_field_slice_list_survives_the_frame_num_wrapping_to_zero() {
 }
 
 #[test]
+fn a_frame_slice_names_one_entry_per_reference_frame() {
+    // The first B picture behind a random access point: list 0 reaches the IDR
+    // three frame numbers back and then the reference picture it was decoded
+    // behind, which is the one command that has to count forward.
+    let frame_num = 3;
+    let l0 = [(3, true), (1, true)];
+    let l1 = [(1, true), (3, true)];
+    let read = slice_lists(frame_num, [list_of(&l0), list_of(&l1)], false);
+    assert_eq!(
+        read[0],
+        vec![0, 2],
+        "list 0 names the IDR and then PicNum 2"
+    );
+    assert_eq!(read[1], vec![2, 0]);
+    // A frame numbers its references by FrameNumWrap alone, so the parity bit
+    // the entries carry for a field must not reach the bitstream.
+    let same: Vec<i64> = l0
+        .iter()
+        .map(|&(back, _)| pic_num(frame_num, back, false, false))
+        .collect();
+    assert_eq!(read[0], same);
+}
+
+#[test]
 fn a_slice_without_explicit_lists_leaves_both_modification_flags_clear() {
-    let read = field_slice_lists(107, [RefPicList::default(), RefPicList::default()]);
+    let read = slice_lists(107, [RefPicList::default(), RefPicList::default()], true);
     assert!(read[0].is_empty());
     assert!(read[1].is_empty());
 }
