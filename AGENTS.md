@@ -36,4 +36,6 @@ cargo test --release
 npm run typecheck
 npm run packages:build
 npm run web:build
+npx prettier --check packages/**/*.{ts,js,json} package.json
+cargo fmt --check
 ```

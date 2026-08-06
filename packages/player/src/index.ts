@@ -1,3 +1,10 @@
+/*!
+ * @mpeg2toh264/player
+ * <https://github.com/otya128/mpeg2toh264>
+ *
+ * SPDX-FileCopyrightText: 2026 otya
+ * SPDX-License-Identifier: MIT
+ */
 /**
  * Play an MPEG-2 transport stream in a `<video>`.
  *

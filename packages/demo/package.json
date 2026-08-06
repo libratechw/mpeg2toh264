@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "description": "Demo application for @mpeg2toh264/player",
   "type": "module",
+  "license": "MIT",
   "private": true,
   "scripts": {
     "dev": "vite",

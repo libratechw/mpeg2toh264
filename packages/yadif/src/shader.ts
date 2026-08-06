@@ -1,4 +1,4 @@
-/*
+/*!
  * SPDX-License-Identifier: LGPL-2.1-or-later
  *
  * yadif, as a WebGL2 fragment shader.
@@ -11,7 +11,7 @@
  * and follows libavfilter/vf_yadif.c:
  *
  *   Copyright (C) 2006-2011 Michael Niedermayer <michaelni@gmx.at>
- *               2010      James Darnley <james.darnley@gmail.com>
+ *                 2010      James Darnley <james.darnley@gmail.com>
  *
  * This file is free software; you can redistribute it and/or modify it under
  * the terms of the GNU Lesser General Public License as published by the Free
@@ -26,7 +26,6 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this file; if not, see <https://www.gnu.org/licenses/>.
  *
- * The player package is MIT; this package is LGPL-2.1-or-later.
  */
 
 /**
