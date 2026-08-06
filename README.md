@@ -1,5 +1,162 @@
 # mpeg2toh264
 
+[日本語版はこちら](#日本語)
+
+An implementation that transcodes MPEG-2 to H.264/AVC without fully decoding the MPEG-2 video.
+
+Conventional transcoders decode MPEG-2 and encode the result from scratch with an H.264 encoder. This implementation instead reuses the MPEG-2 quantized coefficients, macroblock types, motion vectors, and picture-reference relationships, converting them directly into a corresponding H.264 bitstream without motion compensation or similar processing.
+
+This is neither a general-purpose MPEG-2 decoder nor a general-purpose H.264 encoder. It is designed to reuse the structure of the original compression so that MPEG-2 broadcast video can be played with low processing overhead in environments such as browsers, where an H.264 decoder is available.
+
+## How the conversion works
+
+### 1. Converting coefficients without decoding them to pixels
+
+When MPEG-2 8x8 quantized levels are inverse-quantized according to the specification and mismatch control is applied, the resulting values are coefficients in an orthonormal DCT space. Because the H.264 High Profile 8x8 transform reconstructs values in the same space, luma residuals can be converted directly by processing each coefficient as follows:
+
+1. Calculate the target DCT value from the MPEG-2 level, quantizer scale, and quantization matrix.
+2. Supply the MPEG-2 non-intra quantization matrix to the SPS/PPS as the H.264 8x8 scaling list.
+3. Divide the target value by the H.264 inverse-scaling gain at that position and round it to the nearest H.264 level.
+4. Encode the coefficients with CAVLC.
+
+`--oversample` specifies how many times finer the H.264 quantization step is than the MPEG-2 step (default: 2). A value of 1 adds rounding error comparable to MPEG-2's own error and causes roughly 1.5 dB of loss; typical figures are about 0.5 dB for 2 and 0.13 dB for 4. Higher values produce larger output.
+
+MPEG-2 4:2:0 chroma, however, uses one 8x8 DCT block, whereas H.264 uses four 4x4 integer transforms and a 2x2 DC Hadamard transform. Chroma blocks are therefore returned to the spatial domain once with an IDCT and projected onto the H.264 4x4 basis. A chroma QP offset of -6 is used to limit accumulated rounding error.
+
+### 2. Reproducing MPEG-2 prediction in H.264
+
+MPEG-2 motion vectors use half-pixel units, with half-pixels formed by bilinear interpolation between two adjacent pixels. H.264 normally uses a 6-tap filter for half-pixel interpolation, so simply doubling a vector to convert it to quarter-pixel units does not reproduce the same prediction.
+
+This implementation places two predictions one integer pixel apart into reference lists 0 and 1, then averages them using H.264 bidirectional prediction. This exactly reproduces MPEG-2 luma prediction when only one axis is at a half-pixel position. Consequently, normal output uses B slices even when the source picture is an I or P picture.
+
+Conversion accuracy is as follows:
+
+| MPEG-2 position/prediction | H.264 representation | Accuracy |
+| --- | --- | --- |
+| Integer pixels on both axes | One prediction | Exact for both luma and chroma |
+| Half-pixel on one axis only | Bidirectional prediction from two points in the same reference picture | Exact for luma; chroma is offset by 1/4 chroma pixel |
+| Half-pixel on both axes | Bilinear interpolation for one prediction and H.264 interpolation for the other | Luma is also approximate |
+| MPEG-2 bidirectional prediction | Both reference lists are used for forward and backward prediction | The averaging structure is the same, but fractional-pixel filtering is performed by H.264 |
+
+The chroma offset occurs because MPEG-2 rounds the luma vector toward zero before halving it, while H.264 derives chroma vectors from luma vectors at 1/8-chroma-pixel precision and has no way to specify a chroma-only vector.
+
+Because H.264 motion-vector differences are predicted from neighboring blocks, the implementation retains reference indices and vectors for previously emitted 4x4 blocks, performs the same median prediction as an H.264 decoder, and records the difference. It stores only prediction state, not a reference-pixel frame buffer.
+
+### 3. Using a constant prediction for MPEG-2 intra macroblocks
+
+Replacing an MPEG-2 intra macroblock directly with H.264 intra prediction would require subtracting a prediction derived from neighboring pixels, which in turn requires pixel reconstruction.
+
+Instead, intra macroblocks in normal pictures are recorded as inter macroblocks with a zero motion vector. Setting explicit weighted prediction to weight 0 and offset 127 for a dedicated long-term reference index makes the predicted value always 127, regardless of the reference picture's contents. The residual can then remain in the coefficient domain: only `8 x 127` needs to be subtracted from the DC coefficient. The long-term reference picture exists only to provide an index; its pixels are never referenced.
+
+### 4. Random access points
+
+An IDR used to begin decoding is an I slice and has no reference list for the constant prediction. It therefore uses H.264 DC intra prediction. Inverse transformation and reconstruction are performed for this picture so that the decoder can obtain pixels referenced by the next macroblock.
+
+I_PCM could avoid all but the inverse transform, but it caused QSV decoding problems at high resolutions and is therefore not used. A solid-gray frame was also considered, but rejected because it flickered in some playback environments.
+
+Immediately after the IDR, a copy of the same image is emitted as a long-term reference to reserve the index used for subsequent constant predictions. Streaming output creates a random access point every 24 GOPs. Pictures whose references are unavailable in the new decoded-picture buffer, such as leading B pictures in an open GOP, are dropped; the IDR display duration is extended to preserve the original GOP length and audio/video synchronization.
+
+### 5. Interlacing
+
+Progressive sequences are output using frame coding. Interlaced sequences are represented with MBAFF, and top and bottom field pictures are combined into one frame.
+
+## Input and output
+
+Input may be an MPEG-2 Video elementary stream or an MPEG transport stream with 188-byte packets. For transport streams, MPEG-2 Video (stream type `0x02`) and AAC-LC from the same service are selected through the PAT/PMT.
+
+Output:
+
+- `.h264`: Annex B H.264
+- Other extensions (normally `.mp4`): fragmented MP4; AAC audio is multiplexed for transport-stream input, while elementary-stream input contains video only
+
+```bash
+cargo build --release
+./target/release/mpeg2toh264 input.ts output.mp4
+./target/release/mpeg2toh264 input.m2v output.h264
+```
+
+```text
+-o, --oversample <n>   H.264 quantization-step granularity (default: 2; positive)
+-q, --quiet            Suppress progress and summary output
+-h, --help             Show help
+```
+
+AAC is not re-encoded. Ordinary stereo and 5.1-channel audio are preserved. Mono duplicates the same ICS to the left and right channels, while dual mono duplicates the primary audio to both channels, keeping the output stereo even if the source configuration changes midstream.
+
+Main limitations:
+
+- Video support covers MPEG-2 I/P/B pictures and 4:2:0 chroma.
+- Resolution changes or switches between progressive and interlaced sequences during conversion are not supported.
+- Transport-stream audio must be AAC-LC; channel-element rearrangement supports 44.1 kHz and 48 kHz.
+- Corrupt slices, leading B pictures without all references, and unpaired field pictures are skipped.
+- Output is lossy because of requantization, and fractional-pixel prediction uses the approximations shown in the table above.
+
+Open-GOP limitation:
+
+- By default, a random access point is created every 24 GOPs, so the leading B frames of an open GOP are skipped every 24 GOPs.
+
+Interlaced-video limitations:
+
+- Chrome on Windows may fall back to software decoding.
+  - This has been observed on at least Intel systems.
+- Firefox on Windows may freeze when frame and field pictures are mixed.
+  - A workaround that places top and bottom fields in separate samples is possible, but is not implemented because it may adversely affect other environments.
+- Chrome on macOS may fall back to software decoding.
+
+## WebAssembly and MSE player
+
+Docker can run a demo that converts a selected local file or URL in the browser.
+
+```bash
+docker build -t mpeg2toh264-demo .
+docker run --rm -p 8080:80 mpeg2toh264-demo
+# http://localhost:8080
+```
+
+A reverse proxy can be configured when reading a transport stream from another HTTP server without CORS configuration.
+
+```bash
+docker run --rm -p 8080:80 \
+  -e STREAM_UPSTREAM=http://192.168.1.3:40772 \
+  mpeg2toh264-demo
+```
+
+In this example, requesting `/stream/api/channels/GR/27/stream` forwards to `http://192.168.1.3:40772/api/channels/GR/27/stream`.
+
+Local build:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli  # Match the wasm-bindgen version in Cargo.lock
+./tools/build-wasm.sh
+npm install
+npm run packages:build
+npm run web:dev
+```
+
+The demo uses <https://github.com/monyone/aribb24.js> to display captions and superimposed text.
+
+## Repository layout
+
+```text
+crates/mpeg2toh264/       MPEG-2 parsing, H.264 output, containers, and Session
+crates/mpeg2toh264-cli/   CLI
+crates/mpeg2toh264-wasm/  wasm-bindgen wrapper for Session
+packages/player/          Browser player
+packages/yadif/           WebGL yadif
+packages/demo/            Browser demo
+testdata/                 Test data
+tools/                    Table generation, WASM builds, and test-data creation
+```
+
+The interface for each library is documented in the README in its directory.
+
+The Rust crate, CLI, and player are licensed under MIT. `packages/yadif` is licensed under LGPL-2.1-or-later because it contains code derived from FFmpeg. The AAC processing approach was inspired by <https://github.com/xtne6f/tsreadex>.
+
+---
+
+## 日本語
+
 MPEG-2を完全にデコードせずH.264/AVCへトランスコードする実装
 
 一般的なトランスコーダーではMPEG-2をデコードしてH.264エンコーダーで1からエンコードするという処理を行いますが、この実装はMPEG-2が持つ量子化係数、マクロブロック種別、動きベクトル、ピクチャ参照関係を再利用し、動き補償などの処理を行わずに対応するH.264のビットストリームへ直接変換します。
