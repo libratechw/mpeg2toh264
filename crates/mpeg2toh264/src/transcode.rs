@@ -1632,7 +1632,11 @@ fn write_picture(
         // macroblocks from, so the second field goes through the same path
         // every content picture does.
         let anchor_second_field = ctx.real_idr && second_output_field;
-        if anchor_second_field {
+        // Only the first field of an IDR or recovery picture is independently
+        // reconstructed. The second field is a B slice and must use inter
+        // macroblock syntax; carrying this state across would write I-slice
+        // mb_type values under a B-slice header and desynchronise the decoder.
+        if (ctx.real_idr || ctx.recovery_intra) && second_output_field {
             intra_state = None;
         }
         let layout = if anchor_second_field {
