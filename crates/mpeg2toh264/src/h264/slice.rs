@@ -22,6 +22,53 @@ impl SliceType {
     }
 }
 
+/// One short-term reference field of a list written out by name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RefPicListEntry {
+    /// How far back the field's frame sits in `frame_num`.
+    pub frames_back: u32,
+    /// Whether the field has the parity of the field being coded.
+    pub same_parity: bool,
+}
+
+/// The longest run this writer names: three short-term frames, two fields each.
+pub const MAX_REF_PIC_LIST: usize = 6;
+
+/// A reference picture list built entry by entry, in list order.
+#[derive(Clone, Copy)]
+pub struct RefPicList {
+    entries: [Option<RefPicListEntry>; MAX_REF_PIC_LIST],
+    len: usize,
+}
+
+impl Default for RefPicList {
+    fn default() -> Self {
+        Self {
+            entries: [None; MAX_REF_PIC_LIST],
+            len: 0,
+        }
+    }
+}
+
+impl RefPicList {
+    pub fn push(&mut self, entry: RefPicListEntry) {
+        assert!(
+            self.len < MAX_REF_PIC_LIST,
+            "reference list longer than {MAX_REF_PIC_LIST} entries"
+        );
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = RefPicListEntry> + '_ {
+        self.entries[..self.len].iter().filter_map(|entry| *entry)
+    }
+}
+
 pub struct SliceHeaderConfig {
     pub first_mb_in_slice: u32,
     pub slice_type: SliceType,
@@ -58,6 +105,19 @@ pub struct SliceHeaderConfig {
     pub num_ref_idx_l1_active: Option<u32>,
     /// Put this long-term picture first in list 0.
     pub l0_first_long_term: Option<u32>,
+    /// Both reference lists written out in full, which replaces
+    /// `l0_first_long_term` and `l1_first_short_term_delta` for the slices that
+    /// use it.
+    ///
+    /// Field slices need it. Their lists are built by a rule that treats the
+    /// second field of a complementary pair differently depending on whether
+    /// the pair is a reference one (clause 8.2.4.2.5), and decoders do not
+    /// agree on where that leaves a non-reference pair: VideoToolbox shortens
+    /// the run of short-term fields by one there, which moves the long-term
+    /// entry the flat prediction weights sit on and hands every macroblock a
+    /// picture other than the one it was coded against. Naming every entry
+    /// leaves nothing for the initialisation to decide.
+    pub explicit_ref_lists: Option<[RefPicList; 2]>,
     /// Force list 1 to begin with a short-term picture, given as the difference
     /// between the current `frame_num` and that picture's.
     ///
@@ -114,6 +174,7 @@ impl Default for SliceHeaderConfig {
             num_ref_idx_l0_active: None,
             num_ref_idx_l1_active: None,
             l0_first_long_term: None,
+            explicit_ref_lists: None,
             l1_first_short_term_delta: None,
             flat_pred_ref_idx: [None; 2],
         }
@@ -145,6 +206,43 @@ fn write_pred_weight_table(w: &mut BitWriter, counts: &[u32], flat_pred_ref_idx:
             }
         }
     }
+}
+
+/// Write `ref_pic_list_modification` for one list, naming its short-term run.
+///
+/// Only field slices come through here. Each command moves the field it names
+/// to the next index and shifts the rest along (clause 8.2.4.3.1), so naming
+/// the run in order puts those indices beyond doubt whatever the initialisation
+/// made of them, and the entries left over -- the long-term fields -- keep
+/// their order behind it.
+///
+/// The numbering is the one a field picture uses: `CurrPicNum` is
+/// `2 * frame_num + 1`, and a field's `PicNum` is twice its frame's
+/// `FrameNumWrap`, plus one when the field has the parity of the field being
+/// coded. Each command carries the step from the field named before it, which
+/// is why the list is walked in order rather than by index.
+fn write_ref_pic_list_modification(w: &mut BitWriter, list: &RefPicList, frame_num: u32) {
+    w.flag(list.len() > 0); // ref_pic_list_modification_flag_lX
+    if list.len() == 0 {
+        return;
+    }
+    // Signed throughout: a reference older than the last wrap of `frame_num`
+    // has a negative `FrameNumWrap`, and the differences below are what the
+    // decoder adds back, so they have to be taken before any wrapping.
+    let frame_num = i64::from(frame_num);
+    let mut predicted = 2 * frame_num + 1; // CurrPicNum
+    for entry in list.iter() {
+        let pic_num = 2 * (frame_num - i64::from(entry.frames_back)) + i64::from(entry.same_parity);
+        if pic_num < predicted {
+            w.ue(0); // subtract from the predicted picNum
+            w.ue((predicted - pic_num - 1) as u32); // abs_diff_pic_num_minus1
+        } else {
+            w.ue(1); // add to the predicted picNum
+            w.ue((pic_num - predicted - 1) as u32);
+        }
+        predicted = pic_num;
+    }
+    w.ue(3); // end of the list
 }
 
 pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
@@ -190,21 +288,30 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
     }
 
     // ref_pic_list_modification. List 0's default order already puts the nearest
-    // preceding reference first, so only list 1 needs correcting.
+    // preceding reference first, so only list 1 needs correcting -- except in
+    // the field slices that name both lists outright.
     if cfg.slice_type != SliceType::I {
-        w.flag(cfg.l0_first_long_term.is_some());
-        if let Some(long_term) = cfg.l0_first_long_term {
-            w.ue(2); // modification_of_pic_nums_idc 2: select a long-term picture
-            w.ue(long_term);
-            w.ue(3); // modification_of_pic_nums_idc 3: end of the list
+        if let Some(lists) = &cfg.explicit_ref_lists {
+            write_ref_pic_list_modification(w, &lists[0], cfg.frame_num);
+        } else {
+            w.flag(cfg.l0_first_long_term.is_some());
+            if let Some(long_term) = cfg.l0_first_long_term {
+                w.ue(2); // modification_of_pic_nums_idc 2: select a long-term picture
+                w.ue(long_term);
+                w.ue(3); // modification_of_pic_nums_idc 3: end of the list
+            }
         }
     }
     if is_b {
-        w.flag(cfg.l1_first_short_term_delta.is_some());
-        if let Some(delta) = cfg.l1_first_short_term_delta {
-            w.ue(0); // modification_of_pic_nums_idc 0: subtract from the predicted picNum
-            w.ue(delta - 1); // abs_diff_pic_num_minus1
-            w.ue(3); // modification_of_pic_nums_idc 3: end of the list
+        if let Some(lists) = &cfg.explicit_ref_lists {
+            write_ref_pic_list_modification(w, &lists[1], cfg.frame_num);
+        } else {
+            w.flag(cfg.l1_first_short_term_delta.is_some());
+            if let Some(delta) = cfg.l1_first_short_term_delta {
+                w.ue(0); // modification_of_pic_nums_idc 0: subtract from the predicted picNum
+                w.ue(delta - 1); // abs_diff_pic_num_minus1
+                w.ue(3); // modification_of_pic_nums_idc 3: end of the list
+            }
         }
     }
 

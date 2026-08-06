@@ -47,7 +47,9 @@ use crate::h264::quant::{
 use crate::h264::reconstruct::{
     chroma_dc_terms, chroma_residual_4x4, residual_8x8, InverseScale8x8,
 };
-use crate::h264::slice::{write_slice_header, SliceHeaderConfig, SliceType};
+use crate::h264::slice::{
+    write_slice_header, RefPicList, RefPicListEntry, SliceHeaderConfig, SliceType,
+};
 use crate::mpeg2::constants::{mb_flag, PictureStructure, PictureType, QUANTISER_SCALE};
 use crate::mpeg2::headers::{
     parse_elementary_stream, picture_geometry, sequence_sample_aspect_ratio, Picture,
@@ -77,6 +79,8 @@ const POC_PER_FRAME: u32 = 4;
 /// The order count of the copy that follows the IDR, which displays between the
 /// IDR and the first content picture.
 const CLONE_POC: u32 = 2;
+/// `LongTermFrameIdx` of that copy, the only long-term picture there ever is.
+const LONG_TERM_FRAME_IDX: u32 = 0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TranscodeOptions {
@@ -133,6 +137,44 @@ pub struct TranscodeResult {
     pub stats: Stats,
     /// Whether this result carries a non-IDR recovery picture.
     pub recovery_point: bool,
+}
+
+/// How many short-term reference frames the buffer holds, the long-term copy
+/// taking the remaining slot.
+const MAX_SHORT_TERM_FRAMES: usize = MAX_NUM_REF_FRAMES as usize - 1;
+
+/// The `frame_num` of every short-term reference frame in the buffer, oldest
+/// first.
+///
+/// Not simply the last few values of `frame_num`: the copy that carries the
+/// long-term mark spends one of its own without joining the short-term chain,
+/// leaving a hole behind the IDR in front of it. A field slice names its
+/// references by how far back they sit, so it needs the values and not a count.
+#[derive(Clone, Copy, Default)]
+struct ShortTermFrames {
+    frame_nums: [u32; MAX_SHORT_TERM_FRAMES],
+    len: usize,
+}
+
+impl ShortTermFrames {
+    /// Take a reference in, sliding the oldest out of a full buffer.
+    fn push(&mut self, frame_num: u32) {
+        if self.len == MAX_SHORT_TERM_FRAMES {
+            self.frame_nums.rotate_left(1);
+            self.len -= 1;
+        }
+        self.frame_nums[self.len] = frame_num;
+        self.len += 1;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Oldest first, which is the order the sliding window will empty them in.
+    fn iter(&self) -> impl DoubleEndedIterator<Item = u32> + '_ {
+        self.frame_nums[..self.len].iter().copied()
+    }
 }
 
 /// Which reference index reaches which picture, per list.
@@ -227,6 +269,8 @@ pub struct IncrementalTranscoder {
     /// reference outright: the copy behind an IDR is long-term and leaves the
     /// IDR itself, one `frame_num` further back, as the newest short-term one.
     newest_short_term: u32,
+    /// The buffer's short-term references, oldest first.
+    short_term: ShortTermFrames,
     gop_base: u32,
     seen_picture: bool,
     max_tr_in_gop: u32,
@@ -250,6 +294,7 @@ impl IncrementalTranscoder {
             prev_ref_frame_num: 0,
             short_term_count: 0,
             newest_short_term: 0,
+            short_term: ShortTermFrames::default(),
             gop_base: 0,
             seen_picture: false,
             max_tr_in_gop: 0,
@@ -394,6 +439,11 @@ impl IncrementalTranscoder {
             0
         } else {
             self.newest_short_term
+        };
+        let mut short_term = if random_access {
+            ShortTermFrames::default()
+        } else {
+            self.short_term
         };
         // temporal_reference restarts at each group of pictures, so display
         // order is recovered by accumulating a base as the counter wraps.
@@ -564,6 +614,7 @@ impl IncrementalTranscoder {
                 },
                 is_reference,
                 layout,
+                short_term,
                 options,
                 mbaff,
                 real_idr,
@@ -598,10 +649,15 @@ impl IncrementalTranscoder {
                 prev_ref_frame_num = 1;
                 short_term_count = 1;
                 newest_short_term = frame_num;
+                // The IDR emptied the buffer and the copy that follows it takes
+                // the long-term slot, so the IDR is all the short-term chain has.
+                short_term.clear();
+                short_term.push(frame_num);
             } else if is_reference {
                 prev_ref_frame_num = frame_num;
-                short_term_count = (short_term_count + 1).min(3);
+                short_term_count = (short_term_count + 1).min(MAX_SHORT_TERM_FRAMES as u32);
                 newest_short_term = frame_num;
+                short_term.push(frame_num);
             }
             pictures_converted += 1;
         }
@@ -620,6 +676,7 @@ impl IncrementalTranscoder {
         self.prev_ref_frame_num = prev_ref_frame_num;
         self.short_term_count = short_term_count;
         self.newest_short_term = newest_short_term;
+        self.short_term = short_term;
         self.gop_base = gop_base;
         self.seen_picture = seen_picture;
         self.max_tr_in_gop = max_tr_in_gop;
@@ -647,6 +704,8 @@ struct PictureContext {
     poc: u32,
     is_reference: bool,
     layout: RefLayout,
+    /// The short-term references a field slice names its lists from.
+    short_term: ShortTermFrames,
     options: TranscodeOptions,
     mbaff: bool,
     real_idr: bool,
@@ -1260,6 +1319,81 @@ fn field_picture_ref_index(
     frame_ref * 2 + i32::from(selected != current)
 }
 
+/// Name the short-term entries of a field slice's two reference lists.
+///
+/// The order is the one clause 8.2.4.2.5 builds for a field picture whose pair
+/// is not a reference pair: the frames in list order, each contributing the
+/// field with the parity of the one being coded and then its mate. Writing it
+/// out instead of leaving it to the decoder is what keeps
+/// [`field_picture_ref_index`]'s arithmetic true on decoders that count the
+/// short-term fields differently -- VideoToolbox is one, and puts the
+/// long-term picture two indices below where the slice header's weights are.
+///
+/// The long-term fields behind them are deliberately left unnamed. Reordering
+/// keeps the entries a slice does not name, in the order the initialisation put
+/// them, so the pair still lands right behind the run named here -- and naming
+/// it is not an option, because VideoToolbox rejects `long_term_pic_num` in a
+/// field slice outright and fails the picture with `kVTVideoDecoderBadDataErr`.
+fn field_ref_lists(
+    short_term: &ShortTermFrames,
+    frame_num: u32,
+    backward: bool,
+) -> [RefPicList; 2] {
+    let mut newest_first = [0u32; MAX_SHORT_TERM_FRAMES];
+    let mut count = 0;
+    for reference in short_term.iter().rev() {
+        newest_first[count] = (frame_num + MAX_FRAME_NUM - reference) % MAX_FRAME_NUM;
+        count += 1;
+    }
+    let newest_first = &newest_first[..count];
+
+    fn push_frame(list: &mut RefPicList, frames_back: u32) {
+        for same_parity in [true, false] {
+            list.push(RefPicListEntry {
+                frames_back,
+                same_parity,
+            });
+        }
+    }
+
+    let mut lists = [RefPicList::default(), RefPicList::default()];
+    match newest_first.split_first() {
+        // A B picture sits between its references. The one it was decoded
+        // behind is the following picture, which list 0 reaches last and list 1
+        // first; the rest precede it, nearest first in both.
+        Some((&following, preceding)) if backward => {
+            for &frames_back in preceding {
+                push_frame(&mut lists[0], frames_back);
+            }
+            push_frame(&mut lists[0], following);
+            push_frame(&mut lists[1], following);
+            for &frames_back in preceding {
+                push_frame(&mut lists[1], frames_back);
+            }
+        }
+        // Without a following picture the two lists come out identical, and the
+        // initialisation ends by exchanging the first two entries of list 1.
+        // The macroblock writer reaches the nearest reference through both, so
+        // reproduce that exchange rather than leaving the lists the same.
+        Some((&nearest, rest)) => {
+            for &frames_back in newest_first {
+                push_frame(&mut lists[0], frames_back);
+            }
+            for same_parity in [false, true] {
+                lists[1].push(RefPicListEntry {
+                    frames_back: nearest,
+                    same_parity,
+                });
+            }
+            for &frames_back in rest {
+                push_frame(&mut lists[1], frames_back);
+            }
+        }
+        None => {}
+    }
+    lists
+}
+
 /// Copy the content IDR into the long-term reference without changing pixels.
 ///
 /// Intra macroblocks need a reference index whose weights can force the flat
@@ -1285,7 +1419,7 @@ fn write_reference_clone(g: &FrameGeometry, mbaff: bool) -> Vec<u8> {
             // The IDR is the only picture in the buffer, and a pair of coded
             // fields sharing a `frame_num` is one frame to a frame picture, so
             // index 0 finds it whichever way the source sent it.
-            long_term_current: Some(0),
+            long_term_current: Some(LONG_TERM_FRAME_IDX),
             mbaff,
             slice_qp: PPS_INIT_QP,
             pps_init_qp: PPS_INIT_QP,
@@ -1700,6 +1834,17 @@ fn write_picture(
         // The long-term picture contributes both of its fields behind them,
         // except to the pair that has not reached it yet.
         let field_list_len = short_term_fields + if anchor_second_field { 0 } else { 2 };
+        // The short-term run a field slice would otherwise leave a decoder to
+        // work out. The second field of a reference pair is left alone: its
+        // first field stands in the list on its own, which decoders do agree
+        // about, and naming that list would mean naming a field of the picture
+        // being coded.
+        let explicit_ref_lists =
+            (direct_field_pair && !anchor_second_field && !second_field_of_reference_pair)
+                .then(|| field_ref_lists(&ctx.short_term, ctx.frame_num, layout.bwd_l0 >= 0));
+        debug_assert!(explicit_ref_lists.is_none_or(|lists| lists
+            .iter()
+            .all(|list| list.len() == short_term_fields as usize)));
         let output_slice_type = if intra_field {
             SliceType::I
         } else {
@@ -1793,6 +1938,7 @@ fn write_picture(
                     } else {
                         layout.count
                     }),
+                    explicit_ref_lists,
                     l1_first_short_term_delta: layout
                         .l1_short_term_delta
                         .filter(|_| !direct_field_pair),
