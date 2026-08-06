@@ -21,14 +21,6 @@ use crate::mpeg2::headers::Interlacing;
 use crate::round_half_up;
 use crate::transcode::{IncrementalTranscoder, TranscodeOptions};
 
-/// How many GOPs apart the restart points are.
-///
-/// A decoder can begin at any of them, which is what lets a player evict what
-/// it has already shown without cutting into what it is about to. They cost an
-/// intra-coded picture each, so they are kept far enough apart that the cost is
-/// negligible and close enough that eviction has somewhere to stop.
-const RANDOM_ACCESS_GOP_INTERVAL: usize = 24;
-
 const TIMESCALE: u64 = 90_000;
 
 /// Short AAC holes are packet loss, not the end of the audio track. Repeating
@@ -88,6 +80,7 @@ pub struct Session {
     gops: Mpeg2GopStream,
     adts: AdtsStream,
     transcoder: IncrementalTranscoder,
+    random_access_gop_interval: usize,
 
     sequence_number: u32,
     /// Where the next fragment starts, in 90 kHz ticks.
@@ -170,6 +163,7 @@ impl Session {
             gops: Mpeg2GopStream::new(),
             adts: AdtsStream::new(),
             transcoder: IncrementalTranscoder::new(options),
+            random_access_gop_interval: options.rap_interval,
             sequence_number: 1,
             video_presentation_start: 0,
             audio_frames_emitted: 0,
@@ -295,7 +289,7 @@ impl Session {
     }
 
     fn is_random_access_point(&self) -> bool {
-        self.gops_emitted > 0 && self.gops_emitted % RANDOM_ACCESS_GOP_INTERVAL == 0
+        self.gops_emitted > 0 && self.gops_emitted % self.random_access_gop_interval.max(1) == 0
     }
 
     fn flush_pending(&mut self, final_flush: bool, out: &mut Vec<Fragment>) -> Result<()> {

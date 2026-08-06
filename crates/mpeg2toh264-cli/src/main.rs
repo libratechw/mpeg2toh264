@@ -95,7 +95,10 @@ fn parse_args(args: &[String]) -> Invocation {
         input,
         output,
         quiet,
-        transcode: TranscodeOptions { oversample },
+        transcode: TranscodeOptions {
+            oversample,
+            rap_interval: 24,
+        },
     }))
 }
 

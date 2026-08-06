@@ -63,6 +63,8 @@ export interface Mpeg2TsPlayerOptions {
   mediaSource?: "auto" | "worker" | "main";
   /** The quantiser search factor. Higher is slower and closer to the source. */
   oversample?: number;
+  /** Number of MPEG-2 GOPs between random access points. */
+  rapInterval?: number;
   /**
    * Which service to convert, out of a transport stream carrying more than
    * one. Left unset, the first that turns up with a picture in it. The
@@ -328,6 +330,7 @@ export class Mpeg2TsPlayer extends EventTarget {
           ? null
           : String(this.#options.wasmUrl),
       oversample: this.#options.oversample,
+      rapInterval: this.#options.rapInterval,
       serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
       queueHighWaterMark:

@@ -81,12 +81,14 @@ const CLONE_POC: u32 = 2;
 #[derive(Clone, Copy, Debug)]
 pub struct TranscodeOptions {
     pub oversample: f64,
+    pub rap_interval: usize,
 }
 
 impl Default for TranscodeOptions {
     fn default() -> Self {
         Self {
             oversample: DEFAULT_OVERSAMPLE,
+            rap_interval: 24,
         }
     }
 }

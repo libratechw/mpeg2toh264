@@ -144,6 +144,10 @@
           <option value="worker">Worker（MSE in Workers）</option>
           <option value="main">メインスレッド</option>
         </select>
+        <label for="oversample">oversample</label>
+        <input id="oversample" type="number" min="0.1" step="0.1" value="2" />
+        <label for="rap-interval">RAP間隔（GOP数）</label>
+        <input id="rap-interval" type="number" min="1" step="1" value="24" />
         <label for="service" id="service-label" hidden>サービス</label>
         <select id="service" hidden></select>
         <ul>
@@ -175,7 +179,10 @@
           <dd id="deinterlace-stats">—</dd>
         </dl>
       </fieldset>
-      <p>MPEG-2映像 + AAC-LC音声 · 取得も変換もWeb Worker内で完結 · ローカルファイルはアップロードされません</p>
+      <p>
+        MPEG-2映像 + AAC-LC音声 · 取得も変換もWeb Worker内で完結 ·
+        ローカルファイルはアップロードされません
+      </p>
     </main>
     <script type="module" src="./src/demo.ts"></script>
   </body>

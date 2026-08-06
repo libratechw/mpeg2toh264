@@ -67,10 +67,16 @@ export class Transcoder {
    */
   constructor(
     oversample: number | undefined,
+    rapInterval: number | undefined,
     originTicks: number | null,
     serviceId: number | null,
   ) {
-    this.#session = new Session(oversample, originTicks, serviceId);
+    this.#session = new Session(
+      oversample,
+      originTicks,
+      serviceId,
+      rapInterval,
+    );
   }
 
   /** The timestamp presentation time zero stands for, once a fragment fixed it. */
