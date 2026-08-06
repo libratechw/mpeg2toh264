@@ -11,10 +11,13 @@
     "packages:build": "npm run build --workspace @mpeg2toh264/player && npm run build --workspace @mpeg2toh264/yadif",
     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
     "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "format:check": "prettier --check packages/**/*.{ts,js,json} package.json",
+    "format:write": "prettier --write packages/**/*.{ts,js,json} package.json"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
+    "prettier": "^3.9.6",
     "typescript": "^5.9.2",
     "vite": "^7.3.6"
   }
