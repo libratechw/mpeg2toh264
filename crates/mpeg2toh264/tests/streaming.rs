@@ -8,8 +8,9 @@ use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{Fragment, Session, TranscodeOptions};
 use support::{
-    adts_frame, adts_frame_with_payload, adts_stream, mux_transport_stream, read_fixture, PesUnit,
-    AUDIO_PID, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+    adts_frame, adts_frame_with_payload, adts_stream, mux_transport_stream, read_fixture,
+    wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO,
+    VIDEO_PID,
 };
 
 /// Offset of the first `00 00 01 B8` group header.
@@ -513,7 +514,15 @@ fn av_stream(copies: usize, audio_frames: usize) -> Vec<u8> {
 }
 
 fn run_session(stream: &[u8], chunk_size: usize) -> Vec<Fragment> {
-    let mut session = Session::default();
+    run_session_with_options(stream, chunk_size, TranscodeOptions::default())
+}
+
+fn run_session_with_options(
+    stream: &[u8],
+    chunk_size: usize,
+    options: TranscodeOptions,
+) -> Vec<Fragment> {
+    let mut session = Session::new(options);
     let mut fragments = Vec::new();
     for chunk in stream.chunks(chunk_size) {
         fragments.extend(session.push(chunk).expect("push succeeds"));
@@ -590,9 +599,13 @@ fn fragments_advance_along_one_timeline() {
 }
 
 #[test]
-fn restarts_the_decoder_every_twenty_fourth_group() {
-    // Restart points are what let a player evict what it has already shown.
-    let fragments = run_session(&video_only_stream(26), 256 * 1024);
+fn emits_a_recovery_point_every_twenty_fourth_group() {
+    // Recovery points are what let a player evict what it has already shown.
+    let options = TranscodeOptions {
+        recovery_interval: 24,
+        ..TranscodeOptions::default()
+    };
+    let fragments = run_session_with_options(&video_only_stream(26), 256 * 1024, options);
     let (_, media) = split_fragments(&fragments);
     let restarts: Vec<usize> = media
         .iter()
@@ -611,8 +624,113 @@ fn restarts_the_decoder_every_twenty_fourth_group() {
     assert_eq!(
         restarts,
         vec![0, 24],
-        "the opening fragment, then every 24th"
+        "the opening fragment, then a recovery point every 24th"
     );
+}
+
+#[test]
+fn continuous_playback_does_not_restart_at_an_open_gop() {
+    let pictures_per_gop = parse_elementary_stream(&read_fixture("ibbp.m2v"))
+        .expect("fixture parses")
+        .len();
+    let fragments = run_session(&video_only_stream(26), 256 * 1024);
+    let (_, media) = split_fragments(&fragments);
+
+    assert_eq!(media.len(), 26);
+    for (index, fragment) in media.iter().enumerate().skip(1) {
+        let Fragment::Media {
+            data,
+            random_access,
+            video_samples,
+            ..
+        } = fragment
+        else {
+            unreachable!()
+        };
+        assert_eq!(*random_access, index == 24);
+        assert_eq!(
+            data.windows(9)
+                .any(|bytes| bytes == [0, 0, 0, 5, 6, 6, 1, 0xc4, 0x80]),
+            index == 24,
+            "GOP {index} recovery-point SEI"
+        );
+        if index == 24 {
+            let trun = data
+                .windows(4)
+                .position(|bytes| bytes == b"trun")
+                .expect("fragment has a video trun");
+            let first_sample_flags = u32::from_be_bytes(
+                data[trun + 24..trun + 28]
+                    .try_into()
+                    .expect("first sample flags"),
+            );
+            assert_eq!(
+                first_sample_flags, 0x0200_0000,
+                "the recovery picture is an ISO-BMFF sync sample"
+            );
+        }
+        assert_eq!(
+            *video_samples, pictures_per_gop,
+            "GOP {index} lost an open-GOP picture"
+        );
+    }
+}
+
+#[test]
+fn audio_pending_timeline_keeps_open_gop_pictures_at_a_recovery_point() {
+    let pictures_per_gop = parse_elementary_stream(&read_fixture("ibbp.m2v"))
+        .expect("fixture parses")
+        .len();
+    let fragments = run_session(&av_stream(26, 800), 256 * 1024);
+    let (_, media) = split_fragments(&fragments);
+    let recovery = media.get(24).expect("the recovery GOP is emitted");
+    let Fragment::Media {
+        random_access,
+        video_samples,
+        ..
+    } = recovery
+    else {
+        unreachable!()
+    };
+
+    assert!(*random_access);
+    assert_eq!(*video_samples, pictures_per_gop);
+}
+
+#[test]
+fn recovery_points_preserve_distinct_leading_b_pictures() {
+    let source = read_fixture("open_gop_leading_bb.m2v");
+    let source_pictures = parse_elementary_stream(&source)
+        .expect("fixture parses")
+        .len();
+    assert_eq!(source_pictures, 46);
+
+    let options = TranscodeOptions {
+        // Exercise every genuine open-GOP boundary in the fixture.
+        recovery_interval: 1,
+        ..TranscodeOptions::default()
+    };
+    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000));
+    let fragments = run_session_with_options(&stream, 64 * 1024, options);
+    let (_, media) = split_fragments(&fragments);
+    let video_samples: usize = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { video_samples, .. } => *video_samples,
+            _ => unreachable!(),
+        })
+        .sum();
+
+    // The opening IDR has its reference clone; every source picture, including
+    // each red/blue leading-B pair, must still have its own sample.
+    assert_eq!(video_samples, source_pictures + 1);
+    assert!(media.iter().skip(1).all(|fragment| matches!(
+        fragment,
+        Fragment::Media {
+            random_access: true,
+            ..
+        }
+    )));
 }
 
 #[test]

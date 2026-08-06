@@ -7,8 +7,8 @@ use std::process::{Command, Output};
 mod support;
 
 use support::{
-    adts_stream, mux_transport_stream, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS,
-    STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
+    adts_stream, mux_transport_stream, wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID,
+    STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
 
 fn binary() -> PathBuf {
@@ -93,6 +93,33 @@ fn rejects_a_nonsensical_oversample() {
     let result = run(&["--oversample=0", "a", "b"]);
     assert_eq!(result.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&result.stderr).contains("oversample"));
+}
+
+#[test]
+fn rejects_a_nonsensical_recovery_interval() {
+    let result = run(&["--recovery-interval=0", "a", "b"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("recovery interval"));
+}
+
+#[test]
+fn accepts_a_recovery_interval() {
+    let temp = TempDir::new("recovery-interval");
+    let input = temp.join("input.ts");
+    let output = temp.join("output.mp4");
+    let video = std::fs::read(fixture("open_gop_leading_bb.m2v")).expect("video fixture");
+    std::fs::write(&input, wrap_mpeg2_es_in_ts(&video, Some(900_000)))
+        .expect("transport stream fixture");
+
+    let result = run(&["--recovery-interval", "1", path(&input), path(&output)]);
+    assert!(result.status.success(), "{:?}", result);
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout)
+            .matches("restart point")
+            .count(),
+        4,
+        "the opening IDR and all three later GOPs are restart points"
+    );
 }
 
 #[test]

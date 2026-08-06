@@ -139,7 +139,7 @@ export interface LoadCommand {
   /** Where the `.wasm` is, or null to take the copy next to the worker. */
   wasmUrl: string | null;
   oversample: number | undefined;
-  rapInterval: number | undefined;
+  recoveryInterval: number | undefined;
   /**
    * Which service to convert, out of a transport stream that carries more than
    * one. Null takes the first that turns up with a picture in it, which is

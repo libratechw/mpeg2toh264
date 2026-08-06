@@ -67,7 +67,7 @@ export class Transcoder {
    */
   constructor(
     oversample: number | undefined,
-    rapInterval: number | undefined,
+    recoveryInterval: number | undefined,
     originTicks: number | null,
     serviceId: number | null,
   ) {
@@ -75,7 +75,7 @@ export class Transcoder {
       oversample,
       originTicks,
       serviceId,
-      rapInterval,
+      recoveryInterval,
     );
   }
 

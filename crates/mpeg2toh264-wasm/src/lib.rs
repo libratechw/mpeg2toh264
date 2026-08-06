@@ -105,16 +105,16 @@ impl Session {
         oversample: Option<f64>,
         origin_ticks: Option<f64>,
         service_id: Option<u16>,
-        rap_interval: Option<u32>,
+        recovery_interval: Option<u32>,
     ) -> Result<Session, JsError> {
         let defaults = TranscodeOptions::default();
         let oversample = oversample.unwrap_or(defaults.oversample);
         if !oversample.is_finite() || oversample <= 0.0 {
             return Err(JsError::new("oversample must be a positive number"));
         }
-        let rap_interval = rap_interval.unwrap_or(defaults.rap_interval as u32);
-        if rap_interval == 0 {
-            return Err(JsError::new("rapInterval must be a positive integer"));
+        let recovery_interval = recovery_interval.unwrap_or(defaults.recovery_interval as u32);
+        if recovery_interval == 0 {
+            return Err(JsError::new("recoveryInterval must be a positive integer"));
         }
         let origin = match origin_ticks {
             Some(ticks) if !ticks.is_finite() || ticks < 0.0 => {
@@ -127,7 +127,7 @@ impl Session {
             inner: mpeg2toh264::Session::for_service(
                 TranscodeOptions {
                     oversample,
-                    rap_interval: rap_interval as usize,
+                    recovery_interval: recovery_interval as usize,
                 },
                 origin,
                 service_id,

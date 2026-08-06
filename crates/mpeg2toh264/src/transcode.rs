@@ -81,14 +81,17 @@ const CLONE_POC: u32 = 2;
 #[derive(Clone, Copy, Debug)]
 pub struct TranscodeOptions {
     pub oversample: f64,
-    pub rap_interval: usize,
+    /// Put a recovery point at every this many GOPs. The recovery picture is
+    /// independently coded without flushing the decoded picture buffer, so an
+    /// open GOP's leading B pictures remain available during continuous play.
+    pub recovery_interval: usize,
 }
 
 impl Default for TranscodeOptions {
     fn default() -> Self {
         Self {
             oversample: DEFAULT_OVERSAMPLE,
-            rap_interval: 24,
+            recovery_interval: 24,
         }
     }
 }
@@ -121,6 +124,8 @@ pub struct TranscodeResult {
     pub pictures_converted: usize,
     pub pictures_skipped: usize,
     pub stats: Stats,
+    /// Whether this result carries a non-IDR recovery picture.
+    pub recovery_point: bool,
 }
 
 /// Which reference index reaches which picture, per list.
@@ -219,6 +224,7 @@ pub struct IncrementalTranscoder {
     seen_picture: bool,
     max_tr_in_gop: u32,
     random_access_pending: bool,
+    recovery_point_pending: bool,
     pictures_converted: usize,
     pictures_skipped: usize,
     stats: Stats,
@@ -241,6 +247,7 @@ impl IncrementalTranscoder {
             seen_picture: false,
             max_tr_in_gop: 0,
             random_access_pending: false,
+            recovery_point_pending: false,
             pictures_converted: 0,
             pictures_skipped: 0,
             stats: Stats::default(),
@@ -252,6 +259,14 @@ impl IncrementalTranscoder {
         if self.initialized {
             self.random_access_pending = true;
             self.awaiting_idr = true;
+        }
+    }
+
+    /// Make the next intra picture independently decodable without flushing
+    /// references used by an open GOP's leading B pictures.
+    pub fn request_recovery_point(&mut self) {
+        if self.initialized {
+            self.recovery_point_pending = true;
         }
     }
 
@@ -292,6 +307,7 @@ impl IncrementalTranscoder {
         let scaling = first.quant.non_intra;
 
         let random_access = self.initialized && self.random_access_pending;
+        let recovery_requested = self.initialized && self.recovery_point_pending;
         let mut parts: Vec<Vec<u8>> = Vec::new();
         if !self.initialized {
             parts.push(write_sps(&SpsConfig {
@@ -348,6 +364,7 @@ impl IncrementalTranscoder {
 
         let mut pictures_converted = 0usize;
         let mut pictures_skipped = 0usize;
+        let mut recovery_emitted = false;
 
         let mut prev_ref_frame_num = if random_access {
             0
@@ -428,6 +445,10 @@ impl IncrementalTranscoder {
                 continue;
             }
             let is_reference = real_idr || picture_type != PictureType::B;
+            let recovery_intra = recovery_requested
+                && !recovery_emitted
+                && !awaiting_idr
+                && picture_type == PictureType::I;
 
             let frame_num = if real_idr {
                 0
@@ -532,9 +553,13 @@ impl IncrementalTranscoder {
                 options,
                 mbaff,
                 real_idr,
+                recovery_intra,
             };
             if has_field_pairs {
                 parts.push(write_access_unit_delimiter());
+            }
+            if recovery_intra {
+                parts.push(write_recovery_point_sei());
             }
             parts.push(write_picture(
                 pic,
@@ -547,6 +572,7 @@ impl IncrementalTranscoder {
                 &mut self.stats,
                 &mut slice_writer,
             )?);
+            recovery_emitted |= recovery_intra;
 
             if real_idr {
                 // The copy follows and takes the long-term slot, leaving the
@@ -584,6 +610,7 @@ impl IncrementalTranscoder {
         self.seen_picture = seen_picture;
         self.max_tr_in_gop = max_tr_in_gop;
         self.random_access_pending = false;
+        self.recovery_point_pending = recovery_requested && !recovery_emitted;
         self.pictures_converted += pictures_converted;
         self.pictures_skipped += pictures_skipped;
 
@@ -592,6 +619,7 @@ impl IncrementalTranscoder {
             pictures_converted: self.pictures_converted,
             pictures_skipped: self.pictures_skipped,
             stats: self.stats,
+            recovery_point: recovery_emitted,
         })
     }
 }
@@ -608,6 +636,7 @@ struct PictureContext {
     options: TranscodeOptions,
     mbaff: bool,
     real_idr: bool,
+    recovery_intra: bool,
 }
 
 /// How one macroblock is predicted, once the source's motion has been mapped.
@@ -1379,6 +1408,13 @@ fn write_access_unit_delimiter() -> Vec<u8> {
     to_nal_unit(w.bytes(), 0, nal_type::AUD)
 }
 
+/// Recovery point SEI (D.2.7): recovery_frame_cnt 0, exact match, no broken
+/// link, and no changing slice groups. The payload is byte-aligned before the
+/// SEI RBSP's own trailing bit.
+fn write_recovery_point_sei() -> Vec<u8> {
+    to_nal_unit(&[6, 1, 0xc4, 0x80], 0, nal_type::SEI)
+}
+
 /// Which of the two per-slot buffers a field macroblock's targets landed in, and
 /// which of its four blocks carry anything.
 #[derive(Clone, Copy, Default)]
@@ -1537,7 +1573,7 @@ fn write_picture(
     // it is the only one that has to carry the samples a decoder will make of
     // it. A field pair is two coded pictures and gets a plane each, which the
     // reset at the head of every slice takes care of.
-    let mut intra_state = ctx.real_idr.then(|| IntraState {
+    let mut intra_state = (ctx.real_idr || ctx.recovery_intra).then(|| IntraState {
         picture: ReconstructedPicture::new(
             g.mb_width * 16,
             g.mb_height * 16 / if paired_field.is_some() { 2 } else { 1 },
@@ -1589,6 +1625,7 @@ fn write_picture(
         // IDR picture -- so the other field is an ordinary reference field, and
         // the sliding window leaves the pair alone.
         let idr_field = ctx.real_idr && !second_output_field;
+        let intra_field = (ctx.real_idr || ctx.recovery_intra) && !second_output_field;
         // Nor is it coded like one. A frame sent as a pair of fields makes its
         // second field a P field predicted from the first as a matter of
         // course, and H.264 intra prediction has nothing to make those inter
@@ -1630,7 +1667,7 @@ fn write_picture(
         // The long-term picture contributes both of its fields behind them,
         // except to the pair that has not reached it yet.
         let field_list_len = short_term_fields + if anchor_second_field { 0 } else { 2 };
-        let output_slice_type = if idr_field {
+        let output_slice_type = if intra_field {
             SliceType::I
         } else {
             // A B slice is the only one with a list 1 to put the flat weights in.
@@ -2026,13 +2063,18 @@ fn write_picture(
                 || (!direct_field_pair && mb_x == g.mb_width - 1 && mb_y == g.mb_height - 1)
             {
                 writer.rbsp_trailing_bits();
-                // Only the IDR reaches here: the second field of a pair drops
-                // its `intra_state` and goes through the content path instead.
-                debug_assert!(idr_field, "H.264 intra prediction is for the IDR alone");
+                // Only the independently coded first field reaches here: the
+                // second field of a pair drops `intra_state` and follows the
+                // content path instead.
+                debug_assert!(intra_field, "intra reconstruction requires an I slice");
                 picture_nals.extend_from_slice(&to_nal_unit(
                     writer.bytes(),
                     3,
-                    nal_type::SLICE_IDR,
+                    if idr_field {
+                        nal_type::SLICE_IDR
+                    } else {
+                        nal_type::SLICE_NON_IDR
+                    },
                 ));
                 if direct_field_pair && !second_output_field {
                     slice_open = false;

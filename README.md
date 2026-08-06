@@ -48,13 +48,15 @@ Replacing an MPEG-2 intra macroblock directly with H.264 intra prediction would 
 
 Instead, intra macroblocks in normal pictures are recorded as inter macroblocks with a zero motion vector. Setting explicit weighted prediction to weight 0 and offset 127 for a dedicated long-term reference index makes the predicted value always 127, regardless of the reference picture's contents. The residual can then remain in the coefficient domain: only `8 x 127` needs to be subtracted from the DC coefficient. The long-term reference picture exists only to provide an index; its pixels are never referenced.
 
-### 4. Random access points
+### 4. IDR and recovery points
 
 An IDR used to begin decoding is an I slice and has no reference list for the constant prediction. It therefore uses H.264 DC intra prediction. Inverse transformation and reconstruction are performed for this picture so that the decoder can obtain pixels referenced by the next macroblock.
 
 I_PCM could avoid all but the inverse transform, but it caused QSV decoding problems at high resolutions and is therefore not used. A solid-gray frame was also considered, but rejected because it flickered in some playback environments.
 
-Immediately after the IDR, a copy of the same image is emitted as a long-term reference to reserve the index used for subsequent constant predictions. Streaming output creates a random access point every 24 GOPs. Pictures whose references are unavailable in the new decoded-picture buffer, such as leading B pictures in an open GOP, are dropped; the IDR display duration is extended to preserve the original GOP length and audio/video synchronization.
+Immediately after the opening IDR, a copy of the same image is emitted as a long-term reference to reserve the index used for subsequent constant predictions.
+
+Periodic random access uses a non-IDR I picture with a recovery-point SEI instead of flushing the decoded-picture buffer. References from the previous GOP therefore remain available during continuous playback, and an open GOP's leading B pictures are preserved. A decoder starting at the recovery point discards those leading pictures, whose presentation times precede the I picture, and recovers from the independently coded I picture onward. The interval defaults to 24 GOPs and can be changed with `--recovery-interval`.
 
 ### 5. Interlacing
 
@@ -76,9 +78,10 @@ cargo build --release
 ```
 
 ```text
--o, --oversample <n>   H.264 quantization-step granularity (default: 2; positive)
--q, --quiet            Suppress progress and summary output
--h, --help             Show help
+-o, --oversample <n>          H.264 quantization-step granularity (default: 2; positive)
+-r, --recovery-interval <n>   GOPs between non-IDR recovery points (default: 24)
+-q, --quiet                   Suppress progress and summary output
+-h, --help                    Show help
 ```
 
 AAC is not re-encoded. Ordinary stereo and 5.1-channel audio are preserved. Mono duplicates the same ICS to the left and right channels, while dual mono duplicates the primary audio to both channels, keeping the output stereo even if the source configuration changes midstream.
@@ -90,10 +93,6 @@ Main limitations:
 - Transport-stream audio must be AAC-LC; channel-element rearrangement supports 44.1 kHz and 48 kHz.
 - Corrupt slices, leading B pictures without all references, and unpaired field pictures are skipped.
 - Output is lossy because of requantization, and fractional-pixel prediction uses the approximations shown in the table above.
-
-Open-GOP limitation:
-
-- By default, a random access point is created every 24 GOPs, so the leading B frames of an open GOP are skipped every 24 GOPs.
 
 Interlaced-video limitations:
 
@@ -204,13 +203,15 @@ MPEG-2のイントラマクロブロックをH.264のイントラ予測へその
 
 そこで通常のピクチャでは、イントラマクロブロックも動きベクトル0のインターマクロブロックとして記録します。専用の長期参照インデックスに明示的な重み付き予測の重み0、オフセット127を設定すると、参照画像の内容にかかわらず予測値は常に127になります。残差側はDC係数から8×127を引くだけなので係数領域のまま処理できます。長期参照ピクチャはインデックスを置くためだけに存在し画素は参照されません。
 
-### 4. RAP
+### 4. IDRとリカバリーポイント
 
 デコードを開始するIDRはIスライスであり、一定値予測を置く参照リストがないため、これだけはH.264のDCイントラ予測を使います。そのため、デコーダーが次のマクロブロックで参照する画素を得るために逆変換と再構成も行います。
 なお、I_PCMを使うことで逆変換のみにできるものの、解像度が大きくなるとQSVでのデコードに問題が生じたためI_PCMは使用していません。
 ほかにはグレー一色のフレームを用意するといった手段も考えられたものの、再生環境によってはちらつくためこれも採用していません。
 
-IDRの直後には同じ画像の長期参照用コピーを置き、以後の一定値予測用インデックスを確保します。ストリーミングでは24 GOPごとにRAPを作ります。オープンGOP先頭のBピクチャなど、新しいデコード済みピクチャバッファに必要な参照がないピクチャは破棄し、IDRの表示時間を伸ばして元のGOP長と音声同期を保ちます。
+先頭IDRの直後には同じ画像の長期参照用コピーを置き、以後の一定値予測用インデックスを確保します。
+
+周期的なランダムアクセス点ではDPBをフラッシュするIDRではなく、リカバリーポイントSEIを付けたnon-IDR Iピクチャを使います。そのため連続再生では前GOPの参照が維持され、Open GOPの先頭Bピクチャも表示されます。リカバリーポイントからデコードを開始する場合、Iピクチャより表示時刻が前の先頭Bピクチャは捨て、独立符号化したIピクチャ以降から復旧します。間隔の既定値は24 GOPで、`--recovery-interval`で変更できます。
 
 ### 5. インターレース
 
@@ -232,9 +233,10 @@ cargo build --release
 ```
 
 ```text
--o, --oversample <n>   H.264量子化刻みの細かさ (既定: 2、正の数)
--q, --quiet            進捗と概要を表示しない
--h, --help             ヘルプを表示
+-o, --oversample <n>          H.264量子化刻みの細かさ (既定: 2、正の数)
+-r, --recovery-interval <n>   non-IDRリカバリーポイントのGOP間隔 (既定: 24)
+-q, --quiet                   進捗と概要を表示しない
+-h, --help                    ヘルプを表示
 ```
 
 AACは再エンコードせず、通常のステレオと5.1chは保持し、モノラルは同じICSを左右へ複製、デュアルモノは主音声を左右へ複製することで途中で構成が変わってもステレオを維持します。
@@ -246,10 +248,6 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
 - TSの音声はAAC-LC、チャンネルエレメントの組み替えは44.1 kHzまたは48 kHzを対象とする
 - 破損スライス、参照が揃わない先頭Bピクチャ、片方だけのフィールドピクチャは読み飛ばす
 - 出力は再量子化による非可逆変換であり、小数画素予測には表の通りの近似がある
-
-オープンGOPの制約:
-
-- デフォルトでは24 GOPごとにRAPを構成するため24 GOPごとにオープンGOPの先頭Bフレームが飛ばされる
 
 インターレースの映像の制約:
 

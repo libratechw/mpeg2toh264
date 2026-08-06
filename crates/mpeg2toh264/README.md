@@ -21,6 +21,8 @@ println!(
 
 GOP単位で状態を維持して変換する場合は`IncrementalTranscoder`を使います。`request_random_access_point()`を呼ぶと、次に変換可能なIピクチャから新しいIDR区間を開始します。
 
+`Session`は`recovery_interval`ごとにnon-IDRのリカバリーポイントを生成します。DPBをフラッシュしないため、連続再生ではOpen GOPのleading Bピクチャも表示されます。その位置から再生を開始する場合はleading Bを捨て、Iピクチャ以降から復旧します。
+
 ## ストリーミング
 
 `Session`はMPEG-TSのチャンクを受け取り、MSEへ追加できるfragmented MP4を返します。分離、GOP分割、映像変換、AAC処理、多重化、音声と映像のタイムライン調整を内部で行います。

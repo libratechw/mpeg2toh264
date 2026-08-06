@@ -80,7 +80,7 @@ pub struct Session {
     gops: Mpeg2GopStream,
     adts: AdtsStream,
     transcoder: IncrementalTranscoder,
-    random_access_gop_interval: usize,
+    recovery_point_gop_interval: usize,
 
     sequence_number: u32,
     /// Where the next fragment starts, in 90 kHz ticks.
@@ -163,7 +163,7 @@ impl Session {
             gops: Mpeg2GopStream::new(),
             adts: AdtsStream::new(),
             transcoder: IncrementalTranscoder::new(options),
-            random_access_gop_interval: options.rap_interval,
+            recovery_point_gop_interval: options.recovery_interval,
             sequence_number: 1,
             video_presentation_start: 0,
             audio_frames_emitted: 0,
@@ -282,14 +282,17 @@ impl Session {
         self.audio_clock_frames += frames.len() as u64;
     }
 
-    /// Whether the fragment about to be emitted opens at an IDR, which is both
-    /// the first one and every restart point after it.
+    /// Whether the fragment about to be emitted opens at an IDR. Periodic
+    /// recovery points deliberately do not count: they retain the prior DPB so
+    /// an open GOP's leading B pictures remain codeable.
     fn starts_at_idr(&self) -> bool {
-        self.transcoder.awaiting_random_access() || self.is_random_access_point()
+        self.transcoder.awaiting_random_access()
     }
 
     fn is_random_access_point(&self) -> bool {
-        self.gops_emitted > 0 && self.gops_emitted % self.random_access_gop_interval.max(1) == 0
+        self.recovery_point_gop_interval != 0
+            && self.gops_emitted > 0
+            && self.gops_emitted % self.recovery_point_gop_interval == 0
     }
 
     fn flush_pending(&mut self, final_flush: bool, out: &mut Vec<Fragment>) -> Result<()> {
@@ -412,7 +415,7 @@ impl Session {
     ) -> Result<()> {
         let random_access = self.is_random_access_point();
         if random_access {
-            self.transcoder.request_random_access_point();
+            self.transcoder.request_recovery_point();
         }
         let starts_at_idr = self.transcoder.awaiting_random_access();
         let timeline = match timeline {
@@ -467,7 +470,7 @@ impl Session {
         out.push(Fragment::Media {
             data: fragment.media_segment,
             start,
-            random_access: starts_at_idr,
+            random_access: starts_at_idr || h264.recovery_point,
             video_samples: fragment.sample_count,
             audio_samples: audio_frames.len(),
             interlacing: timeline.interlacing,

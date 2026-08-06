@@ -483,7 +483,7 @@ class Playback {
       });
       const converter = new Transcoder(
         this.#command.oversample,
-        this.#command.rapInterval,
+        this.#command.recoveryInterval,
         this.#origin,
         this.#command.serviceId,
       );

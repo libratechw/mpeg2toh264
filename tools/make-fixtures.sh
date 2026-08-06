@@ -21,6 +21,15 @@ ffmpeg -y -v error -f lavfi -i testsrc2=size=352x288:rate=25 -frames:v 10 \
 ffmpeg -y -v error -f lavfi -i testsrc2=size=352x288:rate=25 -frames:v 15 \
   -c:v mpeg2video -g 15 -bf 2 -qscale:v 4 -f mpeg2video ibbp.m2v
 
+# Three genuine open-GOP boundaries. In display order the stream is
+# IBBPBBPBBPBBPBBI..., and the two B pictures immediately ahead of every I are
+# solid red then solid blue. A transcoder that drops or repeats those leading
+# pictures is therefore conspicuous both visually and in decoded-frame tests.
+ffmpeg -y -v error -f lavfi -i testsrc2=size=352x288:rate=25 -frames:v 46 \
+  -vf "drawbox=x=0:y=0:w=iw:h=ih:color=red:t=fill:enable='eq(mod(n,15),13)',drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='eq(mod(n,15),14)'" \
+  -c:v mpeg2video -g 15 -bf 2 -sc_threshold 1000000000 -qscale:v 4 \
+  -f mpeg2video open_gop_leading_bb.m2v
+
 # 1440x1080 interlaced, shaped like a terrestrial broadcast. Exercises field
 # motion types, field DCT and macroblock_escape.
 ffmpeg -y -v error -f lavfi -i testsrc2=size=1440x1080:rate=30000/1001 -frames:v 15 \

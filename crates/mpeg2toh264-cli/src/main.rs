@@ -26,6 +26,8 @@ Arguments:
 
 Options:
   -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
+  -r, --recovery-interval <n>
+                            GOPs between recovery points (default: 24)
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 ";
@@ -53,6 +55,7 @@ fn fail(message: &str) -> ! {
 fn parse_args(args: &[String]) -> Invocation {
     let mut positional: Vec<&str> = Vec::new();
     let mut oversample: f64 = 2.0;
+    let mut recovery_interval: usize = 24;
     let mut quiet = false;
 
     let mut i = 0;
@@ -71,6 +74,16 @@ fn parse_args(args: &[String]) -> Invocation {
             _ if arg.starts_with("--oversample=") => {
                 oversample = arg["--oversample=".len()..].parse().unwrap_or(f64::NAN);
             }
+            "-r" | "--recovery-interval" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    fail(&format!("{arg} requires a value"));
+                };
+                recovery_interval = value.parse().unwrap_or(0);
+            }
+            _ if arg.starts_with("--recovery-interval=") => {
+                recovery_interval = arg["--recovery-interval=".len()..].parse().unwrap_or(0);
+            }
             _ if arg.starts_with('-') => fail(&format!("unknown option '{arg}'")),
             _ => positional.push(arg),
         }
@@ -79,6 +92,9 @@ fn parse_args(args: &[String]) -> Invocation {
 
     if !oversample.is_finite() || oversample <= 0.0 {
         fail("oversample must be a positive number");
+    }
+    if recovery_interval == 0 {
+        fail("recovery interval must be a positive integer");
     }
     if positional.len() != 2 {
         fail(&format!(
@@ -97,7 +113,7 @@ fn parse_args(args: &[String]) -> Invocation {
         quiet,
         transcode: TranscodeOptions {
             oversample,
-            rap_interval: 24,
+            recovery_interval,
         },
     }))
 }

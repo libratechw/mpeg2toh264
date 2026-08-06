@@ -670,7 +670,10 @@ fn make_media_segment(
     for i in 0..samples.len() {
         entries.u32(durations[i]);
         entries.u32(payloads[i].len() as u32);
-        // sample_flags: non-reference and non-sync unless the NAL is an IDR.
+        // sample_flags: non-reference and non-sync unless this is an IDR or a
+        // recovery picture. Safari needs the container flag to retain an MSE
+        // eviction boundary; the recovery-point SEI tells the decoder how the
+        // non-IDR I picture becomes independently usable.
         entries.u32(if sync_samples[i] {
             0x0200_0000
         } else {
@@ -874,10 +877,14 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
         );
     }
     let timing = mpeg2_sample_timing(timeline, has_idr_clone);
-    let sync_samples: Vec<bool> = samples
+    let recovery_point = sei.is_some_and(|nal| nal.get(1) == Some(&6));
+    let mut sync_samples: Vec<bool> = samples
         .iter()
         .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
         .collect();
+    if recovery_point && !sync_samples.is_empty() {
+        sync_samples[0] = true;
+    }
     let codec = format!("{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3]);
     let prefixes: Vec<&[u8]> = sei.into_iter().collect();
 
@@ -969,10 +976,14 @@ pub fn h264_gop_to_fmp4(
     // very start of the timeline has nowhere to put it and simply displays that
     // much later.
     let base_decode_time = presentation_start.saturating_sub(timing.reorder_delay as u64);
-    let sync_samples: Vec<bool> = samples
+    let recovery_point = sei.is_some_and(|nal| nal.get(1) == Some(&6));
+    let mut sync_samples: Vec<bool> = samples
         .iter()
         .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
         .collect();
+    if recovery_point && !sync_samples.is_empty() {
+        sync_samples[0] = true;
+    }
     let prefixes: Vec<&[u8]> = sei.into_iter().collect();
 
     let media_segment = match audio_track {

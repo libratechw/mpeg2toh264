@@ -22,7 +22,8 @@ const urlInput = document.querySelector<HTMLInputElement>("#url")!;
 const fileInput = document.querySelector<HTMLInputElement>("#file")!;
 const placement = document.querySelector<HTMLSelectElement>("#placement")!;
 const oversample = document.querySelector<HTMLInputElement>("#oversample")!;
-const rapInterval = document.querySelector<HTMLInputElement>("#rap-interval")!;
+const recoveryInterval =
+  document.querySelector<HTMLInputElement>("#recovery-interval")!;
 const playPause = document.querySelector<HTMLButtonElement>("#playpause")!;
 const back = document.querySelector<HTMLButtonElement>("#back")!;
 const forward = document.querySelector<HTMLButtonElement>("#forward")!;
@@ -125,7 +126,7 @@ function createPlayer(): Mpeg2TsPlayer {
   const created = new Mpeg2TsPlayer(video, {
     mediaSource,
     oversample: Number(oversample.value),
-    rapInterval: Number(rapInterval.value),
+    recoveryInterval: Number(recoveryInterval.value),
     serviceId: wantedService ?? undefined,
     deinterlace: deinterlace.checked,
     deinterlacer: (element) => {
