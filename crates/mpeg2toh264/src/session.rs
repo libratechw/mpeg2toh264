@@ -7,6 +7,8 @@
 //! arithmetic is the part most easily got wrong and it belongs next to the code
 //! it constrains.
 
+use std::collections::VecDeque;
+
 use crate::container::adts::{
     aac_frame_count_through_video_time, AacConfig, AacFrame, AdtsStream, AAC_FRAME_SAMPLES,
 };
@@ -113,6 +115,25 @@ impl UnitPlan {
             (Self::Passthrough(_), true) => UnitLeadIn::FirstPicture,
         }
     }
+}
+
+/// How far a caller driving the session itself has got through its input.
+///
+/// The end of the input is three steps rather than one: the demuxer's last
+/// packets still go in the ordinary way, then what the group splitter and the
+/// ADTS reader are holding goes in, and only then does the final flush run.
+/// [`Session::finish`] walks those in a single call; a deferred caller can be
+/// suspended in the middle of any of them, so where it is has to be written
+/// down.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// Ordinary input; more may still arrive.
+    Feeding,
+    /// The demuxer has been flushed and its last packets are going in.
+    Draining,
+    /// Everything is in, and what is left is the final flush.
+    Finishing,
+    Done,
 }
 
 /// A unit that is going out, waiting only for its video to be converted.
@@ -230,10 +251,11 @@ pub struct Session {
     /// can go out until they come back, because everything after this unit is
     /// measured from where it ends.
     converting: Option<Ready>,
-    /// Whether a deferred caller has reached the end of its input, so that
-    /// calling [`Session::finish_deferred`] again drains rather than flushing
-    /// the demuxer a second time.
-    finishing: bool,
+    /// Packets a deferred caller's input has produced but that have not been
+    /// packaged yet. They go in one at a time; see [`Session::pump`].
+    pending_packets: VecDeque<ElementaryPacket>,
+    /// How far a deferred caller has got through its input.
+    phase: Phase,
 
     /// PES timestamp of the first audio packet, in 90 kHz units.
     audio_start_pts: Option<u64>,
@@ -324,7 +346,8 @@ impl Session {
             pending_audio: Vec::new(),
             audio_config: None,
             converting: None,
-            finishing: false,
+            pending_packets: VecDeque::new(),
+            phase: Phase::Feeding,
             audio_start_pts: None,
             audio_clock_start_pts: None,
             audio_clock_frames: 0,
@@ -376,29 +399,23 @@ impl Session {
     /// handed back to [`Self::complete`].
     pub fn push_deferred(&mut self, chunk: &[u8]) -> Result<Progress> {
         self.expect_nothing_in_flight()?;
+        if self.phase != Phase::Feeding {
+            bail!("the session has already been told the input has ended");
+        }
         let packets = self.demuxer.push(chunk)?;
-        let mut out = Vec::new();
-        self.ingest(packets, &mut out)?;
-        self.advance(false, out)
+        self.pending_packets.extend(packets);
+        self.pump(Vec::new())
     }
 
     /// [`Self::finish`], for the same caller. Call it until it returns
     /// [`Progress::Idle`].
     pub fn finish_deferred(&mut self) -> Result<Progress> {
-        if self.converting.is_none() && !self.finishing {
-            let packets = self.demuxer.finish()?;
-            let mut out = Vec::new();
-            self.ingest(packets, &mut out)?;
-            self.pending_gops.extend(self.gops.finish());
-            let final_audio = self.adts.finish()?;
-            if self.audio_config.is_none() {
-                self.audio_config = final_audio.first().map(|frame| frame.config.clone());
-            }
-            self.pending_audio.extend(final_audio);
-            self.finishing = true;
-            return self.advance(true, out);
+        self.expect_nothing_in_flight()?;
+        if self.phase == Phase::Feeding {
+            self.pending_packets.extend(self.demuxer.finish()?);
+            self.phase = Phase::Draining;
         }
-        self.advance(true, Vec::new())
+        self.pump(Vec::new())
     }
 
     /// Hand back one converted picture per job, in the order they were given
@@ -421,7 +438,49 @@ impl Session {
             Step::Done(h264) => {
                 let mut out = Vec::new();
                 self.finish_gop(converting, Some(*h264), &mut out)?;
-                self.advance(self.finishing, out)
+                self.pump(out)
+            }
+        }
+    }
+
+    /// Take the demuxed packets in one at a time, packaging whatever each of
+    /// them completes, and stop at the first unit whose pictures have to be
+    /// converted.
+    ///
+    /// One packet at a time because that is what [`Self::push`] does, and the
+    /// two have to reach the same fragments: how much audio a fragment carries
+    /// is worked out from what has arrived when its group of pictures goes out,
+    /// so taking a whole chunk in before packaging any of it would put audio in
+    /// a fragment that ran ahead of it.
+    fn pump(&mut self, mut out: Vec<Fragment>) -> Result<Progress> {
+        loop {
+            match self.advance(self.phase == Phase::Finishing, out)? {
+                pending @ Progress::Pending { .. } => return Ok(pending),
+                Progress::Idle(fragments) => out = fragments,
+            }
+            if let Some(packet) = self.pending_packets.pop_front() {
+                self.ingest_packet(packet, &mut out)?;
+                continue;
+            }
+            match self.phase {
+                // More input may still arrive, so what is held back stays back.
+                Phase::Feeding => return Ok(Progress::Idle(out)),
+                Phase::Draining => {
+                    // Everything the demuxer had is in. What the group splitter
+                    // and the ADTS reader are still holding goes in now, and
+                    // the last fragments take whatever is left over.
+                    self.pending_gops.extend(self.gops.finish());
+                    let final_audio = self.adts.finish()?;
+                    if self.audio_config.is_none() {
+                        self.audio_config = final_audio.first().map(|frame| frame.config.clone());
+                    }
+                    self.pending_audio.extend(final_audio);
+                    self.phase = Phase::Finishing;
+                }
+                Phase::Finishing | Phase::Done => {
+                    self.phase = Phase::Done;
+                    return Ok(Progress::Idle(out));
+                }
             }
         }
     }
@@ -461,16 +520,6 @@ impl Session {
         for packet in packets {
             self.ingest_packet(packet, out)?;
             self.flush_pending(false, out)?;
-        }
-        Ok(())
-    }
-
-    /// Take the demuxed packets in without packaging anything, which is what a
-    /// caller that converts the pictures itself has to do first: it cannot
-    /// package a unit until it has been given one back.
-    fn ingest(&mut self, packets: Vec<ElementaryPacket>, out: &mut Vec<Fragment>) -> Result<()> {
-        for packet in packets {
-            self.ingest_packet(packet, out)?;
         }
         Ok(())
     }

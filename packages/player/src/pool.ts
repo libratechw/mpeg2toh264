@@ -14,6 +14,7 @@
  * than copy. The compiled module is shared instead, which is what stops each
  * worker fetching and compiling the same bytes over again.
  */
+import PictureWorker from "./picture-worker.js?worker&inline";
 import type {
   PictureWorkerRequest,
   PictureWorkerResponse,
@@ -75,13 +76,8 @@ export class PicturePool {
   ): Promise<PicturePool | null> {
     const workers: Worker[] = [];
     try {
-      for (let index = 0; index < size; index += 1) {
-        workers.push(
-          new Worker(new URL("./picture-worker.ts", import.meta.url), {
-            type: "module",
-          }),
-        );
-      }
+      for (let index = 0; index < size; index += 1)
+        workers.push(new PictureWorker());
       await Promise.all(workers.map((worker) => start(worker, module)));
     } catch {
       for (const worker of workers) worker.terminate();

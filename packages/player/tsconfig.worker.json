@@ -11,6 +11,7 @@
     "src/source.ts",
     "src/mse.ts",
     "src/protocol.ts",
-    "src/worker-mse.d.ts"
+    "src/worker-mse.d.ts",
+    "src/worker-modules.d.ts"
   ]
 }

@@ -16,7 +16,14 @@ use mpeg2toh264::{
     plan_unit, transcode, Fragment, PictureEncoder, Progress, Session, TranscodeOptions,
     TranscoderState,
 };
-use support::{fnv1a, read_fixture, wrap_mpeg2_es_in_ts, FIXTURES};
+use support::{
+    adts_stream, fnv1a, mux_transport_stream, read_fixture, wrap_mpeg2_es_in_ts, PesUnit,
+    AUDIO_PID, FIXTURES, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO, STREAM_TYPE_PRIVATE_DATA,
+    VIDEO_PID,
+};
+
+/// The private stream this test carries alongside the two tracks.
+const PRIVATE_PID: u16 = 0x110;
 
 /// Plan a whole elementary stream as one unit and convert its jobs with
 /// `encode`, which decides where and in what order the work happens.
@@ -227,68 +234,126 @@ fn digest(fragments: &[Fragment]) -> Vec<(String, u64, usize, usize)> {
         .collect()
 }
 
+/// A stream with both tracks and a private one, interleaved the way a
+/// broadcast sends them.
+///
+/// Audio is what makes this worth building rather than reusing a video-only
+/// fixture: how much of it a fragment carries is worked out from what has
+/// arrived by the time its group of pictures goes out, so a driver that takes
+/// input in at a different rate packs the fragments differently. Nothing about
+/// the video would show that.
+fn broadcast_stream(name: &str, audio_frames: usize) -> Vec<u8> {
+    let video = read_fixture(name);
+    let audio = adts_stream(audio_frames, 3, 2);
+    let video_chunks: Vec<&[u8]> = video.chunks(20_000).collect();
+    let audio_chunks: Vec<&[u8]> = audio.chunks(400).collect();
+    let caption = b"a private payload standing in for a caption";
+
+    let mut units: Vec<PesUnit<'_>> = Vec::new();
+    for index in 0..video_chunks.len().max(audio_chunks.len()) {
+        if let Some(payload) = video_chunks.get(index) {
+            units.push(PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                payload,
+                pts: Some(900_000 + index as u64 * 3_000),
+            });
+        }
+        if let Some(payload) = audio_chunks.get(index) {
+            units.push(PesUnit {
+                pid: AUDIO_PID,
+                stream_id: 0xc0,
+                payload,
+                pts: Some(903_600 + index as u64 * 3_000),
+            });
+        }
+        if index % 4 == 0 {
+            units.push(PesUnit {
+                pid: PRIVATE_PID,
+                stream_id: 0xbd,
+                payload: caption,
+                pts: Some(900_000 + index as u64 * 3_000),
+            });
+        }
+    }
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+            (PRIVATE_PID, STREAM_TYPE_PRIVATE_DATA),
+        ],
+        &units,
+    )
+}
+
 #[test]
 fn a_session_driven_picture_by_picture_produces_the_same_fragments() {
-    for name in FIXTURES {
-        let stream = wrap_mpeg2_es_in_ts(&read_fixture(name), Some(900_000));
-
-        let mut sequential = Session::new(TranscodeOptions::default());
-        let mut expected = Vec::new();
-        for chunk in stream.chunks(4096) {
-            expected.extend(sequential.push(chunk).expect("push"));
-        }
-        expected.extend(sequential.finish().expect("finish"));
-
-        // The same session, with the pictures converted outside it. This is
-        // the shape a worker pool drives: push, convert what comes back, hand
-        // it over, and keep handing over until nothing more is asked for.
-        let mut deferred = Session::new(TranscodeOptions::default());
-        let mut encoder = PictureEncoder::new();
-        let mut actual = Vec::new();
-        let run = |progress: Progress, actual: &mut Vec<Fragment>| -> Vec<Vec<u8>> {
-            match progress {
-                Progress::Idle(fragments) => {
-                    actual.extend(fragments);
-                    Vec::new()
-                }
-                Progress::Pending { fragments, jobs } => {
-                    actual.extend(fragments);
-                    jobs
-                }
-            }
-        };
-        for chunk in stream.chunks(4096) {
-            let mut jobs = run(deferred.push_deferred(chunk).expect("push"), &mut actual);
-            while !jobs.is_empty() {
-                let outputs: Vec<PictureOutput> = jobs
-                    .iter()
-                    .map(|job| encoder.encode(job).expect("encodes"))
-                    .collect();
-                jobs = run(deferred.complete(&outputs).expect("complete"), &mut actual);
-            }
-        }
-        loop {
-            let progress = deferred.finish_deferred().expect("finish");
-            let finished = matches!(progress, Progress::Idle(_));
-            let mut jobs = run(progress, &mut actual);
-            while !jobs.is_empty() {
-                let outputs: Vec<PictureOutput> = jobs
-                    .iter()
-                    .map(|job| encoder.encode(job).expect("encodes"))
-                    .collect();
-                jobs = run(deferred.complete(&outputs).expect("complete"), &mut actual);
-            }
-            if finished {
-                break;
-            }
-        }
-
-        assert_eq!(
-            digest(&actual),
-            digest(&expected),
-            "{name}: driving the session picture by picture changed its fragments"
+    let streams = FIXTURES
+        .iter()
+        .map(|name| {
+            (
+                *name,
+                wrap_mpeg2_es_in_ts(&read_fixture(name), Some(900_000)),
+            )
+        })
+        .chain(
+            // With audio and captions alongside, and in more than one chunk
+            // size, because the packing depends on when each packet lands.
+            ["ibbp.m2v", "open_gop_leading_bb.m2v"]
+                .into_iter()
+                .map(|name| (name, broadcast_stream(name, 400))),
         );
-        assert!(!expected.is_empty(), "{name}: the session produced nothing");
+    for (name, stream) in streams {
+        for chunk_size in [4096, 65536] {
+            let mut sequential = Session::new(TranscodeOptions::default());
+            let mut expected = Vec::new();
+            for chunk in stream.chunks(chunk_size) {
+                expected.extend(sequential.push(chunk).expect("push"));
+            }
+            expected.extend(sequential.finish().expect("finish"));
+
+            // The same session, with the pictures converted outside it. This
+            // is the shape a worker pool drives: push, convert what comes
+            // back, hand it over, and keep going until nothing more is asked.
+            let mut deferred = Session::new(TranscodeOptions::default());
+            let mut encoder = PictureEncoder::new();
+            let mut actual = Vec::new();
+            let mut drive =
+                |progress: Progress, session: &mut Session, actual: &mut Vec<Fragment>| {
+                    let mut progress = progress;
+                    loop {
+                        let jobs = match progress {
+                            Progress::Idle(fragments) => {
+                                actual.extend(fragments);
+                                return;
+                            }
+                            Progress::Pending { fragments, jobs } => {
+                                actual.extend(fragments);
+                                jobs
+                            }
+                        };
+                        let outputs: Vec<PictureOutput> = jobs
+                            .iter()
+                            .map(|job| encoder.encode(job).expect("encodes"))
+                            .collect();
+                        progress = session.complete(&outputs).expect("complete");
+                    }
+                };
+            for chunk in stream.chunks(chunk_size) {
+                let progress = deferred.push_deferred(chunk).expect("push");
+                drive(progress, &mut deferred, &mut actual);
+            }
+            let progress = deferred.finish_deferred().expect("finish");
+            drive(progress, &mut deferred, &mut actual);
+
+            assert!(!expected.is_empty(), "{name}: the session produced nothing");
+            assert_eq!(
+                digest(&actual),
+                digest(&expected),
+                "{name} in {chunk_size} byte chunks: driving the session \
+                 picture by picture changed its fragments"
+            );
+        }
     }
 }
 
