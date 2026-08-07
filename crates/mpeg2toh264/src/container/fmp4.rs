@@ -10,6 +10,7 @@ use crate::mpeg2::headers::{
 };
 use crate::mpeg2::macroblock::{decode_slice, MacroblockGrid};
 use crate::round_half_up;
+use crate::TranscodeOptions;
 
 const TIMESCALE: u32 = 90_000;
 
@@ -167,7 +168,9 @@ pub struct Mpeg2VideoTimeline {
     /// Whether the transcoder gave each field of a pair its own access unit,
     /// which makes such a picture occupy two MP4 samples instead of one. Set by
     /// the caller from [`TranscodeOptions::split_field_samples`]; parsing the
-    /// source cannot tell.
+    /// source cannot tell. [`mpeg2_video_timeline`] fills it in to match that
+    /// option's default, so a caller that transcodes with the defaults and
+    /// never touches this still counts the same samples the bitstream holds.
     ///
     /// [`TranscodeOptions::split_field_samples`]: crate::TranscodeOptions::split_field_samples
     pub split_field_samples: bool,
@@ -342,7 +345,7 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
         sample_duration,
         presentation_indices,
         field_pairs,
-        split_field_samples: false,
+        split_field_samples: TranscodeOptions::default().split_field_samples,
         sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
         interlacing: pictures_interlacing(&pictures),
     })

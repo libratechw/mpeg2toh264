@@ -29,7 +29,11 @@ Options:
   -r, --recovery-interval <n>
                             GOPs between recovery points (default: 24)
   -s, --split-field-samples Give each field of a complementary pair its own MP4
-                            sample, for decoders that freeze without it
+                            sample (default). A pair sharing one sample breaks
+                            Firefox on Windows and Safari where frame pictures
+                            give way to field pictures.
+      --no-split-field-samples
+                            Keep a complementary field pair in one MP4 sample
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 ";
@@ -58,7 +62,7 @@ fn parse_args(args: &[String]) -> Invocation {
     let mut positional: Vec<&str> = Vec::new();
     let mut oversample: f64 = 2.0;
     let mut recovery_interval: usize = 24;
-    let mut split_field_samples = false;
+    let mut split_field_samples = true;
     let mut quiet = false;
 
     let mut i = 0;
@@ -68,6 +72,7 @@ fn parse_args(args: &[String]) -> Invocation {
             "-h" | "--help" => return Invocation::Help,
             "-q" | "--quiet" => quiet = true,
             "-s" | "--split-field-samples" => split_field_samples = true,
+            "--no-split-field-samples" => split_field_samples = false,
             "-o" | "--oversample" => {
                 i += 1;
                 let Some(value) = args.get(i) else {

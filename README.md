@@ -99,10 +99,11 @@ Interlaced-video limitations:
 
 - Chrome on Windows may fall back to software decoding.
   - This has been observed on at least Intel systems.
-- Firefox on Windows may freeze on field pictures.
-  - `splitFieldSamples` (CLI: `--split-field-samples`) enables a workaround that places the top and bottom fields in separate samples.
-  - A standalone field sample may adversely affect other environments, so it is off by default.
 - Chrome on macOS may fall back to software decoding.
+- Where PAFF is used, putting both fields in the same MP4 sample interferes with playback in Firefox on Windows and in Safari, so each field is written as its own sample by default.
+  - In Firefox on Windows, the field pictures freeze where frame pictures give way to them.
+  - Safari raises `MEDIA_ERR_DECODE`, through MSE only, when frame and field pictures are mixed.
+  - Note that with separate samples, ffmpeg reports corrupt decoded frame errors when `-thread_type frame` is used with `-threads` of 2 or more.
 
 ## WebAssembly and MSE player
 
@@ -256,10 +257,11 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
 
 - WindowsのChromeではソフトウェアデコーダーにフォールバックされることがある
   - 少なくともIntel環境で確認
-- WindowsのFirefoxではフィールドピクチャで映像がフリーズすることがある
-  - `splitFieldSamples` (CLIは`--split-field-samples`) でtop/bottomを別サンプルにするワークアラウンドを有効にできる
-  - 単独のフィールドサンプルは他の環境に悪影響がありそうなため既定では無効
 - MacのChromeではソフトウェアデコーダーにフォールバックされることがある
+- PAFFが使われる際にMP4の同一サンプルに両方のフィールドを入れるとWindows版FirefoxとSafariで再生に支障があるため既定で別サンプルとして出力
+  - WindowsのFirefoxではフレームピクチャからフィールドピクチャに変わるとフィールドピクチャの映像がフリーズする
+  - SafariではMSE経由の場合のみフレームピクチャとフィールドピクチャが混在すると`MEDIA_ERR_DECODE`となる
+  - 別サンプルとした場合ffmpegで`-thread_type frame`で`-threads`が2以上のときcorrupt decoded frameのエラーが出るため注意
 
 ## WebAssemblyとMSEプレイヤー
 

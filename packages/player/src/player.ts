@@ -66,10 +66,13 @@ export interface Mpeg2TsPlayerOptions {
   /** Number of MPEG-2 GOPs between non-IDR recovery points. */
   recoveryInterval?: number;
   /**
-   * Give each field of a complementary pair its own MP4 sample. Firefox on
-   * Windows freezes on field pictures held in one sample; this works around
-   * that, at the cost of a standalone field sample, which fewer decoders
-   * accept. Off by default.
+   * Give each field of a complementary pair its own MP4 sample. On by default,
+   * because both break where frame pictures give way to field pictures:
+   * Firefox on Windows freezes, and a pair sharing one sample decodes to an
+   * image of `CVFieldCount` 2 where a frame picture gives 1, which Safari fails
+   * on because WebKit reuses the format description it cached from the first
+   * decoded image. Only a sample boundary moves; the elementary stream is the
+   * same either way.
    */
   splitFieldSamples?: boolean;
   /**

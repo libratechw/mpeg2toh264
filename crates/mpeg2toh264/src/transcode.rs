@@ -90,10 +90,13 @@ pub struct TranscodeOptions {
     /// open GOP's leading B pictures remain available during continuous play.
     pub recovery_interval: usize,
     /// Put the two coded fields of a complementary pair in separate access
-    /// units, and so in separate MP4 samples. Firefox on Windows freezes on
-    /// field pictures held in one sample; splitting them works around it, at
-    /// the cost of handing decoders a standalone field sample, which is the
-    /// less widely accepted of the two.
+    /// units, and so in separate MP4 samples. On by default, because both
+    /// break where frame pictures give way to field pictures: Firefox on
+    /// Windows freezes, and a pair sharing a sample decodes to an image of
+    /// `CVFieldCount` 2 where a frame picture gives 1, which Safari fails on
+    /// because WebKit reuses the format description it cached from the first
+    /// decoded image. Only an access unit delimiter moves, so the elementary
+    /// stream is the same either way.
     pub split_field_samples: bool,
 }
 
@@ -102,7 +105,7 @@ impl Default for TranscodeOptions {
         Self {
             oversample: DEFAULT_OVERSAMPLE,
             recovery_interval: 24,
-            split_field_samples: false,
+            split_field_samples: true,
         }
     }
 }
