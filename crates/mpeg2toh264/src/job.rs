@@ -351,7 +351,11 @@ impl PictureContext {
 impl PictureOutput {
     /// The whole result as one buffer, which is what a message port takes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![0u8; OUTPUT_HEADER_LEN + self.bitstream.len()];
+        // Reserved and then appended to; see the note in
+        // [`crate::transcode`]'s `job_bytes` on why this is not sized and
+        // filled.
+        let mut out = Vec::with_capacity(OUTPUT_HEADER_LEN + self.bitstream.len());
+        out.resize(OUTPUT_HEADER_LEN, 0);
         out[0] = ENCODING_VERSION;
         out[1] = u8::from(self.decoded);
         let stats = [
@@ -367,7 +371,7 @@ impl PictureOutput {
         for (index, value) in stats.iter().enumerate() {
             put_u64(&mut out, 8 + index * 8, *value);
         }
-        out[OUTPUT_HEADER_LEN..].copy_from_slice(&self.bitstream);
+        out.extend_from_slice(&self.bitstream);
         out
     }
 

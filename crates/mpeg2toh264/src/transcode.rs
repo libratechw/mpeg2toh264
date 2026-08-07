@@ -598,10 +598,16 @@ fn job_bytes(
     } else {
         &data[pics[source].context_start..pics[source].context_end]
     };
-    let mut out = vec![0u8; JOB_HEADER_LEN + prefix.len() + (end - start)];
+    // Reserved and then appended to, rather than sized and filled: a buffer
+    // made the second way is zeroed before any of it is written, and the zeroes
+    // are a memset over every byte of the unit. That is worth avoiding
+    // anywhere, and worth more in the browser, where a memset is a real call
+    // rather than something the machine does in the background.
+    let mut out = Vec::with_capacity(JOB_HEADER_LEN + prefix.len() + (end - start));
+    out.resize(JOB_HEADER_LEN, 0);
     ctx.encode(&mut out);
-    out[JOB_HEADER_LEN..JOB_HEADER_LEN + prefix.len()].copy_from_slice(prefix);
-    out[JOB_HEADER_LEN + prefix.len()..].copy_from_slice(&data[start..end]);
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(&data[start..end]);
     out
 }
 
