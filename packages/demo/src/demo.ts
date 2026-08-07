@@ -21,6 +21,7 @@ const picture = document.querySelector<HTMLElement>("#picture")!;
 const urlForm = document.querySelector<HTMLFormElement>("#url-form")!;
 const urlInput = document.querySelector<HTMLInputElement>("#url")!;
 const fileInput = document.querySelector<HTMLInputElement>("#file")!;
+const unload = document.querySelector<HTMLButtonElement>("#unload")!;
 const placement = document.querySelector<HTMLSelectElement>("#placement")!;
 const oversample = document.querySelector<HTMLInputElement>("#oversample")!;
 const recoveryInterval =
@@ -62,6 +63,7 @@ const DOUBLE_CLICK_DELAY_MS = 300;
 
 const IDLE_FPS = "瞬間: - トータル: -";
 const IDLE_DEINTERLACE = "-";
+const IDLE_DETAILS = "-";
 
 const STATES: Record<PlayerState, string> = {
   idle: "MPEG-2 TSのURLを指定するかファイルを選択してください",
@@ -113,9 +115,33 @@ function setStatus(message: string, error = false) {
 }
 
 function setDetails() {
-  details.textContent = [label, length, scan, progress, counts]
-    .filter(Boolean)
-    .join(" ");
+  details.textContent =
+    [label, length, scan, progress, counts].filter(Boolean).join(" ") ||
+    IDLE_DETAILS;
+}
+
+/** Whether MPEG-2 can reach the decoder at all, which is for the browser to say. */
+const canPassthrough = supportsPassthrough();
+
+/**
+ * The settings the conversion reads once, as it starts, and never looks at
+ * again. Offering them over a player that has already passed that point would
+ * be offering a change that does not happen, so they wait for the next load --
+ * which is what the unload button is for.
+ */
+const LOAD_TIME_ONLY = [
+  placement,
+  oversample,
+  recoveryInterval,
+  splitFieldSamples,
+  passthrough,
+];
+
+function syncSettings() {
+  const loaded = player !== null;
+  for (const setting of LOAD_TIME_ONLY) setting.disabled = loaded;
+  if (!canPassthrough) passthrough.disabled = true;
+  unload.disabled = !loaded;
 }
 
 /**
@@ -237,6 +263,7 @@ function createPlayer(): Mpeg2TsPlayer {
   );
   player = created;
   syncControls();
+  syncSettings();
   return created;
 }
 
@@ -339,6 +366,45 @@ function play(
   if (autoplay) void loading.then(() => video.play()).catch(() => {});
   else void loading.catch(() => {});
 }
+
+/**
+ * Give up the input and everything read from it, and stand as the page did
+ * before the first load: the settings that only a load can act on come back,
+ * and the picked file is let go of rather than held for a reload that is no
+ * longer coming.
+ */
+function unloadSource() {
+  captions?.destroy();
+  captions = null;
+  player?.destroy();
+  player = null;
+  yadif = null;
+  playing = null;
+  if (fileUrl) URL.revokeObjectURL(fileUrl);
+  fileUrl = null;
+  // A file picker that still names the unloaded file would not fire `change`
+  // on picking it again, so choosing it a second time would do nothing.
+  fileInput.value = "";
+  forgetService();
+  label = "";
+  progress = "";
+  counts = "";
+  length = "";
+  scan = "";
+  duration = null;
+  scrubbing = false;
+  seek.value = "0";
+  fps.textContent = IDLE_FPS;
+  deinterlaceStats.textContent = IDLE_DEINTERLACE;
+  setDetails();
+  setPlayhead();
+  syncPlayPause();
+  syncControls();
+  syncSettings();
+  setStatus(STATES.idle);
+}
+
+unload.addEventListener("click", unloadSource);
 
 /** How far playback can be moved: the whole input, or as much as there is. */
 function reach(): number {
@@ -609,15 +675,8 @@ service.addEventListener("change", () => {
 deinterlace.addEventListener("change", applyDeinterlace);
 doubleRate.addEventListener("change", applyDeinterlace);
 
-// Which codec reaches the MediaSource is settled when the conversion starts,
-// so changing this means converting the input again from the beginning.
-passthrough.addEventListener("change", () => {
-  if (playing) play(playing.url, playing.label, fileUrl, true);
-});
-
-if (!supportsPassthrough()) {
+if (!canPassthrough) {
   passthrough.checked = false;
-  passthrough.disabled = true;
   passthrough.labels?.[0]?.append(" (このブラウザーはMPEG-2を再生できません)");
 }
 
@@ -684,4 +743,5 @@ if (!supportsWorkerMediaSource()) {
   )!.disabled = true;
 }
 
+syncSettings();
 setStatus(STATES.idle);
