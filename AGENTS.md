@@ -28,6 +28,7 @@
 - `wasm-bindgen-cli` must match the crate version in `Cargo.lock`; the build script checks it.
 - Page and Worker TypeScript are separate programs. `packages/player/src/mse.ts` is shared, while Worker MSE declarations live in `worker-mse.d.ts`; avoid broadening tsconfig inputs in a way that merges conflicting DOM libraries.
 - ffmpeg decoding the output cleanly is not the whole story. Safari decodes through VideoToolbox, which has disagreed with ffmpeg about reference picture lists and about how long an IDR stays a reference; `tools/vtdec.swift` and `tools/vtdiff.py` measure that without a browser, and `tools/m2v-pictures.py` finds the sources that reach the awkward paths.
+- VideoToolbox decoding the output cleanly is not the whole story either. Safari reaches it through Media Source Extensions, which parses with AVStreamDataParser, submits one sample at a time, and reuses a cached image format description; `tools/sdpdec.m` is the only harness that reproduces all three, and it is what found the field pair decode error. A fault that appears in the browser but not in `tools/vtdec.swift` belongs here.
 
 ## Useful commands
 
