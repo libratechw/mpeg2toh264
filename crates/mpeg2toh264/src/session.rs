@@ -16,11 +16,12 @@ use crate::container::fmp4::{
     UnitLeadIn,
 };
 use crate::container::mpegts::{ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
-use crate::error::Result;
+use crate::error::{bail, Result};
+use crate::job::PictureOutput;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
 use crate::mpeg2::headers::Interlacing;
 use crate::round_half_up;
-use crate::transcode::{IncrementalTranscoder, TranscodeOptions, VideoMode};
+use crate::transcode::{IncrementalTranscoder, Step, TranscodeOptions, TranscodeResult, VideoMode};
 
 const TIMESCALE: u64 = 90_000;
 
@@ -114,6 +115,43 @@ impl UnitPlan {
     }
 }
 
+/// A unit that is going out, waiting only for its video to be converted.
+struct Ready {
+    gop: Mpeg2Gop,
+    audio: Vec<AacFrame>,
+    plan: UnitPlan,
+    starts_at_idr: bool,
+}
+
+/// How far a session got, for a caller converting the pictures itself.
+///
+/// The conversion of a unit is the one part of this that need not happen here,
+/// and in a browser it is the part worth not happening here: it is most of the
+/// work, and it divides into pictures that have nothing to say to each other.
+/// So a session driven this way stops when it reaches one, hands out the
+/// pictures, and waits to be given them back.
+pub enum Progress {
+    /// Nothing is owed. Feed more input.
+    Idle(Vec<Fragment>),
+    /// Convert these and call [`Session::complete`] with one output per job,
+    /// in the same order.
+    Pending {
+        fragments: Vec<Fragment>,
+        jobs: Vec<Vec<u8>>,
+    },
+}
+
+impl Progress {
+    /// The fragments either way, for a caller that hands them on before
+    /// looking at what is still owed.
+    pub fn fragments(&mut self) -> Vec<Fragment> {
+        match self {
+            Self::Idle(fragments) => std::mem::take(fragments),
+            Self::Pending { fragments, .. } => std::mem::take(fragments),
+        }
+    }
+}
+
 /// How the video reaches the MP4.
 enum VideoPipeline {
     Transcode(IncrementalTranscoder),
@@ -187,6 +225,15 @@ pub struct Session {
     pending_gops: Vec<Mpeg2Gop>,
     pending_audio: Vec<AacFrame>,
     audio_config: Option<AacConfig>,
+
+    /// The unit whose pictures a deferred caller is converting. Nothing else
+    /// can go out until they come back, because everything after this unit is
+    /// measured from where it ends.
+    converting: Option<Ready>,
+    /// Whether a deferred caller has reached the end of its input, so that
+    /// calling [`Session::finish_deferred`] again drains rather than flushing
+    /// the demuxer a second time.
+    finishing: bool,
 
     /// PES timestamp of the first audio packet, in 90 kHz units.
     audio_start_pts: Option<u64>,
@@ -276,6 +323,8 @@ impl Session {
             pending_gops: Vec::new(),
             pending_audio: Vec::new(),
             audio_config: None,
+            converting: None,
+            finishing: false,
             audio_start_pts: None,
             audio_clock_start_pts: None,
             audio_clock_frames: 0,
@@ -320,12 +369,114 @@ impl Session {
         Ok(out)
     }
 
+    /// [`Self::push`], for a caller that will convert the pictures itself.
+    ///
+    /// Returns [`Progress::Pending`] as soon as a unit needs its video coded,
+    /// and nothing more comes out of the session until those pictures are
+    /// handed back to [`Self::complete`].
+    pub fn push_deferred(&mut self, chunk: &[u8]) -> Result<Progress> {
+        self.expect_nothing_in_flight()?;
+        let packets = self.demuxer.push(chunk)?;
+        let mut out = Vec::new();
+        self.ingest(packets, &mut out)?;
+        self.advance(false, out)
+    }
+
+    /// [`Self::finish`], for the same caller. Call it until it returns
+    /// [`Progress::Idle`].
+    pub fn finish_deferred(&mut self) -> Result<Progress> {
+        if self.converting.is_none() && !self.finishing {
+            let packets = self.demuxer.finish()?;
+            let mut out = Vec::new();
+            self.ingest(packets, &mut out)?;
+            self.pending_gops.extend(self.gops.finish());
+            let final_audio = self.adts.finish()?;
+            if self.audio_config.is_none() {
+                self.audio_config = final_audio.first().map(|frame| frame.config.clone());
+            }
+            self.pending_audio.extend(final_audio);
+            self.finishing = true;
+            return self.advance(true, out);
+        }
+        self.advance(true, Vec::new())
+    }
+
+    /// Hand back one converted picture per job, in the order they were given
+    /// out, and carry on.
+    pub fn complete(&mut self, outputs: &[PictureOutput]) -> Result<Progress> {
+        let Some(converting) = self.converting.take() else {
+            bail!("no pictures were asked for");
+        };
+        let VideoPipeline::Transcode(transcoder) = &mut self.video else {
+            bail!("the passthrough pipeline converts no pictures");
+        };
+        match transcoder.complete(&converting.gop.data, outputs)? {
+            Step::Again(jobs) => {
+                self.converting = Some(converting);
+                Ok(Progress::Pending {
+                    fragments: Vec::new(),
+                    jobs,
+                })
+            }
+            Step::Done(h264) => {
+                let mut out = Vec::new();
+                self.finish_gop(converting, Some(*h264), &mut out)?;
+                self.advance(self.finishing, out)
+            }
+        }
+    }
+
+    /// Package whatever is ready, stopping at the first unit whose pictures
+    /// have to be converted.
+    fn advance(&mut self, final_flush: bool, mut out: Vec<Fragment>) -> Result<Progress> {
+        while let Some(ready) = self.take_ready(final_flush)? {
+            let VideoPipeline::Transcode(transcoder) = &mut self.video else {
+                // Passthrough codes nothing, so there is never anything to wait
+                // for and the unit goes out as it stands.
+                self.finish_gop(ready, None, &mut out)?;
+                continue;
+            };
+            let jobs = transcoder.begin(&ready.gop.data)?;
+            self.converting = Some(ready);
+            return Ok(Progress::Pending {
+                fragments: out,
+                jobs,
+            });
+        }
+        Ok(Progress::Idle(out))
+    }
+
+    fn expect_nothing_in_flight(&self) -> Result<()> {
+        if self.converting.is_some() {
+            bail!("pictures from the previous unit have not been handed back");
+        }
+        Ok(())
+    }
+
     fn consume_elementary(
         &mut self,
         packets: Vec<ElementaryPacket>,
         out: &mut Vec<Fragment>,
     ) -> Result<()> {
         for packet in packets {
+            self.ingest_packet(packet, out)?;
+            self.flush_pending(false, out)?;
+        }
+        Ok(())
+    }
+
+    /// Take the demuxed packets in without packaging anything, which is what a
+    /// caller that converts the pictures itself has to do first: it cannot
+    /// package a unit until it has been given one back.
+    fn ingest(&mut self, packets: Vec<ElementaryPacket>, out: &mut Vec<Fragment>) -> Result<()> {
+        for packet in packets {
+            self.ingest_packet(packet, out)?;
+        }
+        Ok(())
+    }
+
+    fn ingest_packet(&mut self, packet: ElementaryPacket, out: &mut Vec<Fragment>) -> Result<()> {
+        {
             match packet.kind {
                 ElementaryKind::Video => {
                     let units = self.gops.push(&packet.data, packet.pts);
@@ -355,7 +506,6 @@ impl Session {
                     });
                 }
             }
-            self.flush_pending(false, out)?;
         }
         Ok(())
     }
@@ -394,10 +544,25 @@ impl Session {
     }
 
     /// Work out what one unit turns into, on whichever path this session is on.
+    ///
+    /// Nothing is decoded to get here, so this assumes every picture with a
+    /// slice in it will convert. That is what the audio pairing below is
+    /// measured against; a unit that turns out to hold a damaged picture is
+    /// drawn again by [`Self::package`] once the transcoder has said so.
     fn plan_unit(&self, data: &[u8], starts_at_idr: bool) -> Result<UnitPlan> {
+        self.plan_unit_without(data, starts_at_idr, &[])
+    }
+
+    /// The same, told which source pictures would not decode.
+    fn plan_unit_without(
+        &self,
+        data: &[u8],
+        starts_at_idr: bool,
+        undecodable: &[bool],
+    ) -> Result<UnitPlan> {
         let mut plan = match self.video {
             VideoPipeline::Transcode(_) => {
-                UnitPlan::Transcode(mpeg2_video_timeline(data, !starts_at_idr)?)
+                UnitPlan::Transcode(mpeg2_video_timeline(data, !starts_at_idr, undecodable)?)
             }
             VideoPipeline::Passthrough { .. } => {
                 UnitPlan::Passthrough(mpeg2_passthrough_unit(data, !starts_at_idr)?)
@@ -416,50 +581,87 @@ impl Session {
     }
 
     fn flush_pending(&mut self, final_flush: bool, out: &mut Vec<Fragment>) -> Result<()> {
+        while let Some(ready) = self.take_ready(final_flush)? {
+            self.finish_gop(ready, None, out)?;
+        }
+        Ok(())
+    }
+
+    /// Take the next unit that can go out, with the audio that belongs beside
+    /// it, or nothing when it is still waiting on either.
+    ///
+    /// Everything that decides whether a unit goes happens here, and nothing
+    /// that decides it happens after: what comes back is committed to, and the
+    /// only thing left is to convert its video and package it.
+    fn take_ready(&mut self, final_flush: bool) -> Result<Option<Ready>> {
         if !self.demuxer.has_aac_audio() {
-            for gop in std::mem::take(&mut self.pending_gops) {
-                self.emit_gop(&gop, Vec::new(), None, out)?;
+            if self.pending_gops.is_empty() {
+                return Ok(None);
             }
-            return Ok(());
+            let gop = self.pending_gops.remove(0);
+            return Ok(Some(self.commit(gop, Vec::new(), None)?));
         }
         // Keep one GOP pending so all AAC packets up to the next GOP boundary
         // can share the same moof. MSE implementations then see both trafs per
         // fragment.
         let keep = usize::from(!final_flush);
-        while self.pending_gops.len() > keep {
-            let Some(config) = self.audio_config.clone() else {
-                break;
-            };
-            if !final_flush && self.pending_audio.is_empty() {
-                break;
-            }
-            let gop = self.pending_gops[0].clone();
-            let starts_at_idr = self.starts_at_idr();
-            let plan = self.plan_unit(&gop.data, starts_at_idr)?;
-            self.align_timelines(&gop, plan.timeline());
-            let video_duration =
-                mpeg2_fragment_duration(plan.timeline(), plan.lead_in(starts_at_idr));
-            // Audio is measured from where the audio track itself starts, not
-            // from where the video does.
-            let through = (self.video_presentation_start + video_duration) as i64
-                - self.audio_origin_ticks as i64;
-            let desired = aac_frame_count_through_video_time(through, config.sample_rate);
-            let wanted = (desired - self.audio_frames_emitted as i64).max(0) as usize;
-            if !final_flush && self.pending_audio.len() < wanted {
-                break;
-            }
-            self.pending_gops.remove(0);
-            // The last fragment takes whatever audio is left, since nothing
-            // follows it to carry the remainder.
-            let take = if final_flush && self.pending_gops.is_empty() {
-                self.pending_audio.len()
-            } else {
-                wanted.min(self.pending_audio.len())
-            };
-            let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
-            self.emit_gop(&gop, frames, Some(plan), out)?;
+        if self.pending_gops.len() <= keep {
+            return Ok(None);
         }
-        Ok(())
+        let Some(config) = self.audio_config.clone() else {
+            return Ok(None);
+        };
+        if !final_flush && self.pending_audio.is_empty() {
+            return Ok(None);
+        }
+        let gop = self.pending_gops[0].clone();
+        let starts_at_idr = self.starts_at_idr();
+        let plan = self.plan_unit(&gop.data, starts_at_idr)?;
+        self.align_timelines(&gop, plan.timeline());
+        let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(starts_at_idr));
+        // Audio is measured from where the audio track itself starts, not
+        // from where the video does.
+        let through = (self.video_presentation_start + video_duration) as i64
+            - self.audio_origin_ticks as i64;
+        let desired = aac_frame_count_through_video_time(through, config.sample_rate);
+        let wanted = (desired - self.audio_frames_emitted as i64).max(0) as usize;
+        if !final_flush && self.pending_audio.len() < wanted {
+            return Ok(None);
+        }
+        self.pending_gops.remove(0);
+        // The last fragment takes whatever audio is left, since nothing
+        // follows it to carry the remainder.
+        let take = if final_flush && self.pending_gops.is_empty() {
+            self.pending_audio.len()
+        } else {
+            wanted.min(self.pending_audio.len())
+        };
+        let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
+        Ok(Some(self.commit(gop, frames, Some(plan))?))
+    }
+
+    /// Settle what a unit that is going out will be: whether it carries a
+    /// restart point, and so what its plan is.
+    fn commit(
+        &mut self,
+        gop: Mpeg2Gop,
+        audio: Vec<AacFrame>,
+        plan: Option<UnitPlan>,
+    ) -> Result<Ready> {
+        if self.is_random_access_point() {
+            self.video.request_recovery_point();
+        }
+        let starts_at_idr = self.video.awaiting_random_access();
+        let plan = match plan {
+            Some(plan) => plan,
+            None => self.plan_unit(&gop.data, starts_at_idr)?,
+        };
+        Ok(Ready {
+            gop,
+            audio,
+            plan,
+            starts_at_idr,
+        })
     }
 
     /// Put the two tracks on one timeline, using the timestamps the transport
@@ -527,22 +729,23 @@ impl Session {
         origin as u64 + self.audio_frames_emitted * AAC_FRAME_SAMPLES
     }
 
-    fn emit_gop(
+    /// Package a committed unit and hand its fragment out.
+    ///
+    /// `h264` is the video already converted, for a caller that converted it
+    /// somewhere else; `None` converts it here.
+    fn finish_gop(
         &mut self,
-        gop: &Mpeg2Gop,
-        audio_frames: Vec<AacFrame>,
-        plan: Option<UnitPlan>,
+        ready: Ready,
+        h264: Option<TranscodeResult>,
         out: &mut Vec<Fragment>,
     ) -> Result<()> {
-        let random_access = self.is_random_access_point();
-        if random_access {
-            self.video.request_recovery_point();
-        }
-        let starts_at_idr = self.video.awaiting_random_access();
-        let plan = match plan {
-            Some(plan) => plan,
-            None => self.plan_unit(&gop.data, starts_at_idr)?,
-        };
+        let Ready {
+            gop,
+            audio: audio_frames,
+            plan,
+            starts_at_idr,
+        } = ready;
+        let gop = &gop;
         // Aligning can still move the origin, so read the start after it.
         self.align_timelines(gop, plan.timeline());
         let start = self.video_presentation_start as f64 / TIMESCALE as f64;
@@ -566,6 +769,7 @@ impl Session {
             starts_at_idr,
             config.as_ref(),
             audio_track.as_ref(),
+            h264,
         )?;
         // A unit that yielded no picture, with no audio to carry alongside it,
         // makes a moof describing no samples of anything. A recording cut mid
@@ -607,10 +811,29 @@ impl Session {
         starts_at_idr: bool,
         audio: Option<&AacConfig>,
         audio_track: Option<&Fmp4AudioSamples>,
+        converted: Option<TranscodeResult>,
     ) -> Result<(Fmp4Fragment, bool)> {
         match (&mut self.video, plan) {
             (VideoPipeline::Transcode(transcoder), UnitPlan::Transcode(timeline)) => {
-                let h264 = transcoder.push(&gop.data)?;
+                let h264 = match converted {
+                    Some(h264) => h264,
+                    None => transcoder.push(&gop.data)?,
+                };
+                // The plan reached this unit without decoding a slice, so it
+                // reserved a sample for every picture that had one. A picture
+                // that then would not decode leaves a sample with no access
+                // unit behind it, and only the transcoder can say which. Draw
+                // the unit again knowing that, which is the one case where the
+                // timeline is worth walking twice.
+                let redrawn = if h264.undecodable.iter().any(|&damaged| damaged) {
+                    Some(self.plan_unit_without(&gop.data, starts_at_idr, &h264.undecodable)?)
+                } else {
+                    None
+                };
+                let timeline = match &redrawn {
+                    Some(redrawn) => redrawn.timeline(),
+                    None => timeline,
+                };
                 let fragment = h264_gop_to_fmp4(
                     &h264.bitstream,
                     timeline,

@@ -1,14 +1,12 @@
 //! Packaging this transcoder's Annex B output as a fragmented MP4.
 
-use crate::bitreader::BitReader;
 use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
 use crate::mpeg2::constants::{start_code, PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
-    parse_elementary_stream, picture_geometry, pictures_interlacing, sequence_sample_aspect_ratio,
-    Interlacing, Picture, SampleAspectRatio,
+    parse_elementary_stream, pictures_interlacing, sequence_sample_aspect_ratio, Interlacing,
+    Picture, SampleAspectRatio,
 };
-use crate::mpeg2::macroblock::{decode_slice, MacroblockGrid};
 use crate::round_half_up;
 use crate::TranscodeOptions;
 
@@ -288,24 +286,6 @@ pub fn complementary_field<'a>(
     })
 }
 
-/// Whether every slice in a source picture reaches its end cleanly. The
-/// transcoder drops a picture when any of its independently decodable slices
-/// is damaged or truncated; the MP4 timeline must make the identical decision
-/// or it will reserve a sample that the H.264 stream does not contain.
-fn picture_is_decodable(
-    reader: &mut BitReader<'_>,
-    picture: &Picture,
-    grid: &mut MacroblockGrid,
-) -> bool {
-    let geometry = picture_geometry(picture);
-    grid.reset(geometry.mb_width * geometry.mb_height);
-    !picture.slices.is_empty()
-        && picture
-            .slices
-            .iter()
-            .all(|slice| decode_slice(reader, picture, slice, geometry.mb_width, grid).is_ok())
-}
-
 /// One source picture the timeline kept, and the bytes it was coded in.
 ///
 /// The range runs from the end of the picture before it, so the sequence and
@@ -339,8 +319,17 @@ pub struct Mpeg2Unit {
 ///
 /// `has_references` is set when the unit continues an already-populated decoded
 /// picture buffer, so its leading B pictures are codeable.
-pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2VideoTimeline> {
-    Ok(walk_pictures(data, has_references, true)?.timeline)
+///
+/// `undecodable`, indexed by source picture, names the pictures the transcoder
+/// found damaged. The timeline must reserve a sample for each picture the
+/// transcoder emits and no others, and this is how it is told which those are;
+/// an empty slice means none were, which is the ordinary case.
+pub fn mpeg2_video_timeline(
+    data: &[u8],
+    has_references: bool,
+    undecodable: &[bool],
+) -> Result<Mpeg2VideoTimeline> {
+    Ok(walk_pictures(data, has_references, undecodable)?.timeline)
 }
 
 /// Cut a unit into the samples a passthrough MP4 carries, alongside the same
@@ -350,16 +339,16 @@ pub fn mpeg2_video_timeline(data: &[u8], has_references: bool) -> Result<Mpeg2Vi
 /// bar the ones it drops for being undecodable: nothing is decoded on this
 /// path, and a damaged slice is the decoder's business rather than this one's.
 pub fn mpeg2_passthrough_unit(data: &[u8], has_references: bool) -> Result<Mpeg2Unit> {
-    walk_pictures(data, has_references, false)
+    walk_pictures(data, has_references, &[])
 }
 
 /// Walk a unit's pictures, keeping the ones that can be coded or carried.
 ///
-/// `require_decodable` decodes every slice to find the damaged ones, which is
-/// what the transcoding path needs -- it must reserve a sample for each picture
-/// the transcoder will emit and no others. Passthrough hands the bytes on
-/// untouched, so it skips the pass and keeps everything with a slice in it.
-fn walk_pictures(data: &[u8], has_references: bool, require_decodable: bool) -> Result<Mpeg2Unit> {
+/// Nothing is decoded here. A picture is kept if it has slices at all and was
+/// not named in `undecodable`, which is what the transcoder reports back once
+/// it has tried; passthrough hands the bytes on untouched and names nothing,
+/// since a damaged slice is then the decoder's business rather than this one's.
+fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Result<Mpeg2Unit> {
     let pictures = parse_elementary_stream(data)?;
     let Some(first) = pictures.first() else {
         bail!("no MPEG-2 pictures for MP4 timeline");
@@ -390,8 +379,6 @@ fn walk_pictures(data: &[u8], has_references: bool, require_decodable: bool) -> 
     let mut presentation_indices = Vec::new();
     let mut field_pairs = Vec::new();
     let mut samples = Vec::new();
-    let mut reader = BitReader::new(data);
-    let mut grid = MacroblockGrid::new();
     let mut picture_index = 0;
     // Where the picture in hand starts, which is where the one before it ended.
     // A picture that is dropped leaves its bytes to the sample that follows,
@@ -399,6 +386,9 @@ fn walk_pictures(data: &[u8], has_references: bool, require_decodable: bool) -> 
     let mut sample_start = 0;
     while picture_index < pictures.len() {
         let picture = &pictures[picture_index];
+        // Where this picture sits among the unit's own, which is how the
+        // transcoder names the ones it could not decode.
+        let source_index = picture_index;
         let mut mate = None;
         let mut unpaired = false;
         if picture.coding.picture_structure != PictureStructure::Frame {
@@ -441,12 +431,11 @@ fn walk_pictures(data: &[u8], has_references: bool, require_decodable: bool) -> 
         if unpaired {
             continue;
         }
-        let decodable = if require_decodable {
-            picture_is_decodable(&mut reader, picture, &mut grid)
-                && !mate.is_some_and(|field| !picture_is_decodable(&mut reader, field, &mut grid))
-        } else {
-            !picture.slices.is_empty() && !mate.is_some_and(|field| field.slices.is_empty())
+        let kept = |index: usize, picture: &Picture| {
+            !picture.slices.is_empty() && !undecodable.get(index).copied().unwrap_or(false)
         };
+        let decodable =
+            kept(source_index, picture) && mate.is_none_or(|field| kept(source_index + 1, field));
         if !decodable {
             continue;
         }
@@ -503,7 +492,7 @@ fn content_sample_count(timeline: &Mpeg2VideoTimeline) -> usize {
 
 /// Where a picture's coded data ends, which is the start code that terminated
 /// its last slice. A picture with no slices at all ends where it began.
-fn picture_end(picture: &Picture, start: usize) -> usize {
+pub(crate) fn picture_end(picture: &Picture, start: usize) -> usize {
     picture
         .slices
         .last()

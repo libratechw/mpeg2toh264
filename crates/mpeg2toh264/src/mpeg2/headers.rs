@@ -252,6 +252,20 @@ pub struct Picture {
     pub sequence_ext: SequenceExtension,
     pub quant: QuantMatrices,
     pub slices: Vec<Slice>,
+    /// Byte range of the sequence-level headers standing in front of this
+    /// picture: from its sequence header to one past the last thing that
+    /// changed the description, which is the sequence extension and any
+    /// quantiser matrix extension that arrived before it.
+    ///
+    /// This is what a converter has to put in front of the picture's own bytes
+    /// for a fresh parse to describe it the way this walk did. Normally it is
+    /// the block a sequence opens with, a hundred-odd bytes holding no picture
+    /// at all. A stream that changes its quantiser matrices part way through a
+    /// sequence stretches the range over the pictures in between, which is why
+    /// a reader takes the last picture of a prefixed stream rather than the
+    /// first.
+    pub context_start: usize,
+    pub context_end: usize,
 }
 
 /// Derived, ready-to-use view of the picture geometry.
@@ -455,8 +469,13 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut quant = QuantMatrices::default();
     let mut current: Option<usize> = None;
     let mut saw_gop_header = false;
+    // The sequence description in hand: where its header starts, and one past
+    // the last thing that changed it. Recorded on each picture so that one
+    // picture can be re-parsed on its own; see [`Picture::context_start`].
+    let mut context_start = 0;
+    let mut context_end = 0;
 
-    for sc in &codes {
+    for (position, sc) in codes.iter().enumerate() {
         // A start code terminates whatever slice was in progress.
         if let Some(index) = current {
             if let Some(last) = pictures[index].slices.last_mut() {
@@ -467,19 +486,27 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
         }
 
         let mut r = BitReader::at_bit(data, sc.payload_offset * 8);
+        // Where this header stops, which is where the next one starts.
+        let ends_at = codes
+            .get(position + 1)
+            .map_or(data.len(), |next| next.offset);
 
         if sc.code == start_code::SEQUENCE_HEADER {
             let (header, matrices) = read_sequence_header(&mut r)?;
             seq = Some(header);
             quant = matrices;
             seq_ext = None;
+            context_start = sc.offset;
+            context_end = ends_at;
         } else if sc.code == start_code::EXTENSION {
             let id = r.u(4);
             if id == extension::SEQUENCE {
                 if let Some(header) = seq.as_mut() {
                     seq_ext = Some(read_sequence_extension(&mut r, header)?);
+                    context_end = ends_at;
                 }
             } else if id == extension::QUANT_MATRIX {
+                context_end = ends_at;
                 // Applies from the next picture onwards; the already-emitted
                 // pictures keep the matrices they were coded with, which value
                 // semantics give for free.
@@ -510,6 +537,8 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 sequence_ext: seq_ext.unwrap_or_else(SequenceExtension::mpeg1_default),
                 quant: quant.clone(),
                 slices: Vec::new(),
+                context_start,
+                context_end,
             });
             saw_gop_header = false;
             current = Some(pictures.len() - 1);

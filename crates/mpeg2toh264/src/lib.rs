@@ -18,11 +18,13 @@ mod error;
 pub mod bitreader;
 pub mod container;
 pub mod h264;
+pub mod job;
 pub mod mpeg2;
 pub mod session;
 pub mod transcode;
 
 pub use error::{Error, Result};
+pub use job::{PictureJob, PictureOutput, TranscoderState};
 
 pub use container::fmp4::{
     h264_gop_to_fmp4, h264_to_fmp4, mpeg2_gop_to_fmp4, mpeg2_passthrough_unit, mpeg2_to_fmp4,
@@ -34,9 +36,10 @@ pub use container::mpegts::{
     MpegTsAvDemuxer,
 };
 pub use mpeg2::headers::{pictures_interlacing, Interlacing};
-pub use session::{Fragment, Session};
+pub use session::{Fragment, Progress, Session};
 pub use transcode::{
-    transcode, IncrementalTranscoder, TranscodeOptions, TranscodeResult, VideoMode,
+    plan_unit, transcode, IncrementalTranscoder, PictureEncoder, TranscodeOptions, TranscodeResult,
+    UnitPlan, VideoMode,
 };
 
 /// JavaScript's `Math.round`, which the reference implementation used

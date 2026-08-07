@@ -21,7 +21,7 @@
 //! available in B slices. See [`crate::h264::mvmap`].
 
 use crate::bitreader::BitReader;
-use crate::container::fmp4::complementary_field;
+use crate::container::fmp4::{complementary_field, picture_end};
 use crate::error::{bail, Result};
 use crate::h264::bitwriter::{nal_type, to_nal_unit, BitWriter};
 use crate::h264::chroma::{
@@ -49,6 +49,10 @@ use crate::h264::reconstruct::{
 };
 use crate::h264::slice::{
     write_slice_header, RefPicList, RefPicListEntry, SliceHeaderConfig, SliceType,
+};
+use crate::job::{
+    PictureContext, PictureJob, PictureOutput, RefLayout, ShortTermFrames, TranscoderState,
+    JOB_HEADER_LEN, MAX_SHORT_TERM_FRAMES,
 };
 use crate::mpeg2::constants::{mb_flag, PictureStructure, PictureType, QUANTISER_SCALE};
 use crate::mpeg2::headers::{
@@ -95,7 +99,7 @@ pub enum VideoMode {
     Passthrough,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct TranscodeOptions {
     pub oversample: f64,
     /// Put a recovery point at every this many GOPs. The recovery picture is
@@ -149,6 +153,22 @@ pub struct Stats {
     pub errors: u64,
 }
 
+impl Stats {
+    /// Take one picture's counts into a running total. Pictures are counted
+    /// wherever they happen to be converted, so the totals are added up rather
+    /// than accumulated in place.
+    pub fn add(&mut self, other: &Stats) {
+        self.integer_vectors += other.integer_vectors;
+        self.single_axis_half_vectors += other.single_axis_half_vectors;
+        self.both_axis_half_vectors += other.both_axis_half_vectors;
+        self.bidirectional_vectors += other.bidirectional_vectors;
+        self.intra_macroblocks += other.intra_macroblocks;
+        self.inter_macroblocks += other.inter_macroblocks;
+        self.dropped += other.dropped;
+        self.errors += other.errors;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TranscodeResult {
     pub bitstream: Vec<u8>,
@@ -157,75 +177,13 @@ pub struct TranscodeResult {
     pub stats: Stats,
     /// Whether this result carries a non-IDR recovery picture.
     pub recovery_point: bool,
-}
-
-/// How many short-term reference frames the buffer holds, the long-term copy
-/// taking the remaining slot.
-const MAX_SHORT_TERM_FRAMES: usize = MAX_NUM_REF_FRAMES as usize - 1;
-
-/// The `frame_num` of every short-term reference frame in the buffer, oldest
-/// first.
-///
-/// Not simply the last few values of `frame_num`: the copy that carries the
-/// long-term mark spends one of its own without joining the short-term chain,
-/// leaving a hole behind the IDR in front of it. A field slice names its
-/// references by how far back they sit, so it needs the values and not a count.
-#[derive(Clone, Copy, Default)]
-struct ShortTermFrames {
-    frame_nums: [u32; MAX_SHORT_TERM_FRAMES],
-    len: usize,
-}
-
-impl ShortTermFrames {
-    /// Take a reference in, sliding the oldest out of a full buffer.
-    fn push(&mut self, frame_num: u32) {
-        if self.len == MAX_SHORT_TERM_FRAMES {
-            self.frame_nums.rotate_left(1);
-            self.len -= 1;
-        }
-        self.frame_nums[self.len] = frame_num;
-        self.len += 1;
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    /// Oldest first, which is the order the sliding window will empty them in.
-    fn iter(&self) -> impl DoubleEndedIterator<Item = u32> + '_ {
-        self.frame_nums[..self.len].iter().copied()
-    }
-}
-
-/// Which reference index reaches which picture, per list.
-#[derive(Clone, Copy, Debug)]
-struct RefLayout {
-    count: u32,
-    /// The picture an MPEG-2 forward vector refers to.
-    fwd_l0: i32,
-    fwd_l1: i32,
-    /// The picture an MPEG-2 backward vector refers to; -1 in I and P pictures.
-    bwd_l0: i32,
-    bwd_l1: i32,
-    /// The index whose weights force a flat prediction, which intra macroblocks
-    /// use in place of H.264 intra prediction; see [`crate::h264::slice`]. It is
-    /// the long-term picture, which is kept purely to have an index to hang
-    /// those weights on -- its samples are never read.
-    flat: i32,
-    /// Set for I and P pictures, where both lists must reach the same picture
-    /// and list 1's default construction would swap its first two entries. It
-    /// holds how far back in `frame_num` the newest short-term reference is.
-    l1_short_term_delta: Option<u32>,
-    /// Set on the second field of the picture that opens a random access point.
+    /// Which of the unit's source pictures would not decode, indexed by
+    /// picture. Empty when none of them were, which is the ordinary case.
     ///
-    /// That field is routinely a P field predicted from the first half of its
-    /// own pair, and that half is the only reference field in the buffer. One
-    /// picture cannot be named twice in one list, so the two roles are split
-    /// between the lists: list 0 holds the field at its ordinary weight for the
-    /// motion the source coded, list 1 holds it again carrying the flat weights
-    /// its intra macroblocks need. Both lists are one entry long, so every
-    /// index below is 0 whatever parity the source asked for.
-    anchor_second_field: bool,
+    /// The MP4 timeline has to drop exactly these, and cannot find them for
+    /// itself without decoding every slice a second time. This is the report
+    /// that saves it the walk; see [`crate::mpeg2_video_timeline`].
+    pub undecodable: Vec<bool>,
 }
 
 /// The neighbour state a picture's coding reads back, kept between pictures.
@@ -268,32 +226,528 @@ impl PictureScratch {
     }
 }
 
+/// One piece of a unit's assembled bitstream.
+///
+/// The plan knows the order everything goes in before any of it is coded, which
+/// is what lets the pictures be coded anywhere and in any order: the assembly
+/// only has to drop each result into the slot held for it.
+enum Part {
+    /// Bytes the plan already has: parameter sets, delimiters, the recovery
+    /// point message, the copy that follows an IDR.
+    Literal(Vec<u8>),
+    /// Whatever the job at this index turns into.
+    Picture(usize),
+}
+
+/// What one unit becomes, worked out from its headers alone.
+///
+/// Nothing here has decoded a slice. The plan assumes every picture it keeps
+/// will decode, because finding out costs as much as the conversion itself and
+/// would leave that cost on whichever thread walks the stream. A picture that
+/// turns out not to decode is answered by planning the unit again, this time
+/// told which ones to leave out; see [`IncrementalTranscoder::push`].
+pub struct UnitPlan {
+    parts: Vec<Part>,
+    /// One per picture the unit codes, in output order.
+    pub jobs: Vec<PictureJob>,
+    /// What a transcoder carries away from this unit, if the plan holds.
+    pub state: TranscoderState,
+    pictures_converted: usize,
+    pictures_skipped: usize,
+    recovery_emitted: bool,
+}
+
+impl UnitPlan {
+    /// Take the jobs' bytes out to be converted, leaving behind which source
+    /// pictures each was for. Handing them over rather than copying them is
+    /// what keeps a unit's bytes crossing to a worker once.
+    pub fn take_jobs(&mut self) -> Vec<Vec<u8>> {
+        self.jobs
+            .iter_mut()
+            .map(|job| std::mem::take(&mut job.data))
+            .collect()
+    }
+
+    /// Put the coded pictures back into the order the plan laid out for them.
+    pub fn assemble(&self, outputs: &[PictureOutput]) -> Vec<u8> {
+        let total: usize = self
+            .parts
+            .iter()
+            .map(|part| match part {
+                Part::Literal(bytes) => bytes.len(),
+                Part::Picture(index) => outputs[*index].bitstream.len(),
+            })
+            .sum();
+        let mut bitstream = Vec::with_capacity(total);
+        for part in &self.parts {
+            match part {
+                Part::Literal(bytes) => bitstream.extend_from_slice(bytes),
+                Part::Picture(index) => bitstream.extend_from_slice(&outputs[*index].bitstream),
+            }
+        }
+        bitstream
+    }
+}
+
+/// Work out what one unit turns into, without decoding any of it.
+///
+/// `undecodable`, indexed by source picture, names the pictures a previous
+/// attempt found damaged. It is empty on the first attempt, which is what makes
+/// this a walk of headers rather than of macroblocks.
+pub fn plan_unit(
+    data: &[u8],
+    start: &TranscoderState,
+    options: TranscodeOptions,
+    random_access: bool,
+    recovery_requested: bool,
+    undecodable: &[bool],
+) -> Result<UnitPlan> {
+    let pics = parse_elementary_stream(data)?;
+    let Some(first) = pics.first() else {
+        bail!("no pictures in stream");
+    };
+
+    let width = first.sequence.horizontal_size;
+    let height = first.sequence.vertical_size;
+    let mbaff = !first.sequence_ext.progressive_sequence;
+    if start.initialized && (width != start.width || height != start.height || mbaff != start.mbaff)
+    {
+        bail!("MPEG-2 sequence parameters changed during incremental transcode");
+    }
+
+    // Interlaced coding is not handled by the frame path. A field-DCT
+    // macroblock builds its 8x8 blocks from alternate lines and field motion
+    // predicts each field separately; representing either in H.264 needs
+    // macroblock-adaptive frame/field coding.
+    //
+    // Field pictures are paired below and represented as one MBAFF frame.
+
+    let g = frame_geometry(width, height, !mbaff);
+    let scaling = first.quant.non_intra;
+
+    let mut parts: Vec<Part> = Vec::new();
+    if !start.initialized {
+        parts.push(Part::Literal(write_sps(&SpsConfig {
+            width,
+            height,
+            // Higher than the frame size alone would ask for, because a
+            // level is a promise about the bitstream and not just about
+            // its dimensions. Requantising with no reference buffer costs
+            // bits: broadcast HD comes out around 35 Mb/s, with second-long
+            // peaks past 50, where level 4.0 promises 25. Access units are
+            // outsized too -- a random access point is a whole picture of
+            // raw samples -- and 5.1 is back to the looser MinCR that the
+            // levels below 3.1 use.
+            level_idc: 51,
+            frame_mbs_only: !mbaff,
+            // The long-term flat-prediction picture plus the two most recent
+            // I or P pictures, which are what a B picture predicts from. The
+            // count also fixes how many short-term pictures the sliding
+            // window keeps, so the reference indices in RefLayout depend on
+            // it.
+            max_num_ref_frames: MAX_NUM_REF_FRAMES,
+            log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM_MINUS4,
+            log2_max_poc_lsb_minus4: LOG2_MAX_POC_LSB_MINUS4,
+            // An MPEG-2 stream codes its anchor picture before the B
+            // pictures that display ahead of it, so one picture has to be
+            // held back.
+            max_num_reorder_frames: Some(1),
+            max_dec_frame_buffering: Some(4),
+            sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
+        })));
+        parts.push(Part::Literal(write_pps(&PpsConfig {
+            init_qp: PPS_INIT_QP,
+            scaling_8x8_intra: Some(&scaling),
+            scaling_8x8_inter: Some(&scaling),
+            chroma_qp_index_offset: CHROMA_QP_OFFSET,
+        })));
+    }
+
+    let mut jobs: Vec<PictureJob> = Vec::new();
+    let mut pictures_converted = 0usize;
+    let mut pictures_skipped = 0usize;
+    let mut recovery_emitted = false;
+
+    // A stream restarting at a random access point has an empty decoded picture
+    // buffer and an unstarted display order, so it begins from nothing.
+    let mut state = if random_access {
+        start.restarted()
+    } else {
+        *start
+    };
+
+    // Where each picture's bytes begin, which is where the one before it ended.
+    // A picture that is dropped leaves its bytes to the one that follows, since
+    // a header among them describes that picture too.
+    let mut starts = Vec::with_capacity(pics.len());
+    let mut at = 0;
+    for pic in &pics {
+        starts.push(at);
+        at = picture_end(pic, at);
+    }
+
+    let mut logical_pictures = Vec::with_capacity(pics.len());
+    let mut source_index = 0;
+    while source_index < pics.len() {
+        let pic = &pics[source_index];
+        if pic.coding.picture_structure == PictureStructure::Frame {
+            logical_pictures.push((source_index, None));
+            source_index += 1;
+            continue;
+        }
+        let Some(_) = complementary_field(pics.get(source_index + 1), pic) else {
+            // Carried through unpaired so the group's temporal references
+            // still account for it, and dropped below.
+            logical_pictures.push((source_index, None));
+            source_index += 1;
+            continue;
+        };
+        logical_pictures.push((source_index, Some(source_index + 1)));
+        source_index += 2;
+    }
+    let has_field_pairs = logical_pictures.iter().any(|(_, mate)| mate.is_some());
+
+    for &(source, mate) in &logical_pictures {
+        let pic = &pics[source];
+        let picture_type = pic.header.picture_coding_type;
+        if !picture_type.is_ipb() {
+            pictures_skipped += 1;
+            continue;
+        }
+        let tr = pic.header.temporal_reference;
+        if pic.starts_gop && state.seen_picture {
+            state.gop_base += state.max_tr_in_gop + 1;
+            state.max_tr_in_gop = 0;
+        }
+        state.seen_picture = true;
+        state.max_tr_in_gop = state.max_tr_in_gop.max(tr);
+
+        // A lone field is no frame. The MP4 timeline drops it for the same
+        // reason and has to make the identical decision.
+        if mate.is_none() && pic.coding.picture_structure != PictureStructure::Frame {
+            pictures_skipped += 1;
+            continue;
+        }
+        // A B picture needs both of its references present.
+        if picture_type == PictureType::B && state.short_term_count < 2 {
+            pictures_skipped += 1;
+            continue;
+        }
+        // Nothing can be coded before the IDR that starts the decoded
+        // picture buffer, and only an I picture can become one.
+        let real_idr = state.awaiting_idr && picture_type == PictureType::I;
+        if state.awaiting_idr && !real_idr {
+            pictures_skipped += 1;
+            continue;
+        }
+        // A damaged slice takes its picture with it, and a unit that begins
+        // part way through one has every slice truncated. This is the one
+        // thing the walk cannot see for itself: it is what a previous attempt
+        // reported back. The MP4 timeline reaches the same verdict from the
+        // same report, so the two stay in step.
+        let is_undecodable = |index: usize| undecodable.get(index).copied().unwrap_or(false);
+        if is_undecodable(source) || mate.is_some_and(is_undecodable) {
+            pictures_skipped += 1;
+            continue;
+        }
+        let is_reference = real_idr || picture_type != PictureType::B;
+        let recovery_intra = recovery_requested
+            && !recovery_emitted
+            && !state.awaiting_idr
+            && picture_type == PictureType::I;
+
+        let frame_num = if real_idr {
+            0
+        } else {
+            (state.prev_ref_frame_num + 1) % MAX_FRAME_NUM
+        };
+        let layout = if picture_type == PictureType::B {
+            // A B picture sits between its two references, so list 0
+            // defaults to [forward, backward, long-term] and list 1 to
+            // [backward, forward, long-term].
+            RefLayout {
+                count: state.short_term_count + 1,
+                fwd_l0: 0,
+                fwd_l1: 1,
+                bwd_l0: state.short_term_count as i32 - 1,
+                bwd_l1: 0,
+                flat: state.short_term_count as i32,
+                l1_short_term_delta: None,
+                anchor_second_field: false,
+            }
+        } else {
+            RefLayout {
+                count: state.short_term_count + 1,
+                fwd_l0: 0,
+                fwd_l1: 0,
+                bwd_l0: -1,
+                bwd_l1: -1,
+                // Long-term entries follow every short-term one in both
+                // default lists.
+                flat: state.short_term_count as i32,
+                l1_short_term_delta: (state.short_term_count > 0)
+                    .then(|| (frame_num + MAX_FRAME_NUM - state.newest_short_term) % MAX_FRAME_NUM),
+                anchor_second_field: false,
+            }
+        };
+        // The picture is coded from here on, so the wait for one that opens the
+        // decoded picture buffer ends here too.
+        state.awaiting_idr = false;
+        let ctx = PictureContext {
+            frame_num,
+            // The IDR displays first, so it takes the lowest POC in the segment.
+            poc: if real_idr {
+                0
+            } else {
+                POC_PER_FRAME * (state.gop_base + tr)
+            },
+            is_reference,
+            layout,
+            short_term: state.short_term,
+            options,
+            mbaff,
+            real_idr,
+            recovery_intra,
+            weight_scale: scaling,
+            picture_count: if mate.is_some() { 2 } else { 1 },
+        };
+        if has_field_pairs {
+            parts.push(Part::Literal(write_access_unit_delimiter()));
+        }
+        if recovery_intra {
+            parts.push(Part::Literal(write_recovery_point_sei()));
+        }
+        parts.push(Part::Picture(jobs.len()));
+        jobs.push(PictureJob {
+            index: jobs.len(),
+            source,
+            mate,
+            data: job_bytes(data, &pics, &starts, source, mate, &ctx),
+        });
+        recovery_emitted |= recovery_intra;
+
+        if real_idr {
+            // A field pair cannot mark itself long-term, so the copy behind
+            // it marks the pair rather than marking itself.
+            let mark_from_clone = mate.is_some();
+            if has_field_pairs {
+                parts.push(Part::Literal(write_access_unit_delimiter()));
+            }
+            parts.push(Part::Literal(write_reference_clone(
+                &g,
+                mbaff,
+                mark_from_clone,
+            )));
+            state.prev_ref_frame_num = 1;
+            state.short_term_count = 1;
+            // The IDR emptied the buffer and took the long-term slot either
+            // way, so the copy is all the short-term chain has.
+            state.newest_short_term = 1;
+            state.short_term.clear();
+            state.short_term.push(state.newest_short_term);
+        } else if is_reference {
+            state.prev_ref_frame_num = frame_num;
+            state.short_term_count = (state.short_term_count + 1).min(MAX_SHORT_TERM_FRAMES as u32);
+            state.newest_short_term = frame_num;
+            state.short_term.push(frame_num);
+        }
+        pictures_converted += 1;
+    }
+
+    state.initialized = true;
+    state.width = width;
+    state.height = height;
+    state.mbaff = mbaff;
+
+    Ok(UnitPlan {
+        parts,
+        jobs,
+        state,
+        pictures_converted,
+        pictures_skipped,
+        recovery_emitted,
+    })
+}
+
+/// The bytes a worker needs to code one picture: its context, then an
+/// elementary stream the picture can be parsed out of on its own.
+///
+/// The stream is the picture's own bytes with the headers that describe it in
+/// front, which is normally the block its sequence opens with -- a hundred-odd
+/// bytes carrying no picture at all. A sequence that changes its quantiser
+/// matrices part way through stretches that block over the pictures in between
+/// and the prefix carries them along, which is why the context says how many
+/// pictures at the end belong to the job rather than trusting the count.
+fn job_bytes(
+    data: &[u8],
+    pics: &[Picture],
+    starts: &[usize],
+    source: usize,
+    mate: Option<usize>,
+    ctx: &PictureContext,
+) -> Vec<u8> {
+    let start = starts[source];
+    let end = picture_end(
+        &pics[mate.unwrap_or(source)],
+        starts[mate.unwrap_or(source)],
+    );
+    // A picture whose own bytes already reach back over its headers -- the
+    // first of a sequence -- needs no prefix, and would only see them twice.
+    let prefix = if start <= pics[source].context_start {
+        &data[..0]
+    } else {
+        &data[pics[source].context_start..pics[source].context_end]
+    };
+    let mut out = vec![0u8; JOB_HEADER_LEN + prefix.len() + (end - start)];
+    ctx.encode(&mut out);
+    out[JOB_HEADER_LEN..JOB_HEADER_LEN + prefix.len()].copy_from_slice(prefix);
+    out[JOB_HEADER_LEN + prefix.len()..].copy_from_slice(&data[start..end]);
+    out
+}
+
+/// Converts one picture at a time, and nothing else.
+///
+/// This is the whole of what a thread or a worker has to hold. It knows nothing
+/// of the stream around it: everything a picture is coded against arrives with
+/// it, which is what makes the pictures of a unit convertible at the same time.
+/// What it keeps between them is only scratch -- at an HD macroblock count
+/// several megabytes of it, and handing that back to the allocator after each
+/// picture only to fault it in again is most of what a picture costs outside
+/// its own coding.
+pub struct PictureEncoder {
+    scratch: Option<PictureScratch>,
+    by_address: MacroblockGrid,
+    paired_by_address: MacroblockGrid,
+    writer: BitWriter,
+    /// The requantiser, kept across pictures that ask for the same matrix --
+    /// which is all of them, in a stream that does not change it.
+    quantiser: Option<([i32; 64], Quantiser8x8)>,
+}
+
+impl Default for PictureEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PictureEncoder {
+    pub fn new() -> Self {
+        Self {
+            scratch: None,
+            by_address: MacroblockGrid::new(),
+            paired_by_address: MacroblockGrid::new(),
+            // A picture's worth of coded macroblocks is megabytes, and asking
+            // the allocator for that per picture costs more than the writing.
+            writer: BitWriter::with_capacity(1 << 22),
+            quantiser: None,
+        }
+    }
+
+    /// Code the picture a [`PictureJob`] describes.
+    ///
+    /// A slice that will not decode is not an error here: it is a fact about
+    /// the source that the plan could not know, reported back so the unit can
+    /// be planned again without it.
+    pub fn encode(&mut self, job: &[u8]) -> Result<PictureOutput> {
+        let ctx = PictureContext::decode(job)?;
+        let data = &job[JOB_HEADER_LEN..];
+        let pics = parse_elementary_stream(data)?;
+        let wanted = ctx.picture_count as usize;
+        if pics.len() < wanted {
+            bail!(
+                "picture job carries {} coded pictures, expected {wanted}",
+                pics.len()
+            );
+        }
+        // Everything in front of these is the context the picture is described
+        // by, and is not coded.
+        let pic = &pics[pics.len() - wanted];
+        let paired_pic = (wanted == 2).then(|| &pics[pics.len() - 1]);
+
+        let mut stats = Stats::default();
+        let mut reader = BitReader::new(data);
+        if !decode_picture(&mut reader, pic, &mut self.by_address, &mut stats) {
+            return Ok(PictureOutput {
+                decoded: false,
+                stats,
+                bitstream: Vec::new(),
+            });
+        }
+        if let Some(mate) = paired_pic {
+            if !decode_picture(&mut reader, mate, &mut self.paired_by_address, &mut stats) {
+                return Ok(PictureOutput {
+                    decoded: false,
+                    stats,
+                    bitstream: Vec::new(),
+                });
+            }
+        }
+
+        let g = frame_geometry(
+            pic.sequence.horizontal_size,
+            pic.sequence.vertical_size,
+            !ctx.mbaff,
+        );
+        if !self
+            .quantiser
+            .as_ref()
+            .is_some_and(|(scale, _)| *scale == ctx.weight_scale)
+        {
+            self.quantiser = Some((ctx.weight_scale, Quantiser8x8::new(&ctx.weight_scale)));
+        }
+        let (_, quant) = self.quantiser.as_ref().expect("just built");
+        let scratch = self
+            .scratch
+            .get_or_insert_with(|| PictureScratch::new(g.mb_width, g.mb_height));
+        let bitstream = write_picture(
+            pic,
+            &self.by_address,
+            paired_pic.map(|mate| (mate, &self.paired_by_address)),
+            &g,
+            quant,
+            scratch,
+            &ctx,
+            &mut stats,
+            &mut self.writer,
+        )?;
+        Ok(PictureOutput {
+            decoded: true,
+            stats,
+            bitstream,
+        })
+    }
+}
+
+/// Decode every slice of one coded picture, reporting whether all of them came
+/// out whole. A picture with no slices at all is not damaged, merely empty, and
+/// is dropped without being counted as an error.
+fn decode_picture(
+    reader: &mut BitReader<'_>,
+    pic: &Picture,
+    grid: &mut MacroblockGrid,
+    stats: &mut Stats,
+) -> bool {
+    let geo = picture_geometry(pic);
+    grid.reset(geo.mb_width * geo.mb_height);
+    let mut decoded_slices = 0usize;
+    let mut malformed = false;
+    for slice in &pic.slices {
+        match decode_slice(reader, pic, slice, geo.mb_width, grid) {
+            Ok(()) => decoded_slices += 1,
+            Err(_) => malformed = true,
+        }
+    }
+    if malformed {
+        stats.errors += 1;
+    }
+    !malformed && decoded_slices > 0
+}
+
 pub struct IncrementalTranscoder {
     options: TranscodeOptions,
-    /// Built at the first picture and kept: the sequence dimensions may not
-    /// change while a transcoder is alive.
-    scratch: Option<PictureScratch>,
-    initialized: bool,
-    /// Whether the decoded picture buffer is still waiting to be opened, which
-    /// only an intra picture can do. True at the start and again at every
-    /// restart, and false only once a picture has actually been coded -- a unit
-    /// that opens part way through a group of pictures, as a seek does, may
-    /// hold nothing that can open one.
-    awaiting_idr: bool,
-    width: u32,
-    height: u32,
-    mbaff: bool,
-    prev_ref_frame_num: u32,
-    short_term_count: u32,
-    /// `frame_num` of the newest short-term reference, which is not the newest
-    /// reference outright: the copy behind an IDR is long-term and leaves the
-    /// IDR itself, one `frame_num` further back, as the newest short-term one.
-    newest_short_term: u32,
-    /// The buffer's short-term references, oldest first.
-    short_term: ShortTermFrames,
-    gop_base: u32,
-    seen_picture: bool,
-    max_tr_in_gop: u32,
+    state: TranscoderState,
+    encoder: PictureEncoder,
+    in_flight: Option<InFlight>,
     random_access_pending: bool,
     recovery_point_pending: bool,
     pictures_converted: usize,
@@ -301,23 +755,35 @@ pub struct IncrementalTranscoder {
     stats: Stats,
 }
 
+/// A unit whose pictures are out being converted.
+struct InFlight {
+    plan: UnitPlan,
+    /// Which source pictures earlier rounds found damaged, which is what the
+    /// plan above was drawn knowing.
+    undecodable: Vec<bool>,
+    /// The two requests the plan was drawn under, kept so that drawing it again
+    /// asks for the same thing.
+    random_access: bool,
+    recovery_requested: bool,
+}
+
+/// What became of the pictures handed back to [`IncrementalTranscoder::complete`].
+pub enum Step {
+    /// The unit is finished.
+    Done(Box<TranscodeResult>),
+    /// A picture would not decode, so the unit was planned again without it.
+    /// Convert these and hand them back in turn; it takes at most one round,
+    /// because by now every picture has been tried.
+    Again(Vec<Vec<u8>>),
+}
+
 impl IncrementalTranscoder {
     pub fn new(options: TranscodeOptions) -> Self {
         Self {
             options,
-            scratch: None,
-            initialized: false,
-            awaiting_idr: true,
-            width: 0,
-            height: 0,
-            mbaff: false,
-            prev_ref_frame_num: 0,
-            short_term_count: 0,
-            newest_short_term: 0,
-            short_term: ShortTermFrames::default(),
-            gop_base: 0,
-            seen_picture: false,
-            max_tr_in_gop: 0,
+            state: TranscoderState::new(),
+            encoder: PictureEncoder::new(),
+            in_flight: None,
             random_access_pending: false,
             recovery_point_pending: false,
             pictures_converted: 0,
@@ -335,16 +801,16 @@ impl IncrementalTranscoder {
 
     /// Restart the H.264 DPB from an IDR at the next incremental unit.
     pub fn request_random_access_point(&mut self) {
-        if self.initialized {
+        if self.state.initialized {
             self.random_access_pending = true;
-            self.awaiting_idr = true;
+            self.state.awaiting_idr = true;
         }
     }
 
     /// Make the next intra picture independently decodable without flushing
     /// references used by an open GOP's leading B pictures.
     pub fn request_recovery_point(&mut self) {
-        if self.initialized {
+        if self.state.initialized {
             self.recovery_point_pending = true;
         }
     }
@@ -353,384 +819,128 @@ impl IncrementalTranscoder {
     /// picture buffer. The MP4 timeline has to reach the same verdict on the
     /// same pictures, so it asks.
     pub fn awaiting_random_access(&self) -> bool {
-        self.awaiting_idr
+        self.state.awaiting_idr
     }
 
     pub fn errors(&self) -> u64 {
         self.stats.errors
     }
 
+    /// Convert one unit here and now.
     pub fn push(&mut self, data: &[u8]) -> Result<TranscodeResult> {
-        let options = self.options;
-        let pics = parse_elementary_stream(data)?;
-        let Some(first) = pics.first() else {
-            bail!("no pictures in stream");
-        };
-
-        let width = first.sequence.horizontal_size;
-        let height = first.sequence.vertical_size;
-        let mbaff = !first.sequence_ext.progressive_sequence;
-        if self.initialized && (width != self.width || height != self.height || mbaff != self.mbaff)
-        {
-            bail!("MPEG-2 sequence parameters changed during incremental transcode");
+        let mut jobs = self.begin(data)?;
+        loop {
+            let mut outputs = Vec::with_capacity(jobs.len());
+            for job in &jobs {
+                outputs.push(self.encoder.encode(job)?);
+            }
+            match self.complete(data, &outputs)? {
+                Step::Done(result) => return Ok(*result),
+                Step::Again(again) => jobs = again,
+            }
         }
+    }
 
-        // Interlaced coding is not handled by the frame path. A field-DCT
-        // macroblock builds its 8x8 blocks from alternate lines and field motion
-        // predicts each field separately; representing either in H.264 needs
-        // macroblock-adaptive frame/field coding.
-        //
-        // Field pictures are paired below and represented as one MBAFF frame.
+    /// Plan one unit and hand out its pictures to be converted.
+    ///
+    /// Each is a self-contained buffer that [`PictureEncoder::encode`] turns
+    /// into an access unit, wherever it happens to run. Hand the results back
+    /// to [`Self::complete`] in the order they were given out. Nothing about
+    /// the transcoder moves until then, so a unit that is begun and abandoned
+    /// costs only what it took to plan.
+    pub fn begin(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let random_access = self.state.initialized && self.random_access_pending;
+        let recovery_requested = self.state.initialized && self.recovery_point_pending;
+        let undecodable = Vec::new();
+        let mut plan = plan_unit(
+            data,
+            &self.state,
+            self.options,
+            random_access,
+            recovery_requested,
+            &undecodable,
+        )?;
+        let jobs = plan.take_jobs();
+        self.in_flight = Some(InFlight {
+            plan,
+            undecodable,
+            random_access,
+            recovery_requested,
+        });
+        Ok(jobs)
+    }
 
-        let g = frame_geometry(width, height, !mbaff);
-        let scaling = first.quant.non_intra;
-
-        let random_access = self.initialized && self.random_access_pending;
-        let recovery_requested = self.initialized && self.recovery_point_pending;
-        let mut parts: Vec<Vec<u8>> = Vec::new();
-        if !self.initialized {
-            parts.push(write_sps(&SpsConfig {
-                width,
-                height,
-                // Higher than the frame size alone would ask for, because a
-                // level is a promise about the bitstream and not just about
-                // its dimensions. Requantising with no reference buffer costs
-                // bits: broadcast HD comes out around 35 Mb/s, with second-long
-                // peaks past 50, where level 4.0 promises 25. Access units are
-                // outsized too -- a random access point is a whole picture of
-                // raw samples -- and 5.1 is back to the looser MinCR that the
-                // levels below 3.1 use.
-                level_idc: 51,
-                frame_mbs_only: !mbaff,
-                // The long-term flat-prediction picture plus the two most recent
-                // I or P pictures, which are what a B picture predicts from. The
-                // count also fixes how many short-term pictures the sliding
-                // window keeps, so the reference indices in RefLayout depend on
-                // it.
-                max_num_ref_frames: MAX_NUM_REF_FRAMES,
-                log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM_MINUS4,
-                log2_max_poc_lsb_minus4: LOG2_MAX_POC_LSB_MINUS4,
-                // An MPEG-2 stream codes its anchor picture before the B
-                // pictures that display ahead of it, so one picture has to be
-                // held back.
-                max_num_reorder_frames: Some(1),
-                max_dec_frame_buffering: Some(4),
-                sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
-            }));
-            parts.push(write_pps(&PpsConfig {
-                init_qp: PPS_INIT_QP,
-                scaling_8x8_intra: Some(&scaling),
-                scaling_8x8_inter: Some(&scaling),
-                chroma_qp_index_offset: CHROMA_QP_OFFSET,
-            }));
+    /// Take the converted pictures back, in the order [`Self::begin`] gave
+    /// their jobs out. `data` is the same unit that was begun.
+    pub fn complete(&mut self, data: &[u8], outputs: &[PictureOutput]) -> Result<Step> {
+        let Some(mut flight) = self.in_flight.take() else {
+            bail!("no unit is being converted");
+        };
+        if outputs.len() != flight.plan.jobs.len() {
+            bail!(
+                "{} converted pictures handed back for a unit of {}",
+                outputs.len(),
+                flight.plan.jobs.len()
+            );
         }
-
-        let quant = Quantiser8x8::new(&scaling);
-        let scratch = self
-            .scratch
-            .get_or_insert_with(|| PictureScratch::new(g.mb_width, g.mb_height));
-        let mut reader = BitReader::new(data);
-        // One picture's macroblocks, reused by every picture in the group. At
-        // an HD macroblock count this is several megabytes, and handing it back
-        // to the allocator after each picture only to fault it in again for the
-        // next is most of what the pictures cost outside their own coding.
-        let mut by_address = MacroblockGrid::new();
-        let mut paired_by_address = MacroblockGrid::new();
-        // Likewise the slice payload: a picture's worth of coded macroblocks
-        // is megabytes, and asking the allocator for that per picture costs
-        // more than the writing does.
-        let mut slice_writer = BitWriter::with_capacity(1 << 22);
-
-        let mut pictures_converted = 0usize;
-        let mut pictures_skipped = 0usize;
-        let mut recovery_emitted = false;
-
-        let mut prev_ref_frame_num = if random_access {
-            0
-        } else {
-            self.prev_ref_frame_num
-        };
-        let mut short_term_count = if random_access {
-            0
-        } else {
-            self.short_term_count
-        };
-        let mut newest_short_term = if random_access {
-            0
-        } else {
-            self.newest_short_term
-        };
-        let mut short_term = if random_access {
-            ShortTermFrames::default()
-        } else {
-            self.short_term
-        };
-        // temporal_reference restarts at each group of pictures, so display
-        // order is recovered by accumulating a base as the counter wraps.
-        let mut gop_base = if random_access { 0 } else { self.gop_base };
-        let mut seen_picture = !random_access && self.seen_picture;
-        let mut max_tr_in_gop = if random_access { 0 } else { self.max_tr_in_gop };
-        // A fresh stream, and a stream restarting at a random access point, has
-        // an empty decoded picture buffer and so cannot code anything that
-        // predicts.
-        let mut awaiting_idr = self.awaiting_idr || random_access;
-
-        let mut logical_pictures = Vec::with_capacity(pics.len());
-        let mut source_index = 0;
-        while source_index < pics.len() {
-            let pic = &pics[source_index];
-            if pic.coding.picture_structure == PictureStructure::Frame {
-                logical_pictures.push((pic, None));
-                source_index += 1;
+        let mut damaged = false;
+        for (job, output) in flight.plan.jobs.iter().zip(outputs) {
+            if output.decoded {
                 continue;
             }
-            let Some(mate) = complementary_field(pics.get(source_index + 1), pic) else {
-                // Carried through unpaired so the group's temporal references
-                // still account for it, and dropped below.
-                logical_pictures.push((pic, None));
-                source_index += 1;
-                continue;
+            let mut mark = |index: usize| {
+                if flight.undecodable.len() <= index {
+                    flight.undecodable.resize(index + 1, false);
+                }
+                flight.undecodable[index] = true;
             };
-            logical_pictures.push((pic, Some(mate)));
-            source_index += 2;
+            mark(job.source);
+            if let Some(mate) = job.mate {
+                mark(mate);
+            }
+            damaged = true;
+            // The damage is the transcoder's to report whether or not the
+            // picture is coded on the next attempt, where it will have been
+            // dropped and so will not report it again.
+            self.stats.errors += output.stats.errors;
         }
-        let has_field_pairs = logical_pictures.iter().any(|(_, mate)| mate.is_some());
-
-        'pictures: for &(pic, paired_pic) in &logical_pictures {
-            let picture_type = pic.header.picture_coding_type;
-            if !picture_type.is_ipb() {
-                pictures_skipped += 1;
-                continue;
-            }
-            let tr = pic.header.temporal_reference;
-            if pic.starts_gop && seen_picture {
-                gop_base += max_tr_in_gop + 1;
-                max_tr_in_gop = 0;
-            }
-            seen_picture = true;
-            max_tr_in_gop = max_tr_in_gop.max(tr);
-
-            // A lone field is no frame. The MP4 timeline drops it for the same
-            // reason and has to make the identical decision.
-            if paired_pic.is_none() && pic.coding.picture_structure != PictureStructure::Frame {
-                pictures_skipped += 1;
-                continue;
-            }
-            // A B picture needs both of its references present.
-            if picture_type == PictureType::B && short_term_count < 2 {
-                pictures_skipped += 1;
-                continue;
-            }
-            // Nothing can be coded before the IDR that starts the decoded
-            // picture buffer, and only an I picture can become one.
-            let real_idr = awaiting_idr && picture_type == PictureType::I;
-            if awaiting_idr && !real_idr {
-                pictures_skipped += 1;
-                continue;
-            }
-            let is_reference = real_idr || picture_type != PictureType::B;
-            let recovery_intra = recovery_requested
-                && !recovery_emitted
-                && !awaiting_idr
-                && picture_type == PictureType::I;
-
-            let frame_num = if real_idr {
-                0
-            } else {
-                (prev_ref_frame_num + 1) % MAX_FRAME_NUM
-            };
-            let layout = if picture_type == PictureType::B {
-                // A B picture sits between its two references, so list 0
-                // defaults to [forward, backward, long-term] and list 1 to
-                // [backward, forward, long-term].
-                RefLayout {
-                    count: short_term_count + 1,
-                    fwd_l0: 0,
-                    fwd_l1: 1,
-                    bwd_l0: short_term_count as i32 - 1,
-                    bwd_l1: 0,
-                    flat: short_term_count as i32,
-                    l1_short_term_delta: None,
-                    anchor_second_field: false,
-                }
-            } else {
-                RefLayout {
-                    count: short_term_count + 1,
-                    fwd_l0: 0,
-                    fwd_l1: 0,
-                    bwd_l0: -1,
-                    bwd_l1: -1,
-                    // Long-term entries follow every short-term one in both
-                    // default lists.
-                    flat: short_term_count as i32,
-                    l1_short_term_delta: (short_term_count > 0)
-                        .then(|| (frame_num + MAX_FRAME_NUM - newest_short_term) % MAX_FRAME_NUM),
-                    anchor_second_field: false,
-                }
-            };
-            let geo = picture_geometry(pic);
-            by_address.reset(geo.mb_width * geo.mb_height);
-            let mut decoded_slices = 0usize;
-            let mut first_slice_error = None;
-            for slice in &pic.slices {
-                match decode_slice(&mut reader, pic, slice, geo.mb_width, &mut by_address) {
-                    Ok(()) => decoded_slices += 1,
-                    Err(error) if first_slice_error.is_none() => {
-                        first_slice_error = Some((slice, error))
-                    }
-                    Err(_) => {}
-                }
-            }
-            // A damaged slice takes its picture with it, and a unit that
-            // begins part way through one has every slice truncated. Either way
-            // the MP4 timeline reaches the same verdict from the same slices,
-            // so the two stay in step; what was lost is in `pictures_skipped`.
-            if first_slice_error.is_some() || decoded_slices == 0 {
-                if first_slice_error.is_some() {
-                    self.stats.errors += 1;
-                }
-                pictures_skipped += 1;
-                continue;
-            }
-            if let Some(mate) = paired_pic {
-                let mate_geo = picture_geometry(mate);
-                paired_by_address.reset(mate_geo.mb_width * mate_geo.mb_height);
-                let mut decoded_slices = 0usize;
-                let mut first_slice_error = None;
-                for slice in &mate.slices {
-                    match decode_slice(
-                        &mut reader,
-                        mate,
-                        slice,
-                        mate_geo.mb_width,
-                        &mut paired_by_address,
-                    ) {
-                        Ok(()) => decoded_slices += 1,
-                        Err(error) if first_slice_error.is_none() => {
-                            first_slice_error = Some((slice, error))
-                        }
-                        Err(_) => {}
-                    }
-                }
-                if first_slice_error.is_some() || decoded_slices == 0 {
-                    if first_slice_error.is_some() {
-                        self.stats.errors += 1;
-                    }
-                    pictures_skipped += 1;
-                    continue 'pictures;
-                }
-            }
-            // The wait for a picture to open the buffer with ends here rather
-            // than above, because a picture whose slices will not decode has
-            // not opened anything. The MP4 timeline waits on the same terms.
-            awaiting_idr = false;
-            let ctx = PictureContext {
-                frame_num,
-                // The IDR displays first, so it takes the lowest POC in the segment.
-                poc: if real_idr {
-                    0
-                } else {
-                    POC_PER_FRAME * (gop_base + tr)
-                },
-                is_reference,
-                layout,
-                short_term,
-                options,
-                mbaff,
-                real_idr,
-                recovery_intra,
-            };
-            if has_field_pairs {
-                parts.push(write_access_unit_delimiter());
-            }
-            if recovery_intra {
-                parts.push(write_recovery_point_sei());
-            }
-            parts.push(write_picture(
-                pic,
-                &by_address,
-                paired_pic.map(|mate| (mate, &paired_by_address)),
-                &g,
-                &quant,
-                scratch,
-                &ctx,
-                &mut self.stats,
-                &mut slice_writer,
-            )?);
-            recovery_emitted |= recovery_intra;
-
-            if real_idr {
-                // A field pair cannot mark itself long-term, so the copy behind
-                // it marks the pair rather than marking itself.
-                let mark_from_clone = paired_pic.is_some();
-                if has_field_pairs {
-                    parts.push(write_access_unit_delimiter());
-                }
-                parts.push(write_reference_clone(&g, mbaff, mark_from_clone));
-                prev_ref_frame_num = 1;
-                short_term_count = 1;
-                // The IDR emptied the buffer and took the long-term slot either
-                // way, so the copy is all the short-term chain has.
-                newest_short_term = 1;
-                short_term.clear();
-                short_term.push(newest_short_term);
-            } else if is_reference {
-                prev_ref_frame_num = frame_num;
-                short_term_count = (short_term_count + 1).min(MAX_SHORT_TERM_FRAMES as u32);
-                newest_short_term = frame_num;
-                short_term.push(frame_num);
-            }
-            pictures_converted += 1;
+        if damaged {
+            // Every picture was tried, so the whole of what the plan got wrong
+            // is now known and the next attempt is the last.
+            flight.plan = plan_unit(
+                data,
+                &self.state,
+                self.options,
+                flight.random_access,
+                flight.recovery_requested,
+                &flight.undecodable,
+            )?;
+            let jobs = flight.plan.take_jobs();
+            self.in_flight = Some(flight);
+            return Ok(Step::Again(jobs));
         }
-
-        let total: usize = parts.iter().map(Vec::len).sum();
-        let mut bitstream = Vec::with_capacity(total);
-        for part in &parts {
-            bitstream.extend_from_slice(part);
+        let bitstream = flight.plan.assemble(outputs);
+        for output in outputs {
+            self.stats.add(&output.stats);
         }
-
-        self.initialized = true;
-        self.awaiting_idr = awaiting_idr;
-        self.width = width;
-        self.height = height;
-        self.mbaff = mbaff;
-        self.prev_ref_frame_num = prev_ref_frame_num;
-        self.short_term_count = short_term_count;
-        self.newest_short_term = newest_short_term;
-        self.short_term = short_term;
-        self.gop_base = gop_base;
-        self.seen_picture = seen_picture;
-        self.max_tr_in_gop = max_tr_in_gop;
+        self.state = flight.plan.state;
         self.random_access_pending = false;
-        self.recovery_point_pending = recovery_requested && !recovery_emitted;
-        self.pictures_converted += pictures_converted;
-        self.pictures_skipped += pictures_skipped;
-
-        Ok(TranscodeResult {
+        self.recovery_point_pending = flight.recovery_requested && !flight.plan.recovery_emitted;
+        self.pictures_converted += flight.plan.pictures_converted;
+        self.pictures_skipped += flight.plan.pictures_skipped;
+        Ok(Step::Done(Box::new(TranscodeResult {
             bitstream,
             pictures_converted: self.pictures_converted,
             pictures_skipped: self.pictures_skipped,
             stats: self.stats,
-            recovery_point: recovery_emitted,
-        })
+            recovery_point: flight.plan.recovery_emitted,
+            undecodable: flight.undecodable,
+        })))
     }
 }
 
 pub fn transcode(data: &[u8], options: TranscodeOptions) -> Result<TranscodeResult> {
     IncrementalTranscoder::new(options).push(data)
-}
-
-struct PictureContext {
-    frame_num: u32,
-    poc: u32,
-    is_reference: bool,
-    layout: RefLayout,
-    /// The short-term references a field slice names its lists from.
-    short_term: ShortTermFrames,
-    options: TranscodeOptions,
-    mbaff: bool,
-    real_idr: bool,
-    recovery_intra: bool,
 }
 
 /// How one macroblock is predicted, once the source's motion has been mapped.

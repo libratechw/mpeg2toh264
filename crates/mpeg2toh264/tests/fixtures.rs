@@ -115,7 +115,7 @@ fn packages_each_fixture_as_a_fragmented_mp4() {
     for name in FIXTURES {
         let source = read_fixture(name);
         let result = transcode(&source, TranscodeOptions::default()).expect("transcode succeeds");
-        let timeline = mpeg2_video_timeline(&source, false).expect("timeline");
+        let timeline = mpeg2_video_timeline(&source, false, &[]).expect("timeline");
         let mp4 = h264_to_fmp4(&result.bitstream, &timeline).expect("mp4 packaging");
 
         assert_eq!(
@@ -171,7 +171,7 @@ fn reads_the_field_order_of_every_fixture() {
             );
         }
         // The timeline is where a session reads it from, so it has to agree.
-        let timeline = mpeg2_video_timeline(&source, false).expect("timeline");
+        let timeline = mpeg2_video_timeline(&source, false, &[]).expect("timeline");
         assert_eq!(timeline.interlacing, interlacing, "{name} timeline");
     }
 }

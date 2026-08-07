@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use mpeg2toh264::job::PictureOutput;
 use mpeg2toh264::{
     extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_passthrough_unit,
-    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, Fragment, Session, TranscodeOptions, VideoMode,
+    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, Fragment, PictureEncoder, Progress, Session,
+    TranscodeOptions, VideoMode,
 };
 
 const USAGE: &str = "\
@@ -36,6 +38,9 @@ Options:
                             Keep a complementary field pair in one MP4 sample
   -p, --passthrough         Carry the MPEG-2 video into the MP4 unconverted,
                             for a player that decodes it. MP4 output only
+  -j, --threads <n>         Convert this many pictures at once (default: 1).
+                            The output is the same whatever this is set to.
+                            MP4 output from a transport stream only
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 ";
@@ -44,6 +49,7 @@ struct CliOptions {
     input: PathBuf,
     output: PathBuf,
     quiet: bool,
+    threads: usize,
     transcode: TranscodeOptions,
 }
 
@@ -67,6 +73,7 @@ fn parse_args(args: &[String]) -> Invocation {
     let mut split_field_samples = true;
     let mut quiet = false;
     let mut passthrough = false;
+    let mut threads: usize = 1;
 
     let mut i = 0;
     while i < args.len() {
@@ -97,6 +104,16 @@ fn parse_args(args: &[String]) -> Invocation {
             _ if arg.starts_with("--recovery-interval=") => {
                 recovery_interval = arg["--recovery-interval=".len()..].parse().unwrap_or(0);
             }
+            "-j" | "--threads" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    fail(&format!("{arg} requires a value"));
+                };
+                threads = value.parse().unwrap_or(0);
+            }
+            _ if arg.starts_with("--threads=") => {
+                threads = arg["--threads=".len()..].parse().unwrap_or(0);
+            }
             _ if arg.starts_with('-') => fail(&format!("unknown option '{arg}'")),
             _ => positional.push(arg),
         }
@@ -108,6 +125,9 @@ fn parse_args(args: &[String]) -> Invocation {
     }
     if recovery_interval == 0 {
         fail("recovery interval must be a positive integer");
+    }
+    if threads == 0 {
+        fail("thread count must be a positive integer");
     }
     if positional.len() != 2 {
         fail(&format!(
@@ -131,6 +151,7 @@ fn parse_args(args: &[String]) -> Invocation {
         input,
         output,
         quiet,
+        threads,
         transcode: TranscodeOptions {
             oversample,
             recovery_interval,
@@ -180,7 +201,9 @@ fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
         (data, "fragmented MP4", carried, 0)
     } else if !raw_h264 {
         let result = transcode(&source, options.transcode)?;
-        let mut timeline = mpeg2_video_timeline(&source, false)?;
+        // The transcode has already found the pictures that would not decode,
+        // so the timeline is told rather than made to look for itself.
+        let mut timeline = mpeg2_video_timeline(&source, false, &result.undecodable)?;
         timeline.split_field_samples = options.transcode.split_field_samples;
         let mp4 = h264_to_fmp4(&result.bitstream, &timeline)?;
         let mut data = mp4.init_segment;
@@ -239,9 +262,90 @@ struct SessionTotals {
     bytes: usize,
 }
 
+/// A handful of threads, each with a picture encoder of its own, taking jobs
+/// off a queue.
+///
+/// A queue rather than a share each, because the pictures of one unit are not
+/// the same size of job: the one that opens a random access point is the only
+/// one that reconstructs samples, and it costs several times what the rest do.
+struct EncoderPool<'scope> {
+    send_work: Option<std::sync::mpsc::Sender<(usize, Vec<u8>)>>,
+    take_done: std::sync::mpsc::Receiver<(usize, mpeg2toh264::Result<PictureOutput>)>,
+    _threads: Vec<std::thread::ScopedJoinHandle<'scope, ()>>,
+}
+
+impl<'scope> EncoderPool<'scope> {
+    fn new(scope: &'scope std::thread::Scope<'scope, '_>, threads: usize) -> Self {
+        let (send_work, take_work) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+        let (send_done, take_done) = std::sync::mpsc::channel();
+        let take_work = std::sync::Arc::new(std::sync::Mutex::new(take_work));
+        let handles = (0..threads)
+            .map(|_| {
+                let take_work = std::sync::Arc::clone(&take_work);
+                let send_done = send_done.clone();
+                scope.spawn(move || {
+                    let mut encoder = PictureEncoder::new();
+                    loop {
+                        let job = take_work.lock().expect("not poisoned").recv();
+                        let Ok((index, job)) = job else { return };
+                        if send_done.send((index, encoder.encode(&job))).is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        Self {
+            send_work: Some(send_work),
+            take_done,
+            _threads: handles,
+        }
+    }
+
+    /// Convert one unit's pictures, giving them back in the order they came.
+    fn run(&self, jobs: Vec<Vec<u8>>) -> Result<Vec<PictureOutput>, Box<dyn std::error::Error>> {
+        let wanted = jobs.len();
+        let send_work = self.send_work.as_ref().expect("the pool is open");
+        for (index, job) in jobs.into_iter().enumerate() {
+            send_work.send((index, job))?;
+        }
+        let mut outputs: Vec<Option<PictureOutput>> = (0..wanted).map(|_| None).collect();
+        for _ in 0..wanted {
+            let (index, output) = self.take_done.recv()?;
+            outputs[index] = Some(output?);
+        }
+        Ok(outputs
+            .into_iter()
+            .map(|output| output.expect("filled"))
+            .collect())
+    }
+}
+
+impl Drop for EncoderPool<'_> {
+    fn drop(&mut self) {
+        // Closing the queue is what tells the threads to stop; the scope then
+        // waits for them.
+        self.send_work = None;
+    }
+}
+
 fn run_session_mp4(
     options: &CliOptions,
+    input: BufReader<File>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if options.threads > 1 {
+        return std::thread::scope(|scope| {
+            let pool = EncoderPool::new(scope, options.threads);
+            run_session_mp4_with(options, input, Some(&pool))
+        });
+    }
+    run_session_mp4_with(options, input, None)
+}
+
+fn run_session_mp4_with(
+    options: &CliOptions,
     mut input: BufReader<File>,
+    pool: Option<&EncoderPool<'_>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let mut output = BufWriter::new(File::create(&options.output)?);
@@ -249,20 +353,65 @@ fn run_session_mp4(
     let mut totals = SessionTotals::default();
     let mut chunk = vec![0; 1 << 20];
 
+    // Without a pool the session converts each picture as it reaches it, which
+    // is the same work in the same order on one thread.
+    let Some(pool) = pool else {
+        loop {
+            let read = input.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            for fragment in session.push(&chunk[..read])? {
+                write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
+            }
+        }
+        for fragment in session.finish()? {
+            write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
+        }
+        output.flush()?;
+        report_session(options, &totals, started);
+        return Ok(());
+    };
+
+    // With one, the session stops at each unit and hands its pictures over.
+    let drain = |mut progress: Progress,
+                 output: &mut BufWriter<File>,
+                 totals: &mut SessionTotals,
+                 session: &mut Session|
+     -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            for fragment in progress.fragments() {
+                write_fragment(output, fragment, totals, options.quiet, started)?;
+            }
+            let Progress::Pending { jobs, .. } = progress else {
+                return Ok(());
+            };
+            progress = session.complete(&pool.run(jobs)?)?;
+        }
+    };
+
     loop {
         let read = input.read(&mut chunk)?;
         if read == 0 {
             break;
         }
-        for fragment in session.push(&chunk[..read])? {
-            write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
+        let progress = session.push_deferred(&chunk[..read])?;
+        drain(progress, &mut output, &mut totals, &mut session)?;
+    }
+    loop {
+        let progress = session.finish_deferred()?;
+        let done = matches!(progress, Progress::Idle(_));
+        drain(progress, &mut output, &mut totals, &mut session)?;
+        if done {
+            break;
         }
     }
-    for fragment in session.finish()? {
-        write_fragment(&mut output, fragment, &mut totals, options.quiet, started)?;
-    }
     output.flush()?;
+    report_session(options, &totals, started);
+    Ok(())
+}
 
+fn report_session(options: &CliOptions, totals: &SessionTotals, started: Instant) {
     if !options.quiet {
         let seconds = started.elapsed().as_secs_f64();
         let fps = if seconds > 0.0 {
@@ -284,7 +433,6 @@ fn run_session_mp4(
             seconds * 1000.0,
         );
     }
-    Ok(())
 }
 
 fn write_fragment(

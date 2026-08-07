@@ -123,6 +123,38 @@ fn accepts_a_recovery_interval() {
 }
 
 #[test]
+fn rejects_a_nonsensical_thread_count() {
+    let result = run(&["--threads=0", "a", "b"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("thread count"));
+}
+
+#[test]
+fn converting_on_several_threads_writes_the_same_file() {
+    // The whole point of splitting a unit into pictures is that where they are
+    // converted cannot reach the output. One thread and four have to agree
+    // byte for byte, or the split has carried something between them.
+    let temp = TempDir::new("threads");
+    let input = temp.join("input.ts");
+    let video = std::fs::read(fixture("open_gop_leading_bb.m2v")).expect("video fixture");
+    std::fs::write(&input, wrap_mpeg2_es_in_ts(&video, Some(900_000)))
+        .expect("transport stream fixture");
+
+    let mut written = Vec::new();
+    for threads in ["1", "4"] {
+        let output = temp.join(&format!("output-{threads}.mp4"));
+        let result = run(&["--threads", threads, path(&input), path(&output)]);
+        assert!(result.status.success(), "{:?}", result);
+        written.push(std::fs::read(&output).expect("output"));
+    }
+    assert!(!written[0].is_empty(), "the conversion wrote nothing");
+    assert_eq!(
+        written[0], written[1],
+        "converting on four threads changed the file"
+    );
+}
+
+#[test]
 fn reports_a_missing_input_without_panicking() {
     let temp = TempDir::new("missing");
     let result = run(&["/nonexistent/input.m2v", path(&temp.join("out.h264"))]);
