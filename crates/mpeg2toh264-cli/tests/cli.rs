@@ -229,3 +229,47 @@ fn ts_mp4_carries_its_aac_audio_track() {
     assert!(bytes.windows(4).any(|window| window == b"mp4a"));
     assert!(bytes.windows(4).any(|window| window == b"moof"));
 }
+
+#[test]
+fn passthrough_writes_an_mpeg_2_track_instead_of_converting() {
+    let temp = TempDir::new("passthrough");
+    let output = temp.join("output.mp4");
+    let result = run(&["--passthrough", path(&fixture("ibbp.m2v")), path(&output)]);
+    assert!(result.status.success(), "{:?}", result);
+
+    let summary = String::from_utf8_lossy(&result.stdout);
+    assert!(summary.contains("pictures carried"), "{summary}");
+
+    let bytes = std::fs::read(&output).expect("output exists");
+    assert_eq!(&bytes[4..8], b"ftyp");
+    assert!(
+        bytes.windows(4).any(|window| window == b"mp4v"),
+        "the sample entry is an MPEG-4 visual one"
+    );
+    assert!(
+        !bytes.windows(4).any(|window| window == b"avcC"),
+        "nothing was converted, so nothing describes H.264"
+    );
+    // The MPEG-2 start codes are the samples themselves, not something the
+    // conversion path would ever put in an mdat.
+    assert!(
+        bytes.windows(4).any(|window| window == [0, 0, 1, 0xb3]),
+        "the sequence header reached the file"
+    );
+}
+
+#[test]
+fn refuses_to_pass_mpeg_2_through_to_a_raw_h264_file() {
+    let temp = TempDir::new("passthrough-h264");
+    let result = run(&[
+        "-p",
+        path(&fixture("ibbp.m2v")),
+        path(&temp.join("output.h264")),
+    ]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("passthrough"),
+        "{:?}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

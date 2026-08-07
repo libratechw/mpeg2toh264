@@ -8,8 +8,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use mpeg2toh264::{
-    extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_video_timeline,
-    transcode, Fragment, Session, TranscodeOptions,
+    extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_passthrough_unit,
+    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, Fragment, Session, TranscodeOptions, VideoMode,
 };
 
 const USAGE: &str = "\
@@ -34,6 +34,8 @@ Options:
                             give way to field pictures.
       --no-split-field-samples
                             Keep a complementary field pair in one MP4 sample
+  -p, --passthrough         Carry the MPEG-2 video into the MP4 unconverted,
+                            for a player that decodes it. MP4 output only
   -q, --quiet               Do not print conversion progress or summary
   -h, --help                Show this help
 ";
@@ -64,6 +66,7 @@ fn parse_args(args: &[String]) -> Invocation {
     let mut recovery_interval: usize = 24;
     let mut split_field_samples = true;
     let mut quiet = false;
+    let mut passthrough = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -73,6 +76,7 @@ fn parse_args(args: &[String]) -> Invocation {
             "-q" | "--quiet" => quiet = true,
             "-s" | "--split-field-samples" => split_field_samples = true,
             "--no-split-field-samples" => split_field_samples = false,
+            "-p" | "--passthrough" => passthrough = true,
             "-o" | "--oversample" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
@@ -116,6 +120,13 @@ fn parse_args(args: &[String]) -> Invocation {
     if input == output {
         fail("input and output must be different files");
     }
+    if passthrough
+        && output
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("h264"))
+    {
+        fail("passthrough carries MPEG-2 video, which raw H.264 output cannot hold");
+    }
     Invocation::Run(Box::new(CliOptions {
         input,
         output,
@@ -124,6 +135,11 @@ fn parse_args(args: &[String]) -> Invocation {
             oversample,
             recovery_interval,
             split_field_samples,
+            video: if passthrough {
+                VideoMode::Passthrough
+            } else {
+                VideoMode::Transcode
+            },
         },
     }))
 }
@@ -153,25 +169,44 @@ fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let started = Instant::now();
-    let result = transcode(&source, options.transcode)?;
-    let elapsed = started.elapsed();
-
-    let (output_data, output_kind) = if !raw_h264 {
+    let passthrough = options.transcode.video == VideoMode::Passthrough;
+    let (output_data, output_kind, converted, skipped) = if passthrough {
+        let mut unit = mpeg2_passthrough_unit(&source, false)?;
+        unit.timeline.split_field_samples = options.transcode.split_field_samples;
+        let carried = unit.samples.len();
+        let mp4 = mpeg2_to_fmp4(&source, &unit)?;
+        let mut data = mp4.init_segment;
+        data.extend_from_slice(&mp4.media_segment);
+        (data, "fragmented MP4", carried, 0)
+    } else if !raw_h264 {
+        let result = transcode(&source, options.transcode)?;
         let mut timeline = mpeg2_video_timeline(&source, false)?;
         timeline.split_field_samples = options.transcode.split_field_samples;
         let mp4 = h264_to_fmp4(&result.bitstream, &timeline)?;
         let mut data = mp4.init_segment;
         data.extend_from_slice(&mp4.media_segment);
-        (data, "fragmented MP4")
+        (
+            data,
+            "fragmented MP4",
+            result.pictures_converted,
+            result.pictures_skipped,
+        )
     } else {
-        (result.bitstream, "raw H.264")
+        let result = transcode(&source, options.transcode)?;
+        (
+            result.bitstream,
+            "raw H.264",
+            result.pictures_converted,
+            result.pictures_skipped,
+        )
     };
+    let elapsed = started.elapsed();
     std::fs::write(&options.output, &output_data)?;
 
     if !options.quiet {
         let seconds = elapsed.as_secs_f64();
         let fps = if seconds > 0.0 {
-            result.pictures_converted as f64 / seconds
+            converted as f64 / seconds
         } else {
             f64::INFINITY
         };
@@ -186,9 +221,9 @@ fn run(options: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {
             options.output.display(),
         );
         println!(
-            "{} pictures converted, {} skipped, {} bytes, {:.1} ms ({fps:.2} fps)",
-            result.pictures_converted,
-            result.pictures_skipped,
+            "{} pictures {}, {skipped} skipped, {} bytes, {:.1} ms ({fps:.2} fps)",
+            converted,
+            if passthrough { "carried" } else { "converted" },
             output_data.len(),
             seconds * 1000.0,
         );

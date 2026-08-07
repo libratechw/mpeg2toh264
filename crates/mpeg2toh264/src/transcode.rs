@@ -82,6 +82,19 @@ const CLONE_POC: u32 = 2;
 /// `LongTermFrameIdx` of that copy, the only long-term picture there ever is.
 const LONG_TERM_FRAME_IDX: u32 = 0;
 
+/// What to do with the source video.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VideoMode {
+    /// Convert it to H.264, which is what every browser can decode.
+    #[default]
+    Transcode,
+    /// Carry the MPEG-2 through into the MP4 as it stands, for a player whose
+    /// decoder handles it. Nothing is requantised, so the picture is the
+    /// broadcast's own and the conversion costs almost nothing -- but a decoder
+    /// that does not take MPEG-2 plays none of it.
+    Passthrough,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TranscodeOptions {
     pub oversample: f64,
@@ -98,6 +111,9 @@ pub struct TranscodeOptions {
     /// decoded image. Only an access unit delimiter moves, so the elementary
     /// stream is the same either way.
     pub split_field_samples: bool,
+    /// Ignored by [`transcode`] itself, which is the conversion; it is
+    /// [`crate::Session`] that decides between the two paths.
+    pub video: VideoMode,
 }
 
 impl Default for TranscodeOptions {
@@ -106,6 +122,7 @@ impl Default for TranscodeOptions {
             oversample: DEFAULT_OVERSAMPLE,
             recovery_interval: 24,
             split_field_samples: true,
+            video: VideoMode::default(),
         }
     }
 }

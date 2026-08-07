@@ -4,6 +4,7 @@
  */
 import {
   Mpeg2TsPlayer,
+  supportsPassthrough,
   supportsWorkerMediaSource,
   type PlayerState,
 } from "@mpeg2toh264/player";
@@ -38,6 +39,7 @@ const stage = document.querySelector<HTMLElement>("#stage")!;
 const fullscreen = document.querySelector<HTMLButtonElement>("#fullscreen")!;
 const service = document.querySelector<HTMLSelectElement>("#service")!;
 const serviceLabel = document.querySelector<HTMLElement>("#service-label")!;
+const passthrough = document.querySelector<HTMLInputElement>("#passthrough")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
 const splitFieldSamples = document.querySelector<HTMLInputElement>(
@@ -132,6 +134,7 @@ function createPlayer(): Mpeg2TsPlayer {
     recoveryInterval: Number(recoveryInterval.value),
     splitFieldSamples: splitFieldSamples.checked,
     serviceId: wantedService ?? undefined,
+    passthrough: passthrough.checked,
     deinterlace: deinterlace.checked,
     deinterlacer: (element) => {
       yadif = new Deinterlacer(element, {
@@ -605,6 +608,18 @@ service.addEventListener("change", () => {
 
 deinterlace.addEventListener("change", applyDeinterlace);
 doubleRate.addEventListener("change", applyDeinterlace);
+
+// Which codec reaches the MediaSource is settled when the conversion starts,
+// so changing this means converting the input again from the beginning.
+passthrough.addEventListener("change", () => {
+  if (playing) play(playing.url, playing.label, fileUrl, true);
+});
+
+if (!supportsPassthrough()) {
+  passthrough.checked = false;
+  passthrough.disabled = true;
+  passthrough.labels?.[0]?.append(" (このブラウザーはMPEG-2を再生できません)");
+}
 
 urlForm.addEventListener("submit", (event) => {
   event.preventDefault();

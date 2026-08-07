@@ -143,6 +143,11 @@ export interface LoadCommand {
   /** Give each field of a complementary pair its own MP4 sample. */
   splitFieldSamples: boolean | undefined;
   /**
+   * Whether to carry the MPEG-2 video through as it stands rather than
+   * converting it, for a browser whose decoder takes MPEG-2.
+   */
+  passthrough: boolean;
+  /**
    * Which service to convert, out of a transport stream that carries more than
    * one. Null takes the first that turns up with a picture in it, which is
    * what a recording of a single programme has anyway.

@@ -64,6 +64,9 @@ export class Transcoder {
    *
    * `serviceId` takes one named service out of a transport stream carrying
    * several; null takes the first that turns up with a picture in it.
+   *
+   * `passthrough` carries the MPEG-2 video into the MP4 as it stands rather
+   * than converting it, for a browser whose decoder takes MPEG-2.
    */
   constructor(
     oversample: number | undefined,
@@ -71,6 +74,7 @@ export class Transcoder {
     originTicks: number | null,
     serviceId: number | null,
     splitFieldSamples: boolean | undefined,
+    passthrough = false,
   ) {
     this.#session = new Session(
       oversample,
@@ -78,6 +82,7 @@ export class Transcoder {
       serviceId,
       recoveryInterval,
       splitFieldSamples,
+      passthrough,
     );
   }
 

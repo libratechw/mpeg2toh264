@@ -25,8 +25,9 @@ pub mod transcode;
 pub use error::{Error, Result};
 
 pub use container::fmp4::{
-    h264_gop_to_fmp4, h264_to_fmp4, mpeg2_video_timeline, Fmp4Fragment, Fmp4Output,
-    Mpeg2VideoTimeline,
+    h264_gop_to_fmp4, h264_to_fmp4, mpeg2_gop_to_fmp4, mpeg2_passthrough_unit, mpeg2_to_fmp4,
+    mpeg2_video_timeline, Fmp4Fragment, Fmp4Output, Mpeg2Sample, Mpeg2Unit, Mpeg2VideoTimeline,
+    UnitLeadIn,
 };
 pub use container::mpegts::{
     extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, ElementaryKind,
@@ -34,7 +35,9 @@ pub use container::mpegts::{
 };
 pub use mpeg2::headers::{pictures_interlacing, Interlacing};
 pub use session::{Fragment, Session};
-pub use transcode::{transcode, IncrementalTranscoder, TranscodeOptions, TranscodeResult};
+pub use transcode::{
+    transcode, IncrementalTranscoder, TranscodeOptions, TranscodeResult, VideoMode,
+};
 
 /// JavaScript's `Math.round`, which the reference implementation used
 /// throughout: exact halves go towards positive infinity, where Rust's

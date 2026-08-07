@@ -487,6 +487,7 @@ class Playback {
         this.#origin,
         this.#command.serviceId,
         this.#command.splitFieldSamples,
+        this.#command.passthrough,
       );
       this.#transcoder = converter;
       await this.#convert(leg, source, converter);

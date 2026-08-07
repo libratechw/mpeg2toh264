@@ -19,6 +19,7 @@ await player.load('https://example.com/video.ts');
 - `wasmUrl`: WASMファイルのURL
 - `mediaSource`: MSEを`worker`と`main`のどちらで動かすか。既定の`auto`はブラウザー機能から選ぶ
 - `oversample`: 変換時の量子化刻み
+- `passthrough`: MPEG-2映像を変換せずそのまま再生する。MPEG-2をデコードできるブラウザー (AppleプラットフォームのSafari) のみ。`supportsPassthrough()`で判定できる
 - `serviceId`: 複数サービスを含むTSから変換するサービス
 - `queueHighWaterMark`: 追加待ちデータの上限
 - `maxAheadSeconds`: 再生位置より先に変換して保持する秒数

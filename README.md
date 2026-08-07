@@ -81,9 +81,18 @@ cargo build --release
 -o, --oversample <n>          H.264 quantization-step granularity (default: 2; positive)
 -r, --recovery-interval <n>   GOPs between non-IDR recovery points (default: 24)
 -s, --split-field-samples     Put each field of a pair in its own MP4 sample
+-p, --passthrough             Carry the MPEG-2 video through unconverted (MP4 only)
 -q, --quiet                   Suppress progress and summary output
 -h, --help                    Show help
 ```
+
+### Passthrough
+
+`--passthrough` skips the conversion and stores the MPEG-2 video in the MP4 as it stands, in an `mp4v` sample entry whose `esds` names object type `0x61` (ISO/IEC 13818-2 Main Profile) and carries the sequence header. The MIME type becomes `video/mp4; codecs="mp4v.61"`.
+
+Nothing is requantized, so the picture is bit-exact with the broadcast and conversion costs almost nothing. In exchange, only a player with an MPEG-2 decoder can play it: Safari on Apple platforms decodes it through VideoToolbox, while Chrome and Firefox do not. Ask `MediaSource.isTypeSupported('video/mp4; codecs="mp4v.61"')`, or the player's `supportsPassthrough()`, before choosing it.
+
+Both paths cut the same access units out of the source and place them at the same times, so the audio track and the fragment timeline are unaffected by the choice. The transcoding path additionally drops pictures whose slices are damaged, because it has to code them; passthrough leaves that to the decoder.
 
 AAC is not re-encoded. Ordinary stereo and 5.1-channel audio are preserved. Mono duplicates the same ICS to the left and right channels, while dual mono duplicates the primary audio to both channels, keeping the output stereo even if the source configuration changes midstream.
 
@@ -239,9 +248,18 @@ cargo build --release
 -o, --oversample <n>          H.264量子化刻みの細かさ (既定: 2、正の数)
 -r, --recovery-interval <n>   non-IDRリカバリーポイントのGOP間隔 (既定: 24)
 -s, --split-field-samples     フィールドペアを1フィールドずつMP4サンプルに分割
+-p, --passthrough             MPEG-2映像を変換せずそのまま格納 (MP4出力のみ)
 -q, --quiet                   進捗と概要を表示しない
 -h, --help                    ヘルプを表示
 ```
+
+### パススルー
+
+`--passthrough`は変換を行わず、MPEG-2映像をそのままMP4へ格納します。サンプルエントリーは`mp4v`で、`esds`のobject type `0x61` (ISO/IEC 13818-2 Main Profile) とシーケンスヘッダーで映像を記述します。MIMEタイプは`video/mp4; codecs="mp4v.61"`です。
+
+再量子化しないので画質は放送そのままで、変換のコストもほぼありません。代わりにMPEG-2デコーダーを持つプレイヤーでしか再生できません。AppleプラットフォームのSafariはVideoToolboxでデコードできますが、ChromeとFirefoxはできません。`MediaSource.isTypeSupported('video/mp4; codecs="mp4v.61"')`、またはプレイヤーの`supportsPassthrough()`で確認してから選択してください。
+
+どちらの経路も同じアクセスユニットを切り出して同じ時刻に置くため、音声トラックとフラグメントのタイムラインは選択に影響されません。ただし変換経路は符号化する必要があるためスライスが破損したピクチャを捨てますが、パススルーはデコーダーに任せます。
 
 AACは再エンコードせず、通常のステレオと5.1chは保持し、モノラルは同じICSを左右へ複製、デュアルモノは主音声を左右へ複製することで途中で構成が変わってもステレオを維持します。
 

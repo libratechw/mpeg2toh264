@@ -11,15 +11,16 @@ use crate::container::adts::{
     aac_frame_count_through_video_time, AacConfig, AacFrame, AdtsStream, AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
-    h264_gop_to_fmp4, mpeg2_fragment_duration, mpeg2_video_timeline, Fmp4AudioSamples,
-    Mpeg2VideoTimeline,
+    h264_gop_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, mpeg2_passthrough_unit,
+    mpeg2_video_timeline, Fmp4AudioSamples, Fmp4Fragment, Mpeg2Unit, Mpeg2VideoTimeline,
+    UnitLeadIn,
 };
 use crate::container::mpegts::{ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
 use crate::error::Result;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
 use crate::mpeg2::headers::Interlacing;
 use crate::round_half_up;
-use crate::transcode::{IncrementalTranscoder, TranscodeOptions};
+use crate::transcode::{IncrementalTranscoder, TranscodeOptions, VideoMode};
 
 const TIMESCALE: u64 = 90_000;
 
@@ -74,12 +75,106 @@ pub enum Fragment {
     },
 }
 
+/// What the video of one unit turns into, and what the muxer needs to know
+/// about it.
+///
+/// Both paths cut the same source pictures out of a unit -- the passthrough one
+/// keeps damaged slices, which are the decoder's business rather than this
+/// crate's, and is otherwise the same walk -- so the timeline underneath is the
+/// same. They differ in what covers the display slots of an open GOP's leading
+/// pictures where a fragment opens the presentation: the transcoder puts an
+/// extra copy of its IDR there, and passthrough simply shows its first picture
+/// for longer.
+enum UnitPlan {
+    Transcode(Mpeg2VideoTimeline),
+    Passthrough(Mpeg2Unit),
+}
+
+impl UnitPlan {
+    fn timeline(&self) -> &Mpeg2VideoTimeline {
+        match self {
+            Self::Transcode(timeline) => timeline,
+            Self::Passthrough(unit) => &unit.timeline,
+        }
+    }
+
+    fn timeline_mut(&mut self) -> &mut Mpeg2VideoTimeline {
+        match self {
+            Self::Transcode(timeline) => timeline,
+            Self::Passthrough(unit) => &mut unit.timeline,
+        }
+    }
+
+    fn lead_in(&self, starts_at_idr: bool) -> UnitLeadIn {
+        match (self, starts_at_idr) {
+            (_, false) => UnitLeadIn::None,
+            (Self::Transcode(_), true) => UnitLeadIn::IdrClone,
+            (Self::Passthrough(_), true) => UnitLeadIn::FirstPicture,
+        }
+    }
+}
+
+/// How the video reaches the MP4.
+enum VideoPipeline {
+    Transcode(IncrementalTranscoder),
+    /// Carried through as MPEG-2, where an intra picture is already everything
+    /// a recovery point has to be: nothing is flushed, nothing is coded, and
+    /// the pictures around it are the source's own.
+    Passthrough {
+        /// The transcoder's `awaiting_idr` under another name: no picture can
+        /// be carried until one arrives that a decoder can start on.
+        awaiting_intra: bool,
+        /// A periodic restart point is due, and goes to the next unit that
+        /// opens with an intra picture.
+        recovery_pending: bool,
+        split_field_samples: bool,
+    },
+}
+
+impl VideoPipeline {
+    /// Whether the next unit has to be one a decoder can begin at. The MP4
+    /// timeline has to reach the same verdict on the same pictures, so it asks.
+    fn awaiting_random_access(&self) -> bool {
+        match self {
+            Self::Transcode(transcoder) => transcoder.awaiting_random_access(),
+            Self::Passthrough { awaiting_intra, .. } => *awaiting_intra,
+        }
+    }
+
+    fn request_recovery_point(&mut self) {
+        match self {
+            Self::Transcode(transcoder) => transcoder.request_recovery_point(),
+            Self::Passthrough {
+                recovery_pending, ..
+            } => *recovery_pending = true,
+        }
+    }
+
+    fn split_field_samples(&self) -> bool {
+        match self {
+            Self::Transcode(transcoder) => transcoder.split_field_samples(),
+            Self::Passthrough {
+                split_field_samples,
+                ..
+            } => *split_field_samples,
+        }
+    }
+
+    fn errors(&self) -> u64 {
+        match self {
+            Self::Transcode(transcoder) => transcoder.errors(),
+            // Nothing is decoded here, so nothing malformed is found.
+            Self::Passthrough { .. } => 0,
+        }
+    }
+}
+
 /// Streaming transcode of one transport stream.
 pub struct Session {
     demuxer: MpegTsAvDemuxer,
     gops: Mpeg2GopStream,
     adts: AdtsStream,
-    transcoder: IncrementalTranscoder,
+    video: VideoPipeline,
     recovery_point_gop_interval: usize,
 
     sequence_number: u32,
@@ -147,7 +242,7 @@ impl Session {
         self.demuxer.scrambled()
     }
     pub fn errors(&self) -> u64 {
-        self.demuxer.errors() + self.transcoder.errors()
+        self.demuxer.errors() + self.video.errors()
     }
 
     /// Start a session whose timeline is measured from a PES timestamp of the
@@ -162,7 +257,16 @@ impl Session {
             demuxer: MpegTsAvDemuxer::new(),
             gops: Mpeg2GopStream::new(),
             adts: AdtsStream::new(),
-            transcoder: IncrementalTranscoder::new(options),
+            video: match options.video {
+                VideoMode::Transcode => {
+                    VideoPipeline::Transcode(IncrementalTranscoder::new(options))
+                }
+                VideoMode::Passthrough => VideoPipeline::Passthrough {
+                    awaiting_intra: true,
+                    recovery_pending: false,
+                    split_field_samples: options.split_field_samples,
+                },
+            },
             recovery_point_gop_interval: options.recovery_interval,
             sequence_number: 1,
             video_presentation_start: 0,
@@ -286,7 +390,23 @@ impl Session {
     /// recovery points deliberately do not count: they retain the prior DPB so
     /// an open GOP's leading B pictures remain codeable.
     fn starts_at_idr(&self) -> bool {
-        self.transcoder.awaiting_random_access()
+        self.video.awaiting_random_access()
+    }
+
+    /// Work out what one unit turns into, on whichever path this session is on.
+    fn plan_unit(&self, data: &[u8], starts_at_idr: bool) -> Result<UnitPlan> {
+        let mut plan = match self.video {
+            VideoPipeline::Transcode(_) => {
+                UnitPlan::Transcode(mpeg2_video_timeline(data, !starts_at_idr)?)
+            }
+            VideoPipeline::Passthrough { .. } => {
+                UnitPlan::Passthrough(mpeg2_passthrough_unit(data, !starts_at_idr)?)
+            }
+        };
+        // Only the pipeline knows how many samples a field pair became, and the
+        // timeline has to reserve one for each.
+        plan.timeline_mut().split_field_samples = self.video.split_field_samples();
+        Ok(plan)
     }
 
     fn is_random_access_point(&self) -> bool {
@@ -315,9 +435,10 @@ impl Session {
             }
             let gop = self.pending_gops[0].clone();
             let starts_at_idr = self.starts_at_idr();
-            let timeline = mpeg2_video_timeline(&gop.data, !starts_at_idr)?;
-            self.align_timelines(&gop, &timeline);
-            let video_duration = mpeg2_fragment_duration(&timeline, starts_at_idr);
+            let plan = self.plan_unit(&gop.data, starts_at_idr)?;
+            self.align_timelines(&gop, plan.timeline());
+            let video_duration =
+                mpeg2_fragment_duration(plan.timeline(), plan.lead_in(starts_at_idr));
             // Audio is measured from where the audio track itself starts, not
             // from where the video does.
             let through = (self.video_presentation_start + video_duration) as i64
@@ -336,7 +457,7 @@ impl Session {
                 wanted.min(self.pending_audio.len())
             };
             let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
-            self.emit_gop(&gop, frames, Some(timeline), out)?;
+            self.emit_gop(&gop, frames, Some(plan), out)?;
         }
         Ok(())
     }
@@ -410,28 +531,23 @@ impl Session {
         &mut self,
         gop: &Mpeg2Gop,
         audio_frames: Vec<AacFrame>,
-        timeline: Option<Mpeg2VideoTimeline>,
+        plan: Option<UnitPlan>,
         out: &mut Vec<Fragment>,
     ) -> Result<()> {
         let random_access = self.is_random_access_point();
         if random_access {
-            self.transcoder.request_recovery_point();
+            self.video.request_recovery_point();
         }
-        let starts_at_idr = self.transcoder.awaiting_random_access();
-        let mut timeline = match timeline {
-            Some(timeline) => timeline,
-            None => mpeg2_video_timeline(&gop.data, !starts_at_idr)?,
+        let starts_at_idr = self.video.awaiting_random_access();
+        let plan = match plan {
+            Some(plan) => plan,
+            None => self.plan_unit(&gop.data, starts_at_idr)?,
         };
-        // Only the transcoder knows how many access units a field pair became,
-        // and the timeline has to reserve a sample for each. The duration the
-        // caller measured before this point is the same either way, so a
-        // timeline that arrived from there needs no more than this.
-        timeline.split_field_samples = self.transcoder.split_field_samples();
         // Aligning can still move the origin, so read the start after it.
-        self.align_timelines(gop, &timeline);
+        self.align_timelines(gop, plan.timeline());
         let start = self.video_presentation_start as f64 / TIMESCALE as f64;
+        let interlacing = plan.timeline().interlacing;
 
-        let h264 = self.transcoder.push(&gop.data)?;
         let config = audio_frames
             .first()
             .map(|frame| frame.config.clone())
@@ -444,11 +560,10 @@ impl Session {
                 .collect(),
             base_decode_time: self.audio_base_decode_time(config.sample_rate),
         });
-        let fragment = h264_gop_to_fmp4(
-            &h264.bitstream,
-            &timeline,
-            self.sequence_number,
-            self.video_presentation_start,
+        let (fragment, recovery_point) = self.package(
+            gop,
+            &plan,
+            starts_at_idr,
             config.as_ref(),
             audio_track.as_ref(),
         )?;
@@ -475,12 +590,74 @@ impl Session {
         out.push(Fragment::Media {
             data: fragment.media_segment,
             start,
-            random_access: starts_at_idr || h264.recovery_point,
+            random_access: starts_at_idr || recovery_point,
             video_samples: fragment.sample_count,
             audio_samples: audio_frames.len(),
-            interlacing: timeline.interlacing,
+            interlacing,
         });
         Ok(())
+    }
+
+    /// Turn one unit into a fragment, by whichever path this session is on,
+    /// and say whether a decoder can be started on it.
+    fn package(
+        &mut self,
+        gop: &Mpeg2Gop,
+        plan: &UnitPlan,
+        starts_at_idr: bool,
+        audio: Option<&AacConfig>,
+        audio_track: Option<&Fmp4AudioSamples>,
+    ) -> Result<(Fmp4Fragment, bool)> {
+        match (&mut self.video, plan) {
+            (VideoPipeline::Transcode(transcoder), UnitPlan::Transcode(timeline)) => {
+                let h264 = transcoder.push(&gop.data)?;
+                let fragment = h264_gop_to_fmp4(
+                    &h264.bitstream,
+                    timeline,
+                    self.sequence_number,
+                    self.video_presentation_start,
+                    audio,
+                    audio_track,
+                )?;
+                Ok((fragment, h264.recovery_point))
+            }
+            (
+                VideoPipeline::Passthrough {
+                    awaiting_intra,
+                    recovery_pending,
+                    ..
+                },
+                UnitPlan::Passthrough(unit),
+            ) => {
+                // A unit yields samples only once a picture a decoder can
+                // begin at has arrived, which is what this was waiting for.
+                *awaiting_intra &= unit.samples.is_empty();
+                // An MPEG-2 intra picture needs nothing coded around it to be
+                // a recovery point, so a restart is due exactly when one was
+                // asked for and the unit opens with one.
+                let opens_at_intra = unit.samples.first().is_some_and(|sample| sample.sync);
+                let recovery_point = *recovery_pending && opens_at_intra;
+                *recovery_pending &= !recovery_point;
+                let fragment = mpeg2_gop_to_fmp4(
+                    &gop.data,
+                    unit,
+                    self.sequence_number,
+                    self.video_presentation_start,
+                    plan.lead_in(starts_at_idr),
+                    starts_at_idr || recovery_point,
+                    // Every unit opens with a sequence header, so unlike the
+                    // transcoded path nothing in the unit itself says which one
+                    // the initialization segment should be built from.
+                    !self.initialized,
+                    audio,
+                    audio_track,
+                )?;
+                Ok((fragment, recovery_point))
+            }
+            // The pipeline is chosen once, at construction, and the plan is
+            // made by it.
+            _ => unreachable!("the unit plan matches the pipeline that made it"),
+        }
     }
 }
 

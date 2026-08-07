@@ -76,6 +76,17 @@ export interface Mpeg2TsPlayerOptions {
    */
   splitFieldSamples?: boolean;
   /**
+   * Carry the MPEG-2 video into the MP4 as it stands instead of converting it,
+   * for a browser whose decoder takes MPEG-2 -- Safari on Apple platforms is
+   * the one that does. Nothing is requantised, so the picture is the
+   * broadcast's own and the conversion costs almost nothing.
+   *
+   * A browser without an MPEG-2 decoder plays none of it, and says so by
+   * failing the load rather than by showing anything, so this is worth
+   * checking with `supportsPassthrough()` before setting it.
+   */
+  passthrough?: boolean;
+  /**
    * Which service to convert, out of a transport stream carrying more than
    * one. Left unset, the first that turns up with a picture in it. The
    * `services` event says what a given input is offering.
@@ -150,6 +161,24 @@ export function supportsWorkerMediaSource(): boolean {
   return (
     typeof MediaSource !== "undefined" &&
     MediaSource.canConstructInDedicatedWorker === true
+  );
+}
+
+/** What a passthrough load opens its SourceBuffer with. */
+const PASSTHROUGH_MIME = 'video/mp4; codecs="mp4v.61"';
+
+/**
+ * Whether this browser decodes the MPEG-2 the `passthrough` option hands it.
+ *
+ * Passing the video through costs almost nothing and leaves the picture
+ * exactly as it was broadcast, but it is only playable where the browser has
+ * an MPEG-2 decoder, which is not something to assume: ask here first and
+ * convert to H.264 wherever the answer is no.
+ */
+export function supportsPassthrough(): boolean {
+  return (
+    typeof MediaSource !== "undefined" &&
+    MediaSource.isTypeSupported(PASSTHROUGH_MIME)
   );
 }
 
@@ -342,6 +371,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       oversample: this.#options.oversample,
       recoveryInterval: this.#options.recoveryInterval,
       splitFieldSamples: this.#options.splitFieldSamples,
+      passthrough: this.#options.passthrough ?? false,
       serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
       queueHighWaterMark:

@@ -15,7 +15,11 @@
  * await player.load('https://example.com/video.ts');
  * ```
  */
-export { Mpeg2TsPlayer, supportsWorkerMediaSource } from "./player.js";
+export {
+  Mpeg2TsPlayer,
+  supportsPassthrough,
+  supportsWorkerMediaSource,
+} from "./player.js";
 export type {
   Mpeg2TsPlayerEventMap,
   Mpeg2TsPlayerOptions,

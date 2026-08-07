@@ -51,12 +51,29 @@ for fragment in session.finish()? {
 
 複数サービスを含むTSからサービスを指定する場合は`Session::for_service`を使います。
 
+## パススルー
+
+`TranscodeOptions::video`に`VideoMode::Passthrough`を指定すると、`Session`はMPEG-2映像を変換せずそのままMP4へ格納します。デコードも符号化も行わないため映像は放送のビットそのままで、MPEG-2デコーダーを持つプレイヤーでしか再生できません。`Fragment::Init`の`mime_codec`は`video/mp4; codecs="mp4v.61"`になります。
+
+音声の扱い、フラグメントの区切り、タイムラインは変換経路と同じです。
+
+```rust
+use mpeg2toh264::{Session, TranscodeOptions, VideoMode};
+
+let mut session = Session::new(TranscodeOptions {
+    video: VideoMode::Passthrough,
+    ..TranscodeOptions::default()
+});
+```
+
 ## コンテナー関数
 
 - `extract_mpeg2_video_es`: MPEG-TSからMPEG-2 Videoを取り出す
 - `mpeg2_video_timeline`: MPEG-2の表示順と各サンプルの時刻を復元する
+- `mpeg2_passthrough_unit`: 同じ表示順に加えて、各サンプルのバイト範囲を返す
 - `h264_to_fmp4`: 一括変換したAnnex B H.264をfragmented MP4に格納する
 - `h264_gop_to_fmp4`: GOP単位のH.264とAACをMSE向けフラグメントにする
+- `mpeg2_to_fmp4` / `mpeg2_gop_to_fmp4`: 同じものをMPEG-2のまま格納する
 - `first_pts` / `last_pts`: TS断片の先頭・末尾のPESタイムスタンプを読む
 
 詳細な型とエラー条件は公開項目のrustdocを参照してください。

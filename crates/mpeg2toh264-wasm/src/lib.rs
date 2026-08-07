@@ -6,7 +6,7 @@
 //! What is here turns Rust values into the shapes JavaScript expects.
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
-use mpeg2toh264::{Fragment, TranscodeOptions};
+use mpeg2toh264::{Fragment, TranscodeOptions, VideoMode};
 use wasm_bindgen::prelude::*;
 
 /// The shape of what [`Session::push`] returns, declared so the browser sources
@@ -105,6 +105,13 @@ impl Session {
     /// sample, working around decoders that freeze on field pictures.
     /// `undefined` leaves the pair in one sample, which is what more decoders
     /// accept.
+    ///
+    /// `passthrough` carries the MPEG-2 video into the MP4 as it stands
+    /// instead of converting it, for a browser whose decoder takes MPEG-2.
+    /// Nothing is requantised, so the picture is the broadcast's own and the
+    /// conversion costs almost nothing -- but a browser that does not decode
+    /// MPEG-2 plays none of it. Ask `MediaSource.isTypeSupported` with the
+    /// `mimeCodec` the init fragment reports before relying on it.
     #[wasm_bindgen(constructor)]
     pub fn new(
         oversample: Option<f64>,
@@ -112,6 +119,7 @@ impl Session {
         service_id: Option<u16>,
         recovery_interval: Option<u32>,
         split_field_samples: Option<bool>,
+        passthrough: Option<bool>,
     ) -> Result<Session, JsError> {
         let defaults = TranscodeOptions::default();
         let oversample = oversample.unwrap_or(defaults.oversample);
@@ -136,6 +144,11 @@ impl Session {
                     recovery_interval: recovery_interval as usize,
                     split_field_samples: split_field_samples
                         .unwrap_or(defaults.split_field_samples),
+                    video: if passthrough.unwrap_or(false) {
+                        VideoMode::Passthrough
+                    } else {
+                        VideoMode::Transcode
+                    },
                 },
                 origin,
                 service_id,
