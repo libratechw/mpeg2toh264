@@ -191,6 +191,7 @@ class RemoteSink implements FragmentSink {
 function createWorkerSink(command: LoadCommand): MseSink {
   const id = command.id;
   const created = new MseSink({
+    preferManaged: command.preferManagedMediaSource,
     queueHighWaterMark: command.queueHighWaterMark,
     maxAheadSeconds: command.maxAheadSeconds,
     keepBehindSeconds: command.keepBehindSeconds,
@@ -200,7 +201,7 @@ function createWorkerSink(command: LoadCommand): MseSink {
     onError: (error) => post({ type: "error", id, message: error.message }),
   });
   const handle = created.mediaSource.handle;
-  post({ type: "handle", id, handle }, [handle]);
+  post({ type: "handle", id, handle, managed: created.managed }, [handle]);
   return created;
 }
 

@@ -18,6 +18,7 @@ await player.load('https://example.com/video.ts');
 
 - `wasmUrl`: WASMファイルのURL
 - `mediaSource`: MSEを`worker`と`main`のどちらで動かすか。既定の`auto`はブラウザー機能から選ぶ
+- `preferManagedMediaSource`: `MediaSource`と`ManagedMediaSource`の両方があるブラウザーで後者を使う。`MediaSource`がないiPhoneではこの指定によらず`ManagedMediaSource`を使うため、指定は主に他の環境での動作確認用。`requiresManagedMediaSource()`でそのブラウザーに`ManagedMediaSource`しかないかを判定できる
 - `oversample`: 変換時の量子化刻み
 - `passthrough`: MPEG-2映像を変換せずそのまま再生する。MPEG-2をデコードできるブラウザー (AppleプラットフォームのSafari) のみ。`supportsPassthrough()`で判定できる
 - `serviceId`: 複数サービスを含むTSから変換するサービス

@@ -141,6 +141,9 @@ async function measure(options: DecoderProbeOptions): Promise<DecoderProbe> {
   } finally {
     video.pause();
     video.removeAttribute("src");
+    // The `<source>` child a managed source needed points at a URL about to be
+    // revoked, and `load` would go looking for it.
+    video.replaceChildren();
     video.load();
     if (source) URL.revokeObjectURL(source.url);
   }
@@ -151,15 +154,32 @@ interface ProbeSource {
   ready: Promise<void>;
 }
 
+/**
+ * Media Source Extensions under whichever name this browser has them.
+ *
+ * An iPhone has no `MediaSource`: iOS gets Managed Media Source instead, which
+ * is the same API with the user agent deciding when it wants data. The clip
+ * here is one append and needs none of that, but it does need to go through
+ * the path the pictures being judged will come down, and on an iPhone this is
+ * that path. Reached through `globalThis` because lib.dom.d.ts does not
+ * declare it (checked against TypeScript 5.9), and typed as the twin it
+ * matches everywhere this uses it.
+ */
+const MEDIA_SOURCE: typeof MediaSource | undefined =
+  typeof MediaSource === "undefined"
+    ? (globalThis as { ManagedMediaSource?: typeof MediaSource })
+        .ManagedMediaSource
+    : MediaSource;
+
+/** Whether that is the managed one, which an element is given differently. */
+const MANAGED = typeof MediaSource === "undefined";
+
 /** Feed the clip through the same MSE path used for playback where possible. */
 function probeClipSource(
   video: HTMLVideoElement,
   timeoutMs: number,
 ): ProbeSource {
-  if (
-    typeof MediaSource === "undefined" ||
-    !MediaSource.isTypeSupported(PROBE_CODEC)
-  ) {
+  if (!MEDIA_SOURCE || !MEDIA_SOURCE.isTypeSupported(PROBE_CODEC)) {
     throw new Error("the probe clip needs Media Source Extensions");
   }
   const comma = PROBE_CLIP.indexOf(",");
@@ -167,9 +187,22 @@ function probeClipSource(
   const data = new Uint8Array(bytes.length);
   for (let i = 0; i < bytes.length; i++) data[i] = bytes.charCodeAt(i);
 
-  const mediaSource = new MediaSource();
+  const mediaSource = new MEDIA_SOURCE();
   const url = URL.createObjectURL(mediaSource);
-  video.src = url;
+  if (MANAGED) {
+    // A managed source stays closed on a `src` attribute. Safari opens one
+    // only where the element has given up remote playback -- AirPlay cannot
+    // carry a source the page is feeding -- and where the URL is on a
+    // `<source>` child. Without both, `sourceopen` never comes.
+    video.disableRemotePlayback = true;
+    const source = document.createElement("source");
+    source.type = "video/mp4";
+    source.src = url;
+    video.append(source);
+    video.load();
+  } else {
+    video.src = url;
+  }
   const ready = (async (): Promise<void> => {
     await deadline(event(mediaSource, "sourceopen"), timeoutMs);
     const buffer = mediaSource.addSourceBuffer(PROBE_CODEC);

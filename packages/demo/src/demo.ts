@@ -4,6 +4,8 @@
  */
 import {
   Mpeg2TsPlayer,
+  requiresManagedMediaSource,
+  supportsManagedMediaSource,
   supportsPassthrough,
   supportsWorkerMediaSource,
   type PlayerState,
@@ -123,6 +125,29 @@ function setDetails() {
 /** Whether MPEG-2 can reach the decoder at all, which is for the browser to say. */
 const canPassthrough = supportsPassthrough();
 
+/** Whether the managed source is the only one here, as it is on an iPhone. */
+const onlyManaged = requiresManagedMediaSource();
+
+/**
+ * What each entry of the placement list asks the player for.
+ *
+ * The two are separate options -- which of the implementations, and which side
+ * of the wire runs it -- and this is the pairs worth offering. `auto` names
+ * neither and lets the player look at the browser, which is what an iPhone
+ * needs: there the managed one is all there is and asking for it is beside the
+ * point.
+ */
+const PLACEMENTS: Record<
+  string,
+  { mediaSource: "auto" | "worker" | "main"; managed: boolean }
+> = {
+  auto: { mediaSource: "auto", managed: false },
+  worker: { mediaSource: "worker", managed: false },
+  main: { mediaSource: "main", managed: false },
+  "managed-worker": { mediaSource: "worker", managed: true },
+  "managed-main": { mediaSource: "main", managed: true },
+};
+
 /**
  * The settings the conversion reads once, as it starts, and never looks at
  * again. Offering them over a player that has already passed that point would
@@ -153,9 +178,10 @@ function createPlayer(): Mpeg2TsPlayer {
   captions = null;
   player?.destroy();
   yadif = null;
-  const mediaSource = placement.value as "auto" | "worker" | "main";
+  const chosen = PLACEMENTS[placement.value] ?? PLACEMENTS["auto"]!;
   const created = new Mpeg2TsPlayer(video, {
-    mediaSource,
+    mediaSource: chosen.mediaSource,
+    preferManagedMediaSource: chosen.managed,
     oversample: Number(oversample.value),
     recoveryInterval: Number(recoveryInterval.value),
     splitFieldSamples: splitFieldSamples.checked,
@@ -733,14 +759,25 @@ if (!supportsDeinterlace()) {
   });
 }
 
-if (!supportsWorkerMediaSource()) {
-  const auto = placement.querySelector<HTMLOptionElement>(
-    'option[value="auto"]',
-  )!;
-  auto.textContent = `${auto.textContent} このブラウザーはメインスレッド`;
-  placement.querySelector<HTMLOptionElement>(
-    'option[value="worker"]',
-  )!.disabled = true;
+// Which pairs this browser can actually run. Chromium has MSE in Workers and
+// no managed source; Safari has the managed one and no MSE in Workers; an
+// iPhone has nothing but the managed one. So most of the list is greyed out
+// wherever it is read, and which parts tells you where you are.
+{
+  const option = (value: string) =>
+    placement.querySelector<HTMLOptionElement>(`option[value="${value}"]`)!;
+  const hasManaged = supportsManagedMediaSource();
+  option("worker").disabled = !supportsWorkerMediaSource();
+  option("main").disabled = onlyManaged;
+  option("managed-worker").disabled =
+    !hasManaged || !supportsWorkerMediaSource(true);
+  option("managed-main").disabled = !hasManaged;
+  // 自動 is the browser's own answer, so it says what the answer turned out
+  // to be rather than leaving it to be guessed at.
+  const auto = option("auto");
+  const implementation = onlyManaged ? "ManagedMediaSource" : "MediaSource";
+  const side = supportsWorkerMediaSource(onlyManaged) ? "Worker" : "メイン";
+  auto.textContent = `${auto.textContent} (このブラウザーでは${implementation} (${side}))`;
 }
 
 syncSettings();

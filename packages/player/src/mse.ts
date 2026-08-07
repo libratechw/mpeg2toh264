@@ -27,6 +27,92 @@ import { QUEUE_HIGH_WATER_FRAGMENTS } from "./protocol.js";
  */
 const REMOVE_MARGIN_SECONDS = 0.001;
 
+/** Whatever this browser calls the thing a `SourceBuffer` is appended to. */
+type MediaSourceConstructor = {
+  new (): MediaSource;
+  isTypeSupported(type: string): boolean;
+  /**
+   * Whether a worker may own one. Optional because the managed one is reached
+   * through `globalThis`, where nothing guarantees it answers at all.
+   */
+  readonly canConstructInDedicatedWorker?: boolean;
+};
+
+/**
+ * Managed Media Source, where there is one.
+ *
+ * An iPhone has no `MediaSource` at all -- Safari gives iOS this instead, and
+ * a page that only knows the older name plays nothing there. It is the same
+ * API with the user agent in charge of the buffer: it says through
+ * `startstreaming` and `endstreaming` when it wants data and when it has
+ * enough, and it may hand memory back on its own rather than waiting to be
+ * asked. Both are things a producer should listen to, which is what `#streaming`
+ * below is for.
+ *
+ * Reached through `globalThis` because neither lib.dom.d.ts nor
+ * lib.webworker.d.ts declares it (checked against TypeScript 5.9), and typed
+ * as its unmanaged twin because everything used here is common to the two.
+ */
+const managedMediaSource = (
+  globalThis as { ManagedMediaSource?: MediaSourceConstructor }
+).ManagedMediaSource;
+
+/**
+ * Which of the two to open, given whether the managed one is preferred.
+ *
+ * Where a browser has both -- Safari on a Mac or an iPad -- the plain one is
+ * taken by default: it is the one whose eviction this file was written
+ * against, and the buffer stays the page's own business. `preferManaged`
+ * asks for the other, which is worth doing to see on a desktop what an iPhone
+ * will do. Null where the browser has neither.
+ */
+function mediaSourceClass(
+  preferManaged = false,
+): MediaSourceConstructor | null {
+  const plain: MediaSourceConstructor | null =
+    typeof MediaSource === "undefined" ? null : MediaSource;
+  if (preferManaged && managedMediaSource) return managedMediaSource;
+  return plain ?? managedMediaSource ?? null;
+}
+
+/**
+ * Whether Media Source Extensions here will take this codec.
+ *
+ * Asking the constructor that would be opened rather than `MediaSource`, which
+ * on an iPhone is not there to be asked.
+ */
+export function mediaSourceSupports(mimeCodec: string, preferManaged = false) {
+  return mediaSourceClass(preferManaged)?.isTypeSupported(mimeCodec) ?? false;
+}
+
+/**
+ * Whether a worker may own the one that would be opened.
+ *
+ * The two answer for themselves: MSE in Workers is Chromium's, and Chromium
+ * has no managed source, so the managed answer is no everywhere today. It is
+ * asked rather than assumed because the exposure is the specification's to
+ * widen, not this player's to decide.
+ */
+export function mediaSourceConstructsInWorker(preferManaged = false): boolean {
+  return (
+    mediaSourceClass(preferManaged)?.canConstructInDedicatedWorker === true
+  );
+}
+
+/** Whether this browser has a Managed Media Source to open at all. */
+export function supportsManagedMediaSource(): boolean {
+  return managedMediaSource !== undefined;
+}
+
+/**
+ * Whether the managed one is all there is, as it is on an iPhone. A player
+ * there opens one whatever it was asked for, which is worth showing a viewer
+ * who is being offered the choice.
+ */
+export function requiresManagedMediaSource(): boolean {
+  return typeof MediaSource === "undefined" && managedMediaSource !== undefined;
+}
+
 /** Where a producer hands fragments, and how it learns to slow down. */
 export interface FragmentSink {
   /** Resolves once there is room for more fragments. */
@@ -82,6 +168,11 @@ export class ReadyGate {
 }
 
 export interface MseSinkOptions {
+  /**
+   * Open a Managed Media Source where the browser has both. An iPhone has only
+   * the managed one and gets it either way. See `mediaSourceClass`.
+   */
+  preferManaged?: boolean;
   /** Stop taking fragments above this many bytes waiting to be appended. */
   queueHighWaterMark: number;
   /** Stop taking fragments while the buffer reaches this far past the playhead. */
@@ -111,13 +202,22 @@ interface Pending {
 
 export class MseSink implements FragmentSink {
   /**
-   * Made here rather than in `open`, because a caller needs something to
-   * attach before the codec is known: the worker sends `mediaSource.handle`
-   * across the moment a load starts, and `sourceopen` does not fire until the
-   * page has put it on the element -- long before the first init fragment.
+   * Made in the constructor rather than in `open`, because a caller needs
+   * something to attach before the codec is known: the worker sends
+   * `mediaSource.handle` across the moment a load starts, and `sourceopen`
+   * does not fire until the page has put it on the element -- long before the
+   * first init fragment.
    */
-  readonly mediaSource: MediaSource = new MediaSource();
+  readonly mediaSource: MediaSource;
 
+  /**
+   * Whether that is a Managed Media Source, which a media element takes in its
+   * own way. See the player's `#createSink`.
+   */
+  readonly managed: boolean;
+
+  /** The one the source was made from, and the one that answers for codecs. */
+  readonly #class: MediaSourceConstructor;
   readonly #options: MseSinkOptions;
   readonly #opened: Promise<void>;
   #sourceBuffer: SourceBuffer | null = null;
@@ -129,6 +229,18 @@ export class MseSink implements FragmentSink {
   #queuedBytes = 0;
   #operation: "append" | "remove" | "clear" | null = null;
   #quotaBlocked = false;
+  /**
+   * Whether a managed source wants data at the moment.
+   *
+   * True until told otherwise, and always true for an unmanaged source, which
+   * takes whatever it is given. A managed one starts out not streaming and
+   * asks once it is attached and playing, so waiting for permission before the
+   * initialization segment would mean waiting for a player that never starts:
+   * this holds the door open until `endstreaming` closes it.
+   */
+  #streaming = true;
+  /** The last thing said about there being no room, so it is said once. */
+  #blocked = false;
   /** Whether everything buffered is waiting to be thrown away; see `reset`. */
   #clearing = false;
   /** Which stretch of timeline is being filled. Bumped by every `reset`. */
@@ -147,6 +259,18 @@ export class MseSink implements FragmentSink {
 
   constructor(options: MseSinkOptions) {
     this.#options = options;
+    const source = mediaSourceClass(options.preferManaged);
+    if (!source) throw new Error("this browser has no Media Source Extensions");
+    this.#class = source;
+    this.mediaSource = new source();
+    this.managed = source === managedMediaSource;
+    if (this.managed) {
+      this.mediaSource.addEventListener(
+        "startstreaming",
+        this.#onStartStreaming,
+      );
+      this.mediaSource.addEventListener("endstreaming", this.#onEndStreaming);
+    }
     this.#opened = new Promise((resolve) => {
       this.mediaSource.addEventListener(
         "sourceopen",
@@ -168,7 +292,7 @@ export class MseSink implements FragmentSink {
    * it -- re-open the one already running.
    */
   async open(mimeCodec: string, data: ArrayBuffer): Promise<void> {
-    if (!MediaSource.isTypeSupported(mimeCodec))
+    if (!this.#class.isTypeSupported(mimeCodec))
       throw new Error(`unsupported codec: ${mimeCodec}`);
     await this.#opened;
     if (this.#closed) return;
@@ -224,10 +348,8 @@ export class MseSink implements FragmentSink {
     this.#randomAccessPoints = [];
     this.#playheadPlaced = false;
     this.#ending = false;
-    if (this.#quotaBlocked) {
-      this.#quotaBlocked = false;
-      this.#options.onBlocked?.(false);
-    }
+    this.#quotaBlocked = false;
+    this.#updateBlocked();
     if (this.#sourceBuffer) this.#clearing = true;
     // Whoever was waiting on the drain is waiting for a stream that is not
     // being ended after all.
@@ -255,6 +377,16 @@ export class MseSink implements FragmentSink {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.managed) {
+      this.mediaSource.removeEventListener(
+        "startstreaming",
+        this.#onStartStreaming,
+      );
+      this.mediaSource.removeEventListener(
+        "endstreaming",
+        this.#onEndStreaming,
+      );
+    }
     this.#sourceBuffer?.removeEventListener("updateend", this.#onUpdateEnd);
     this.#sourceBuffer?.removeEventListener("error", this.#onSourceBufferError);
     this.#sourceBuffer = null;
@@ -330,7 +462,7 @@ export class MseSink implements FragmentSink {
       ) {
         this.#quotaBlocked = true;
         this.#updateRoom();
-        this.#options.onBlocked?.(true);
+        this.#updateBlocked();
         // Try at once rather than waiting for playback to raise an event: if
         // the buffer ahead runs out first, nothing will raise one.
         this.#evict();
@@ -347,7 +479,7 @@ export class MseSink implements FragmentSink {
       }
     } else if (this.#operation === "remove") {
       this.#quotaBlocked = false;
-      this.#options.onBlocked?.(false);
+      this.#updateBlocked();
     } else if (this.#operation === "clear") {
       this.#clearing = false;
     }
@@ -356,6 +488,30 @@ export class MseSink implements FragmentSink {
     this.#evict();
     this.#updateRoom();
     this.#pump();
+  };
+
+  /**
+   * The managed source asking for data again, which is the only thing that
+   * reopens the door `endstreaming` closed.
+   */
+  #onStartStreaming = (): void => {
+    this.#streaming = true;
+    this.#updateRoom();
+    this.#updateBlocked();
+  };
+
+  /**
+   * The managed source saying it has enough.
+   *
+   * What is already queued still goes in -- it was converted, and a few
+   * fragments are cheaper to append than to convert again -- but nothing more
+   * is taken until it asks. This is the whole point of the managed source: it
+   * knows what the radio and the battery are doing and the page does not.
+   */
+  #onEndStreaming = (): void => {
+    this.#streaming = false;
+    this.#updateRoom();
+    this.#updateBlocked();
   };
 
   #onSourceBufferError = (): void => {
@@ -462,10 +618,23 @@ export class MseSink implements FragmentSink {
   #updateRoom(): void {
     const room =
       !this.#quotaBlocked &&
+      this.#streaming &&
       this.#ahead() < this.#options.maxAheadSeconds &&
       this.#queuedBytes < this.#options.queueHighWaterMark &&
       this.#queue.length < QUEUE_HIGH_WATER_FRAGMENTS;
     if (this.#room.set(room)) this.#options.onReadyChange?.(room);
+  }
+
+  /**
+   * Say whether conversion is waiting on the buffer, whichever of the two
+   * reasons it is: no room left, or a managed source that wants nothing for
+   * now. Both look the same from where the conversion sits.
+   */
+  #updateBlocked(): void {
+    const blocked = this.#quotaBlocked || !this.#streaming;
+    if (blocked === this.#blocked) return;
+    this.#blocked = blocked;
+    this.#options.onBlocked?.(blocked);
   }
 
   /** Wake `finish`, either because everything is appended or because we gave up. */

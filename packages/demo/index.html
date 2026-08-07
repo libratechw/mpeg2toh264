@@ -134,8 +134,10 @@
         <label for="placement">MediaSource</label>
         <select id="placement">
           <option value="auto">自動</option>
-          <option value="worker">MSE in Workers</option>
-          <option value="main">メインスレッド</option>
+          <option value="worker">MediaSource (Worker)</option>
+          <option value="main">MediaSource (メイン)</option>
+          <option value="managed-worker">ManagedMediaSource (Worker)</option>
+          <option value="managed-main">ManagedMediaSource (メイン)</option>
         </select>
         <label for="oversample">oversample</label>
         <input id="oversample" type="number" min="0.1" step="0.1" value="2" />

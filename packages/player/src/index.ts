@@ -20,6 +20,10 @@ export {
   supportsPassthrough,
   supportsWorkerMediaSource,
 } from "./player.js";
+export {
+  requiresManagedMediaSource,
+  supportsManagedMediaSource,
+} from "./mse.js";
 export type {
   Mpeg2TsPlayerEventMap,
   Mpeg2TsPlayerOptions,

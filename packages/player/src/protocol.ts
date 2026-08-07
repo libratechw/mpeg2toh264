@@ -154,6 +154,11 @@ export interface LoadCommand {
    */
   serviceId: number | null;
   sink: SinkKind;
+  /**
+   * Open a Managed Media Source where the browser has both. It reaches the
+   * worker because either side may be the one holding the source.
+   */
+  preferManagedMediaSource: boolean;
   queueHighWaterMark: number;
   maxAheadSeconds: number;
   keepBehindSeconds: number;
@@ -171,7 +176,16 @@ export type Command =
 
 export type Notification =
   /** Attach this to the media element. Worker-sink loads only. */
-  | { type: "handle"; id: number; handle: MediaSourceHandle }
+  | {
+      type: "handle";
+      id: number;
+      handle: MediaSourceHandle;
+      /**
+       * Whether it proxies a Managed Media Source, which the element has to be
+       * told about: only the worker can see which one was opened.
+       */
+      managed: boolean;
+    }
   /** Open a `SourceBuffer` and append this. Main-sink loads only. */
   | { type: "open"; id: number; mimeCodec: string; data: ArrayBuffer }
   /** Append this. Main-sink loads only. */

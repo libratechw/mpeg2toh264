@@ -6,7 +6,11 @@
  * attaching the source to the element, moving the playhead, and telling the
  * worker where playback has got to.
  */
-import { MseSink } from "./mse.js";
+import {
+  mediaSourceConstructsInWorker,
+  mediaSourceSupports,
+  MseSink,
+} from "./mse.js";
 import {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_MAX_AHEAD_SECONDS,
@@ -61,6 +65,15 @@ export interface Mpeg2TsPlayerOptions {
    * browser has MSE in Workers, and the page otherwise.
    */
   mediaSource?: "auto" | "worker" | "main";
+  /**
+   * Open a Managed Media Source where the browser has both.
+   *
+   * An iPhone has only the managed one and gets it whatever this says -- that
+   * is what makes the player work there at all. Everywhere both exist the
+   * plain one is used by default; setting this asks for the managed one, which
+   * is how to see on a desktop what an iPhone will do with a stream.
+   */
+  preferManagedMediaSource?: boolean;
   /** The quantiser search factor. Higher is slower and closer to the source. */
   oversample?: number;
   /** Number of MPEG-2 GOPs between non-IDR recovery points. */
@@ -156,12 +169,15 @@ export interface Mpeg2TsPlayerEventMap {
  * provides, and it ships alongside the `srcObject` support a transferred
  * handle needs. Without it the page keeps the MediaSource, which is where
  * Firefox and Safari are today.
+ *
+ * The two implementations are asked separately, since a browser may expose one
+ * to a worker and not the other: pass the same `preferManagedMediaSource` the
+ * player will be given, or the answer is about the wrong one.
  */
-export function supportsWorkerMediaSource(): boolean {
-  return (
-    typeof MediaSource !== "undefined" &&
-    MediaSource.canConstructInDedicatedWorker === true
-  );
+export function supportsWorkerMediaSource(
+  preferManagedMediaSource = false,
+): boolean {
+  return mediaSourceConstructsInWorker(preferManagedMediaSource);
 }
 
 /** What a passthrough load opens its SourceBuffer with. */
@@ -174,12 +190,12 @@ const PASSTHROUGH_MIME = 'video/mp4; codecs="mp4v.61"';
  * exactly as it was broadcast, but it is only playable where the browser has
  * an MPEG-2 decoder, which is not something to assume: ask here first and
  * convert to H.264 wherever the answer is no.
+ *
+ * The two implementations of Media Source Extensions answer for themselves, so
+ * this takes the same `preferManagedMediaSource` the player will be given.
  */
-export function supportsPassthrough(): boolean {
-  return (
-    typeof MediaSource !== "undefined" &&
-    MediaSource.isTypeSupported(PASSTHROUGH_MIME)
-  );
+export function supportsPassthrough(preferManagedMediaSource = false): boolean {
+  return mediaSourceSupports(PASSTHROUGH_MIME, preferManagedMediaSource);
 }
 
 function toError(error: unknown): Error {
@@ -223,6 +239,10 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** The sink, when the page owns the MediaSource. */
   #sink: MseSink | null = null;
   #objectUrl: string | null = null;
+  /** The `<source>` child a Managed Media Source needs; see #attachManaged. */
+  #source: HTMLSourceElement | null = null;
+  /** Whether remote playback was turned off here, and so is ours to turn back. */
+  #disabledRemotePlayback = false;
   #playhead: ReturnType<typeof setInterval> | null = null;
   #pending: { resolve: () => void; reject: (error: Error) => void } | null =
     null;
@@ -247,7 +267,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     const preference = options.mediaSource ?? "auto";
     this.#sinkKind =
       preference === "auto"
-        ? supportsWorkerMediaSource()
+        ? supportsWorkerMediaSource(options.preferManagedMediaSource)
           ? "worker"
           : "main"
         : preference;
@@ -341,7 +361,10 @@ export class Mpeg2TsPlayer extends EventTarget {
   load(url: string | URL): Promise<void> {
     if (this.#destroyed)
       return Promise.reject(new Error("the player has been destroyed"));
-    if (this.#sinkKind === "worker" && !supportsWorkerMediaSource()) {
+    if (
+      this.#sinkKind === "worker" &&
+      !supportsWorkerMediaSource(this.#options.preferManagedMediaSource)
+    ) {
       return Promise.reject(
         new Error("this browser cannot construct a MediaSource in a worker"),
       );
@@ -374,6 +397,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       passthrough: this.#options.passthrough ?? false,
       serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
+      preferManagedMediaSource: this.#options.preferManagedMediaSource ?? false,
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
       maxAheadSeconds:
@@ -463,6 +487,10 @@ export class Mpeg2TsPlayer extends EventTarget {
     if (notification.id !== this.#generation) return;
     switch (notification.type) {
       case "handle":
+        // A handle is attached the one way it can be, so the `<source>` child
+        // #attachManaged uses is not on offer here; what a managed source
+        // still needs is the element to have given up remote playback.
+        if (notification.managed) this.#disableRemotePlayback();
         // MediaProvider was last widened before MSE in Workers shipped, so it
         // still does not list MediaSourceHandle. This assignment is the entire
         // point of the handle.
@@ -547,7 +575,15 @@ export class Mpeg2TsPlayer extends EventTarget {
     // A seek opens the stream again, with the initialization segment of
     // wherever it landed. The MediaSource behind it is the same one: rebuilding
     // it would take the element's playback state with it.
-    const sink = this.#sink ?? this.#createSink(id);
+    let sink: MseSink;
+    try {
+      // Making one is where a browser with no Media Source Extensions at all
+      // says so, and the load is what has to hear it.
+      sink = this.#sink ?? this.#createSink(id);
+    } catch (error) {
+      this.#fail(toError(error));
+      return;
+    }
     sink.open(mimeCodec, data).then(
       // The worker is waiting on flow to know the open succeeded. Going
       // through ready() rather than saying true covers the case where the
@@ -564,6 +600,7 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #createSink(id: number): MseSink {
     const sink = new MseSink({
+      preferManaged: this.#options.preferManagedMediaSource,
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
       maxAheadSeconds:
@@ -585,10 +622,45 @@ export class Mpeg2TsPlayer extends EventTarget {
     });
     this.#sink = sink;
     this.#objectUrl = URL.createObjectURL(sink.mediaSource);
-    this.video.src = this.#objectUrl;
+    if (sink.managed) this.#attachManaged(this.#objectUrl);
+    else this.video.src = this.#objectUrl;
     this.#mark("attached", now());
     if (this.#duration !== null) sink.setDuration(this.#duration);
     return sink;
+  }
+
+  /**
+   * Put a Managed Media Source on the element, which takes more than a `src`.
+   *
+   * Safari leaves one closed until the element has given up remote playback --
+   * AirPlay has nowhere to send a source the page is feeding, so the two are
+   * mutually exclusive -- and until the URL is on a `<source>` child rather
+   * than the attribute. Neither is optional: miss one and `sourceopen` never
+   * arrives and the load waits for a stream that has not begun.
+   */
+  #attachManaged(url: string): void {
+    this.video.removeAttribute("src");
+    this.#disableRemotePlayback();
+    const source = document.createElement("source");
+    source.type = "video/mp4";
+    source.src = url;
+    this.video.append(source);
+    this.#source = source;
+    // A source child is not a src: nothing is loaded until the element is told
+    // to look at what it has been given.
+    this.video.load();
+  }
+
+  /**
+   * Rule out AirPlay, which a managed source cannot be sent over and which
+   * Safari will not open one until the element has given up. The element
+   * belongs to whoever made it, so it is put back on the way out -- unless it
+   * was already off, and theirs to keep.
+   */
+  #disableRemotePlayback(): void {
+    if (this.video.disableRemotePlayback) return;
+    this.video.disableRemotePlayback = true;
+    this.#disabledRemotePlayback = true;
   }
 
   #drainSink(): void {
@@ -700,6 +772,12 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#sink = null;
     if (this.#objectUrl) URL.revokeObjectURL(this.#objectUrl);
     this.#objectUrl = null;
+    this.#source?.remove();
+    this.#source = null;
+    if (this.#disabledRemotePlayback) {
+      this.video.disableRemotePlayback = false;
+      this.#disabledRemotePlayback = false;
+    }
     this.video.removeAttribute("src");
     this.video.srcObject = null;
     this.video.load();
