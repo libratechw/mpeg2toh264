@@ -753,6 +753,25 @@ fn fixed16_16(value: u32) -> u32 {
     ((value as u64) << 16) as u32
 }
 
+/// How wide the track is to be seen, in 16.16 fixed point: the coded width with
+/// the sample aspect ratio applied.
+///
+/// `tkhd` carries a display size, not a coded one, and the two differ for every
+/// anamorphic broadcast -- 1440x1080 at 16:9 is 1920 wide on the screen. A
+/// reader that takes the sample entry's `pasp` reaches the same number without
+/// this, which is why ffmpeg and the browsers that parse the file themselves
+/// were content; AVFoundation takes the track's, so on Safari the picture was
+/// declared 4:3 while being painted 16:9 inside it. Rounded as ffmpeg rounds it,
+/// keeping the fraction of a ratio that does not divide the width evenly.
+fn track_width(width: u32, sample_aspect_ratio: Option<SampleAspectRatio>) -> u32 {
+    let Some(sar) = sample_aspect_ratio.filter(|sar| sar.width > 0 && sar.height > 0) else {
+        return fixed16_16(width);
+    };
+    let scaled = u64::from(width) * u64::from(sar.width) * 65536;
+    let denominator = u64::from(sar.height);
+    ((scaled + denominator / 2) / denominator) as u32
+}
+
 /// The unity 3x3 display matrix every track here uses, in 16.16 fixed point.
 fn identity_matrix(buf: &mut Buf) {
     buf.u32(0x0001_0000).u32(0).u32(0);
@@ -789,7 +808,8 @@ fn make_init_segment(
         body.u32(0).u32(0).u32(1).u32(0).u32(0).zeros(8);
         body.u16(0).u16(0).u16(0).u16(0);
         identity_matrix(&mut body);
-        body.u32(fixed16_16(width)).u32(fixed16_16(height));
+        body.u32(track_width(width, sample_aspect_ratio))
+            .u32(fixed16_16(height));
         full_box("tkhd", 0, 7, &body.into_vec())
     };
     let mdhd = {
@@ -1611,5 +1631,19 @@ mod tests {
             mpeg2_sync_samples(&passthrough_unit(true), false),
             vec![false; 6]
         );
+    }
+
+    #[test]
+    fn the_track_is_as_wide_as_the_picture_is_to_be_seen() {
+        let sar = |width, height| Some(SampleAspectRatio { width, height });
+        // The two anamorphic shapes a broadcast comes in, and the square
+        // sample that needs no stretch at all.
+        assert_eq!(track_width(1440, sar(4, 3)), fixed16_16(1920));
+        assert_eq!(track_width(720, sar(8, 9)), fixed16_16(640));
+        assert_eq!(track_width(1920, sar(1, 1)), fixed16_16(1920));
+        assert_eq!(track_width(1920, None), fixed16_16(1920));
+        // A ratio that does not divide the width evenly keeps its fraction
+        // rather than landing on a pixel: 704 * 40 / 33 is 853 and a third.
+        assert_eq!(track_width(704, sar(40, 33)), 853 * 65536 + 21845);
     }
 }
