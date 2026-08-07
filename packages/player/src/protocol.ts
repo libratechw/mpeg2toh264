@@ -148,6 +148,19 @@ export interface LoadCommand {
    */
   passthrough: boolean;
   /**
+   * How many workers convert pictures alongside the one that owns the session.
+   *
+   * A group of pictures divides into frames that have nothing to say to each
+   * other, so they can be converted at once; what cannot be divided is under a
+   * tenth of the work. Undefined sizes it from `hardwareConcurrency`, and 1
+   * converts them in the session's own worker as it always did.
+   *
+   * The output does not depend on this. Where a worker cannot spawn workers
+   * the pool is quietly not there, and the `workers` notification says what
+   * was settled on.
+   */
+  pictureWorkers: number | undefined;
+  /**
    * Which service to convert, out of a transport stream that carries more than
    * one. Null takes the first that turns up with a picture in it, which is
    * what a recording of a single programme has anyway.
@@ -226,6 +239,11 @@ export type Notification =
    * converted. Sent once the program tables have been read, and again after a
    * seek re-reads them.
    */
+  /**
+   * How many picture workers came up, which is zero where this browser would
+   * not have them and the conversion runs in one worker as before.
+   */
+  | { type: "workers"; id: number; pictureWorkers: number }
   | { type: "services"; id: number; services: Services }
   | { type: "private_stream_1"; id: number; stream: PrivateStream }
   | { type: "private_stream_2"; id: number; stream: PrivateStream }

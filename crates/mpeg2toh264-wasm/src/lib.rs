@@ -6,7 +6,8 @@
 //! What is here turns Rust values into the shapes JavaScript expects.
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
-use mpeg2toh264::{Fragment, TranscodeOptions, VideoMode};
+use mpeg2toh264::job::PictureOutput;
+use mpeg2toh264::{Fragment, Progress, TranscodeOptions, VideoMode};
 use wasm_bindgen::prelude::*;
 
 /// The shape of what [`Session::push`] returns, declared so the browser sources
@@ -49,12 +50,28 @@ export type Fragment =
       /** Absolute 90 kHz timestamp, or null when no media clock is available. */
       pts: number | null;
     };
+
+/**
+ * How far a session got, for a caller converting the pictures itself.
+ *
+ * `jobs` is one opaque buffer per picture. Hand each to `PictureEncoder.encode`
+ * -- here, or in as many workers as there are to spare -- and give the results
+ * back to `Session.complete` in the same order. Until then the session produces
+ * nothing further.
+ */
+export type Progress = {
+  fragments: Fragment[];
+  /** Empty when nothing is owed. */
+  jobs: Uint8Array[];
+};
 "#;
 
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(typescript_type = "Fragment[]")]
     pub type FragmentArray;
+    #[wasm_bindgen(typescript_type = "Progress")]
+    pub type ProgressObject;
 }
 
 /// Streaming transcode of one transport stream.
@@ -201,6 +218,80 @@ impl Session {
     pub fn finish(&mut self) -> Result<FragmentArray, JsError> {
         to_js_array(self.inner.finish().map_err(to_js_error)?)
     }
+
+    /// [`Session::push`], for a caller that converts the pictures itself.
+    ///
+    /// Stops at the first unit whose video has to be coded and hands its
+    /// pictures back as `jobs`. Nothing more comes out of the session until
+    /// those are returned to `complete`.
+    #[wasm_bindgen(js_name = pushDeferred)]
+    pub fn push_deferred(&mut self, chunk: &[u8]) -> Result<ProgressObject, JsError> {
+        to_js_progress(self.inner.push_deferred(chunk).map_err(to_js_error)?)
+    }
+
+    /// [`Session::finish`], for the same caller. Call it until `jobs` is empty.
+    #[wasm_bindgen(js_name = finishDeferred)]
+    pub fn finish_deferred(&mut self) -> Result<ProgressObject, JsError> {
+        to_js_progress(self.inner.finish_deferred().map_err(to_js_error)?)
+    }
+
+    /// Hand back one converted picture per job, in the order they were given
+    /// out, and carry on.
+    pub fn complete(&mut self, outputs: Vec<Uint8Array>) -> Result<ProgressObject, JsError> {
+        let outputs: Result<Vec<PictureOutput>, JsError> = outputs
+            .iter()
+            .map(|output| PictureOutput::decode(&output.to_vec()).map_err(to_js_error))
+            .collect();
+        to_js_progress(self.inner.complete(&outputs?).map_err(to_js_error)?)
+    }
+}
+
+/// Converts one picture at a time, and nothing else.
+///
+/// This is what a picture worker holds. It knows nothing of the stream around
+/// it -- everything a picture is coded against arrives with it -- so a pool of
+/// these, each in its own worker and so its own WebAssembly instance, converts
+/// a unit's pictures at the same time without sharing any memory.
+///
+/// ```js
+/// const encoder = new PictureEncoder();
+/// self.onmessage = ({ data: job }) => {
+///   const output = encoder.encode(job);
+///   self.postMessage(output, [output.buffer]);
+/// };
+/// ```
+///
+/// Keep one for as long as the worker lives: what it holds between pictures is
+/// several megabytes of scratch at an HD macroblock count, and asking the
+/// allocator for that per picture costs more than the coding does.
+#[wasm_bindgen]
+pub struct PictureEncoder {
+    inner: mpeg2toh264::PictureEncoder,
+}
+
+#[wasm_bindgen]
+impl PictureEncoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: mpeg2toh264::PictureEncoder::new(),
+        }
+    }
+
+    /// Convert one of the jobs a `Progress` handed out. The result is opaque
+    /// and goes straight back to `Session.complete`; a picture whose slices
+    /// will not decode comes back as a result saying so rather than as an
+    /// error, because that is a fact about the source and not a failure here.
+    pub fn encode(&mut self, job: &[u8]) -> Result<Uint8Array, JsError> {
+        let output = self.inner.encode(job).map_err(to_js_error)?;
+        Ok(Uint8Array::from(output.encode().as_slice()))
+    }
+}
+
+impl Default for PictureEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The last presentation timestamp in a slice of transport stream, in 90 kHz
@@ -224,6 +315,21 @@ pub fn last_timestamp(data: &[u8]) -> Option<f64> {
 #[wasm_bindgen(js_name = firstTimestamp)]
 pub fn first_timestamp(data: &[u8]) -> Option<f64> {
     mpeg2toh264::first_pts(data).map(|ticks| ticks as f64)
+}
+
+fn to_js_progress(progress: Progress) -> Result<ProgressObject, JsError> {
+    let (fragments, jobs) = match progress {
+        Progress::Idle(fragments) => (fragments, Vec::new()),
+        Progress::Pending { fragments, jobs } => (fragments, jobs),
+    };
+    let object = Object::new();
+    set(&object, "fragments", &to_js_array(fragments)?.into())?;
+    let array = Array::new_with_length(jobs.len() as u32);
+    for (index, job) in jobs.iter().enumerate() {
+        array.set(index as u32, copy_out(job));
+    }
+    set(&object, "jobs", &array.into())?;
+    Ok(JsValue::from(object).unchecked_into())
 }
 
 fn to_js_array(fragments: Vec<Fragment>) -> Result<FragmentArray, JsError> {

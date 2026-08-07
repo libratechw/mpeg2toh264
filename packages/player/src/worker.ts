@@ -25,6 +25,7 @@ import {
   type Services,
   type TimingMark,
 } from "./protocol.js";
+import { defaultPoolSize, PicturePool } from "./pool.js";
 import { openSource, readSlice, readTail, type Source } from "./source.js";
 import {
   detach,
@@ -232,6 +233,13 @@ class Playback {
   /** Which leg is current. Anything from an older one is dropped. */
   #legNumber = 0;
   #transcoder: Transcoder | null = null;
+  /**
+   * The workers converting pictures, or null where this browser will not have
+   * them. It outlives a leg -- a seek reopens the input, not the pool -- and
+   * is shut down with the load.
+   */
+  #pool: PicturePool | null = null;
+  #openedPool = false;
   /** Private PES packets waiting for the media timeline origin to be known. */
   #private: Array<Extract<Fragment, { kind: "private-stream" }>> = [];
   /** Wall time the read loop spent on each of the two things it waits for. */
@@ -389,8 +397,31 @@ class Playback {
     this.#legNumber++;
     this.#transcoder?.free();
     this.#transcoder = null;
+    this.#pool?.terminate();
+    this.#pool = null;
     this.#private = [];
     this.#sink.close();
+  }
+
+  /**
+   * Bring the picture workers up, once per load.
+   *
+   * A pool is an optimisation and never a requirement: where a worker cannot
+   * spawn workers the session converts the pictures itself, exactly as it did
+   * before there was a pool, and the output is the same either way. So this
+   * says what it settled on and carries on regardless.
+   */
+  async #openPool(module: WebAssembly.Module): Promise<void> {
+    if (this.#openedPool) return;
+    this.#openedPool = true;
+    const wanted = this.#command.pictureWorkers ?? defaultPoolSize();
+    if (wanted <= 1) return;
+    this.#pool = await PicturePool.create(module, wanted);
+    post({
+      type: "workers",
+      id: this.#command.id,
+      pictureWorkers: this.#pool?.size ?? 0,
+    });
   }
 
   /**
@@ -463,9 +494,11 @@ class Playback {
     const signal = this.#leg!.signal;
     const id = this.#command.id;
     try {
-      await loadWasm(this.#command.wasmUrl);
+      const module = await loadWasm(this.#command.wasmUrl);
       if (!this.#running(leg)) return;
       mark(id, "wasm");
+      await this.#openPool(module);
+      if (!this.#running(leg)) return;
       const source = await openSource(this.#command.url, signal, offset);
       if (!this.#running(leg)) return;
       mark(id, "response");
@@ -490,6 +523,7 @@ class Playback {
         this.#command.splitFieldSamples,
         this.#command.passthrough,
       );
+      converter.usePool(this.#pool);
       this.#transcoder = converter;
       await this.#convert(leg, source, converter);
     } catch (error) {
@@ -624,7 +658,8 @@ class Playback {
       queuedBytes -= chunk.byteLength;
       available.set(chunks.length > 0 || ended);
       if (queuedBytes <= INPUT_QUEUE_LOW_WATER_BYTES) refill.set(true);
-      const fragments = converter.push(chunk);
+      const fragments = await converter.push(chunk);
+      if (!this.#running(leg)) return;
       this.#announceServices(id, converter);
       if (
         !converted &&
@@ -644,7 +679,8 @@ class Playback {
     }
     await reading;
     if (readError) throw readError;
-    const final = converter.finish();
+    const final = await converter.finish();
+    if (!this.#running(leg)) return;
     this.#place(converter);
     if (!(await this.#deliver(leg, final))) return;
     this.#report(converter);

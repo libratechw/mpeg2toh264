@@ -100,6 +100,23 @@ export interface Mpeg2TsPlayerOptions {
    */
   passthrough?: boolean;
   /**
+   * How many workers convert pictures alongside the one running the
+   * conversion.
+   *
+   * A group of pictures divides into frames that have nothing to say to each
+   * other, so several can be converted at once; what cannot be divided --
+   * demuxing, the plan, the muxing -- is under a tenth of the work. Left
+   * unset, this follows `hardwareConcurrency` up to a small cap; 1 converts
+   * every picture in the one worker, as before there was a pool.
+   *
+   * The output does not depend on it, and neither does playback: where a
+   * worker cannot spawn workers there is simply no pool. The `workers` event
+   * says what was settled on. Each worker costs its own scratch, which at an
+   * HD macroblock count is tens of megabytes, so this is worth turning down
+   * where memory matters more than speed.
+   */
+  pictureWorkers?: number;
+  /**
    * Which service to convert, out of a transport stream carrying more than
    * one. Left unset, the first that turns up with a picture in it. The
    * `services` event says what a given input is offering.
@@ -141,6 +158,12 @@ export interface Mpeg2TsPlayerEventMap {
    * choice, which `serviceId` makes on the next `load()`. See `Services`.
    */
   services: CustomEvent<Services>;
+  /**
+   * How many workers ended up converting pictures alongside the conversion,
+   * which is zero where this browser would not have them and the pictures are
+   * converted in the one worker as before. Arrives once per load.
+   */
+  workers: CustomEvent<{ pictureWorkers: number }>;
   /** A private_stream_1 (stream_id 0xbd) PES payload from the selected service. */
   private_stream_1: CustomEvent<PrivateStream>;
   /** A private_stream_2 (stream_id 0xbf) PES payload from the selected service. */
@@ -395,6 +418,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       recoveryInterval: this.#options.recoveryInterval,
       splitFieldSamples: this.#options.splitFieldSamples,
       passthrough: this.#options.passthrough ?? false,
+      pictureWorkers: this.#options.pictureWorkers,
       serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
       preferManagedMediaSource: this.#options.preferManagedMediaSource ?? false,
@@ -526,6 +550,11 @@ export class Mpeg2TsPlayer extends EventTarget {
         // wrong moves every other line half a field the wrong way.
         this.#applyDeinterlace();
         this.#emit("scan", notification.scan);
+        break;
+      case "workers":
+        this.#emit("workers", {
+          pictureWorkers: notification.pictureWorkers,
+        });
         break;
       case "services":
         this.#emit("services", notification.services);

@@ -26,6 +26,8 @@ const fileInput = document.querySelector<HTMLInputElement>("#file")!;
 const unload = document.querySelector<HTMLButtonElement>("#unload")!;
 const placement = document.querySelector<HTMLSelectElement>("#placement")!;
 const oversample = document.querySelector<HTMLInputElement>("#oversample")!;
+const pictureWorkers =
+  document.querySelector<HTMLInputElement>("#picture-workers")!;
 const recoveryInterval =
   document.querySelector<HTMLInputElement>("#recovery-interval")!;
 const playPause = document.querySelector<HTMLButtonElement>("#playpause")!;
@@ -106,6 +108,8 @@ let progress = "";
 let counts = "";
 let length = "";
 let scan = "";
+/** How many workers the conversion ended up spread over, once it says. */
+let workers = "";
 /** How long the input is, once it turns out to be one that can be seeked. */
 let duration: number | null = null;
 /** Whether the bar is being dragged, which owns the position until let go. */
@@ -118,8 +122,9 @@ function setStatus(message: string, error = false) {
 
 function setDetails() {
   details.textContent =
-    [label, length, scan, progress, counts].filter(Boolean).join(" ") ||
-    IDLE_DETAILS;
+    [label, length, scan, workers, progress, counts]
+      .filter(Boolean)
+      .join(" ") || IDLE_DETAILS;
 }
 
 /** Whether MPEG-2 can reach the decoder at all, which is for the browser to say. */
@@ -157,6 +162,7 @@ const PLACEMENTS: Record<
 const LOAD_TIME_ONLY = [
   placement,
   oversample,
+  pictureWorkers,
   recoveryInterval,
   splitFieldSamples,
   passthrough,
@@ -183,6 +189,10 @@ function createPlayer(): Mpeg2TsPlayer {
     mediaSource: chosen.mediaSource,
     preferManagedMediaSource: chosen.managed,
     oversample: Number(oversample.value),
+    // Blank leaves it to the player, which sizes it from the machine.
+    pictureWorkers: pictureWorkers.value
+      ? Number(pictureWorkers.value)
+      : undefined,
     recoveryInterval: Number(recoveryInterval.value),
     splitFieldSamples: splitFieldSamples.checked,
     serviceId: wantedService ?? undefined,
@@ -238,6 +248,14 @@ function createPlayer(): Mpeg2TsPlayer {
   // A recording of one programme announces one service and the control stays
   // out of the way. One that carries a broadcaster's sub-channel as well is
   // offering a choice nothing but a viewer can make, so it goes on the page.
+  created.addEventListener("workers", (event) => {
+    const count = event.detail.pictureWorkers;
+    // Zero means this browser would not have a pool, and the pictures are
+    // being converted in the one worker that runs the conversion.
+    workers = count > 0 ? `変換ワーカー ${count}` : "変換ワーカーなし";
+    setDetails();
+  });
+
   created.addEventListener("services", (event) => {
     const { available, current } = event.detail;
     if (available.length < 2) {
@@ -379,6 +397,7 @@ function play(
   counts = "";
   length = "";
   scan = "";
+  workers = "";
   duration = null;
   seek.value = "0";
   fps.textContent = IDLE_FPS;
@@ -417,6 +436,7 @@ function unloadSource() {
   counts = "";
   length = "";
   scan = "";
+  workers = "";
   duration = null;
   scrubbing = false;
   seek.value = "0";

@@ -10,7 +10,9 @@ import init, {
   lastTimestamp as wasmLastTimestamp,
   Session,
   type Fragment,
+  type Progress,
 } from "../wasm/mpeg2toh264_wasm.js";
+import type { PicturePool } from "./pool.js";
 import type { Stats } from "./protocol.js";
 
 export type { Fragment };
@@ -21,14 +23,38 @@ const DEFAULT_WASM_URL = new URL(
   import.meta.url,
 );
 
-let loaded: { url: string; module: Promise<unknown> } | null = null;
+let loaded: { url: string; module: Promise<WebAssembly.Module> } | null = null;
 
-/** Instantiate the module once per worker, however many loads run through it. */
-export function loadWasm(wasmUrl: string | null): Promise<unknown> {
+/**
+ * Instantiate the module once per worker, however many loads run through it,
+ * and keep what it was compiled from.
+ *
+ * The compiled module is what the picture workers are started with: a
+ * `WebAssembly.Module` goes over `postMessage` as it stands, so the bytes are
+ * fetched and compiled here and nowhere else however many workers there are.
+ */
+export function loadWasm(wasmUrl: string | null): Promise<WebAssembly.Module> {
   const url = wasmUrl ?? DEFAULT_WASM_URL.href;
-  if (loaded?.url !== url)
-    loaded = { url, module: init({ module_or_path: url }) };
+  if (loaded?.url !== url) loaded = { url, module: compileAndInit(url) };
   return loaded.module;
+}
+
+async function compileAndInit(url: string): Promise<WebAssembly.Module> {
+  const module = await compile(url);
+  await init({ module_or_path: module });
+  return module;
+}
+
+async function compile(url: string): Promise<WebAssembly.Module> {
+  try {
+    return await WebAssembly.compileStreaming(fetch(url));
+  } catch {
+    // Streaming compilation insists on an `application/wasm` content type, and
+    // not every way of serving this sets one. Reading the bytes first works
+    // whatever the server says they are.
+    const response = await fetch(url);
+    return WebAssembly.compile(await response.arrayBuffer());
+  }
 }
 
 /**
@@ -50,6 +76,7 @@ export function firstTimestamp(data: Uint8Array): number | null {
 
 export class Transcoder {
   #session: Session;
+  #pool: PicturePool | null = null;
   #totalMs = 0;
   #totalFrames = 0;
   #intervalMs = 0;
@@ -101,12 +128,52 @@ export class Transcoder {
     return Array.from(this.#session.serviceIds);
   }
 
-  push(chunk: Uint8Array): Fragment[] {
-    return this.#timed(() => this.#session.push(chunk));
+  /**
+   * Convert the pictures of every unit in a pool rather than here.
+   *
+   * Null puts them back on this thread, which is what happens where a worker
+   * cannot spawn workers. The output is the same either way; only where the
+   * coding runs changes.
+   */
+  usePool(pool: PicturePool | null): void {
+    this.#pool = pool;
   }
 
-  finish(): Fragment[] {
-    return this.#timed(() => this.#session.finish());
+  async push(chunk: Uint8Array): Promise<Fragment[]> {
+    if (!this.#pool) return this.#timed(() => this.#session.push(chunk));
+    return this.#deferred(() => this.#session.pushDeferred(chunk));
+  }
+
+  async finish(): Promise<Fragment[]> {
+    if (!this.#pool) return this.#timed(() => this.#session.finish());
+    return this.#deferred(() => this.#session.finishDeferred());
+  }
+
+  /**
+   * Run one step of the session and satisfy whatever it asks for, until it
+   * asks for nothing.
+   *
+   * Completing a unit lets the session reach the one behind it, so this runs
+   * down everything that is ready rather than one unit per call.
+   *
+   * The time counted is the wall clock across the whole of it, pool included,
+   * which is what the rate on screen should mean: how fast the conversion is
+   * going, rather than how busy this thread was while it went.
+   */
+  async #deferred(step: () => Progress): Promise<Fragment[]> {
+    const started = performance.now();
+    const fragments: Fragment[] = [];
+    let progress = step();
+    for (;;) {
+      fragments.push(...progress.fragments);
+      if (progress.jobs.length === 0) break;
+      progress = this.#session.complete(await this.#pool!.run(progress.jobs));
+    }
+    const elapsed = performance.now() - started;
+    this.#totalMs += elapsed;
+    this.#intervalMs += elapsed;
+    this.#account(fragments);
+    return fragments;
   }
 
   /** Rust memory, so dropping the reference would not be enough. */
@@ -145,6 +212,14 @@ export class Transcoder {
     const started = performance.now();
     const fragments = run();
     const elapsed = performance.now() - started;
+    this.#totalMs += elapsed;
+    this.#intervalMs += elapsed;
+    this.#account(fragments);
+    return fragments;
+  }
+
+  /** Count what a batch of fragments carried, however it was converted. */
+  #account(fragments: Fragment[]): void {
     let videoFrames = 0;
     for (const fragment of fragments) {
       if (fragment.kind !== "media") continue;
@@ -152,11 +227,8 @@ export class Transcoder {
       this.#audioFrames += fragment.audioSamples;
     }
     this.#videoFrames += videoFrames;
-    this.#totalMs += elapsed;
     this.#totalFrames += videoFrames;
-    this.#intervalMs += elapsed;
     this.#intervalFrames += videoFrames;
-    return fragments;
   }
 }
 

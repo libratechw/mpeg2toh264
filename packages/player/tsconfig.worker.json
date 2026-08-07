@@ -5,6 +5,8 @@
   },
   "include": [
     "src/worker.ts",
+    "src/picture-worker.ts",
+    "src/pool.ts",
     "src/transcoder.ts",
     "src/source.ts",
     "src/mse.ts",
