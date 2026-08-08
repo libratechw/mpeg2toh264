@@ -30,6 +30,15 @@ import {
 } from "./protocol.js";
 
 /**
+ * How far from the edge of a buffered range still counts as being at it.
+ *
+ * A media element stops a little before the last sample it holds -- it will not
+ * start a frame it cannot finish -- and the ranges are reported to whatever
+ * precision the buffer keeps them in. Both are well inside a frame.
+ */
+const GAP_EPSILON = 0.1;
+
+/**
  * The media element events worth timing, in the order they normally arrive.
  *
  * These are the second half of the picture: everything before `opened` is what
@@ -733,7 +742,47 @@ export class Mpeg2TsPlayer extends EventTarget {
   #onTimedEvent = (event: Event): void => {
     if (this.#state === "idle") return;
     this.#mark(event.type as TimingMark, now());
+    if (event.type === "waiting") this.#crossGap();
   };
+
+  /**
+   * Move the playhead over a hole in the media, where playback has stopped at
+   * one.
+   *
+   * The conversion leaves the media where the source put it, so a recording
+   * joined from two takes has a real gap between them rather than one closed up
+   * -- closing it would move everything after it, and the captions, which carry
+   * the source's own timestamps, would be out by the length of the gap for the
+   * rest of the stream. A browser stops at a gap and waits, so somebody has to
+   * step over it, and it is this side: it is the one that knows the playhead.
+   *
+   * Only where media is already buffered past the hole, which is what
+   * distinguishes a hole from the ordinary wait for the converter to catch up.
+   *
+   * Read from the media element rather than from the sink: what stops playback
+   * is the element's own view, which is the tracks' ranges taken together, and
+   * it is the one reading available whether the `MediaSource` is here or in the
+   * worker.
+   */
+  #crossGap(): void {
+    if (this.video.seeking) return;
+    const time = this.video.currentTime;
+    const buffered = this.video.buffered;
+    let next: number | null = null;
+    for (let index = 0; index < buffered.length; index++) {
+      const start = buffered.start(index);
+      // Inside a range with media still ahead: whatever the wait is, it is not
+      // a hole.
+      if (
+        time >= start - GAP_EPSILON &&
+        time < buffered.end(index) - GAP_EPSILON
+      )
+        return;
+      if (start > time + GAP_EPSILON && (next === null || start < next))
+        next = start;
+    }
+    if (next !== null) this.video.currentTime = next;
+  }
 
   /**
    * Report where a step of the load fell on the clock `load()` started.

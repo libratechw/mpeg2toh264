@@ -1193,6 +1193,43 @@ fn a_hole_in_the_recording_does_not_move_what_follows_it() {
 }
 
 #[test]
+fn a_join_between_recordings_is_left_where_the_source_has_it() {
+    // Two takes minutes apart, which is what a recording resumed after a stop
+    // holds. Holding a picture across that would make a viewer sit through the
+    // whole of it, and closing it up would move everything after it -- so the
+    // media keeps its positions and the gap stays in the buffered ranges, where
+    // whoever is driving playback can step over it.
+    const JUMP: u64 = 120 * 90_000;
+    let one = read_fixture("ibbp.m2v");
+    let group = parse_elementary_stream(&one).expect("parses").len() as u64 * (90_000 / 25);
+    let mut units = Vec::new();
+    for copy in 0..6u64 {
+        units.push(PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload: &one,
+            pts: Some(900_000 + copy * group + if copy >= 3 { JUMP } else { 0 }),
+        });
+    }
+    let stream = mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units);
+    let starts = media_starts(&run_session(&stream, 64 * 1024));
+
+    let steps: Vec<f64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let jumped = steps
+        .iter()
+        .filter(|&&step| step > 1.0)
+        .copied()
+        .collect::<Vec<f64>>();
+    assert_eq!(jumped.len(), 1, "one step out of the ordinary in {steps:?}");
+    assert!(
+        (jumped[0] - (JUMP as f64 / 90_000.0) - group as f64 / 90_000.0).abs() < 0.1,
+        "the join is {}s where the source puts it {}s apart",
+        jumped[0],
+        JUMP as f64 / 90_000.0
+    );
+}
+
+#[test]
 fn a_new_audio_configuration_is_described_again() {
     // A broadcast changes what its sound is between programmes, and the
     // initialization segment carries the audio configuration in its `esds` just

@@ -34,10 +34,9 @@ const TIMESCALE: u64 = 90_000;
 const MAX_CONCEALED_AUDIO_FRAMES: u64 = 8;
 
 /// Beyond this, a jump in the timestamps is not a hole in the recording but a
-/// join between two of them. Holding a picture and playing silence for a jump
-/// like that would freeze the presentation for as long as the jump, so the two
-/// sides are simply put next to each other, which is what a player is given
-/// when a recording is cut.
+/// join between two of them. Holding a picture and playing silence across it
+/// would make a viewer sit through the whole jump, so it is left as a gap in
+/// the presentation instead -- see [`Session::open_a_gap`].
 const MAX_HELD_TICKS: i64 = 30 * TIMESCALE as i64;
 
 /// The PES timestamp field is 33 bits and wraps every 26.5 hours (clause
@@ -332,10 +331,10 @@ pub struct Session {
     /// Where the next unit's first display slot is expected, in the source's
     /// own timestamps. A unit that opens later than this has a hole in front of
     /// it -- pictures the recording lost, or ones that would not decode.
+    ///
+    /// It moves only when a fragment goes out, so a unit that yields none
+    /// leaves its own span to be counted as part of the next one's hole.
     expected_pts: Option<i64>,
-    /// Ticks of hole waiting to be held over, which the next fragment that has
-    /// a sample to hold them with will take.
-    video_hole: u64,
 }
 
 impl Session {
@@ -427,7 +426,6 @@ impl Session {
             timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
             expected_pts: None,
-            video_hole: 0,
         }
     }
 
@@ -690,6 +688,13 @@ impl Session {
             if let Some(silence) = silent_frame(&first.config) {
                 frames.splice(0..0, std::iter::repeat_n(silence, missing as usize));
             }
+        } else {
+            // A jump the video side leaves as a gap. Nothing fills it, so the
+            // count is started again from here rather than staying short of
+            // the clock for the rest of the stream, which would leave every
+            // later hole looking like this one.
+            self.audio_clock_start_pts = Some(pts);
+            self.audio_clock_frames = 0;
         }
         self.audio_clock_frames += frames.len() as u64;
     }
@@ -812,27 +817,34 @@ impl Session {
     /// Only a unit that opens a random access point has a sample to hold with:
     /// the extra copy of its IDR, or its first picture on the passthrough path.
     /// So a hole asks for one, and a unit that cannot provide it -- one with no
-    /// intra picture in it -- leaves the hole to the next.
+    /// intra picture in it -- leaves the hole to the next, which measures it
+    /// from the same place and finds it that much wider.
+    ///
+    /// A jump too long to sit through is left as a gap instead; see
+    /// [`Session::open_a_gap`].
     fn hold_over_hole(&mut self, gop: &Mpeg2Gop, plan: &mut UnitPlan) -> Result<()> {
-        let hole = match (
+        let (Some(expected), Some(start)) = (
             self.expected_pts,
             Self::unit_start_pts(gop, plan.timeline()),
-        ) {
-            (Some(expected), Some(start)) => {
-                let ahead = (start - expected).rem_euclid(PTS_MODULUS);
-                let sample = plan.timeline().sample_duration as i64;
-                // Less than a picture is the rounding of a source that does not
-                // divide evenly, not a hole.
-                if ahead < sample || ahead > MAX_HELD_TICKS {
-                    0
-                } else {
-                    ahead as u64
-                }
-            }
-            _ => 0,
+        ) else {
+            return Ok(());
         };
-        self.video_hole += hole;
-        if self.video_hole == 0 {
+        // Signed, across the wrap: a unit that opens a little before the one
+        // ahead of it ended is the ordinary case -- the sample held over a
+        // random access point's leading slots is rounded up to a tick where
+        // there are none -- and the difference has to come out negative rather
+        // than as most of the 26.5 hours the field wraps in.
+        let mut ahead = (start - expected).rem_euclid(PTS_MODULUS);
+        if ahead > PTS_MODULUS / 2 {
+            ahead -= PTS_MODULUS;
+        }
+        // Less than a picture is that rounding, or a source whose frame rate
+        // does not divide evenly. Neither is a hole.
+        if ahead < plan.timeline().sample_duration as i64 {
+            return Ok(());
+        }
+        if ahead > MAX_HELD_TICKS {
+            self.open_a_gap(ahead as u64, start);
             return Ok(());
         }
         if !self.starts_at_idr() {
@@ -841,8 +853,33 @@ impl Session {
             // and this one no longer does.
             *plan = self.plan_unit(&gop.data, true)?;
         }
-        plan.timeline_mut().hold_ticks = self.video_hole as u32;
+        plan.timeline_mut().hold_ticks = ahead as u32;
         Ok(())
+    }
+
+    /// Move both tracks past a jump without filling it, leaving the gap in the
+    /// presentation where the source has it.
+    ///
+    /// A jump this long is a join between two recordings rather than a hole in
+    /// one, and holding a picture across it would make a viewer sit through the
+    /// whole of it. Closing it up is not the answer either: that moves
+    /// everything after it, and the captions -- which are placed by the source's
+    /// own timestamps -- would never line up again. So the media keeps its
+    /// positions and the gap stays visible in the buffered ranges, which is
+    /// where whoever is driving playback can see it and move the playhead
+    /// across. That decision needs to know where the viewer is, and this does
+    /// not.
+    fn open_a_gap(&mut self, gap: u64, start: i64) {
+        self.video_presentation_start += gap;
+        if let Some(rate) = self.audio_config.as_ref().map(|config| config.sample_rate) {
+            // The sound is laid down access unit by access unit, so its gap is
+            // a count of the units that would have filled it.
+            let frames = aac_frame_count_through_video_time(gap as i64, rate).max(0) as u64;
+            self.audio_frames_emitted += frames;
+        }
+        // Taken account of, so a second look at the same unit -- which happens
+        // whenever this one is waiting for its sound -- does not take it again.
+        self.expected_pts = Some(start);
     }
 
     /// How many of the frames waiting were coded under the configuration the
@@ -1091,7 +1128,6 @@ impl Session {
         if let Some(start) = Self::unit_start_pts(gop, plan.timeline()) {
             self.expected_pts = Some(start + fragment.duration.saturating_sub(hold) as i64);
         }
-        self.video_hole = 0;
         self.audio_frames_emitted += audio_frames.len() as u64;
         self.gops_emitted += 1;
 
