@@ -137,6 +137,61 @@ fn takes_both_streams_from_one_service() {
     );
 }
 
+/// A station that leaves a multi-channel block updates its own program map to
+/// name different elementary streams: in Japan the standard-definition
+/// sub-channel gives way to the high-definition one, on another PID and at
+/// another frame size. That is the programme carrying on, not another one
+/// being spliced onto it, so the demuxer follows it. Refusing left the video
+/// stopped where the map changed, with everything after it silently dropped.
+#[test]
+fn follows_the_chosen_services_own_map_to_other_streams() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO};
+
+    let before: &[(u16, u8)] = &[
+        (0x200, STREAM_TYPE_MPEG2_VIDEO),
+        (0x210, STREAM_TYPE_AAC_ADTS),
+    ];
+    let after: &[(u16, u8)] = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO),
+        (0x110, STREAM_TYPE_AAC_ADTS),
+    ];
+    let mut stream = mux_programs(
+        &[(101, 0x1f0, before)],
+        &[PesUnit {
+            pid: 0x200,
+            stream_id: 0xe0,
+            pts: Some(9000),
+            payload: &[0xaa],
+        }],
+    );
+    stream.extend_from_slice(&mux_programs(
+        &[(101, 0x1f0, after)],
+        &[PesUnit {
+            pid: 0x100,
+            stream_id: 0xe0,
+            pts: Some(18000),
+            payload: &[0xbb],
+        }],
+    ));
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes");
+    packets.extend(demuxer.finish().expect("flushes"));
+    let video: Vec<(u16, Vec<u8>)> = packets
+        .into_iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .map(|packet| (packet.pid, packet.data))
+        .collect();
+
+    assert_eq!(
+        video,
+        vec![(0x200, vec![0xaa]), (0x100, vec![0xbb])],
+        "both halves of the programme, in order"
+    );
+    assert_eq!(demuxer.service_id(), Some(101), "and it is one service");
+}
+
 /// A data service sits alongside the television it belongs to and names the
 /// same streams. Which of the two program maps a multiplexer sends first is
 /// its own business, and the announcement order is what settles it.

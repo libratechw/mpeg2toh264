@@ -283,6 +283,10 @@ struct ProgramMap {
     /// Set when a scan moved to a service with different streams, so that what
     /// was gathered from the old ones can be thrown away.
     changed_streams: bool,
+    /// Set when the service being read moved its own streams to other PIDs.
+    /// What was gathered from the old ones is the end of the same programme,
+    /// so it goes out rather than being thrown away.
+    moved_streams: bool,
     all_service_pids: HashMap<u16, Vec<u16>>,
     changed_pids: HashSet<u16>,
     assemblers: HashMap<u16, SectionAssembler>,
@@ -302,6 +306,7 @@ impl Default for ProgramMap {
             services: Vec::new(),
             may_switch_streams: true,
             changed_streams: false,
+            moved_streams: false,
             all_service_pids: HashMap::new(),
             changed_pids: HashSet::new(),
             assemblers: HashMap::new(),
@@ -367,7 +372,11 @@ impl ProgramMap {
                 .iter()
                 .position(|&announced| announced == service)
                 .unwrap_or(usize::MAX);
-            if self.service.is_some() && rank >= self.rank {
+            // A map from the service already chosen is not a competitor to be
+            // ranked against it: it is that service saying what it is made of
+            // now, which is how a station announces that its picture has moved
+            // to another elementary stream.
+            if self.service.is_some() && rank >= self.rank && self.service != Some(service) {
                 return;
             }
             let program_info_length = (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
@@ -456,10 +465,30 @@ impl ProgramMap {
             // doing before any of them have been handed on.
             let same_streams =
                 self.video_pid == video && self.audio_pid == audio && self.private_pids == private;
-            if self.service.is_some() && !same_streams && !self.may_switch_streams {
+            // Unless the service saying so is the one being read. A station
+            // that leaves a multi-channel block sends a new version of its own
+            // program map naming different elementary PIDs -- in Japan the
+            // standard-definition sub-channel's video gives way to the
+            // high-definition one -- and that is the same programme carrying
+            // on, not another one being spliced onto it. Refusing it stops the
+            // video where the map changed. The lock is against being pulled
+            // onto a *different* service once its packets have gone out, and
+            // that is left alone.
+            let continues_this_service = self.service == Some(service);
+            if self.service.is_some()
+                && !same_streams
+                && !self.may_switch_streams
+                && !continues_this_service
+            {
                 return;
             }
-            self.changed_streams |= !same_streams && self.service.is_some();
+            if !same_streams && self.service.is_some() {
+                if continues_this_service {
+                    self.moved_streams = true;
+                } else {
+                    self.changed_streams = true;
+                }
+            }
             self.service = Some(service);
             self.rank = rank;
             self.video_pid = video;
@@ -680,9 +709,42 @@ impl MpegTsAvDemuxer {
                 Ok(Some(packet)) => {
                     self.note_continuity(&packet);
                     if self.program.wants(packet.pid) {
+                        // Which streams the programme was being read from, in
+                        // case its map moves it to others: what is half
+                        // gathered from these belongs to them and not to
+                        // whatever the new PIDs carry.
+                        let previous = (self.program.video_pid, self.program.audio_pid);
                         let changed_pids = self.program.push(&packet, &mut sections);
                         for pid in changed_pids {
                             self.continuity.remove(&pid);
+                        }
+                        if std::mem::take(&mut self.program.moved_streams) {
+                            // The same programme, carried by other streams from
+                            // here on. What was gathered from the old ones is
+                            // the end of it, so it goes out in front of them.
+                            if let Some(pid) = previous.0 {
+                                self.video.flush(ElementaryKind::Video, pid, &mut output)?;
+                            }
+                            if let Some(pid) = previous.1 {
+                                self.audio.flush(ElementaryKind::Audio, pid, &mut output)?;
+                            }
+                            for (pid, state) in self.private.iter_mut() {
+                                if self.program.private_pids.contains(pid) {
+                                    continue;
+                                }
+                                // Which of the two private streams this is, read
+                                // where the ordinary path reads it: out of the
+                                // PES header already gathered.
+                                let kind = match state.parts.get(3) {
+                                    Some(0xbf) => ElementaryKind::PrivateStream2,
+                                    _ => ElementaryKind::PrivateStream1,
+                                };
+                                state.flush(kind, *pid, &mut output)?;
+                            }
+                            self.private
+                                .retain(|pid, _| self.program.private_pids.contains(pid));
+                            self.video_pts = None;
+                            self.audio_pts = None;
                         }
                         if std::mem::take(&mut self.program.changed_streams) {
                             // The streams belong to a different programme now, and
