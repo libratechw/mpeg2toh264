@@ -37,6 +37,25 @@
       #url {
         flex: 1 1 30em;
       }
+      #mirakurun-form {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5em;
+        margin-top: 1em;
+      }
+      #mirakurun-url {
+        flex: 1 1 30em;
+      }
+      #channels {
+        padding-left: 1.5em;
+      }
+      #channels ul {
+        padding-left: 1.5em;
+      }
+      #channels button {
+        margin: 0.15em 0;
+      }
       #stage:fullscreen {
         position: relative;
         background: black;
@@ -125,6 +144,19 @@
           <input id="url" type="text" inputmode="url" placeholder="/video.ts または https://example.com/video.ts" required />
           <button type="submit">URLを開く</button>
         </form>
+        <form id="mirakurun-form">
+          <label for="mirakurun-url">MirakurunのベースURL</label>
+          <input
+            id="mirakurun-url"
+            type="text"
+            inputmode="url"
+            placeholder="http://localhost:40772"
+            required
+          />
+          <button type="submit">チャンネル一覧を取得</button>
+        </form>
+        <p id="channels-status" aria-live="polite"></p>
+        <ul id="channels"></ul>
         <label for="file">TSファイル</label>
         <input id="file" type="file" accept=".ts,.m2ts,.m2t,.mts,video/mp2t" />
         <p>

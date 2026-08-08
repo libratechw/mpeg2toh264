@@ -23,6 +23,12 @@ const video = document.querySelector<HTMLVideoElement>("#video")!;
 const picture = document.querySelector<HTMLElement>("#picture")!;
 const urlForm = document.querySelector<HTMLFormElement>("#url-form")!;
 const urlInput = document.querySelector<HTMLInputElement>("#url")!;
+const mirakurunForm =
+  document.querySelector<HTMLFormElement>("#mirakurun-form")!;
+const mirakurunUrl =
+  document.querySelector<HTMLInputElement>("#mirakurun-url")!;
+const channelsStatus = document.querySelector<HTMLElement>("#channels-status")!;
+const channels = document.querySelector<HTMLUListElement>("#channels")!;
 const fileInput = document.querySelector<HTMLInputElement>("#file")!;
 const unload = document.querySelector<HTMLButtonElement>("#unload")!;
 const placement = document.querySelector<HTMLSelectElement>("#placement")!;
@@ -81,6 +87,88 @@ const STATES: Record<PlayerState, string> = {
   completed: "変換完了",
   error: "",
 };
+
+interface MirakurunService {
+  id: number;
+  serviceId: number;
+  networkId: number;
+  name: string;
+}
+
+interface MirakurunChannel {
+  type: string;
+  channel: string;
+  name: string;
+  services: MirakurunService[];
+}
+
+function mirakurunEndpoint(base: string, path: string): string {
+  return `${base.replace(/\/+$/, "")}${path}`;
+}
+
+function channelPath(channel: MirakurunChannel): string {
+  return `/api/channels/${encodeURIComponent(channel.type)}/${encodeURIComponent(channel.channel)}/stream`;
+}
+
+function servicePath(
+  channel: MirakurunChannel,
+  service: MirakurunService,
+): string {
+  return `/api/channels/${encodeURIComponent(channel.type)}/${encodeURIComponent(channel.channel)}/services/${encodeURIComponent(service.id)}/stream`;
+}
+
+function streamButton(
+  text: string,
+  base: string,
+  path: string,
+): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = text;
+  button.addEventListener("click", () => {
+    const url = mirakurunEndpoint(base, path);
+    urlInput.value = url;
+    forgetService();
+    play(url, text, null, true);
+  });
+  return button;
+}
+
+function showMirakurunChannels(
+  available: MirakurunChannel[],
+  base: string,
+): void {
+  channels.replaceChildren(
+    ...available.map((channel) => {
+      const item = document.createElement("li");
+      item.append(
+        streamButton(
+          `${channel.name} (${channel.type} ${channel.channel})`,
+          base,
+          channelPath(channel),
+        ),
+      );
+      if (channel.services.length > 0) {
+        const services = document.createElement("ul");
+        services.append(
+          ...channel.services.map((service) => {
+            const serviceItem = document.createElement("li");
+            serviceItem.append(
+              streamButton(
+                `${service.name} (service ${service.serviceId})`,
+                base,
+                servicePath(channel, service),
+              ),
+            );
+            return serviceItem;
+          }),
+        );
+        item.append(services);
+      }
+      return item;
+    }),
+  );
+}
 
 function formatDuration(seconds: number): string {
   const whole = Math.floor(seconds);
@@ -863,6 +951,34 @@ if (!canPassthrough) {
   passthrough.checked = false;
   passthrough.labels?.[0]?.append(" (このブラウザーはMPEG-2を再生できません)");
 }
+
+mirakurunForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const base = mirakurunUrl.value.trim();
+  if (!base) return;
+
+  const submit = mirakurunForm.querySelector<HTMLButtonElement>(
+    'button[type="submit"]',
+  )!;
+  submit.disabled = true;
+  channelsStatus.textContent = "チャンネル一覧を取得しています…";
+  channels.replaceChildren();
+  try {
+    const response = await fetch(mirakurunEndpoint(base, "/api/channels"));
+    if (!response.ok)
+      throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+    const available = (await response.json()) as MirakurunChannel[];
+    if (!Array.isArray(available))
+      throw new Error("チャンネル一覧の形式が正しくありません");
+    showMirakurunChannels(available, base);
+    channelsStatus.textContent = `${available.length}チャンネルを取得しました`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    channelsStatus.textContent = `チャンネル一覧を取得できませんでした: ${message}`;
+  } finally {
+    submit.disabled = false;
+  }
+});
 
 urlForm.addEventListener("submit", (event) => {
   event.preventDefault();
