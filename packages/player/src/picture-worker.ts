@@ -18,16 +18,23 @@
 // which would be a copy nothing here ever loads.
 import { initSync, PictureEncoder } from "../wasm/mpeg2toh264_wasm.js";
 
-/** What the pool sends. */
+/**
+ * What the pool sends.
+ *
+ * `run` says which group of pictures a job belongs to. It travels out and back
+ * untouched: a seek abandons the group being converted while workers are still
+ * inside a picture of it, and this is what tells the pool that the result now
+ * arriving answers a question nobody is asking any more.
+ */
 export type PictureWorkerRequest =
   | { type: "start"; module: WebAssembly.Module }
-  | { type: "encode"; index: number; job: Uint8Array };
+  | { type: "encode"; run: number; index: number; job: Uint8Array };
 
 /** What comes back. */
 export type PictureWorkerResponse =
   | { type: "ready" }
-  | { type: "encoded"; index: number; output: Uint8Array }
-  | { type: "failed"; index: number; message: string };
+  | { type: "encoded"; run: number; index: number; output: Uint8Array }
+  | { type: "failed"; run: number; index: number; message: string };
 
 let encoder: PictureEncoder | null = null;
 
@@ -41,10 +48,11 @@ self.onmessage = ({ data }: MessageEvent<PictureWorkerRequest>) => {
     self.postMessage(ready);
     return;
   }
-  const { index, job } = data;
+  const { run, index, job } = data;
   if (!encoder) {
     const failed: PictureWorkerResponse = {
       type: "failed",
+      run,
       index,
       message: "the picture worker was given work before its module",
     };
@@ -53,13 +61,19 @@ self.onmessage = ({ data }: MessageEvent<PictureWorkerRequest>) => {
   }
   try {
     const output = encoder.encode(job);
-    const encoded: PictureWorkerResponse = { type: "encoded", index, output };
+    const encoded: PictureWorkerResponse = {
+      type: "encoded",
+      run,
+      index,
+      output,
+    };
     // The bytes are a copy wasm-bindgen made on the way out, so nobody else
     // holds the buffer and it can be moved rather than copied a second time.
     self.postMessage(encoded, [output.buffer as ArrayBuffer]);
   } catch (error) {
     const failed: PictureWorkerResponse = {
       type: "failed",
+      run,
       index,
       message: error instanceof Error ? error.message : String(error),
     };

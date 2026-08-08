@@ -37,7 +37,12 @@ export function defaultPoolSize(): number {
 /** How long to wait for the workers to come up before giving up on them. */
 const READY_TIMEOUT_MS = 10_000;
 
+/** What a cancelled run rejects with. See `cancel`. */
+const CANCELLED = "the group of pictures was abandoned";
+
 interface Pending {
+  /** Which run this is, so that a result of an earlier one is recognised. */
+  run: number;
   outputs: (Uint8Array | null)[];
   /** Jobs not yet handed to a worker, with the slot each belongs in. */
   queued: { index: number; job: Uint8Array }[];
@@ -50,6 +55,7 @@ export class PicturePool {
   #workers: Worker[];
   #idle: Worker[] = [];
   #pending: Pending | null = null;
+  #runs = 0;
   #broken: string | null = null;
 
   private constructor(workers: Worker[]) {
@@ -110,6 +116,7 @@ export class PicturePool {
     if (jobs.length === 0) return Promise.resolve([]);
     return new Promise((resolve, reject) => {
       this.#pending = {
+        run: ++this.#runs,
         outputs: jobs.map(() => null),
         queued: jobs.map((job, index) => ({ index, job })),
         remaining: jobs.length,
@@ -118,6 +125,26 @@ export class PicturePool {
       };
       this.#fill();
     });
+  }
+
+  /**
+   * Give up on the run in hand, because nobody wants what it is making.
+   *
+   * A seek abandons the leg being read, and the group of pictures halfway
+   * through conversion belongs to it. A worker cannot be interrupted -- coding
+   * a picture is one synchronous call into WebAssembly -- so this does not stop
+   * the work; it stops waiting for it. The pictures still in flight come back
+   * marked with the run they were sent for, are recognised as answering nothing
+   * and dropped, and each worker joins the run that follows as it comes free.
+   *
+   * Without this the seek's first group meets a pool that is still busy, and
+   * `run` refuses it.
+   */
+  cancel(): void {
+    const pending = this.#pending;
+    if (!pending) return;
+    this.#pending = null;
+    pending.reject(new Error(CANCELLED));
   }
 
   terminate(): void {
@@ -143,7 +170,11 @@ export class PicturePool {
         this.#idle.push(worker);
         return;
       }
-      const request: PictureWorkerRequest = { type: "encode", ...next };
+      const request: PictureWorkerRequest = {
+        type: "encode",
+        run: pending.run,
+        ...next,
+      };
       // Nobody here holds the job once it has gone, so it moves rather than
       // being copied a third time.
       worker.postMessage(request, [next.job.buffer as ArrayBuffer]);
@@ -155,6 +186,12 @@ export class PicturePool {
     this.#idle.push(worker);
     const pending = this.#pending;
     if (!pending) return;
+    if (message.run !== pending.run) {
+      // A picture of a run that was cancelled. The output goes nowhere; the
+      // worker that made it is what the run in hand wants.
+      this.#fill();
+      return;
+    }
     if (message.type === "failed") {
       this.#pending = null;
       pending.reject(new Error(message.message));

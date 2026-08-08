@@ -489,6 +489,10 @@ class Playback {
   #nextLeg(): number {
     this.#leg?.abort();
     this.#leg = new AbortController();
+    // The leg may be inside a group of pictures, waiting on the pool. Nothing
+    // it produces belongs anywhere now, and leaving the pool to finish it would
+    // meet the next leg's first group with a pool that is still busy.
+    this.#pool?.cancel();
     this.#transcoder?.free();
     this.#transcoder = null;
     this.#private = [];
