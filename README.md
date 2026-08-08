@@ -124,11 +124,11 @@ A reverse proxy can be configured when reading a transport stream from another H
 
 ```bash
 docker run --rm -p 8080:80 \
-  -e STREAM_UPSTREAM=http://192.168.1.3:40772 \
+  -e PROXY_UPSTREAM=http://192.168.1.3:40772 \
   mpeg2toh264-demo
 ```
 
-In this example, requesting `/stream/api/channels/GR/27/stream` forwards to `http://192.168.1.3:40772/api/channels/GR/27/stream`.
+In this example, requesting `/proxy/api/channels/GR/27/stream` forwards to `http://192.168.1.3:40772/api/channels/GR/27/stream`.
 
 Local build:
 
@@ -285,11 +285,11 @@ docker run --rm -p 8080:80 mpeg2toh264-demo
 
 ```bash
 docker run --rm -p 8080:80 \
-  -e STREAM_UPSTREAM=http://192.168.1.3:40772 \
+  -e PROXY_UPSTREAM=http://192.168.1.3:40772 \
   mpeg2toh264-demo
 ```
 
-この場合`/stream/api/channels/GR/27/stream`を指定すると`http://192.168.1.3:40772/api/channels/GR/27/stream`へ転送します。
+この場合`/proxy/api/channels/GR/27/stream`を指定すると`http://192.168.1.3:40772/api/channels/GR/27/stream`へ転送します。
 
 ローカルビルド:
 

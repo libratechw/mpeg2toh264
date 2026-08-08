@@ -9,9 +9,9 @@ server {
         try_files $uri $uri/ =404;
     }
 
-    # The trailing slash strips /stream/ before forwarding the request.
-    location /stream/ {
-        proxy_pass ${STREAM_UPSTREAM}/;
+    # The trailing slash strips /proxy/ before forwarding the request.
+    location /proxy/ {
+        proxy_pass ${PROXY_UPSTREAM}/;
         proxy_http_version 1.1;
         proxy_ssl_server_name on;
         proxy_ssl_name $proxy_host;
