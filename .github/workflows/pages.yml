@@ -14,6 +14,9 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  WASM_BINDGEN_VERSION: 0.2.126
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,8 +29,24 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add wasm32-unknown-unknown --toolchain stable
 
+      # The CLI takes minutes to build from source, and only its version, not
+      # the workspace, decides which binary we want.
+      - name: Restore the wasm-bindgen CLI
+        id: wasm-bindgen-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/wasm-bindgen*
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ env.WASM_BINDGEN_VERSION }}
+
       - name: Install the wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+        if: steps.wasm-bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version ${{ env.WASM_BINDGEN_VERSION }} --locked
+
+      # Keyed on Cargo.lock and the toolchain; the CLI has its own cache above.
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
