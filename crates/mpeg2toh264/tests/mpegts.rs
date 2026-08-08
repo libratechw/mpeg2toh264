@@ -167,12 +167,23 @@ fn follows_the_chosen_services_own_map_to_other_streams() {
     );
     stream.extend_from_slice(&mux_programs(
         &[(101, 0x1f0, after)],
-        &[PesUnit {
-            pid: 0x100,
-            stream_id: 0xe0,
-            pts: Some(18000),
-            payload: &[0xbb],
-        }],
+        &[
+            // A multiplexer does not cut the old stream where the map changes:
+            // it keeps sending until the new one starts, and that is still the
+            // programme.
+            PesUnit {
+                pid: 0x200,
+                stream_id: 0xe0,
+                pts: Some(13500),
+                payload: &[0xcc],
+            },
+            PesUnit {
+                pid: 0x100,
+                stream_id: 0xe0,
+                pts: Some(18000),
+                payload: &[0xbb],
+            },
+        ],
     ));
 
     let mut demuxer = MpegTsAvDemuxer::new();
@@ -186,8 +197,13 @@ fn follows_the_chosen_services_own_map_to_other_streams() {
 
     assert_eq!(
         video,
-        vec![(0x200, vec![0xaa]), (0x100, vec![0xbb])],
-        "both halves of the programme, in order"
+        vec![
+            (0x200, vec![0xaa]),
+            (0x200, vec![0xcc]),
+            (0x100, vec![0xbb])
+        ],
+        "both halves of the programme, in order, including what the stream \
+         being left sent after the map changed"
     );
     assert_eq!(demuxer.service_id(), Some(101), "and it is one service");
 }

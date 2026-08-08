@@ -614,6 +614,20 @@ impl PesState {
     }
 }
 
+/// A stream the programme has moved off but which is still sending.
+///
+/// A multiplexer does not cut the old stream where the program map changes: it
+/// keeps sending for a fraction of a second, and the stream that replaces it
+/// has not started yet. Everything in between is the programme, so it is read
+/// until the new one's first packet -- a third of a second of picture and
+/// sound, on the recording this was measured against. Its own PES state,
+/// because the two can overlap in the multiplex and a shared one would
+/// interleave them.
+struct Superseded {
+    pid: u16,
+    state: PesState,
+}
+
 /// Stateful MPEG-2-video/AAC demuxer, for streaming a file through in bounded
 /// memory rather than holding all of it.
 #[derive(Default)]
@@ -623,6 +637,10 @@ pub struct MpegTsAvDemuxer {
     program: ProgramMap,
     video: PesState,
     audio: PesState,
+    /// The streams the programme has moved off, still being read; see
+    /// [`Superseded`].
+    superseded_video: Option<Superseded>,
+    superseded_audio: Option<Superseded>,
     private: HashMap<u16, PesState>,
     video_pts: Option<u64>,
     audio_pts: Option<u64>,
@@ -720,13 +738,21 @@ impl MpegTsAvDemuxer {
                         }
                         if std::mem::take(&mut self.program.moved_streams) {
                             // The same programme, carried by other streams from
-                            // here on. What was gathered from the old ones is
-                            // the end of it, so it goes out in front of them.
-                            if let Some(pid) = previous.0 {
-                                self.video.flush(ElementaryKind::Video, pid, &mut output)?;
+                            // here on. The old ones are still sending, and what
+                            // they send until the new ones start belongs to the
+                            // programme too, so they are read on until then --
+                            // with what has been gathered from them so far.
+                            if previous.0 != self.program.video_pid {
+                                self.superseded_video = previous.0.map(|pid| Superseded {
+                                    pid,
+                                    state: std::mem::take(&mut self.video),
+                                });
                             }
-                            if let Some(pid) = previous.1 {
-                                self.audio.flush(ElementaryKind::Audio, pid, &mut output)?;
+                            if previous.1 != self.program.audio_pid {
+                                self.superseded_audio = previous.1.map(|pid| Superseded {
+                                    pid,
+                                    state: std::mem::take(&mut self.audio),
+                                });
                             }
                             for (pid, state) in self.private.iter_mut() {
                                 if self.program.private_pids.contains(pid) {
@@ -757,9 +783,37 @@ impl MpegTsAvDemuxer {
                             self.audio_pts = None;
                         }
                     }
+                    // Whether this packet belongs to a stream the programme has
+                    // moved off, which is read into its own state until the one
+                    // that replaced it starts.
+                    let mut superseded = false;
                     let kind = if Some(packet.pid) == self.program.video_pid {
+                        // The old stream's last access unit goes out in front of
+                        // the new stream's first bytes, which is here.
+                        if let Some(mut old) = self.superseded_video.take() {
+                            old.state
+                                .flush(ElementaryKind::Video, old.pid, &mut output)?;
+                        }
                         Some(ElementaryKind::Video)
                     } else if Some(packet.pid) == self.program.audio_pid {
+                        if let Some(mut old) = self.superseded_audio.take() {
+                            old.state
+                                .flush(ElementaryKind::Audio, old.pid, &mut output)?;
+                        }
+                        Some(ElementaryKind::Audio)
+                    } else if self
+                        .superseded_video
+                        .as_ref()
+                        .is_some_and(|old| old.pid == packet.pid)
+                    {
+                        superseded = true;
+                        Some(ElementaryKind::Video)
+                    } else if self
+                        .superseded_audio
+                        .as_ref()
+                        .is_some_and(|old| old.pid == packet.pid)
+                    {
+                        superseded = true;
                         Some(ElementaryKind::Audio)
                     } else if self.program.private_pids.contains(&packet.pid) {
                         let stream_id = if packet.payload_unit_start {
@@ -794,12 +848,19 @@ impl MpegTsAvDemuxer {
                             }
                         }
                         let superimpose_pts = self.superimpose_pts();
-                        let state = match kind {
-                            ElementaryKind::Video => &mut self.video,
-                            ElementaryKind::Audio => &mut self.audio,
-                            ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2 => {
-                                self.private.entry(packet.pid).or_default()
+                        let state = match (kind, superseded) {
+                            (ElementaryKind::Video, false) => &mut self.video,
+                            (ElementaryKind::Audio, false) => &mut self.audio,
+                            (ElementaryKind::Video, true) => {
+                                &mut self.superseded_video.as_mut().expect("just matched").state
                             }
+                            (ElementaryKind::Audio, true) => {
+                                &mut self.superseded_audio.as_mut().expect("just matched").state
+                            }
+                            (
+                                ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2,
+                                _,
+                            ) => self.private.entry(packet.pid).or_default(),
                         };
                         if packet.payload_unit_start {
                             let previous_kind = match state.parts.get(3) {
@@ -869,6 +930,16 @@ impl MpegTsAvDemuxer {
             bail!("MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)");
         }
         let mut output = Vec::new();
+        // A stream the programme moved off, which the input ended before the
+        // one that replaced it started, still holds the end of the programme.
+        if let Some(mut old) = self.superseded_video.take() {
+            old.state
+                .flush(ElementaryKind::Video, old.pid, &mut output)?;
+        }
+        if let Some(mut old) = self.superseded_audio.take() {
+            old.state
+                .flush(ElementaryKind::Audio, old.pid, &mut output)?;
+        }
         self.video.flush(
             ElementaryKind::Video,
             self.program.video_pid.unwrap_or(0),
