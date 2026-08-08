@@ -6,7 +6,7 @@ mod support;
 use mpeg2toh264::container::adts::AdtsStream;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use mpeg2toh264::{Fragment, Session, TranscodeOptions};
+use mpeg2toh264::{DualMono, Fragment, Session, TranscodeOptions};
 use support::{
     adts_frame, adts_frame_with_payload, adts_stream, mux_programs, mux_transport_stream,
     read_fixture, wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS,
@@ -208,6 +208,66 @@ fn takes_a_single_channel_element_with_no_channel_configuration() {
     assert_eq!(config.channel_count, 2);
     assert_eq!(config.audio_specific_config, [0x11, 0x90]);
     assert_eq!(frames[0].data[0] >> 5, 1, "SCE became a CPE");
+}
+
+/// An `individual_channel_stream` carrying no spectral data, whose global gain
+/// says which service it belongs to: eight bits of gain, an `ics_info` with a
+/// long window and `max_sfb` 0, and the three absent-tool flags.
+fn empty_ics(global_gain: u8) -> String {
+    format!("{global_gain:08b}{}", "0".repeat(14))
+}
+
+/// ARIB carries a bilingual programme as two single channel elements in one
+/// stream rather than as two streams of its own, and a receiver plays one of
+/// them on both speakers. Which one is the viewer's choice. Both are rebuilt
+/// into the same two-channel configuration, so unlike moving to another
+/// elementary stream the change describes nothing anew.
+#[test]
+fn takes_either_service_of_a_dual_mono_stream() {
+    let dual_mono = packed_bits(&format!(
+        "000{tag_main}{main}000{tag_sub}{sub}111",
+        tag_main = "0000",
+        main = empty_ics(0xa5),
+        tag_sub = "0001",
+        sub = empty_ics(0x5a),
+    ));
+    let frame = adts_frame_with_payload(3, 0, &dual_mono);
+    // A channel pair built from one of them, twice: the element instance tag
+    // stays the one the two-channel configuration names whichever is taken.
+    let rebuilt = |gain| packed_bits(&format!("00100000{ics}{ics}111", ics = empty_ics(gain)));
+
+    let mut main = AdtsStream::new();
+    let played = main.push(&frame).expect("the main service decodes");
+    assert_eq!(played[0].data, rebuilt(0xa5));
+    assert_eq!(played[0].config.channel_count, 2);
+    assert!(
+        main.is_dual_mono(),
+        "the stream says it has a second service in it, which the ADTS header \
+         of a mono stream does not"
+    );
+
+    let mut sub = AdtsStream::new();
+    sub.select_dual_mono(DualMono::Sub);
+    let played = sub.push(&frame).expect("the second service decodes");
+    assert_eq!(played[0].data, rebuilt(0x5a));
+    assert_eq!(
+        played[0].config,
+        AdtsStream::new().push(&frame).expect("decodes")[0].config,
+        "the two services are described identically, so nothing is redescribed"
+    );
+
+    // A stream with one service in it has nothing else to play, and asking for
+    // the second leaves it as it was.
+    let mono = adts_frame_with_payload(
+        3,
+        0,
+        &packed_bits(&format!("0000000{}111", empty_ics(0x33))),
+    );
+    let mut asked = AdtsStream::new();
+    asked.select_dual_mono(DualMono::Sub);
+    let played = asked.push(&mono).expect("the mono service decodes");
+    assert_eq!(played[0].data, rebuilt(0x33));
+    assert!(!asked.is_dual_mono());
 }
 
 #[test]

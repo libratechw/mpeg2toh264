@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 
 use crate::container::adts::{
-    aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream,
+    aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream, DualMono,
     AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
@@ -393,6 +393,27 @@ impl Session {
     /// a programme boundary that changes the sound does.
     pub fn select_audio(&mut self, pid: u16) {
         self.demuxer.select_audio(pid);
+    }
+
+    /// Whether the sound being read carries two services in one stream rather
+    /// than a stereo pair, as the frames read so far had it.
+    ///
+    /// The program map says so too, in the audio component descriptor, and says
+    /// it before a frame has been read -- see [`AudioStream::dual_mono`]. This
+    /// is the stream itself, which is what a broadcast that turns dual mono on
+    /// within a programme leaves the map disagreeing with.
+    pub fn audio_is_dual_mono(&self) -> bool {
+        self.adts.is_dual_mono()
+    }
+
+    /// Take the sound of a dual-mono stream from this service from here on.
+    ///
+    /// Both services are rebuilt into the same two-channel configuration, so
+    /// unlike moving to another elementary stream this describes nothing anew:
+    /// the frames on either side of the change sit in the same fragment as
+    /// readily as in two.
+    pub fn select_dual_mono(&mut self, service: DualMono) {
+        self.adts.select_dual_mono(service);
     }
 
     pub fn dropped(&self) -> u64 {

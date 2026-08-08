@@ -60,6 +60,13 @@ pub struct AdtsStream {
     /// once a header has said where its frame ends and a header was there.
     /// Until then every syncword is a candidate rather than a frame.
     synced: bool,
+    /// Which service of a dual-mono stream to rebuild the sound from.
+    dual_mono: DualMono,
+    /// Whether the last frame that could be walked carried two of them. A
+    /// broadcast turns dual mono on and off within one programme -- the ADTS
+    /// header does not change, only the elements in the block -- so this is what
+    /// the stream is now rather than what it was announced as.
+    is_dual_mono: bool,
 }
 
 /// Where an ADTS header says its frame ends -- the part of it that frames the
@@ -432,23 +439,57 @@ fn pce_audio_specific_config(
     out.data
 }
 
+/// Which service of a dual-mono stream the sound is taken from.
+///
+/// ARIB carries a bilingual programme as two single channel elements in one
+/// stream -- the languages beside each other rather than a stereo pair -- and a
+/// receiver plays one of them on both speakers. Which one is the viewer's
+/// choice, and it is a choice inside the stream rather than between streams, so
+/// nothing about the sound's description changes with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DualMono {
+    /// The first element, which is the main service.
+    #[default]
+    Main,
+    /// The second, where there is one. A stream carrying a single service is
+    /// unaffected: there is nothing else in it to play.
+    Sub,
+}
+
 /// Turn SCE or SCE+SCE (dual mono) into a CPE with two identical independent
-/// channel streams. The first SCE is the main service; no spectral value is
-/// decoded or re-encoded.
-fn primary_sce_to_cpe(
+/// channel streams, built from the service asked for. No spectral value is
+/// decoded or re-encoded either way: what changes is which of the two elements
+/// is the one copied.
+///
+/// The rebuilt element keeps the first service's `element_instance_tag`
+/// whichever is chosen, because that is what the two-channel configuration
+/// describing the frame names (ISO/IEC 14496-3 Table 1.19) -- the tag says which
+/// element of that configuration this is, not which of the source's it came
+/// from.
+///
+/// Reports whether there was a second service to choose from, which is what a
+/// caller offering the choice needs and which nothing else in the frame says:
+/// the ADTS header of a dual-mono stream is the header of a mono one.
+fn sce_to_cpe(
     data: &[u8],
     sce: usize,
     frequency_index: u8,
     pces: &[(usize, usize)],
-) -> Result<Vec<u8>> {
+    service: DualMono,
+) -> Result<(Vec<u8>, bool)> {
     let primary_end = sce_end(data, sce, frequency_index)?;
     let mut tail = primary_end;
-    if tail + 7 <= data.len() * 8
+    let mut chosen = (sce + 7, primary_end);
+    let dual_mono = tail + 7 <= data.len() * 8
         && bit(data, tail) == 0
         && bit(data, tail + 1) == 0
-        && bit(data, tail + 2) == 0
-    {
-        tail = sce_end(data, tail, frequency_index)?; // discard the sub service
+        && bit(data, tail + 2) == 0;
+    if dual_mono {
+        let sub_end = sce_end(data, tail, frequency_index)?;
+        if service == DualMono::Sub {
+            chosen = (tail + 7, sub_end);
+        }
+        tail = sub_end; // whichever was not taken is discarded
     }
     let mut out = Bits {
         data: Vec::with_capacity(data.len()),
@@ -463,15 +504,31 @@ fn primary_sce_to_cpe(
     out.value(3, 1); // ID_CPE
     out.copy(data, sce + 3, sce + 7); // element_instance_tag
     out.push(0); // common_window: each copy carries its own ics_info
-    out.copy(data, sce + 7, primary_end);
-    out.copy(data, sce + 7, primary_end);
+    out.copy(data, chosen.0, chosen.1);
+    out.copy(data, chosen.0, chosen.1);
     out.copy(data, tail, raw_data_block_end(data, tail)?);
-    Ok(out.data)
+    Ok((out.data, dual_mono))
 }
 
 impl AdtsStream {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Take the sound of a dual-mono stream from this service from here on.
+    ///
+    /// Nothing already read is revisited, and nothing about the sound's
+    /// description changes: both services are rebuilt into the same two-channel
+    /// configuration, so the frames on either side of the change are described
+    /// by the same initialization segment and play one after the other.
+    pub fn select_dual_mono(&mut self, service: DualMono) {
+        self.dual_mono = service;
+    }
+
+    /// Whether the sound being read is two services in one stream rather than a
+    /// stereo pair, as the last frame to walk had it.
+    pub fn is_dual_mono(&self) -> bool {
+        self.is_dual_mono
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<AacFrame>> {
@@ -638,14 +695,19 @@ impl AdtsStream {
             // read past it is what used to end the conversion there.
             self.current_config = Some(config.clone());
             self.announced = Some((sampling_frequency_index, channel_count));
-            output.push(AacFrame {
-                data: if sce_service {
-                    primary_sce_to_cpe(raw_data, channel_start, sampling_frequency_index, &pces)?
-                } else {
-                    raw_data.to_vec()
-                },
-                config,
-            });
+            let (data, is_dual_mono) = if sce_service {
+                sce_to_cpe(
+                    raw_data,
+                    channel_start,
+                    sampling_frequency_index,
+                    &pces,
+                    self.dual_mono,
+                )?
+            } else {
+                (raw_data.to_vec(), false)
+            };
+            self.is_dual_mono = is_dual_mono;
+            output.push(AacFrame { data, config });
             at += frame_length;
         }
         self.pending.drain(..at);

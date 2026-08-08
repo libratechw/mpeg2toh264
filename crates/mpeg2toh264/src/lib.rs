@@ -26,6 +26,7 @@ pub mod transcode;
 pub use error::{Error, Result};
 pub use job::{PictureJob, PictureOutput, TranscoderState};
 
+pub use container::adts::DualMono;
 pub use container::fmp4::{
     h264_gop_to_fmp4, h264_to_fmp4, mpeg2_gop_to_fmp4, mpeg2_passthrough_unit, mpeg2_to_fmp4,
     mpeg2_video_timeline, Fmp4Fragment, Fmp4Output, Mpeg2Sample, Mpeg2Unit, Mpeg2VideoTimeline,
