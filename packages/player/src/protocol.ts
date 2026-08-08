@@ -216,6 +216,13 @@ export type Notification =
     }
   /** Open a `SourceBuffer` and append this. Main-sink loads only. */
   | { type: "open"; id: number; mimeCodec: string; data: ArrayBuffer }
+  | {
+      type: "video-config";
+      id: number;
+      width: number;
+      height: number;
+      start: number;
+    }
   /** Append this. Main-sink loads only. */
   | {
       type: "fragment";

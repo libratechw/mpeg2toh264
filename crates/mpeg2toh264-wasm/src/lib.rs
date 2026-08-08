@@ -27,6 +27,8 @@ export type Fragment =
       data: Uint8Array;
       /** What to open the SourceBuffer with. */
       mimeCodec: string;
+      width: number;
+      height: number;
     }
   | {
       kind: "media";
@@ -450,10 +452,17 @@ fn to_js_array(fragments: Vec<Fragment>) -> Result<FragmentArray, JsError> {
 fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
     let object = Object::new();
     match fragment {
-        Fragment::Init { data, mime_codec } => {
+        Fragment::Init {
+            data,
+            mime_codec,
+            width,
+            height,
+        } => {
             set(&object, "kind", &"init".into())?;
             set(&object, "data", &copy_out(&data))?;
             set(&object, "mimeCodec", &mime_codec.into())?;
+            set(&object, "width", &(width as f64).into())?;
+            set(&object, "height", &(height as f64).into())?;
         }
         Fragment::Media {
             data,

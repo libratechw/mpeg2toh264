@@ -62,6 +62,9 @@ pub enum Fragment {
         data: Vec<u8>,
         /// The MIME type to open the `SourceBuffer` with.
         mime_codec: String,
+        /// Coded pixels, before the sample aspect ratio stretches them.
+        width: u32,
+        height: u32,
     },
     /// One GOP of media.
     Media {
@@ -1219,13 +1222,16 @@ impl Session {
         // pictures in it are the first coded under their description, which is
         // the fragment a `SourceBuffer` has to be given one for.
         if !fragment.init_segment.is_empty() {
+            let description = stream_sequence_description(&gop.data);
             self.initialized = true;
             self.describe_pending = false;
-            self.described = stream_sequence_description(&gop.data);
+            self.described = description;
             self.described_audio = config;
             out.push(Fragment::Init {
                 data: fragment.init_segment,
                 mime_codec: fragment.mime_codec,
+                width: description.map_or(0, |description| description.width),
+                height: description.map_or(0, |description| description.height),
             });
         }
         out.push(Fragment::Media {

@@ -446,7 +446,9 @@ fn write_fragment(
     started: Instant,
 ) -> Result<(), std::io::Error> {
     let data = match fragment {
-        Fragment::Init { data, mime_codec } => {
+        Fragment::Init {
+            data, mime_codec, ..
+        } => {
             totals.inits += 1;
             if !quiet {
                 println!("init: {mime_codec} ({} bytes)", data.len());

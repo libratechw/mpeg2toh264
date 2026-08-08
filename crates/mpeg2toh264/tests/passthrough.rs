@@ -168,7 +168,10 @@ fn video_only_stream(copies: usize) -> Vec<u8> {
 #[test]
 fn a_passthrough_session_says_it_carries_mpeg_2() {
     let fragments = run_session(&video_only_stream(3), passthrough_options());
-    let Some(Fragment::Init { data, mime_codec }) = fragments.first() else {
+    let Some(Fragment::Init {
+        data, mime_codec, ..
+    }) = fragments.first()
+    else {
         panic!("the init segment comes first");
     };
     assert_eq!(mime_codec, "video/mp4; codecs=\"mp4v.61\"");

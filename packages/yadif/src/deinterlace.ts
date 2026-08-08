@@ -307,6 +307,8 @@ export class Deinterlacer {
   #enabled = false;
   #scan: Scan | null = null;
   #lost = false;
+  /** Coded sizes waiting for the media time at which their init takes effect. */
+  #codedSizes: { width: number; height: number; start: number }[] = [];
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
   /** Everything the next report is counted from. See DeinterlaceStats. */
   #stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0, late: 0 };
@@ -370,6 +372,20 @@ export class Deinterlacer {
 
   get running(): boolean {
     return this.#running;
+  }
+
+  set codedSize(size: { width: number; height: number; start: number } | null) {
+    if (!size) {
+      this.#codedSizes = [];
+      return;
+    }
+    if (size.width <= 0 || size.height <= 0 || !Number.isFinite(size.start))
+      return;
+    const at = this.#codedSizes.findIndex((item) => item.start >= size.start);
+    if (at >= 0 && this.#codedSizes[at]!.start === size.start)
+      this.#codedSizes[at] = size;
+    else
+      this.#codedSizes.splice(at < 0 ? this.#codedSizes.length : at, 0, size);
   }
 
   /** Whether the caller wants filtering, independently of the current source. */
@@ -495,16 +511,27 @@ export class Deinterlacer {
   ): void => {
     this.#handle = null;
     if (!this.#running || this.#lost) return;
-    // The size of the frame as it is coded, which is what the upload carries
-    // and what the filter has to work in. It is not `videoWidth`: that is the
-    // size the frame is meant to be seen at, which for anamorphic video --
-    // 1440x1080 broadcast at 16:9, say -- is wider than the frame really is.
-    // Sizing the texture by it would leave a quarter of every row unwritten.
-    const width = metadata.width;
-    const height = metadata.height;
-    if (width > 0 && height > 0) {
-      if (width !== this.#width || height !== this.#height)
-        this.#resize(width, height);
+    if (metadata.width > 0 && metadata.height > 0) {
+      // An init segment reaches the SourceBuffer before the sample it
+      // describes. Do not resize on that notification: the element may still
+      // be presenting the old resolution. Switch on the first callback at or
+      // beyond the media boundary instead, so the texture and its source move
+      // together even when the display dimensions happen to stay unchanged.
+      let coded: { width: number; height: number; start: number } | undefined;
+      while (
+        this.#codedSizes.length > 0 &&
+        this.#codedSizes[0]!.start <= metadata.mediaTime + 1e-6
+      )
+        coded = this.#codedSizes.shift();
+      if (
+        coded &&
+        (coded.width !== this.#width || coded.height !== this.#height)
+      )
+        this.#resize(coded.width, coded.height);
+      // Standalone users do not have a container feeding coded sizes. Their
+      // callback dimensions remain the best available fallback.
+      if (this.#width === 0 || this.#height === 0)
+        this.#resize(metadata.width, metadata.height);
       // A seek, or a stream that starts again somewhere else, leaves the held
       // frames belonging to a different moment. Timing says so before any
       // event does, and playback that merely dropped a frame is left alone:

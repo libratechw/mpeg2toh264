@@ -60,6 +60,7 @@ export interface PlayerDeinterlacer {
   readonly running: boolean;
   enabled: boolean;
   scan: Scan | null;
+  codedSize?: { width: number; height: number; start: number } | null;
   destroy(): void;
 }
 
@@ -300,6 +301,7 @@ export class Mpeg2TsPlayer extends EventTarget {
   #markedAt = 0;
   /** Built the first time deinterlacing is turned on, and kept after that. */
   #deinterlacer: PlayerDeinterlacer | null = null;
+  #codedSize: { width: number; height: number; start: number } | null = null;
   /** Whether deinterlacing was asked for; whether it runs also needs `#scan`. */
   #wanted = false;
   #destroyed = false;
@@ -440,6 +442,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#deinterlacer = this.#options.deinterlacer(this.video);
       }
       if (this.#deinterlacer) {
+        if (this.#codedSize) this.#deinterlacer.codedSize = this.#codedSize;
         this.#deinterlacer.scan = this.#scan;
         this.#deinterlacer.enabled = this.#wanted;
       }
@@ -450,9 +453,17 @@ export class Mpeg2TsPlayer extends EventTarget {
     }
   }
 
+  #setCodedSize(width: number, height: number, start: number): void {
+    if (width <= 0 || height <= 0) return;
+    this.#codedSize = { width, height, start };
+    if (this.#deinterlacer) this.#deinterlacer.codedSize = this.#codedSize;
+  }
+
   load(url: string | URL): Promise<void> {
     if (this.#destroyed)
       return Promise.reject(new Error("the player has been destroyed"));
+    this.#codedSize = null;
+    if (this.#deinterlacer) this.#deinterlacer.codedSize = null;
     if (
       this.#sinkKind === "worker" &&
       !supportsWorkerMediaSource(this.#options.preferManagedMediaSource)
@@ -592,6 +603,13 @@ export class Mpeg2TsPlayer extends EventTarget {
         break;
       case "open":
         this.#openSink(notification.mimeCodec, notification.data);
+        break;
+      case "video-config":
+        this.#setCodedSize(
+          notification.width,
+          notification.height,
+          notification.start,
+        );
         break;
       case "fragment":
         this.#sink?.push(

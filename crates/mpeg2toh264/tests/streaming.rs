@@ -860,7 +860,13 @@ fn emits_one_initialization_segment_then_media() {
     let (init, media) = split_fragments(&fragments);
 
     assert_eq!(init.len(), 1, "MSE needs the init segment exactly once");
-    let Fragment::Init { data, mime_codec } = init[0] else {
+    let Fragment::Init {
+        data,
+        mime_codec,
+        width,
+        height,
+    } = init[0]
+    else {
         unreachable!()
     };
     assert_eq!(&data[4..8], b"ftyp");
@@ -870,6 +876,14 @@ fn emits_one_initialization_segment_then_media() {
         "{mime_codec}"
     );
     assert!(!mime_codec.contains("mp4a"), "no audio track was declared");
+    let pictures = parse_elementary_stream(&read_fixture("ibbp.m2v")).expect("fixture parses");
+    assert_eq!(
+        (*width, *height),
+        (
+            pictures[0].sequence.horizontal_size,
+            pictures[0].sequence.vertical_size
+        )
+    );
 
     assert_eq!(media.len(), 3, "one fragment per group of pictures");
     assert!(
@@ -1280,10 +1294,12 @@ fn the_result_does_not_depend_on_how_the_input_is_chunked() {
                 Fragment::Init {
                     data: a,
                     mime_codec: ma,
+                    ..
                 },
                 Fragment::Init {
                     data: b,
                     mime_codec: mb,
+                    ..
                 },
             ) => {
                 assert_eq!(a, b);
@@ -1311,7 +1327,10 @@ fn carries_aac_audio_through_untouched() {
     let fragments = run_session(&av_stream(3, audio_frames), 64 * 1024);
     let (init, media) = split_fragments(&fragments);
 
-    let Fragment::Init { mime_codec, data } = init[0] else {
+    let Fragment::Init {
+        mime_codec, data, ..
+    } = init[0]
+    else {
         unreachable!()
     };
     assert!(mime_codec.contains("avc1."), "{mime_codec}");

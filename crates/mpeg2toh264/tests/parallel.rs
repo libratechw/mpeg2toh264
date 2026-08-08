@@ -210,9 +210,9 @@ fn digest(fragments: &[Fragment]) -> Vec<(String, u64, usize, usize)> {
     fragments
         .iter()
         .map(|fragment| match fragment {
-            Fragment::Init { data, mime_codec } => {
-                (format!("init {mime_codec}"), fnv1a(data), 0, 0)
-            }
+            Fragment::Init {
+                data, mime_codec, ..
+            } => (format!("init {mime_codec}"), fnv1a(data), 0, 0),
             Fragment::Media {
                 data,
                 start,

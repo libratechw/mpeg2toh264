@@ -713,8 +713,20 @@ class Playback {
    * only await in here and so the only place the caller can be overtaken.
    */
   async #deliver(leg: number, fragments: Fragment[]): Promise<boolean> {
-    for (const fragment of fragments) {
+    for (const [index, fragment] of fragments.entries()) {
       if (fragment.kind === "init") {
+        const media = fragments
+          .slice(index + 1)
+          .find((item) => item.kind === "media");
+        if (!media)
+          throw new Error("an initialization segment has no media behind it");
+        post({
+          type: "video-config",
+          id: this.#command.id,
+          width: fragment.width,
+          height: fragment.height,
+          start: media.start,
+        });
         await this.#sink.open(fragment.mimeCodec, detach(fragment));
         if (!this.#running(leg)) return false;
         mark(this.#command.id, "opened");
