@@ -46,6 +46,11 @@ pub fn aac_frame_count_through_video_time(video_time: i64, sample_rate: u32) -> 
 pub struct AdtsStream {
     pending: Vec<u8>,
     current_config: Option<AacConfig>,
+    /// `sampling_frequency_index` and `channel_configuration` as the last
+    /// accepted frame's header gave them. Not the same as the configuration
+    /// derived from them: a mono or dual-mono service is rebuilt as a stereo
+    /// pair, so its configuration says two channels whatever the header said.
+    announced: Option<(u8, u8)>,
     /// The channel elements of the last frame that walked, by id and instance
     /// tag. Until one has, a walk that fails says nothing about the frame;
     /// after one has, it says the frame is damaged -- and so does a frame that
@@ -352,13 +357,28 @@ impl AdtsStream {
             }
 
             let raw_data = &self.pending[at + header_length..at + frame_length];
+            let chain = raw_data_block_chain(raw_data, sampling_frequency_index);
+            // The header is the frame's own account of the service it belongs
+            // to, and a broadcast switching between 5.1 and stereo at a
+            // programme boundary changes it. The elements in the block change
+            // with it, so the run the walker has been reading ends here rather
+            // than these being damaged frames of what came before -- but only
+            // where the block walks, since a header alone is four bytes that
+            // damage could have written.
+            if self
+                .announced
+                .is_some_and(|previous| previous != (sampling_frequency_index, channel_count))
+                && chain.is_some()
+            {
+                self.chain = None;
+            }
             // Damaged. A stream this walker has read once it can read, so a
             // frame it cannot is one a decoder cannot either -- and one whose
             // elements are not the ones the stream has been carrying will be
             // refused just the same, since a decoder only has room for the
             // elements its configuration named. Handing either over does not
             // cost a frame, it stops the stream.
-            match raw_data_block_chain(raw_data, sampling_frequency_index) {
+            match chain {
                 Some(chain) if self.chain.as_ref().is_none_or(|last| *last == chain) => {
                     self.chain = Some(chain);
                 }
@@ -448,19 +468,14 @@ impl AdtsStream {
                 channel_count: output_channels,
                 audio_specific_config,
             };
-            if let Some(current) = &self.current_config {
-                if current.sample_rate != sample_rate
-                    || current.audio_specific_config != config.audio_specific_config
-                {
-                    bail!(
-                        "ADTS configuration changed within the stream ({:?} -> {:?}, element {})",
-                        current.audio_specific_config,
-                        config.audio_specific_config,
-                        first_element
-                    );
-                }
-            }
+            // A service that changes what it is -- 5.1 for the programme and
+            // stereo for the announcement after it -- describes itself
+            // differently from there on, and every frame carries the
+            // configuration it was coded under. Whoever is packaging them puts
+            // the change in an initialization segment of its own; refusing to
+            // read past it is what used to end the conversion there.
             self.current_config = Some(config.clone());
+            self.announced = Some((sampling_frequency_index, channel_count));
             output.push(AacFrame {
                 data: if sce_service {
                     primary_sce_to_cpe(raw_data, channel_start, sampling_frequency_index, &pces)?

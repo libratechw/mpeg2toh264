@@ -230,6 +230,20 @@ impl VideoPipeline {
         }
     }
 
+    /// Put the parameter sets in front of the next unit again, whether or not
+    /// what they say has changed, so the fragment it becomes carries an
+    /// initialization segment.
+    ///
+    /// Only the transcoding path has to be told. The passthrough one is asked
+    /// for the segment directly, since every unit it carries opens with the
+    /// sequence header the segment would be built from.
+    fn describe_again(&mut self) {
+        match self {
+            Self::Transcode(transcoder) => transcoder.request_description(),
+            Self::Passthrough { .. } => {}
+        }
+    }
+
     fn split_field_samples(&self) -> bool {
         match self {
             Self::Transcode(transcoder) => transcoder.split_field_samples(),
@@ -266,6 +280,8 @@ pub struct Session {
     /// What the initialization segment that went out describes, and so what a
     /// unit has to be coded under to play against it.
     described: Option<SequenceDescription>,
+    /// The same for the sound, which that segment describes as well.
+    described_audio: Option<AacConfig>,
     /// Whether the next fragment has to carry an initialization segment: the
     /// first one does, and so does the first one after a stream changes what
     /// its sequence header says.
@@ -374,6 +390,7 @@ impl Session {
             gops_emitted: 0,
             initialized: false,
             described: None,
+            described_audio: None,
             describe_pending: true,
             pending_gops: Vec::new(),
             pending_audio: Vec::new(),
@@ -584,8 +601,11 @@ impl Session {
                     }
                     self.audio_pid = Some(packet.pid);
                     let mut frames = self.adts.push(&packet.data)?;
-                    if self.audio_config.is_none() {
-                        self.audio_config = frames.first().map(|frame| frame.config.clone());
+                    // The newest, not the first ever: it is what a fragment
+                    // with no frames of its own is described by, and what the
+                    // frame count of the next one is measured in.
+                    if let Some(config) = frames.last().map(|frame| frame.config.clone()) {
+                        self.audio_config = Some(config);
                     }
                     self.conceal_audio_gap(packet.pts, &mut frames);
                     self.pending_audio.extend(frames);
@@ -703,6 +723,44 @@ impl Session {
         self.describe_pending = true;
     }
 
+    /// Notice sound coded under something other than what the initialization
+    /// segment describes, and arrange for it to be described afresh.
+    ///
+    /// A broadcast switches between 5.1 and stereo at a programme boundary, and
+    /// the segment carries the audio configuration in its `esds` just as it
+    /// carries the picture in its `avcC`. The video's own description has not
+    /// changed, so the parameter sets have to be asked for again rather than
+    /// coming out of a change in them -- and the fragment they open is made a
+    /// restart point, since that is where a decoder can be handed a new
+    /// description with nothing of the old one still in flight.
+    fn note_audio_description(&mut self) {
+        let Some(config) = self.pending_audio.first().map(|frame| frame.config.clone()) else {
+            return;
+        };
+        if self.described_audio.as_ref() == Some(&config) {
+            return;
+        }
+        // Nothing has been described yet: the first fragment does that anyway.
+        if self.described_audio.is_some() {
+            self.video.restart_for_new_description();
+            self.video.describe_again();
+        }
+        self.describe_pending = true;
+    }
+
+    /// How many of the frames waiting were coded under the configuration the
+    /// first of them was, which is as far as one fragment can reach.
+    fn frames_under_one_configuration(&self, take: usize) -> usize {
+        let Some(first) = self.pending_audio.first() else {
+            return take;
+        };
+        self.pending_audio
+            .iter()
+            .take(take)
+            .position(|frame| frame.config != first.config)
+            .unwrap_or(take)
+    }
+
     fn is_random_access_point(&self) -> bool {
         self.recovery_point_gop_interval != 0
             && self.gops_emitted > 0
@@ -747,8 +805,11 @@ impl Session {
         let gop = self.pending_gops[0].clone();
         // Before the plan, because a unit the fragments so far do not describe
         // has to open at a random access point and the plan is drawn knowing
-        // whether it does.
+        // whether it does. The sound is asked the same question: an
+        // initialization segment describes both tracks, so either of them
+        // changing calls for a new one.
         self.note_description(&gop);
+        self.note_audio_description();
         let starts_at_idr = self.starts_at_idr();
         let plan = self.plan_unit(&gop.data, starts_at_idr)?;
         self.align_timelines(&gop, plan.timeline());
@@ -770,6 +831,11 @@ impl Session {
         } else {
             wanted.min(self.pending_audio.len())
         };
+        // A fragment's sound is described by the initialization segment in
+        // front of it, so it holds one configuration. The frames past a change
+        // wait for the fragment that describes them, and the count they are
+        // short by is asked for again as soon as the next one is measured.
+        let take = self.frames_under_one_configuration(take);
         let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
         Ok(Some(self.commit(gop, frames, Some(plan))?))
     }
@@ -925,6 +991,7 @@ impl Session {
             self.initialized = true;
             self.describe_pending = false;
             self.described = stream_sequence_description(&gop.data);
+            self.described_audio = config;
             out.push(Fragment::Init {
                 data: fragment.init_segment,
                 mime_codec: fragment.mime_codec,

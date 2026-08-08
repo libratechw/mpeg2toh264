@@ -41,7 +41,7 @@ pub use mpeg2::headers::{
 pub use session::{Fragment, Progress, Session};
 pub use transcode::{
     plan_unit, transcode, IncrementalTranscoder, PictureEncoder, TranscodeOptions, TranscodeResult,
-    UnitPlan, VideoMode,
+    UnitPlan, UnitRequest, VideoMode,
 };
 
 /// JavaScript's `Math.round`, which the reference implementation used

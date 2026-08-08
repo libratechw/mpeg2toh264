@@ -246,6 +246,22 @@ enum Part {
     Picture(usize),
 }
 
+/// What a caller wants of one unit, beyond the conversion itself.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct UnitRequest {
+    /// Restart the decoded picture buffer here, at an IDR.
+    pub random_access: bool,
+    /// Make the unit's first intra picture a recovery point, without flushing
+    /// the references an open group's leading pictures need.
+    pub recovery_point: bool,
+    /// Put the parameter sets in front of the unit again even though nothing
+    /// they say has changed. The MP4 initialization segment is built from them,
+    /// so this is what a caller that has to send another one asks for -- when
+    /// the sound has changed its configuration, say, and the video's own
+    /// description is as it was.
+    pub description: bool,
+}
+
 /// What one unit becomes, worked out from its headers alone.
 ///
 /// Nothing here has decoded a slice. The plan assumes every picture it keeps
@@ -262,6 +278,9 @@ pub struct UnitPlan {
     pictures_converted: usize,
     pictures_skipped: usize,
     recovery_emitted: bool,
+    /// Whether the parameter sets went in front of this unit, which is what
+    /// gives the fragment it becomes an initialization segment.
+    described: bool,
 }
 
 impl UnitPlan {
@@ -305,8 +324,7 @@ pub fn plan_unit(
     data: &[u8],
     start: &TranscoderState,
     options: TranscodeOptions,
-    random_access: bool,
-    recovery_requested: bool,
+    request: UnitRequest,
     undecodable: &[bool],
 ) -> Result<UnitPlan> {
     let pics = parse_elementary_stream(data)?;
@@ -327,8 +345,11 @@ pub fn plan_unit(
     // is made, and it is what says the fragment opens at a random access point.
     //
     // [`stream_sequence_description`]: crate::mpeg2::headers::stream_sequence_description
-    let redescribe = !start.initialized || description != start.description;
-    let random_access = random_access || (start.initialized && redescribe);
+    // A caller may also ask for them where nothing they say has changed,
+    // because what it needs is the initialization segment built from them.
+    let redescribe = request.description || !start.initialized || description != start.description;
+    let random_access =
+        request.random_access || (start.initialized && description != start.description);
 
     // Interlaced coding is not handled by the frame path. A field-DCT
     // macroblock builds its 8x8 blocks from alternate lines and field motion
@@ -478,7 +499,7 @@ pub fn plan_unit(
             continue;
         }
         let is_reference = real_idr || picture_type != PictureType::B;
-        let recovery_intra = recovery_requested
+        let recovery_intra = request.recovery_point
             && !recovery_emitted
             && !state.awaiting_idr
             && picture_type == PictureType::I;
@@ -585,7 +606,8 @@ pub fn plan_unit(
     // if there are any: a unit that coded none is dropped whole by whoever is
     // packaging it, and a description dropped with it was never sent. Leaving
     // the state as it was is what makes the next unit carry it instead.
-    if redescribe && pictures_converted > 0 {
+    let described = redescribe && pictures_converted > 0;
+    if described {
         parts.splice(0..0, description_parts);
         state.initialized = true;
         state.description = description;
@@ -598,6 +620,7 @@ pub fn plan_unit(
         pictures_converted,
         pictures_skipped,
         recovery_emitted,
+        described,
     })
 }
 
@@ -792,6 +815,7 @@ pub struct IncrementalTranscoder {
     in_flight: Option<InFlight>,
     random_access_pending: bool,
     recovery_point_pending: bool,
+    description_pending: bool,
     pictures_converted: usize,
     pictures_skipped: usize,
     stats: Stats,
@@ -803,10 +827,9 @@ struct InFlight {
     /// Which source pictures earlier rounds found damaged, which is what the
     /// plan above was drawn knowing.
     undecodable: Vec<bool>,
-    /// The two requests the plan was drawn under, kept so that drawing it again
-    /// asks for the same thing.
-    random_access: bool,
-    recovery_requested: bool,
+    /// What the plan was drawn under, kept so that drawing it again asks for
+    /// the same thing.
+    request: UnitRequest,
 }
 
 /// What became of the pictures handed back to [`IncrementalTranscoder::complete`].
@@ -828,6 +851,7 @@ impl IncrementalTranscoder {
             in_flight: None,
             random_access_pending: false,
             recovery_point_pending: false,
+            description_pending: false,
             pictures_converted: 0,
             pictures_skipped: 0,
             stats: Stats::default(),
@@ -855,6 +879,16 @@ impl IncrementalTranscoder {
         if self.state.initialized {
             self.recovery_point_pending = true;
         }
+    }
+
+    /// Put the parameter sets in front of the next unit again, so that the
+    /// fragment it becomes can be given an initialization segment.
+    ///
+    /// The sequence they describe need not have changed: the segment describes
+    /// the sound as well, and a stream that switches between 5.1 and stereo
+    /// needs a new one with the same picture in it.
+    pub fn request_description(&mut self) {
+        self.description_pending = true;
     }
 
     /// Whether the next picture coded has to be one that opens the decoded
@@ -891,23 +925,18 @@ impl IncrementalTranscoder {
     /// the transcoder moves until then, so a unit that is begun and abandoned
     /// costs only what it took to plan.
     pub fn begin(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let random_access = self.state.initialized && self.random_access_pending;
-        let recovery_requested = self.state.initialized && self.recovery_point_pending;
+        let request = UnitRequest {
+            random_access: self.state.initialized && self.random_access_pending,
+            recovery_point: self.state.initialized && self.recovery_point_pending,
+            description: self.description_pending,
+        };
         let undecodable = Vec::new();
-        let mut plan = plan_unit(
-            data,
-            &self.state,
-            self.options,
-            random_access,
-            recovery_requested,
-            &undecodable,
-        )?;
+        let mut plan = plan_unit(data, &self.state, self.options, request, &undecodable)?;
         let jobs = plan.take_jobs();
         self.in_flight = Some(InFlight {
             plan,
             undecodable,
-            random_access,
-            recovery_requested,
+            request,
         });
         Ok(jobs)
     }
@@ -953,8 +982,7 @@ impl IncrementalTranscoder {
                 data,
                 &self.state,
                 self.options,
-                flight.random_access,
-                flight.recovery_requested,
+                flight.request,
                 &flight.undecodable,
             )?;
             let jobs = flight.plan.take_jobs();
@@ -967,7 +995,11 @@ impl IncrementalTranscoder {
         }
         self.state = flight.plan.state;
         self.random_access_pending = false;
-        self.recovery_point_pending = flight.recovery_requested && !flight.plan.recovery_emitted;
+        self.recovery_point_pending =
+            flight.request.recovery_point && !flight.plan.recovery_emitted;
+        // A unit that coded no picture carries no parameter sets either, so a
+        // description asked for and not sent is still owed.
+        self.description_pending = flight.request.description && !flight.plan.described;
         self.pictures_converted += flight.plan.pictures_converted;
         self.pictures_skipped += flight.plan.pictures_skipped;
         Ok(Step::Done(Box::new(TranscodeResult {

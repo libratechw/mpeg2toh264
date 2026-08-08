@@ -14,7 +14,7 @@ use mpeg2toh264::job::PictureOutput;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{
     plan_unit, transcode, Fragment, PictureEncoder, Progress, Session, TranscodeOptions,
-    TranscoderState,
+    TranscoderState, UnitRequest,
 };
 use support::{
     adts_stream, fnv1a, mux_transport_stream, read_fixture, wrap_mpeg2_es_in_ts, PesUnit,
@@ -32,8 +32,7 @@ fn convert(source: &[u8], encode: impl FnOnce(&[Vec<u8>]) -> Vec<PictureOutput>)
         source,
         &TranscoderState::new(),
         TranscodeOptions::default(),
-        false,
-        false,
+        UnitRequest::default(),
         &[],
     )
     .expect("plans");
@@ -372,8 +371,7 @@ fn a_jobs_bytes_do_not_grow_with_how_far_into_the_stream_its_picture_is() {
         &source,
         &TranscoderState::new(),
         TranscodeOptions::default(),
-        false,
-        false,
+        UnitRequest::default(),
         &[],
     )
     .expect("plans");
@@ -397,8 +395,7 @@ fn a_job_carries_the_headers_its_picture_is_described_by() {
             &source,
             &TranscoderState::new(),
             TranscodeOptions::default(),
-            false,
-            false,
+            UnitRequest::default(),
             &[],
         )
         .expect("plans");

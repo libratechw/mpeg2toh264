@@ -240,6 +240,30 @@ fn drops_a_frame_packet_loss_made_unreadable() {
     assert_eq!(frames.len(), 3, "the damaged frame is not passed on");
 }
 
+/// A programme in 5.1 followed by an announcement in stereo is one stream that
+/// changes what it is, not a damaged one. The header says so, and the elements
+/// change with it, so the run of frames the walker was reading ends there.
+#[test]
+fn reads_past_a_change_of_configuration() {
+    let mut stream = adts_stream(2, 3, 2);
+    stream.extend_from_slice(&adts_frame_with_payload(3, 6, &five_point_one_payload(0)));
+    stream.extend_from_slice(&adts_frame_with_payload(3, 6, &five_point_one_payload(0)));
+
+    let mut adts = AdtsStream::new();
+    let mut frames = adts.push(&stream).expect("both configurations decode");
+    frames.extend(adts.finish().expect("nothing is left over"));
+
+    assert_eq!(frames.len(), 4, "no frame is dropped at the change");
+    assert_eq!(frames[0].config.channel_count, 2);
+    assert_eq!(frames[0].config.audio_specific_config, [0x11, 0x90]);
+    assert_eq!(frames[3].config.channel_count, 6);
+    assert_eq!(
+        frames[3].config.audio_specific_config,
+        [0x11, 0xb0],
+        "and each frame carries the configuration it was coded under"
+    );
+}
+
 /// A frame that walks but names an element the stream has not carried is
 /// damage as well: a decoder has room only for the elements its configuration
 /// named, and refuses the frame that mentions another.
@@ -532,6 +556,46 @@ fn video_only_stream(copies: usize) -> Vec<u8> {
 fn av_stream(copies: usize, audio_frames: usize) -> Vec<u8> {
     let video = repeat_fixture("ibbp.m2v", copies);
     let audio = adts_stream(audio_frames, 3, 2);
+    let video_chunks: Vec<&[u8]> = video.chunks(20_000).collect();
+    let audio_chunks: Vec<&[u8]> = audio.chunks(400).collect();
+
+    let mut units: Vec<PesUnit<'_>> = Vec::new();
+    for index in 0..video_chunks.len().max(audio_chunks.len()) {
+        if let Some(payload) = video_chunks.get(index) {
+            units.push(PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                payload,
+                pts: Some(900_000 + index as u64 * 3_000),
+            });
+        }
+        if let Some(payload) = audio_chunks.get(index) {
+            units.push(PesUnit {
+                pid: AUDIO_PID,
+                stream_id: 0xc0,
+                payload,
+                pts: Some(903_600 + index as u64 * 3_000),
+            });
+        }
+    }
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+    )
+}
+
+/// Both tracks, with the sound changing configuration part way through, which
+/// is what a broadcast does between a programme in 5.1 and the announcement in
+/// stereo after it.
+fn audio_change_stream(copies: usize, before: usize, after: usize) -> Vec<u8> {
+    let video = repeat_fixture("ibbp.m2v", copies);
+    let mut audio = adts_stream(before, 3, 2);
+    for _ in 0..after {
+        audio.extend_from_slice(&adts_frame_with_payload(3, 6, &five_point_one_payload(0)));
+    }
     let video_chunks: Vec<&[u8]> = video.chunks(20_000).collect();
     let audio_chunks: Vec<&[u8]> = audio.chunks(400).collect();
 
@@ -980,6 +1044,67 @@ fn carries_aac_audio_through_untouched() {
     assert_eq!(
         total_audio, audio_frames,
         "every access unit fed in comes out again"
+    );
+}
+
+/// How many channels the first audio sample entry of an initialization segment
+/// declares.
+fn sample_entry_channels(init: &[u8]) -> u16 {
+    let at = init
+        .windows(4)
+        .position(|window| window == b"mp4a")
+        .expect("the init segment describes an audio track");
+    // Past the four-character code: six reserved bytes, the data reference
+    // index, and eight more reserved, then the channel count.
+    u16::from_be_bytes([init[at + 20], init[at + 21]])
+}
+
+#[test]
+fn a_new_audio_configuration_is_described_again() {
+    // A broadcast changes what its sound is between programmes, and the
+    // initialization segment carries the audio configuration in its `esds` just
+    // as it carries the picture in its `avcC`. Reading past the change used to
+    // be refused outright, which ended the conversion there.
+    let fragments = run_session(&audio_change_stream(8, 90, 90), 64 * 1024);
+    let (init, media) = split_fragments(&fragments);
+
+    assert_eq!(init.len(), 2, "one description per configuration");
+    let channels: Vec<u16> = init
+        .iter()
+        .map(|fragment| {
+            let Fragment::Init { data, .. } = fragment else {
+                unreachable!()
+            };
+            sample_entry_channels(data)
+        })
+        .collect();
+    assert_eq!(channels, vec![2, 6]);
+
+    let second = fragments
+        .iter()
+        .rposition(|fragment| matches!(fragment, Fragment::Init { .. }))
+        .expect("the second init segment");
+    assert!(
+        matches!(
+            fragments.get(second + 1),
+            Some(Fragment::Media {
+                random_access: true,
+                ..
+            })
+        ),
+        "the fragment a new description opens is one a decoder can start on"
+    );
+
+    let audio_samples: usize = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { audio_samples, .. } => *audio_samples,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        audio_samples, 180,
+        "every frame of both configurations comes out"
     );
 }
 
