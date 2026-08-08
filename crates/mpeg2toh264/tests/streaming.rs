@@ -1547,6 +1547,134 @@ fn moving_the_sound_to_another_stream_does_not_splice_a_frame_across_the_change(
     );
 }
 
+/// A second sound stream, one AAC access unit of it, filled with a byte that
+/// says which stream it came from.
+///
+/// The first byte is what makes it a channel pair rather than a single channel
+/// element, which is what keeps the frame passing through to the fragment
+/// unchanged: a single channel element is rebuilt as a pair, and the rebuilt
+/// bytes are no longer the ones fed in.
+fn marked_adts_frame(mark: u8) -> Vec<u8> {
+    let mut payload = vec![mark; 32];
+    payload[0] = 0x20;
+    adts_frame_with_payload(3, 2, &payload)
+}
+
+/// A bilingual broadcast: one picture and two sounds, sent at once on streams
+/// of their own, each frame marked with the stream it belongs to.
+fn bilingual_av_stream(copies: usize) -> Vec<u8> {
+    const SECOND_AUDIO_PID: u16 = 0x103;
+    let one = read_fixture("ibbp.m2v");
+    let pictures = parse_elementary_stream(&one).expect("parses").len() as u64;
+    const FRAME: u64 = 90_000 / 25;
+    const AAC: u64 = 1024 * 90_000 / 48_000;
+    let group = pictures * FRAME;
+    let streams = &[
+        (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+        (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        (SECOND_AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+    ];
+
+    let mut emitted = 0u64;
+    let mut out = Vec::new();
+    for copy in 0..copies as u64 {
+        let through = (copy + 1) * group / AAC;
+        let first = emitted;
+        let (mut main, mut second) = (Vec::new(), Vec::new());
+        while emitted < through {
+            main.extend_from_slice(&marked_adts_frame(MAIN_SOUND));
+            second.extend_from_slice(&marked_adts_frame(SECOND_SOUND));
+            emitted += 1;
+        }
+        let mut units = vec![PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload: &one,
+            pts: Some(900_000 + copy * group),
+        }];
+        if !main.is_empty() {
+            units.push(PesUnit {
+                pid: AUDIO_PID,
+                stream_id: 0xc0,
+                payload: &main,
+                pts: Some(900_000 + first * AAC),
+            });
+            units.push(PesUnit {
+                pid: SECOND_AUDIO_PID,
+                stream_id: 0xc0,
+                payload: &second,
+                pts: Some(900_000 + first * AAC),
+            });
+        }
+        out.extend_from_slice(&mux_transport_stream(streams, &units));
+    }
+    out
+}
+
+const MAIN_SOUND: u8 = 0xa7;
+const SECOND_SOUND: u8 = 0xb9;
+
+/// Whether a fragment carries sound from the stream marked this way. Sixteen
+/// bytes of one value is a run the converted picture does not have in it.
+fn carries_sound(fragment: &Fragment, mark: u8) -> bool {
+    let Fragment::Media { data, .. } = fragment else {
+        return false;
+    };
+    data.windows(16).any(|run| run.iter().all(|&b| b == mark))
+}
+
+#[test]
+fn changing_the_sound_changes_what_the_fragments_after_it_carry() {
+    // A viewer pressing the button during a live broadcast is asking for the
+    // other sound from here on. The fragments already made carry the sound that
+    // was chosen when they were made and have been appended, so nothing goes
+    // back over them -- what changes is what the next ones are built from.
+    let stream = bilingual_av_stream(6);
+    let mut session = Session::new(TranscodeOptions::default());
+    let chunks: Vec<&[u8]> = stream.chunks(16 * 1024).collect();
+    let switch_at = chunks.len() / 2;
+    let mut fragments = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index == switch_at {
+            let second = session.audio_streams()[1].pid;
+            session.select_audio(second);
+        }
+        fragments.extend(session.push(chunk).expect("push succeeds"));
+    }
+    fragments.extend(session.finish().expect("finish succeeds"));
+
+    let media: Vec<&Fragment> = fragments
+        .iter()
+        .filter(|fragment| matches!(fragment, Fragment::Media { .. }))
+        .collect();
+    let first = media.first().expect("a first fragment");
+    let last = media.last().expect("a last fragment");
+    assert!(
+        carries_sound(first, MAIN_SOUND) && !carries_sound(first, SECOND_SOUND),
+        "the sound before the switch is the one that was being read"
+    );
+    assert!(
+        carries_sound(last, SECOND_SOUND) && !carries_sound(last, MAIN_SOUND),
+        "and after it, the one that was asked for"
+    );
+
+    // The sound is laid down access unit by access unit, so a switch that lost
+    // or duplicated one would put the rest of the stream out against the
+    // picture by that much and leave it there.
+    let switched: usize = fragments
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { audio_samples, .. } => *audio_samples,
+            _ => 0,
+        })
+        .sum();
+    let (_, straight) = presentation_end(&run_session(&stream, 16 * 1024));
+    assert_eq!(
+        switched, straight,
+        "as many access units as a run that never switched"
+    );
+}
+
 #[test]
 fn conceals_a_missing_aac_frame_instead_of_stalling_video() {
     let video = repeat_fixture("ibbp.m2v", 4);

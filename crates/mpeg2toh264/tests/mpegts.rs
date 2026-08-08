@@ -464,3 +464,181 @@ fn emits_only_the_default_caption_and_superimpose_streams() {
     private_pids.sort_unstable();
     assert_eq!(private_pids, [0x130, 0x138]);
 }
+
+/// The audio component descriptor is what a broadcast says its sound with, and
+/// it says all of it in one place: which of the streams is the main one, whether
+/// the two channels of a stream are a stereo pair or two separate services, and
+/// what language each carries. A viewer choosing between them is choosing
+/// between those labels, so they have to come out of the program map -- before
+/// either stream has been read, and without decoding a frame of sound.
+#[test]
+fn reads_what_the_program_map_says_about_each_sound_stream() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
+        STREAM_TYPE_MPEG2_VIDEO,
+    };
+
+    // 1/0 + 1/0 mode, component tag 0x10, bilingual: Japanese and English in
+    // one stream, which a receiver plays one of.
+    let bilingual = [
+        0xc4, 0x0c, 0xf2, 0x02, 0x10, 0x0f, 0xff, 0xff, b'j', b'p', b'n', b'e', b'n', b'g',
+    ];
+    // 2/0 mode, component tag 0x11: an ordinary stereo pair beside it.
+    let commentary = [
+        0x52, 0x01, 0x11, 0xc4, 0x09, 0xf2, 0x03, 0x11, 0x0f, 0xff, 0x7f, b'j', b'p', b'n',
+    ];
+    let streams = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (0x110, STREAM_TYPE_AAC_ADTS, bilingual.as_slice()),
+        (0x111, STREAM_TYPE_AAC_ADTS, commentary.as_slice()),
+    ];
+    let ts = mux_transport_stream_with_descriptors(
+        streams,
+        &[PesUnit {
+            pid: 0x100,
+            stream_id: 0xe0,
+            pts: Some(90_000),
+            payload: &[0, 0, 1, 0xb3],
+        }],
+    );
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&ts).expect("demuxes");
+
+    let sound = demuxer.audio_streams();
+    assert_eq!(sound.len(), 2, "both sound streams, in the map's own order");
+    assert_eq!(sound[0].pid, 0x110);
+    assert_eq!(
+        sound[0].component_tag,
+        Some(0x10),
+        "the audio component descriptor names the tag where no stream \
+         identifier descriptor does"
+    );
+    assert!(sound[0].dual_mono, "1/0 + 1/0 is two services, not a pair");
+    assert_eq!(sound[0].languages, ["jpn", "eng"]);
+    assert_eq!(sound[1].pid, 0x111);
+    assert_eq!(sound[1].component_tag, Some(0x11));
+    assert!(!sound[1].dual_mono);
+    assert_eq!(sound[1].languages, ["jpn"]);
+
+    assert_eq!(
+        demuxer.audio_pid(),
+        Some(0x110),
+        "and until anyone says otherwise the sound is the first of them"
+    );
+}
+
+/// Switching the sound during a live broadcast changes what is read from here
+/// on and nothing else: the stream being left is not rewound, and the one being
+/// joined is not caught up with. What must not happen is the two being run
+/// together -- the tail of one stream's access unit followed by the head of
+/// another's makes one belonging to neither, which a browser's audio decoder
+/// refuses outright rather than concealing.
+#[test]
+fn changes_which_sound_stream_is_read_from_where_it_is_asked() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
+        STREAM_TYPE_MPEG2_VIDEO,
+    };
+
+    const MAIN: u16 = 0x110;
+    const SECOND: u16 = 0x111;
+    let main_tag = [0x52, 0x01, 0x10];
+    let second_tag = [0x52, 0x01, 0x11];
+    let streams = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (MAIN, STREAM_TYPE_AAC_ADTS, main_tag.as_slice()),
+        (SECOND, STREAM_TYPE_AAC_ADTS, second_tag.as_slice()),
+    ];
+    // Long enough that a PES packet takes more than one transport packet, so
+    // that a switch can be asked for in the middle of one.
+    let sound = |fill: u8| vec![fill; 300];
+    let (main_first, second_first) = (sound(0xa1), sound(0xb1));
+    let (main_second, second_second) = (sound(0xa2), sound(0xb2));
+    let ts = mux_transport_stream_with_descriptors(
+        streams,
+        &[
+            PesUnit {
+                pid: MAIN,
+                stream_id: 0xc0,
+                pts: Some(90_000),
+                payload: &main_first,
+            },
+            PesUnit {
+                pid: SECOND,
+                stream_id: 0xc0,
+                pts: Some(90_000),
+                payload: &second_first,
+            },
+            PesUnit {
+                pid: MAIN,
+                stream_id: 0xc0,
+                pts: Some(91_920),
+                payload: &main_second,
+            },
+            PesUnit {
+                pid: SECOND,
+                stream_id: 0xc0,
+                pts: Some(91_920),
+                payload: &second_second,
+            },
+        ],
+    );
+
+    // Up to the middle of the second main-sound PES: its first transport packet
+    // is in, and the one that finishes it is not.
+    let cut = 188 * 7;
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&ts[..cut]).expect("demuxes");
+    demuxer.select_audio(SECOND);
+    packets.extend(demuxer.push(&ts[cut..]).expect("demuxes the rest"));
+    packets.extend(demuxer.finish().expect("flushes"));
+
+    let sound: Vec<(u16, u8, usize)> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Audio)
+        .map(|packet| (packet.pid, packet.data[0], packet.data.len()))
+        .collect();
+    assert_eq!(
+        sound,
+        vec![(MAIN, 0xa1, 300), (MAIN, 0xa2, 170), (SECOND, 0xb2, 300)],
+        "the main sound up to the switch, what had been gathered of it under \
+         its own PID, and the second sound after it"
+    );
+    assert_eq!(demuxer.audio_pid(), Some(SECOND));
+}
+
+/// The choice belongs to the service rather than to one of its program maps. A
+/// station repeats its map every fraction of a second, and a viewer who picked
+/// the second sound is not asking to be put back on the first one by the next
+/// repetition -- nor by the map a station sends when it moves its streams and
+/// names that sound again.
+#[test]
+fn keeps_the_chosen_sound_across_a_repeated_program_map() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
+        STREAM_TYPE_MPEG2_VIDEO,
+    };
+
+    let streams = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (0x110, STREAM_TYPE_AAC_ADTS, &[][..]),
+        (0x111, STREAM_TYPE_AAC_ADTS, &[][..]),
+    ];
+    let video = PesUnit {
+        pid: 0x100,
+        stream_id: 0xe0,
+        pts: Some(90_000),
+        payload: &[0, 0, 1, 0xb3],
+    };
+    let ts = mux_transport_stream_with_descriptors(streams, std::slice::from_ref(&video));
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&ts).expect("demuxes");
+    demuxer.select_audio(0x111);
+    demuxer.push(&ts).expect("demuxes the map again");
+    assert_eq!(demuxer.audio_pid(), Some(0x111));
+}

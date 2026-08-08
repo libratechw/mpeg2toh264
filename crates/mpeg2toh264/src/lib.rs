@@ -32,8 +32,8 @@ pub use container::fmp4::{
     UnitLeadIn,
 };
 pub use container::mpegts::{
-    extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, ElementaryKind,
-    MpegTsAvDemuxer,
+    extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, AudioStream,
+    ElementaryKind, MpegTsAvDemuxer,
 };
 pub use mpeg2::headers::{
     pictures_interlacing, stream_sequence_description, Interlacing, SequenceDescription,

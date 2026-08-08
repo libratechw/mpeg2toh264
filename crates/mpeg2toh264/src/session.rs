@@ -18,7 +18,7 @@ use crate::container::fmp4::{
     mpeg2_video_timeline, Fmp4AudioSamples, Fmp4Fragment, Mpeg2Unit, Mpeg2VideoTimeline,
     UnitLeadIn,
 };
-use crate::container::mpegts::{ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
+use crate::container::mpegts::{AudioStream, ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
 use crate::error::{bail, Result};
 use crate::job::PictureOutput;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
@@ -321,6 +321,9 @@ pub struct Session {
     audio_clock_start_pts: Option<u64>,
     audio_clock_frames: u64,
     audio_clock_sample_rate: Option<u32>,
+    /// Whether the sound is being joined from another elementary stream, and so
+    /// may be carrying moments that have already been laid down.
+    audio_realigning: bool,
     /// Where the audio track begins on the shared timeline, once it is fixed.
     audio_origin_ticks: u64,
     /// The PES timestamp presentation time zero stands for. Supplied by a
@@ -368,6 +371,28 @@ impl Session {
 
     pub fn service_ids(&self) -> &[u16] {
         self.demuxer.service_ids()
+    }
+
+    /// Every sound stream the chosen service offers, and which of them the
+    /// fragments are being made from.
+    pub fn audio_streams(&self) -> &[AudioStream] {
+        self.demuxer.audio_streams()
+    }
+
+    pub fn audio_pid(&self) -> Option<u16> {
+        self.demuxer.audio_pid()
+    }
+
+    /// Take the sound from another of the service's streams from here on.
+    ///
+    /// Only from here on: the fragments already made carry the sound that was
+    /// chosen when they were made, and they have been appended. What changes is
+    /// what the next fragment is built from -- and where the two streams are
+    /// described differently, which a bilingual broadcast's second sound often
+    /// is, that fragment carries an initialization segment saying so, exactly as
+    /// a programme boundary that changes the sound does.
+    pub fn select_audio(&mut self, pid: u16) {
+        self.demuxer.select_audio(pid);
     }
 
     pub fn dropped(&self) -> u64 {
@@ -422,6 +447,7 @@ impl Session {
             audio_clock_start_pts: None,
             audio_clock_frames: 0,
             audio_clock_sample_rate: None,
+            audio_realigning: false,
             audio_origin_ticks: 0,
             timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
@@ -618,6 +644,10 @@ impl Session {
                         let tail = self.adts.finish()?;
                         self.audio_clock_frames += tail.len() as u64;
                         self.pending_audio.extend(tail);
+                        // The stream being joined carries the same moments as
+                        // the one being left, and whichever of them are already
+                        // on the track are not put there twice.
+                        self.audio_realigning = true;
                     }
                     self.audio_pid = Some(packet.pid);
                     let mut frames = self.adts.push(&packet.data)?;
@@ -687,6 +717,23 @@ impl Session {
             elapsed = 0;
         }
         let expected = aac_frame_count_through_video_time(elapsed, rate).max(0) as u64;
+        // Sound joined from another elementary stream opens wherever that
+        // stream's own access units begin, which is before where the one being
+        // left had reached: a switch takes effect at a PES boundary, and the
+        // moments between it and there are on the track already. Laying them
+        // down again would put the sound that much behind the picture and leave
+        // it there, so what has been covered is dropped and the join lands on
+        // the first access unit that has not.
+        if self.audio_realigning {
+            let over = self.audio_clock_frames.saturating_sub(expected) as usize;
+            frames.drain(..over.min(frames.len()));
+            // A packet with nothing left in it was covered in full, so the one
+            // after it is measured the same way. Anything left is the join.
+            self.audio_realigning = frames.is_empty();
+            if frames.is_empty() {
+                return;
+            }
+        }
         let missing = expected.saturating_sub(self.audio_clock_frames);
         let held = (missing * AAC_FRAME_SAMPLES * TIMESCALE / rate as u64) as i64;
         if missing <= MAX_CONCEALED_AUDIO_FRAMES {

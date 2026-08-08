@@ -10,8 +10,9 @@ const SYNC_BYTE: u8 = 0x47;
 const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
 
-/// The component tag carried by an ARIB stream identifier descriptor.
-fn component_tag(descriptors: &[u8]) -> Option<u8> {
+/// The body of the first descriptor carrying this tag, without its own two
+/// bytes of tag and length.
+fn descriptor(descriptors: &[u8], tag: u8) -> Option<&[u8]> {
     let mut at = 0;
     while at + 2 <= descriptors.len() {
         let length = descriptors[at + 1] as usize;
@@ -19,12 +20,89 @@ fn component_tag(descriptors: &[u8]) -> Option<u8> {
         if end > descriptors.len() {
             return None;
         }
-        if descriptors[at] == 0x52 && length == 1 {
-            return Some(descriptors[at + 2]);
+        if descriptors[at] == tag {
+            return Some(&descriptors[at + 2..end]);
         }
         at = end;
     }
     None
+}
+
+/// The component tag carried by an ARIB stream identifier descriptor.
+fn component_tag(descriptors: &[u8]) -> Option<u8> {
+    descriptor(descriptors, 0x52).and_then(|body| (body.len() == 1).then(|| body[0]))
+}
+
+/// One sound stream a service offers, as its program map describes it.
+///
+/// A broadcast that carries a second sound sends it as a stream of its own
+/// beside the first, and says which is which in the descriptors rather than by
+/// the order it lists them in. Everything here comes from the map: nothing has
+/// to be demuxed, so a caller can offer the choice before a byte of either has
+/// been read.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct AudioStream {
+    pub pid: u16,
+    /// The ARIB stream identifier's component tag. A broadcast names its main
+    /// sound 0x10 and the ones beside it 0x11 upwards, which is the only thing
+    /// that distinguishes them where the languages are the same.
+    pub component_tag: Option<u8>,
+    /// Whether the stream's two channels are two separate services rather than
+    /// a stereo pair. Which of the two is played is not a choice about the
+    /// stream but a choice inside it -- see [`crate::container::adts`].
+    pub dual_mono: bool,
+    /// The languages the descriptors name, in the order they name them. Dual
+    /// mono carries the second service's language as a second entry, which is
+    /// what a bilingual broadcast is announced as.
+    pub languages: Vec<String>,
+}
+
+/// ISO 639 language codes are three ASCII letters. Anything else is a
+/// descriptor that has been damaged or that this is not reading correctly, and
+/// a label made of it would be worse than none.
+fn language_code(code: &[u8]) -> Option<String> {
+    code.iter()
+        .all(|byte| byte.is_ascii_alphabetic())
+        .then(|| String::from_utf8_lossy(code).to_ascii_lowercase())
+}
+
+impl AudioStream {
+    /// Read what one stream's descriptors say about the sound in it.
+    ///
+    /// The ARIB audio component descriptor is the one that answers everything
+    /// at once (STD-B10 part 2, 6.2.26): its `component_type` says how many
+    /// channels there are and whether they are one service or two, and its
+    /// language codes -- a second one when `ES_multi_lingual_flag` is set --
+    /// name what a viewer would be choosing between. A stream that carries only
+    /// the ISO 639 language descriptor still gets its language from there.
+    fn from_descriptors(pid: u16, descriptors: &[u8]) -> Self {
+        let mut stream = Self {
+            pid,
+            component_tag: component_tag(descriptors),
+            ..Self::default()
+        };
+        if let Some(body) = descriptor(descriptors, 0xc4) {
+            if body.len() >= 9 {
+                // 1/0 + 1/0 mode: two mono services in one stream.
+                stream.dual_mono = body[1] == 0x02;
+                stream.component_tag = stream.component_tag.or(Some(body[2]));
+                let multilingual = body[5] & 0x80 != 0;
+                stream.languages.extend(language_code(&body[6..9]));
+                if multilingual && body.len() >= 12 {
+                    stream.languages.extend(language_code(&body[9..12]));
+                }
+            }
+        }
+        if stream.languages.is_empty() {
+            if let Some(body) = descriptor(descriptors, 0x0a) {
+                stream.languages.extend(
+                    body.chunks_exact(4)
+                        .filter_map(|entry| language_code(&entry[..3])),
+                );
+            }
+        }
+        stream
+    }
 }
 
 fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
@@ -253,6 +331,7 @@ struct DeferredProgram {
     rank: usize,
     video: Option<u16>,
     audio: Option<u16>,
+    audio_streams: Vec<AudioStream>,
     private: Vec<u16>,
 }
 
@@ -273,6 +352,14 @@ struct ProgramMap {
     deferred: Option<DeferredProgram>,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
+    /// Which sound the caller has asked for. It is a choice about the service
+    /// rather than about one program map, so it survives a map that does not
+    /// offer it -- a station that moves its streams still owes the viewer the
+    /// sound they picked once it names it again.
+    wanted_audio: Option<u16>,
+    /// Every sound stream the chosen service's map advertises, in the order it
+    /// lists them.
+    audio_streams: Vec<AudioStream>,
     private_pids: Vec<u16>,
     /// Every service seen in the program association table, in the order they
     /// were announced.
@@ -302,6 +389,8 @@ impl Default for ProgramMap {
             deferred: None,
             video_pid: None,
             audio_pid: None,
+            wanted_audio: None,
+            audio_streams: Vec::new(),
             private_pids: Vec::new(),
             services: Vec::new(),
             may_switch_streams: true,
@@ -383,7 +472,7 @@ impl ProgramMap {
             let end = section.len() - 4;
             let mut i = 12 + program_info_length;
             let mut video = None;
-            let mut audio = None;
+            let mut audio_streams: Vec<AudioStream> = Vec::new();
             let mut private = Vec::new();
             let mut all_pids = Vec::new();
             while i + 4 < end {
@@ -397,18 +486,25 @@ impl ProgramMap {
                 if info_end > end {
                     break;
                 }
-                let tag = component_tag(&section[info_start..info_end]);
+                let descriptors = &section[info_start..info_end];
+                let tag = component_tag(descriptors);
                 if video.is_none() && stream_type == STREAM_TYPE_MPEG2_VIDEO {
                     video = Some(stream_pid);
                 }
-                if audio.is_none() && stream_type == STREAM_TYPE_AAC_ADTS {
-                    audio = Some(stream_pid);
+                if stream_type == STREAM_TYPE_AAC_ADTS {
+                    audio_streams.push(AudioStream::from_descriptors(stream_pid, descriptors));
                 }
                 if stream_type == 0x06 {
                     private.push((stream_pid, tag));
                 }
                 i += 5 + info_length;
             }
+            // The sound the caller picked, while this map still carries it, and
+            // otherwise the one the broadcast puts first.
+            let audio = self
+                .wanted_audio
+                .filter(|wanted| audio_streams.iter().any(|stream| stream.pid == *wanted))
+                .or_else(|| audio_streams.first().map(|stream| stream.pid));
             let private = select_private_streams(private);
             all_pids.sort_unstable();
             all_pids.dedup();
@@ -432,6 +528,7 @@ impl ProgramMap {
                         self.rank = deferred.rank;
                         self.video_pid = deferred.video;
                         self.audio_pid = deferred.audio;
+                        self.audio_streams = deferred.audio_streams;
                         self.private_pids = deferred.private;
                     }
                 }
@@ -452,6 +549,7 @@ impl ProgramMap {
                         rank,
                         video,
                         audio,
+                        audio_streams,
                         private,
                     });
                 }
@@ -493,6 +591,7 @@ impl ProgramMap {
             self.rank = rank;
             self.video_pid = video;
             self.audio_pid = audio;
+            self.audio_streams = audio_streams;
             self.private_pids = private;
         }
     }
@@ -641,6 +740,9 @@ pub struct MpegTsAvDemuxer {
     /// [`Superseded`].
     superseded_video: Option<Superseded>,
     superseded_audio: Option<Superseded>,
+    /// A sound stream the caller has asked to be read instead, which takes
+    /// effect at the next packet boundary; see [`MpegTsAvDemuxer::select_audio`].
+    audio_switch: Option<u16>,
     private: HashMap<u16, PesState>,
     video_pts: Option<u64>,
     audio_pts: Option<u64>,
@@ -685,6 +787,71 @@ impl MpegTsAvDemuxer {
         self.program.audio_pid.is_some()
     }
 
+    /// Every sound stream the chosen service offers, in the order its program
+    /// map lists them. Empty until that map arrives.
+    pub fn audio_streams(&self) -> &[AudioStream] {
+        &self.program.audio_streams
+    }
+
+    /// Which of them is being read.
+    pub fn audio_pid(&self) -> Option<u16> {
+        self.program.audio_pid
+    }
+
+    /// Read the sound from another of the service's streams from here on.
+    ///
+    /// A broadcast that carries a second sound carries both at once, so this
+    /// changes only which one is taken: nothing already handed out is revisited,
+    /// and the stream being left is not rewound. That is what a viewer pressing
+    /// the button during a live broadcast is asking for, and it is all that can
+    /// be offered anyway -- the fragments made from the old sound have been
+    /// appended and are being played.
+    ///
+    /// The choice is remembered rather than applied to one map, so a station
+    /// that moves its streams and names the same sound again keeps it. A PID
+    /// this service does not offer is remembered too and does nothing until it
+    /// does.
+    pub fn select_audio(&mut self, pid: u16) {
+        self.program.wanted_audio = Some(pid);
+        if self.program.audio_pid == Some(pid) {
+            self.audio_switch = None;
+            return;
+        }
+        if self
+            .program
+            .audio_streams
+            .iter()
+            .any(|stream| stream.pid == pid)
+        {
+            self.audio_switch = Some(pid);
+        }
+    }
+
+    /// Move to the sound stream [`Self::select_audio`] asked for, at a packet
+    /// boundary rather than in the middle of one.
+    ///
+    /// What has been gathered from the stream being left goes out under its own
+    /// PID, so that whoever is reading the access units sees where one stream
+    /// ended and the next began. Joined instead, the two would make one access
+    /// unit belonging to neither -- which a browser's audio decoder refuses
+    /// outright rather than concealing, and that ends playback.
+    fn take_audio_switch(&mut self, output: &mut Vec<ElementaryPacket>) -> Result<()> {
+        let Some(pid) = self.audio_switch.take() else {
+            return Ok(());
+        };
+        if let Some(mut old) = self.superseded_audio.take() {
+            old.state
+                .flush(ElementaryKind::Audio, old.pid, &mut *output)?;
+        }
+        if let Some(old) = self.program.audio_pid {
+            self.audio.flush(ElementaryKind::Audio, old, &mut *output)?;
+        }
+        self.audio = PesState::default();
+        self.program.audio_pid = Some(pid);
+        self.audio_pts = None;
+        Ok(())
+    }
+
     /// ARIB character superimpose is timed by the accompanying audio PES, or
     /// by video when the service has no audio. Its own PES commonly has no PTS.
     fn superimpose_pts(&self) -> Option<u64> {
@@ -714,6 +881,7 @@ impl MpegTsAvDemuxer {
         }
 
         let mut output = Vec::new();
+        self.take_audio_switch(&mut output)?;
         let mut sections = Vec::new();
         while at + TS_PACKET_SIZE <= input.len() {
             match payload_at(&input, at) {
