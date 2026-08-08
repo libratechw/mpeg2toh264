@@ -8,6 +8,7 @@ import {
   supportsManagedMediaSource,
   supportsPassthrough,
   supportsWorkerMediaSource,
+  type AudioTracks,
   type PlayerState,
 } from "@mpeg2toh264/player";
 import {
@@ -44,6 +45,8 @@ const stage = document.querySelector<HTMLElement>("#stage")!;
 const fullscreen = document.querySelector<HTMLButtonElement>("#fullscreen")!;
 const service = document.querySelector<HTMLSelectElement>("#service")!;
 const serviceLabel = document.querySelector<HTMLElement>("#service-label")!;
+const audioSelect = document.querySelector<HTMLSelectElement>("#audio")!;
+const audioSelectLabel = document.querySelector<HTMLElement>("#audio-label")!;
 const passthrough = document.querySelector<HTMLInputElement>("#passthrough")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
@@ -276,6 +279,12 @@ function createPlayer(): Mpeg2TsPlayer {
     service.hidden = false;
     serviceLabel.hidden = false;
   });
+  // What sound the programme is carrying. Unlike the service, this is a choice
+  // a viewer makes while watching: it changes what is converted from here on,
+  // and the fragments already in the buffer keep the sound they were made with.
+  created.addEventListener("audio", (event) => {
+    showAudioChoices(event.detail);
+  });
   created.addEventListener("seekable", (event) => {
     duration = event.detail.duration;
     length = `${formatDuration(duration)} (シーク可能)`;
@@ -381,6 +390,121 @@ function showDeinterlaceStats(stats: DeinterlaceStats): void {
 
 /** The service a viewer picked, which only a fresh load can act on. */
 let wantedService: number | null = null;
+
+/**
+ * The sound a viewer picked, as the value of the option they picked it with.
+ *
+ * A switch lands on the next slice of input rather than at once, so for a
+ * moment the player still reports the sound being left. Without remembering
+ * what was asked for, the redraw that report causes would put the control back
+ * on the old choice in front of the viewer.
+ */
+let wantedAudio: string | null = null;
+
+/** Language codes in the words a viewer would use, and the code otherwise. */
+const LANGUAGE_NAMES: Record<string, string> = {
+  jpn: "日本語",
+  eng: "英語",
+  kor: "韓国語",
+  zho: "中国語",
+  spa: "スペイン語",
+  fra: "フランス語",
+  deu: "ドイツ語",
+  por: "ポルトガル語",
+  rus: "ロシア語",
+  ita: "イタリア語",
+};
+
+/**
+ * The sounds a viewer can choose between, which is not the same as the streams
+ * on offer: a dual-mono stream is two of them, carried as the two channels of
+ * one stream, and a bilingual broadcast is sent either way.
+ *
+ * Each option is named by the language its descriptors give it, falling back on
+ * what a receiver would call it when the broadcast names none.
+ */
+function audioChoices(audio: AudioTracks): { value: string; text: string }[] {
+  const several = audio.available.length > 1;
+  const choices: { value: string; text: string }[] = [];
+  audio.available.forEach((stream, index) => {
+    // The program map does not always say a stream is dual mono. The frames of
+    // the one being read do, and that is the one a viewer is listening to.
+    const dualMono =
+      stream.dualMono || (stream.pid === audio.current && audio.dualMono);
+    const language = (at: number, fallback: string): string => {
+      const code = stream.languages[at];
+      return code ? (LANGUAGE_NAMES[code] ?? code) : fallback;
+    };
+    const named = (text: string): string =>
+      several ? `音声${index + 1} ${text}` : text;
+    if (!dualMono) {
+      choices.push({
+        value: String(stream.pid),
+        text: named(language(0, "")).trim() || "音声",
+      });
+      return;
+    }
+    choices.push({
+      value: String(stream.pid),
+      text: named(language(0, "主音声")),
+    });
+    choices.push({
+      value: `${stream.pid}:sub`,
+      text: named(language(1, "副音声")),
+    });
+  });
+  return choices;
+}
+
+/**
+ * Offer the choice, or put it away where there is only one thing to hear.
+ */
+function showAudioChoices(audio: AudioTracks): void {
+  const choices = audioChoices(audio);
+  if (choices.length < 2) {
+    forgetAudio();
+    return;
+  }
+  const playing = `${audio.current}${audio.dualMonoSub ? ":sub" : ""}`;
+  // A choice the programme no longer offers is not one to keep showing: a
+  // programme boundary can take the stream it named away with it.
+  if (wantedAudio !== null && !choices.some((c) => c.value === wantedAudio))
+    wantedAudio = null;
+  const selected = wantedAudio ?? playing;
+  audioSelect.replaceChildren(
+    ...choices.map(({ value, text }) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      option.selected = value === selected;
+      return option;
+    }),
+  );
+  audioSelect.hidden = false;
+  audioSelectLabel.hidden = false;
+}
+
+/** Put the sound picker away, for a load that has not said what it carries. */
+function forgetAudio(): void {
+  wantedAudio = null;
+  audioSelect.hidden = true;
+  audioSelectLabel.hidden = true;
+  audioSelect.replaceChildren();
+}
+
+// The sound is chosen at the head of the conversion rather than at the
+// playhead, so the change is heard once playback reaches what is being
+// converted now -- moments on a live stream, and as far ahead as the buffer has
+// run on a recording.
+audioSelect.addEventListener("change", () => {
+  const value = audioSelect.value;
+  const [pid, service] = value.split(":");
+  const chosen = Number(pid);
+  if (!Number.isFinite(chosen)) return;
+  wantedAudio = value;
+  player?.selectAudio(chosen);
+  player?.selectDualMono(service === "sub");
+});
 /** What was last played, so switching service can start it again. */
 let playing: { url: string; label: string } | null = null;
 
@@ -391,6 +515,9 @@ function play(
   autoplay = false,
 ) {
   playing = { url, label: sourceLabel };
+  // What the last input carried says nothing about this one, and a choice made
+  // on it names a stream that may not be there.
+  forgetAudio();
   if (fileUrl && fileUrl !== ownedUrl) URL.revokeObjectURL(fileUrl);
   fileUrl = ownedUrl;
   label = sourceLabel;
@@ -432,6 +559,7 @@ function unloadSource() {
   // on picking it again, so choosing it a second time would do nothing.
   fileInput.value = "";
   forgetService();
+  forgetAudio();
   label = "";
   progress = "";
   counts = "";
