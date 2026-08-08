@@ -9,13 +9,14 @@ import init, {
   firstTimestamp as wasmFirstTimestamp,
   lastTimestamp as wasmLastTimestamp,
   Session,
+  type AudioStream,
   type Fragment,
   type Progress,
 } from "../wasm/mpeg2toh264_wasm.js";
 import type { PicturePool } from "./pool.js";
 import type { Stats } from "./protocol.js";
 
-export type { Fragment };
+export type { AudioStream, Fragment };
 
 /** Where the `.wasm` sits relative to this module, when no caller says. */
 const DEFAULT_WASM_URL = new URL(
@@ -126,6 +127,37 @@ export class Transcoder {
   /** Every service this transport stream announced, in the order it did. */
   get serviceIds(): number[] {
     return Array.from(this.#session.serviceIds);
+  }
+
+  /** Every sound stream the chosen service offers, as its map describes them. */
+  get audioStreams(): AudioStream[] {
+    return Array.from(this.#session.audioStreams);
+  }
+
+  /** Which of them the fragments are being made from. */
+  get audioPid(): number | null {
+    return this.#session.audioPid ?? null;
+  }
+
+  /**
+   * Whether the sound being read carries two services in one stream rather
+   * than a stereo pair, as the frames read so far had it.
+   */
+  get audioIsDualMono(): boolean {
+    return this.#session.audioIsDualMono;
+  }
+
+  /**
+   * Take the sound from another of the service's streams, from the next
+   * fragment on. What is already converted keeps the sound it was made with.
+   */
+  selectAudio(pid: number): void {
+    this.#session.selectAudio(pid);
+  }
+
+  /** The same within a dual-mono stream, where the choice is the other channel. */
+  selectDualMono(sub: boolean): void {
+    this.#session.selectDualMono(sub);
   }
 
   /**

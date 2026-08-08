@@ -16,6 +16,7 @@ import {
   DEFAULT_MAX_AHEAD_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
   PLAYHEAD_REPORT_INTERVAL_MS,
+  type AudioTracks,
   type Command,
   type Notification,
   type PlayerState,
@@ -168,6 +169,15 @@ export interface Mpeg2TsPlayerEventMap {
    */
   services: CustomEvent<Services>;
   /**
+   * What sound the programme is carrying and which of it is being taken.
+   * Arrives once the program map has been read and again whenever either
+   * changes -- a programme boundary that offers different streams, a broadcast
+   * that turns dual mono on mid-programme, or a viewer's own choice taking
+   * effect. `selectAudio` and `selectDualMono` are what act on it. See
+   * `AudioTracks`.
+   */
+  audio: CustomEvent<AudioTracks>;
+  /**
    * How many workers ended up converting pictures alongside the conversion,
    * which is zero where this browser would not have them and the pictures are
    * converted in the one worker as before. Arrives once per load.
@@ -282,6 +292,8 @@ export class Mpeg2TsPlayer extends EventTarget {
   #duration: number | null = null;
   /** What the source last said about its fields. See `Scan`. */
   #scan: Scan | null = null;
+  /** What sound the programme last said it was carrying. See `AudioTracks`. */
+  #audio: AudioTracks | null = null;
   /** When `load()` was called, as epoch milliseconds; every mark counts from it. */
   #loadedAt = 0;
   /** When the last mark was, so each one can say what it cost on its own. */
@@ -327,6 +339,54 @@ export class Mpeg2TsPlayer extends EventTarget {
    */
   get scan(): Scan | null {
     return this.#scan;
+  }
+
+  /**
+   * What sound the programme is carrying and which of it is being taken, or
+   * null before its program map has been read. See `AudioTracks`.
+   */
+  get audio(): AudioTracks | null {
+    return this.#audio;
+  }
+
+  /**
+   * Take the sound from another of the service's streams from here on.
+   *
+   * From here on, and no further back: the fragments already converted carry
+   * the sound they were made with and are in the buffer being played, so the
+   * change arrives when the playhead reaches what is being converted now --
+   * a few seconds on a live stream, and however far ahead the buffer has run
+   * on a recording. Emptying the buffer to make it immediate would take the
+   * picture with it.
+   *
+   * The PID is one of `audio.available`. One the program map has yet to name
+   * is remembered until it does, so a page restoring a viewer's choice may
+   * call this before the map arrives.
+   */
+  selectAudio(pid: number): void {
+    this.#worker?.postMessage({
+      type: "audio",
+      id: this.#generation,
+      pid,
+      dualMonoSub: null,
+    } satisfies Command);
+  }
+
+  /**
+   * The same choice inside a dual-mono stream, where the two services are the
+   * two channels of one stream rather than two streams.
+   *
+   * A bilingual broadcast in Japan is carried either way, and which way is not
+   * the viewer's business: `audio.dualMono` says which control to offer. This
+   * one describes nothing anew, so the change costs no restart point.
+   */
+  selectDualMono(sub: boolean): void {
+    this.#worker?.postMessage({
+      type: "audio",
+      id: this.#generation,
+      pid: null,
+      dualMonoSub: sub,
+    } satisfies Command);
   }
 
   /** Which side of the wire ended up owning the MediaSource. */
@@ -567,6 +627,10 @@ export class Mpeg2TsPlayer extends EventTarget {
         break;
       case "services":
         this.#emit("services", notification.services);
+        break;
+      case "audio":
+        this.#audio = notification.audio;
+        this.#emit("audio", notification.audio);
         break;
       case "private_stream_1":
       case "private_stream_2":

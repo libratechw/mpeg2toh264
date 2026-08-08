@@ -7,7 +7,7 @@
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use mpeg2toh264::job::PictureOutput;
-use mpeg2toh264::{Fragment, Progress, TranscodeOptions, VideoMode};
+use mpeg2toh264::{DualMono, Fragment, Progress, TranscodeOptions, VideoMode};
 use wasm_bindgen::prelude::*;
 
 /// The shape of what [`Session::push`] returns, declared so the browser sources
@@ -69,6 +69,34 @@ export type Progress = {
   /** Empty when nothing is owed. */
   jobs: Uint8Array[];
 };
+
+/**
+ * One sound stream a service offers, as its program map describes it.
+ *
+ * All of it comes from the map, so the choice can be offered before a byte of
+ * any of these streams has been read.
+ */
+export type AudioStream = {
+  /** Elementary stream PID, which is what `selectAudio` takes. */
+  pid: number;
+  /**
+   * The ARIB stream identifier's component tag. A broadcast names its main
+   * sound 0x10 and the ones beside it 0x11 upwards, which is all that
+   * distinguishes them where the languages are the same.
+   */
+  componentTag: number | null;
+  /**
+   * Whether the stream's two channels are two separate services rather than a
+   * stereo pair. Choosing between those is `selectDualMono`, not this: they
+   * are one stream.
+   */
+  dualMono: boolean;
+  /**
+   * The languages the descriptors name, in the order they name them, as ISO
+   * 639 codes. Dual mono carries the second service's language second.
+   */
+  languages: string[];
+};
 "#;
 
 #[wasm_bindgen]
@@ -77,6 +105,8 @@ extern "C" {
     pub type FragmentArray;
     #[wasm_bindgen(typescript_type = "Progress")]
     pub type ProgressObject;
+    #[wasm_bindgen(typescript_type = "AudioStream[]")]
+    pub type AudioStreamArray;
 }
 
 /// Streaming transcode of one transport stream.
@@ -192,6 +222,76 @@ impl Session {
     #[wasm_bindgen(getter, js_name = serviceIds)]
     pub fn service_ids(&self) -> Vec<u16> {
         self.inner.service_ids().to_vec()
+    }
+
+    /// Every sound stream the chosen service offers, in the order its program
+    /// map lists them. Empty until that map arrives.
+    #[wasm_bindgen(getter, js_name = audioStreams)]
+    pub fn audio_streams(&self) -> Result<AudioStreamArray, JsError> {
+        let array = Array::new();
+        for stream in self.inner.audio_streams() {
+            let object = Object::new();
+            set(&object, "pid", &(stream.pid as f64).into())?;
+            set(
+                &object,
+                "componentTag",
+                &stream
+                    .component_tag
+                    .map_or(JsValue::NULL, |tag| (tag as f64).into()),
+            )?;
+            set(&object, "dualMono", &stream.dual_mono.into())?;
+            let languages = Array::new();
+            for language in &stream.languages {
+                languages.push(&JsValue::from_str(language));
+            }
+            set(&object, "languages", &languages.into())?;
+            array.push(&object);
+        }
+        Ok(JsValue::from(array).unchecked_into())
+    }
+
+    /// Which of them the fragments are being made from, and `undefined` before
+    /// the program map has named one.
+    #[wasm_bindgen(getter, js_name = audioPid)]
+    pub fn audio_pid(&self) -> Option<u16> {
+        self.inner.audio_pid()
+    }
+
+    /// Take the sound from another of the service's streams from here on.
+    ///
+    /// Only from here on: the fragments already made carry the sound that was
+    /// chosen when they were made and have been appended, so nothing goes back
+    /// over them. Where the two streams are described differently -- a
+    /// commentary in stereo beside a programme in 5.1 -- the fragment the
+    /// change lands in carries an initialization segment of its own, exactly as
+    /// a programme boundary that changes the sound does.
+    #[wasm_bindgen(js_name = selectAudio)]
+    pub fn select_audio(&mut self, pid: u16) {
+        self.inner.select_audio(pid);
+    }
+
+    /// Whether the sound being read carries two services in one stream rather
+    /// than a stereo pair, as the frames read so far had it.
+    ///
+    /// `audioStreams` says so too, from the program map, and says it before a
+    /// frame has arrived. This is the stream itself, which is what a broadcast
+    /// that turns dual mono on within a programme leaves the map disagreeing
+    /// with.
+    #[wasm_bindgen(getter, js_name = audioIsDualMono)]
+    pub fn audio_is_dual_mono(&self) -> bool {
+        self.inner.audio_is_dual_mono()
+    }
+
+    /// Take the sound of a dual-mono stream from the second service rather than
+    /// the first, from here on.
+    ///
+    /// Both are rebuilt into the same two-channel configuration, so nothing is
+    /// described anew and the frames on either side of the change play one
+    /// after the other. A stream with one service in it is unaffected.
+    #[wasm_bindgen(js_name = selectDualMono)]
+    pub fn select_dual_mono(&mut self, sub: bool) {
+        self.inner
+            .select_dual_mono(if sub { DualMono::Sub } else { DualMono::Main });
     }
 
     /// The PES timestamp presentation time zero stands for, once the first

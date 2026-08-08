@@ -185,6 +185,21 @@ export type Command =
   | { type: "flow"; id: number; ready: boolean }
   /** Play from here instead; the buffer does not reach it. See `seekable`. */
   | { type: "seek"; id: number; time: number }
+  /**
+   * Take the sound from somewhere else from here on: another of the service's
+   * streams, or the other service of a dual-mono one. Either may be left
+   * unset, which leaves that half of the choice alone.
+   *
+   * Only from here on. What is already converted is in the buffer and being
+   * played, and this does not go back over it -- so how soon a viewer hears
+   * the change is how far ahead of the playhead the conversion has run.
+   */
+  | {
+      type: "audio";
+      id: number;
+      pid: number | null;
+      dualMonoSub: boolean | null;
+    }
   | { type: "stop"; id: number };
 
 export type Notification =
@@ -245,6 +260,12 @@ export type Notification =
    */
   | { type: "workers"; id: number; pictureWorkers: number }
   | { type: "services"; id: number; services: Services }
+  /**
+   * What sound the programme is carrying and which of it is being taken. Sent
+   * once the program map has been read, and again whenever either changes --
+   * including when the change is the viewer's own.
+   */
+  | { type: "audio"; id: number; audio: AudioTracks }
   | { type: "private_stream_1"; id: number; stream: PrivateStream }
   | { type: "private_stream_2"; id: number; stream: PrivateStream }
   | { type: "stats"; id: number; stats: Stats }
@@ -340,6 +361,51 @@ export interface Services {
   available: number[];
   /** The one the fragments are being made from, or null before it is known. */
   current: number | null;
+}
+
+/**
+ * One sound stream a service offers, as its program map describes it.
+ *
+ * All of it comes from the map, so a page can label the choice before a byte
+ * of any of these streams has been converted.
+ */
+export interface AudioStream {
+  /** Elementary stream PID, which is what `selectAudio` takes. */
+  pid: number;
+  /**
+   * The ARIB stream identifier's component tag. A broadcast names its main
+   * sound 0x10 and the ones beside it 0x11 upwards, which is all that
+   * distinguishes them where the languages are the same.
+   */
+  componentTag: number | null;
+  /**
+   * Whether this stream's two channels are two separate services rather than a
+   * stereo pair. Choosing between those is `selectDualMono`: they are one
+   * stream, and switching between them changes nothing else about the sound.
+   */
+  dualMono: boolean;
+  /**
+   * The languages the descriptors name, in the order they name them, as ISO
+   * 639 codes. A dual-mono stream names the second service's language second,
+   * which is what makes a bilingual broadcast labellable.
+   */
+  languages: string[];
+}
+
+/** What sound the programme is carrying, and which of it is being heard. */
+export interface AudioTracks {
+  /** Every sound stream the chosen service offers, in its map's order. */
+  available: AudioStream[];
+  /** The one the fragments are being made from, or null before it is known. */
+  current: number | null;
+  /**
+   * Whether the sound being read carries two services in one stream, as the
+   * frames converted so far had it. A broadcast can turn this on within a
+   * programme, so it arrives with the sound rather than with the map.
+   */
+  dualMono: boolean;
+  /** Whether the second of those two is the one being taken. */
+  dualMonoSub: boolean;
 }
 
 export interface Progress {

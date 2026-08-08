@@ -18,6 +18,8 @@ import {
   SEEK_PROBE_BYTES,
   SEEK_PROBE_TOLERANCE_SECONDS,
   TAIL_PROBE_BYTES,
+  type AudioStream,
+  type AudioTracks,
   type Command,
   type LoadCommand,
   type Notification,
@@ -246,6 +248,15 @@ class Playback {
   #readingMs = 0;
   /** The last services reported, so the same news is not sent twice. */
   #announced: Services | null = null;
+  /** The same for the sound. */
+  #announcedAudio: AudioTracks | null = null;
+  /**
+   * The sound a viewer picked, which outlives the leg that was running when
+   * they picked it: a seek opens another session, and it owes them the sound
+   * they chose rather than the one the program map puts first.
+   */
+  #audioPid: number | null = null;
+  #dualMonoSub = false;
   #waitingMs = 0;
 
   #totalBytes: number | null = null;
@@ -524,6 +535,10 @@ class Playback {
         this.#command.passthrough,
       );
       converter.usePool(this.#pool);
+      // A PID the program map has yet to name is remembered until it does, so
+      // this can go in before a byte has been read.
+      if (this.#audioPid !== null) converter.selectAudio(this.#audioPid);
+      if (this.#dualMonoSub) converter.selectDualMono(true);
       this.#transcoder = converter;
       await this.#convert(leg, source, converter);
     } catch (error) {
@@ -661,6 +676,7 @@ class Playback {
       const fragments = await converter.push(chunk);
       if (!this.#running(leg)) return;
       this.#announceServices(id, converter);
+      this.#announceAudio(id, converter);
       if (
         !converted &&
         fragments.some((fragment) => fragment.kind === "media")
@@ -784,6 +800,54 @@ class Playback {
     post({ type: "services", id, services: { available, current } });
   }
 
+  /**
+   * Say what sound the programme is carrying and which of it is being taken.
+   *
+   * Both halves of that can change without anyone asking: a programme boundary
+   * brings a new program map, and dual mono is turned on and off within a
+   * programme. So this is sent whenever the answer moves rather than once.
+   */
+  #announceAudio(id: number, converter: Transcoder): void {
+    const audio: AudioTracks = {
+      available: converter.audioStreams,
+      current: converter.audioPid,
+      dualMono: converter.audioIsDualMono,
+      dualMonoSub: this.#dualMonoSub,
+    };
+    if (audio.available.length === 0) return;
+    const was = this.#announcedAudio;
+    const same =
+      was !== null &&
+      was.current === audio.current &&
+      was.dualMono === audio.dualMono &&
+      was.dualMonoSub === audio.dualMonoSub &&
+      describeStreams(was.available) === describeStreams(audio.available);
+    if (same) return;
+    this.#announcedAudio = audio;
+    post({ type: "audio", id, audio });
+  }
+
+  /**
+   * Take the sound from somewhere else from here on.
+   *
+   * Nothing already converted is revisited: the fragments carrying the old
+   * sound are in the buffer and being played, so what a viewer hears is the
+   * change arriving when the playhead reaches what is being converted now.
+   * Emptying the buffer to make it immediate would cost the picture as well.
+   */
+  selectAudio(pid: number | null, dualMonoSub: boolean | null): void {
+    if (pid !== null) {
+      this.#audioPid = pid;
+      this.#transcoder?.selectAudio(pid);
+    }
+    if (dualMonoSub !== null) {
+      this.#dualMonoSub = dualMonoSub;
+      this.#transcoder?.selectDualMono(dualMonoSub);
+    }
+    if (this.#transcoder)
+      this.#announceAudio(this.#command.id, this.#transcoder);
+  }
+
   #report(converter: Transcoder): void {
     const stats = converter.takeStats({
       readingMs: this.#readingMs,
@@ -794,6 +858,23 @@ class Playback {
     this.#waitingMs = 0;
     post({ type: "stats", id: this.#command.id, stats });
   }
+}
+
+/**
+ * A run of sound streams as one string, so that two of them can be told apart
+ * without walking a pair of arrays every time a chunk goes in.
+ */
+function describeStreams(streams: AudioStream[]): string {
+  return streams
+    .map((stream) =>
+      [
+        stream.pid,
+        stream.componentTag,
+        stream.dualMono,
+        stream.languages.join("+"),
+      ].join(":"),
+    )
+    .join(",");
 }
 
 /** Drop whatever the current load is holding. */
@@ -831,6 +912,9 @@ self.onmessage = (event: MessageEvent<Command>) => {
       break;
     case "seek":
       void playback?.seek(command.time);
+      break;
+    case "audio":
+      playback?.selectAudio(command.pid, command.dualMonoSub);
       break;
   }
 };

@@ -34,6 +34,8 @@ export {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_MAX_AHEAD_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
+  type AudioStream,
+  type AudioTracks,
   type PlayerState,
   type PrivateStream,
   type Progress,
