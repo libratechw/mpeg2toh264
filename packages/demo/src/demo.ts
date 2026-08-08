@@ -370,11 +370,12 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): {
 }
 
 function showDeinterlaceStats(stats: DeinterlaceStats): void {
-  const { filtered, missed, dropped, degraded, discontinuities } = stats;
+  const { filtered, missed, dropped, degraded, discontinuities, late } = stats;
   const { fps: presentedFps, frameMs } = stats;
   deinterlaceStats.textContent =
     `${presentedFps.toFixed(1)} FPS ${frameMs.toFixed(1)} ms/フレーム` +
     ` 適用: ${filtered} 取りこぼし: ${missed} 端: ${degraded}` +
+    ` 未表示: ${late}` +
     ` 不連続: ${discontinuities} ドロップ: ${dropped}`;
 }
 

@@ -18,6 +18,19 @@
  * to wait for it, so the canvas is one frame -- around 33 ms -- behind the
  * audio. That is well inside what a viewer can tell, and the alternative is a
  * filter with half its motion measurements missing.
+ *
+ * A picture for every field wants two of them shown in the time one frame
+ * arrives, and the callback saying a frame arrived is not a clock: it runs
+ * when the page gets its turn, a refresh or so either side of the moment the
+ * frame reaches the screen. Hanging the second field off that callback spaces
+ * the two of them by however late it was, and loses the second one outright
+ * whenever the next frame beats it -- which is motion that stops and starts
+ * for no reason a viewer can see. So filtering and showing are separated
+ * here: both fields of a frame are filtered into textures of their own as
+ * soon as it arrives, given the moment they belong to by a clock run off the
+ * media timeline, and put up by an animation frame loop that is the only
+ * thing drawing on the canvas. The queue between the two is what a late
+ * callback is absorbed by, and `bufferFields` is how much of it there is.
  */
 import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 
@@ -27,8 +40,40 @@ const CONTINUOUS_SECONDS = 0.5;
 /** prev, cur and next: everything the filter reads. */
 const HISTORY = 3;
 
+/**
+ * Filtered pictures held ready to go up.
+ *
+ * Two frames' worth of fields, because the pair of a frame is filtered while
+ * the second field of the frame before it is still waiting for its moment.
+ * Anything less and the picture would have to be filtered again at the point
+ * of showing it, which is back to having the two tied together.
+ */
+const OUTPUTS = 4;
+
 /** How often the filter says how it is getting on, in milliseconds. */
 const STATS_INTERVAL_MS = 1000;
+
+/** What a frame period has to be within to be believed, in milliseconds. */
+const MIN_PERIOD_MS = 4;
+const MAX_PERIOD_MS = 200;
+
+/** How much of each measurement the smoothed frame period takes. */
+const PERIOD_SMOOTHING = 0.25;
+
+/**
+ * How much of the error in the predicted display time is taken each frame.
+ *
+ * Low enough that a refresh of noise in one frame's estimate moves the fields
+ * by a fraction of it, high enough to follow a clock that really is drifting
+ * within a second or so.
+ */
+const CLOCK_SMOOTHING = 0.2;
+
+/** The screen's refresh interval until animation frames have said otherwise. */
+const DEFAULT_REFRESH_MS = 1000 / 60;
+
+/** How fast the refresh estimate is allowed to climb back towards a long gap. */
+const REFRESH_DECAY = 0.02;
 
 const VERTEX_SHADER = `#version 300 es
 void main() {
@@ -38,6 +83,30 @@ void main() {
   gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
 }
 `;
+
+/**
+ * Putting a picture that has already been filtered onto the canvas.
+ *
+ * Both the texture it reads and the canvas it writes are held the way a
+ * framebuffer is, rows from the bottom, so there is nothing to turn over
+ * between them and the copy is texel for texel.
+ */
+const BLIT_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+uniform sampler2D uField;
+out vec4 fragColor;
+void main() {
+  fragColor = texelFetch(uField, ivec2(gl_FragCoord.xy), 0);
+}
+`;
+
+/** A filtered picture waiting for the moment it stands for. */
+interface Ready {
+  /** Which of the output textures holds it. */
+  slot: number;
+  /** When it belongs on the screen, on `performance.now()`'s clock. */
+  at: number;
+}
 
 /**
  * How the filter is getting on, and where it is being let down.
@@ -75,13 +144,27 @@ export interface DeinterlaceStats {
   degraded: number;
   /** Times the held frames were dropped as stale: seeks, and stream changes. */
   discontinuities: number;
+  /**
+   * Filtered pictures that were never shown, because an animation frame did
+   * not come round while their moment was still ahead, or because the clock
+   * they were timed by turned out to be somewhere else.
+   *
+   * Only a picture for every field can have these -- a picture for every frame
+   * goes up as its frame arrives -- and they are the page being too busy to
+   * keep a field rate rather than anything the filter did. A few are a hiccup,
+   * and one every few seconds is a display whose refresh rate the field rate
+   * does not divide into. A steady stream of them is a machine that cannot
+   * show fields at all, and turning `doubleRate` off is the answer.
+   */
+  late: number;
   /** Frames presented per second over the last report. */
   fps: number;
   /**
    * What one frame costs, in milliseconds, averaged over the last report:
-   * uploading it and drawing the filtered one. This is the time on the page's
-   * own thread -- the GPU's part of the draw is not in it -- so it is the
-   * measure of what the deinterlacer takes away from everything else.
+   * uploading it, filtering the picture or pair of pictures built from it, and
+   * putting them up. This is the time on the page's own thread -- the GPU's
+   * part of the draw is not in it -- so it is the measure of what the
+   * deinterlacer takes away from everything else.
    */
   frameMs: number;
 }
@@ -112,6 +195,25 @@ export interface DeinterlacerOptions {
    * are the `nospatial` pair.
    */
   doubleRate?: boolean;
+  /**
+   * How many field intervals of slack to hold a picture for every field back
+   * by, on top of the half a frame the second field is late by anyway.
+   *
+   * Every filtered field waits in a queue for the animation frame nearest the
+   * moment it stands for. This is how much of the wait is spare: how late the
+   * callback announcing a frame may be before the fields built from it have
+   * already missed their turn. One field interval -- around 17 ms of a 1080i
+   * broadcast -- covers a callback that slipped a refresh, which is what a
+   * page under any load at all does now and again, and it is the default.
+   *
+   * Zero shows each field at the earliest moment it could be shown at, which
+   * is the least delay and the least tolerance. Raising it past one or two
+   * buys nothing a viewer will see and costs delay a viewer might.
+   *
+   * It has no effect at all without `doubleRate`, where a frame's one picture
+   * goes up as the frame after it arrives and there is nothing to schedule.
+   */
+  bufferFields?: number;
   /**
    * Whether to let the local vertical range widen what the temporal check
    * allows. This is yadif's default and its `nospatial` mode turns it off.
@@ -164,18 +266,34 @@ export class Deinterlacer {
     keyof typeof YADIF_UNIFORMS,
     WebGLUniformLocation | null
   >;
+  /** The program that copies a filtered picture onto the canvas. */
+  readonly #blit: WebGLProgram;
+  readonly #blitField: WebGLUniformLocation | null;
   #textures: WebGLTexture[] = [];
+  /** Somewhere to filter a field into, and to read it back out of. */
+  #outputs: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
+  /** Which output slot was written last; the next one follows round the ring. */
+  #outputHead = OUTPUTS - 1;
+  /** Filtered fields waiting for their moment, oldest first. */
+  #queue: Ready[] = [];
+  /** The rAF loop that puts them up, which is all that draws on the canvas. */
+  #loopHandle: number | null = null;
+  #lastLoopAt = 0;
+  /** The gap between animation frames: as near as the page gets to the screen. */
+  #refreshMs = DEFAULT_REFRESH_MS;
   /** The `<div>` this put around the element, so it can be taken away again. */
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver;
   #topFieldFirst: boolean;
   #doubleRate: boolean;
+  #bufferFields: number;
   #spatialCheck: boolean;
-  /** The rAF waiting to put up the second field, and when it should. */
-  #secondHandle: number | null = null;
-  #secondAt = 0;
   /** How long a frame lasts in wall time, from what the frames themselves say. */
   #periodMs = 0;
+  /** Where the media timeline was last pinned to the wall clock, and when. */
+  #clockMedia = 0;
+  #clockWall = 0;
+  #clocked = false;
   /** The size of a frame as it is coded, which is what a texture holds. */
   #width = 0;
   #height = 0;
@@ -191,7 +309,7 @@ export class Deinterlacer {
   #lost = false;
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
   /** Everything the next report is counted from. See DeinterlaceStats. */
-  #stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0 };
+  #stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0, late: 0 };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
   #lastPresented = 0;
   #reportedAt = 0;
@@ -204,6 +322,7 @@ export class Deinterlacer {
     this.#video = video;
     this.#topFieldFirst = options.topFieldFirst ?? true;
     this.#doubleRate = options.doubleRate ?? false;
+    this.#bufferFields = Math.max(0, options.bufferFields ?? 1);
     this.#spatialCheck = options.spatialCheck ?? true;
     this.#onStats = options.onStats;
     this.canvas = document.createElement("canvas");
@@ -221,7 +340,7 @@ export class Deinterlacer {
     });
     if (!gl) throw new Error("this browser has no WebGL2");
     this.#gl = gl;
-    this.#program = createProgram(gl);
+    this.#program = createProgram(gl, YADIF_FRAGMENT_SHADER);
     const program = this.#program;
     this.#location = Object.fromEntries(
       Object.entries(YADIF_UNIFORMS).map(([key, name]) => [
@@ -229,6 +348,8 @@ export class Deinterlacer {
         gl.getUniformLocation(program, name),
       ]),
     ) as Record<keyof typeof YADIF_UNIFORMS, WebGLUniformLocation | null>;
+    this.#blit = createProgram(gl, BLIT_FRAGMENT_SHADER);
+    this.#blitField = gl.getUniformLocation(this.#blit, "uField");
     this.canvas.addEventListener("webglcontextlost", this.#onContextLost);
     // The canvas is placed in pixels rather than in percentages, because where
     // the picture sits inside the element is arithmetic the browser does not
@@ -299,9 +420,24 @@ export class Deinterlacer {
   set doubleRate(doubleRate: boolean) {
     if (doubleRate === this.#doubleRate) return;
     this.#doubleRate = doubleRate;
-    // Turning it off leaves a second field on its way to a canvas that is
-    // about to stop expecting one.
-    if (!doubleRate) this.#cancelSecond();
+    if (doubleRate) {
+      if (this.#width > 0) this.#allocateOutputs();
+      this.#startLoop();
+    } else {
+      // Turning it off leaves fields on their way to a canvas that is about to
+      // stop expecting them, and a frame's worth of texture each behind them.
+      this.#stopLoop();
+      this.#freeOutputs();
+    }
+  }
+
+  /** How many field intervals of slack the field schedule is held back by. */
+  get bufferFields(): number {
+    return this.#bufferFields;
+  }
+
+  set bufferFields(fields: number) {
+    this.#bufferFields = Math.max(0, fields);
   }
 
   #apply(): void {
@@ -315,6 +451,7 @@ export class Deinterlacer {
     this.#resetStats();
     this.#mount();
     this.#request();
+    this.#startLoop();
   }
 
   /** Take the deinterlaced picture away, leaving the element's own showing. */
@@ -324,8 +461,9 @@ export class Deinterlacer {
     if (this.#handle !== null)
       this.#video.cancelVideoFrameCallback(this.#handle);
     this.#handle = null;
-    this.#cancelSecond();
+    this.#stopLoop();
     this.#frames = 0;
+    this.#clocked = false;
     this.canvas.style.visibility = "hidden";
   }
 
@@ -340,7 +478,9 @@ export class Deinterlacer {
     this.#unmount();
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
+    this.#freeOutputs();
     this.#gl.deleteProgram(this.#program);
+    this.#gl.deleteProgram(this.#blit);
     this.#gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 
@@ -355,8 +495,6 @@ export class Deinterlacer {
   ): void => {
     this.#handle = null;
     if (!this.#running || this.#lost) return;
-    // Whatever was still to be drawn belongs to the frame this one replaces.
-    this.#cancelSecond();
     // The size of the frame as it is coded, which is what the upload carries
     // and what the filter has to work in. It is not `videoWidth`: that is the
     // size the frame is meant to be seen at, which for anamorphic video --
@@ -377,6 +515,11 @@ export class Deinterlacer {
       if (stale) {
         this.#frames = 0;
         this.#stats.discontinuities++;
+        // The fields still waiting stand for moments the element has left
+        // behind, and the clock they were timed by is pinned to the same
+        // place. Both start again from where playback actually is.
+        this.#queue.length = 0;
+        this.#clocked = false;
       }
       this.#count(metadata.presentedFrames, stale);
       // The same picture presented again, which the compositor does whenever
@@ -389,13 +532,7 @@ export class Deinterlacer {
         this.#request();
         return;
       }
-      // How long this frame is on screen, which is what half a frame later
-      // is measured against. Taken from the frames rather than from a frame
-      // rate nobody reports, and in wall time, so a rate other than 1 moves
-      // the second field with it.
-      if (!stale && elapsed > 0) {
-        this.#periodMs = (elapsed * 1000) / (this.#video.playbackRate || 1);
-      }
+      if (!stale && elapsed > 0) this.#measure(elapsed);
       this.#lastMediaTime = metadata.mediaTime;
       const at = performance.now();
       // Frames stopped arriving for a while -- a pause, a stall, a tab in the
@@ -408,50 +545,202 @@ export class Deinterlacer {
       }
       this.#lastFrameAt = at;
       this.#push();
-      this.#render(false, false);
+      if (this.#scheduling()) {
+        // The moment this frame reaches the screen is the moment the frame
+        // before it stops standing for, so both of that one's fields hang off
+        // it: the first half a frame later, and the second half a frame after
+        // that, plus whatever slack the queue is being given.
+        const half = this.#periodMs / 2;
+        const first =
+          this.#clock(metadata.mediaTime, metadata.expectedDisplayTime) +
+          (1 + this.#bufferFields) * half;
+        this.#filter(false, first);
+        this.#filter(true, first + half);
+      } else {
+        this.#render(false, false, null);
+      }
       this.#msSinceReport += performance.now() - at;
       this.#framesSinceReport++;
-      if (this.#doubleRate && this.#periodMs > 0) {
-        this.#scheduleSecond(metadata.expectedDisplayTime);
-      }
       this.#report(at);
     }
     this.#request();
   };
 
   /**
-   * Arrange for the other field of this frame to go up half a frame later.
+   * Whether fields are being filtered ahead of time and queued, rather than
+   * drawn as their frame arrives.
    *
-   * `expectedDisplayTime` is when the element's own frame reaches the screen,
-   * which is the moment the first field stands for; the second field belongs
-   * half a frame after it. Animation frames are the only clock the page has
-   * that the screen keeps, so the draw goes on the first one that is near
-   * enough -- a quarter of a frame short of the mark, which on any refresh
-   * rate is the tick that lands closest to it.
+   * A picture for every frame has nothing to schedule -- there is one of them
+   * and it goes up now -- and neither has a filter that has yet to see two
+   * frames go by, since until then there is no idea how long a frame lasts.
    */
-  #scheduleSecond(displayAt: number): void {
-    this.#secondAt = displayAt + this.#periodMs / 4;
-    this.#secondHandle = requestAnimationFrame(this.#onSecond);
+  #scheduling(): boolean {
+    return (
+      this.#doubleRate && this.#periodMs > 0 && this.#outputs.length === OUTPUTS
+    );
   }
 
-  #onSecond = (now: DOMHighResTimeStamp): void => {
-    this.#secondHandle = null;
-    if (!this.#running || this.#lost || !this.#doubleRate) return;
-    if (now < this.#secondAt) {
-      this.#secondHandle = requestAnimationFrame(this.#onSecond);
-      return;
+  /**
+   * How long a frame lasts in wall time, kept as a smoothed estimate.
+   *
+   * Taken from the frames themselves rather than from a frame rate nobody
+   * reports, and in wall time, so a rate other than 1 moves the fields with
+   * it. A frame the callback never saw makes the step between two of them a
+   * whole multiple of the period, and dividing that back out matters: taken
+   * at face value, one missed frame would put every field of the next one
+   * half a frame late and hold the picture through a refresh it should have
+   * moved in.
+   */
+  #measure(elapsed: number): void {
+    const step = (elapsed * 1000) / (this.#video.playbackRate || 1);
+    const frames =
+      this.#periodMs > 0 ? Math.max(1, Math.round(step / this.#periodMs)) : 1;
+    const period = step / frames;
+    if (period < MIN_PERIOD_MS || period > MAX_PERIOD_MS) return;
+    this.#periodMs =
+      this.#periodMs > 0
+        ? this.#periodMs + (period - this.#periodMs) * PERIOD_SMOOTHING
+        : period;
+  }
+
+  /**
+   * When this frame reaches the screen, from a clock that is pulled towards
+   * what each frame says rather than set by it.
+   *
+   * `expectedDisplayTime` is an estimate, and it moves about by a refresh or
+   * so either way even while playback is perfectly steady. Hanging two fields
+   * off it directly passes that movement to the screen, which is exactly the
+   * unevenness a picture for every field is meant to remove; running a clock
+   * of the media timeline and correcting a fifth of the error each frame
+   * keeps the fields evenly spaced while still following the element. An
+   * error of more than a whole frame is not drift -- the element is
+   * presenting from somewhere else, or at a rate it was not at before -- and
+   * the clock goes straight there, taking the fields timed by the old one
+   * with it.
+   */
+  #clock(mediaTime: number, displayAt: number): number {
+    if (!this.#clocked) {
+      this.#clocked = true;
+      this.#clockMedia = mediaTime;
+      this.#clockWall = displayAt;
+      return displayAt;
     }
-    const at = performance.now();
-    this.#render(false, true);
-    // Counted in the cost of the frame it belongs to rather than as a frame
-    // of its own, so `frameMs` stays the price of one frame of video.
-    this.#msSinceReport += performance.now() - at;
+    const rate = this.#video.playbackRate || 1;
+    const predicted =
+      this.#clockWall + ((mediaTime - this.#clockMedia) * 1000) / rate;
+    const error = displayAt - predicted;
+    let at: number;
+    if (Math.abs(error) > this.#periodMs) {
+      at = displayAt;
+      this.#stats.late += this.#queue.length;
+      this.#queue.length = 0;
+    } else {
+      at = predicted + error * CLOCK_SMOOTHING;
+    }
+    this.#clockMedia = mediaTime;
+    this.#clockWall = at;
+    return at;
+  }
+
+  /**
+   * Filter one field into an output texture and put it in the queue.
+   *
+   * The three frames the filter reads are only the right three between one
+   * frame arriving and the next, so both fields of a frame are built here and
+   * held as pictures. What is queued after that is a copy waiting for a
+   * moment, which no later frame can take away.
+   */
+  #filter(second: boolean, at: number): void {
+    const slot = (this.#outputHead + 1) % OUTPUTS;
+    const output = this.#outputs[slot];
+    if (!output) return;
+    this.#outputHead = slot;
+    // Whatever this slot held has been waiting two frames for a turn it never
+    // got, and its moment is far enough past that showing it now would be a
+    // step backwards. Slots are taken in order, so it can only be the oldest.
+    while (this.#queue.length > 0 && this.#queue[0]?.slot === slot) {
+      this.#queue.shift();
+      this.#stats.late++;
+    }
+    this.#render(false, second, output.framebuffer);
+    this.#queue.push({ slot, at });
+  }
+
+  /** The loop that puts filtered fields up, and the only thing that draws. */
+  #startLoop(): void {
+    if (this.#loopHandle !== null) return;
+    if (!this.#running || this.#lost || !this.#doubleRate) return;
+    this.#lastLoopAt = 0;
+    this.#loopHandle = requestAnimationFrame(this.#onLoop);
+  }
+
+  #stopLoop(): void {
+    if (this.#loopHandle !== null) cancelAnimationFrame(this.#loopHandle);
+    this.#loopHandle = null;
+    this.#queue.length = 0;
+  }
+
+  #onLoop = (now: DOMHighResTimeStamp): void => {
+    this.#loopHandle = null;
+    if (!this.#running || this.#lost || !this.#doubleRate) return;
+    // Animation frames are as near as a page gets to seeing the screen, and
+    // the gap between two of them is a refresh whenever neither was late.
+    // Taking the shortest gap seen and letting it climb back slowly finds the
+    // refresh interval from either side: a hitch pulls the estimate up by a
+    // fiftieth, and the very next ordinary frame pulls it back down.
+    if (this.#lastLoopAt > 0) {
+      const gap = now - this.#lastLoopAt;
+      if (gap >= 1 && gap <= MAX_PERIOD_MS) {
+        this.#refreshMs =
+          gap < this.#refreshMs
+            ? gap
+            : this.#refreshMs + (gap - this.#refreshMs) * REFRESH_DECAY;
+      }
+    }
+    this.#lastLoopAt = now;
+    this.#present(now);
+    this.#loopHandle = requestAnimationFrame(this.#onLoop);
   };
 
-  #cancelSecond(): void {
-    if (this.#secondHandle === null) return;
-    cancelAnimationFrame(this.#secondHandle);
-    this.#secondHandle = null;
+  /**
+   * Put up whichever filtered field belongs on the screen next.
+   *
+   * What is drawn during an animation frame reaches the screen at the composite
+   * after it, so that is the moment being filled, and a field goes up at
+   * whichever composite falls nearest the moment it stands for -- half a
+   * refresh either side of it. Where two of them have come due since the last
+   * one, only the newer is shown: a screen has one picture per refresh, and
+   * the older of the two is a moment the viewer should already be past.
+   */
+  #present(now: number): void {
+    const deadline = now + this.#refreshMs * 1.5;
+    if ((this.#queue[0]?.at ?? Infinity) > deadline) return;
+    let ready = this.#queue.shift();
+    while ((this.#queue[0]?.at ?? Infinity) <= deadline) {
+      this.#stats.late++;
+      ready = this.#queue.shift();
+    }
+    if (!ready) return;
+    const at = performance.now();
+    this.#show(ready.slot);
+    // Counted in the cost of the frame the field came from rather than as a
+    // frame of its own, so `frameMs` stays the price of one frame of video.
+    this.#msSinceReport += performance.now() - at;
+  }
+
+  /** Copy one of the filtered pictures onto the canvas. */
+  #show(slot: number): void {
+    const output = this.#outputs[slot];
+    if (!output) return;
+    const gl = this.#gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(this.#blit);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, output.texture);
+    gl.uniform1i(this.#blitField, 0);
+    gl.viewport(0, 0, this.#width, this.#height);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.canvas.style.visibility = "visible";
   }
 
   /**
@@ -506,7 +795,11 @@ export class Deinterlacer {
   }
 
   /**
-   * Filter one frame onto the canvas.
+   * Filter one frame, onto the canvas or into an output texture.
+   *
+   * A null `target` is the canvas itself, which is where the picture goes when
+   * there is one per frame and nothing to schedule. An output framebuffer is a
+   * field being kept for its moment.
    *
    * Which of the held frames is the one being filtered depends on how many
    * there are. In flight it is the middle one, with the newest waiting its
@@ -520,7 +813,11 @@ export class Deinterlacer {
    * the first. The shader takes the pair of frames the missing line sits
    * between from the parity, so this is the whole of it.
    */
-  #render(flush: boolean, second: boolean): void {
+  #render(
+    flush: boolean,
+    second: boolean,
+    target: WebGLFramebuffer | null,
+  ): void {
     if (this.#frames === 0 || this.#lost) return;
     if (this.#frames === HISTORY && !flush) this.#stats.filtered++;
     else this.#stats.degraded++;
@@ -552,6 +849,7 @@ export class Deinterlacer {
       next = newest;
     }
 
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target);
     gl.useProgram(this.#program);
     for (const [unit, texture] of [prev, cur, next].entries()) {
       gl.activeTexture(gl.TEXTURE0 + unit);
@@ -570,7 +868,9 @@ export class Deinterlacer {
     gl.uniform1i(this.#location.spatialCheck, this.#spatialCheck ? 1 : 0);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
-    this.canvas.style.visibility = "visible";
+    // A picture filtered into a texture is not on the screen yet, and showing
+    // the canvas for it would put up whatever was drawn on it last.
+    if (target === null) this.canvas.style.visibility = "visible";
   }
 
   /**
@@ -637,6 +937,72 @@ export class Deinterlacer {
       );
       this.#textures.push(texture);
     }
+    this.#freeOutputs();
+    if (this.#doubleRate) this.#allocateOutputs();
+  }
+
+  /**
+   * Somewhere to keep a filtered field until its moment comes.
+   *
+   * A frame's worth of texture each, so they exist only while a picture is
+   * being shown for every field. Where a framebuffer will not take one -- an
+   * implementation that will not render to RGBA8, or memory it will not find
+   * -- the whole lot goes and the fields are drawn as their frames arrive,
+   * which is the timing this replaces but is still a picture.
+   */
+  #allocateOutputs(): void {
+    const gl = this.#gl;
+    if (this.#outputs.length === OUTPUTS || this.#width === 0) return;
+    this.#freeOutputs();
+    for (let index = 0; index < OUTPUTS; index++) {
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        this.#width,
+        this.#height,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        null,
+      );
+      const framebuffer = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        texture,
+        0,
+      );
+      const complete =
+        gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (!complete) {
+        gl.deleteFramebuffer(framebuffer);
+        gl.deleteTexture(texture);
+        this.#freeOutputs();
+        return;
+      }
+      this.#outputs.push({ texture, framebuffer });
+    }
+    this.#outputHead = OUTPUTS - 1;
+  }
+
+  #freeOutputs(): void {
+    const gl = this.#gl;
+    for (const { texture, framebuffer } of this.#outputs) {
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(texture);
+    }
+    this.#outputs = [];
+    this.#queue.length = 0;
   }
 
   /**
@@ -675,6 +1041,9 @@ export class Deinterlacer {
   #onEmptied = (): void => {
     this.#frames = 0;
     this.#lastMediaTime = 0;
+    this.#queue.length = 0;
+    this.#clocked = false;
+    this.#periodMs = 0;
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
     this.#resetStats();
@@ -682,7 +1051,13 @@ export class Deinterlacer {
   };
 
   #resetStats(): void {
-    this.#stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0 };
+    this.#stats = {
+      filtered: 0,
+      missed: 0,
+      degraded: 0,
+      discontinuities: 0,
+      late: 0,
+    };
     this.#lastPresented = 0;
     this.#reportedAt = 0;
     this.#lastFrameAt = 0;
@@ -696,8 +1071,12 @@ export class Deinterlacer {
    * the one the first field was taken at.
    */
   #onFlush = (): void => {
-    this.#cancelSecond();
-    if (this.#running) this.#render(true, false);
+    // The fields still queued stand for moments after this one and nothing is
+    // coming to make sense of them, so the picture goes straight to the canvas
+    // rather than through a schedule that has nothing left to keep to.
+    this.#queue.length = 0;
+    this.#clocked = false;
+    if (this.#running) this.#render(true, false, null);
   };
 
   /**
@@ -712,10 +1091,13 @@ export class Deinterlacer {
   };
 }
 
-function createProgram(gl: WebGL2RenderingContext): WebGLProgram {
+function createProgram(
+  gl: WebGL2RenderingContext,
+  source: string,
+): WebGLProgram {
   const program = gl.createProgram();
   const vertex = compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER);
-  const fragment = compile(gl, gl.FRAGMENT_SHADER, YADIF_FRAGMENT_SHADER);
+  const fragment = compile(gl, gl.FRAGMENT_SHADER, source);
   gl.attachShader(program, vertex);
   gl.attachShader(program, fragment);
   gl.linkProgram(program);
