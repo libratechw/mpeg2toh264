@@ -287,6 +287,9 @@ pub struct Session {
 
     /// PES timestamp of the first audio packet, in 90 kHz units.
     audio_start_pts: Option<u64>,
+    /// Which elementary stream the sound is being read from, so that a
+    /// programme moving it to another one is noticed.
+    audio_pid: Option<u16>,
     /// PTS and frame count used to notice missing AAC access units.
     audio_clock_start_pts: Option<u64>,
     audio_clock_frames: u64,
@@ -379,6 +382,7 @@ impl Session {
             pending_packets: VecDeque::new(),
             phase: Phase::Feeding,
             audio_start_pts: None,
+            audio_pid: None,
             audio_clock_start_pts: None,
             audio_clock_frames: 0,
             audio_clock_sample_rate: None,
@@ -565,6 +569,20 @@ impl Session {
                     if self.audio_start_pts.is_none() {
                         self.audio_start_pts = packet.pts;
                     }
+                    // A programme that moves its sound to another elementary
+                    // stream leaves the reader holding the start of a frame the
+                    // old one was cut in the middle of. Joining that to the new
+                    // stream's bytes makes one access unit belonging to neither:
+                    // its header still walks, so nothing downstream drops it,
+                    // and a browser's audio decoder refuses it outright rather
+                    // than concealing it -- which ends playback. So the old
+                    // stream is finished off before the new one begins.
+                    if self.audio_pid.is_some_and(|pid| pid != packet.pid) {
+                        let tail = self.adts.finish()?;
+                        self.audio_clock_frames += tail.len() as u64;
+                        self.pending_audio.extend(tail);
+                    }
+                    self.audio_pid = Some(packet.pid);
                     let mut frames = self.adts.push(&packet.data)?;
                     if self.audio_config.is_none() {
                         self.audio_config = frames.first().map(|frame| frame.config.clone());

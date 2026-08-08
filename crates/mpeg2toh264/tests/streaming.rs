@@ -8,9 +8,9 @@ use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{Fragment, Session, TranscodeOptions};
 use support::{
-    adts_frame, adts_frame_with_payload, adts_stream, mux_transport_stream, read_fixture,
-    wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO,
-    VIDEO_PID,
+    adts_frame, adts_frame_with_payload, adts_stream, mux_programs, mux_transport_stream,
+    read_fixture, wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS,
+    STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID,
 };
 
 /// Offset of the first `00 00 01 B8` group header.
@@ -980,6 +980,91 @@ fn carries_aac_audio_through_untouched() {
     assert_eq!(
         total_audio, audio_frames,
         "every access unit fed in comes out again"
+    );
+}
+
+#[test]
+fn moving_the_sound_to_another_stream_does_not_splice_a_frame_across_the_change() {
+    // The programme's own map moves its picture and its sound to other PIDs,
+    // and the old sound stops in the middle of a frame -- which is where a
+    // multiplexer cuts it. Carrying the half frame over joins it to the new
+    // stream's bytes and makes one access unit belonging to neither: the
+    // header still walks, so nothing downstream drops it, and a browser's
+    // audio decoder refuses it outright and stops playing. The frame this
+    // one claims is long enough to swallow most of what follows it, so
+    // splicing it would show up in the count.
+    let video_before = read_fixture("ibbp.m2v");
+    let video_after = read_fixture("hd1080i.m2v");
+    let audio_before = adts_stream(10, 3, 2);
+    let cut_short = adts_frame(3, 2, 400);
+    let audio_after = adts_stream(10, 3, 2);
+
+    let before: &[(u16, u8)] = &[
+        (0x200, STREAM_TYPE_MPEG2_VIDEO),
+        (0x210, STREAM_TYPE_AAC_ADTS),
+    ];
+    let after: &[(u16, u8)] = &[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO),
+        (0x110, STREAM_TYPE_AAC_ADTS),
+    ];
+    let mut stream = mux_programs(
+        &[(101, 0x1f0, before)],
+        &[
+            PesUnit {
+                pid: 0x200,
+                stream_id: 0xe0,
+                payload: &video_before,
+                pts: Some(900_000),
+            },
+            PesUnit {
+                pid: 0x210,
+                stream_id: 0xc0,
+                payload: &audio_before,
+                pts: Some(900_000),
+            },
+            PesUnit {
+                pid: 0x210,
+                stream_id: 0xc0,
+                payload: &cut_short[..20],
+                pts: None,
+            },
+        ],
+    );
+    stream.extend_from_slice(&mux_programs(
+        &[(101, 0x1f0, after)],
+        &[
+            PesUnit {
+                pid: 0x100,
+                stream_id: 0xe0,
+                payload: &video_after,
+                pts: Some(1_000_000),
+            },
+            PesUnit {
+                pid: 0x110,
+                stream_id: 0xc0,
+                payload: &audio_after,
+                pts: None,
+            },
+        ],
+    ));
+
+    let fragments = run_session(&stream, 64 * 1024);
+    let (init, media) = split_fragments(&fragments);
+    let audio_samples: usize = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { audio_samples, .. } => *audio_samples,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        audio_samples, 20,
+        "every whole frame of both streams, and nothing made out of the join"
+    );
+    assert_eq!(
+        init.len(),
+        2,
+        "the picture moved size along with the stream"
     );
 }
 
