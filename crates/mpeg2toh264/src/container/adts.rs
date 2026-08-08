@@ -255,6 +255,65 @@ impl Bits {
     }
 }
 
+/// The channel elements an implicit channel configuration is made of
+/// (ISO/IEC 14496-3 Table 1.19), as element ids with their instance tags.
+///
+/// `None` for a configuration this cannot name, which is the zero the explicit
+/// `program_config_element` layouts use.
+fn implicit_channel_elements(channels: u8) -> Option<&'static [(u8, u8)]> {
+    const SCE: u8 = 0;
+    const CPE: u8 = 1;
+    const LFE: u8 = 3;
+    Some(match channels {
+        1 => &[(SCE, 0)],
+        2 => &[(CPE, 0)],
+        3 => &[(SCE, 0), (CPE, 0)],
+        4 => &[(SCE, 0), (CPE, 0), (SCE, 1)],
+        5 => &[(SCE, 0), (CPE, 0), (CPE, 1)],
+        6 => &[(SCE, 0), (CPE, 0), (CPE, 1), (LFE, 0)],
+        7 | 8 => &[(SCE, 0), (CPE, 0), (CPE, 1), (CPE, 2), (LFE, 0)],
+        _ => return None,
+    })
+}
+
+/// One access unit of digital silence in `config`'s channel layout.
+///
+/// Every channel carries an `individual_channel_stream` with a long window and
+/// `max_sfb` of zero: no scalefactor band is coded, so there is no spectral
+/// data and every sample decodes to zero. It is the shortest thing a decoder
+/// will accept for the configuration it has been given, which is what a hole in
+/// the sound has to be filled with -- a decoder handed nothing at all stops.
+///
+/// `None` where the configuration is not one of the implicit layouts, since the
+/// elements have to be the ones the decoder was told to expect.
+pub fn silent_frame(config: &AacConfig) -> Option<AacFrame> {
+    let elements = implicit_channel_elements(config.channel_count)?;
+    // global_gain, an ics_info of a long window with no scalefactor bands, and
+    // the three absent-tool flags. Twenty-two bits, all zero.
+    const EMPTY_CHANNEL: usize = 22;
+    let mut out = Bits {
+        data: Vec::new(),
+        len: 0,
+    };
+    for &(id, tag) in elements {
+        out.value(3, id as u32);
+        out.value(4, tag as u32);
+        if id == 1 {
+            out.push(0); // common_window: each channel carries its own ics_info
+            out.value(EMPTY_CHANNEL, 0);
+        }
+        out.value(EMPTY_CHANNEL, 0);
+    }
+    out.value(3, 7); // ID_END
+    while out.len & 7 != 0 {
+        out.push(0);
+    }
+    Some(AacFrame {
+        data: out.data,
+        config: config.clone(),
+    })
+}
+
 fn pce_audio_specific_config(
     data: &[u8],
     pce: &PceInfo,

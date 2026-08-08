@@ -10,7 +10,8 @@
 use std::collections::VecDeque;
 
 use crate::container::adts::{
-    aac_frame_count_through_video_time, AacConfig, AacFrame, AdtsStream, AAC_FRAME_SAMPLES,
+    aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream,
+    AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
     h264_gop_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, mpeg2_passthrough_unit,
@@ -27,10 +28,17 @@ use crate::transcode::{IncrementalTranscoder, Step, TranscodeOptions, TranscodeR
 
 const TIMESCALE: u64 = 90_000;
 
-/// Short AAC holes are packet loss, not the end of the audio track. Repeating
-/// the following access unit keeps MSE's joint audio/video buffered range
-/// continuous. Larger jumps are discontinuities and are not concealed here.
+/// A hole this short is packet loss at its smallest, and repeating the
+/// following access unit across it is less audible than the silence that would
+/// otherwise go there. Longer ones are filled with silence instead.
 const MAX_CONCEALED_AUDIO_FRAMES: u64 = 8;
+
+/// Beyond this, a jump in the timestamps is not a hole in the recording but a
+/// join between two of them. Holding a picture and playing silence for a jump
+/// like that would freeze the presentation for as long as the jump, so the two
+/// sides are simply put next to each other, which is what a player is given
+/// when a recording is cut.
+const MAX_HELD_TICKS: i64 = 30 * TIMESCALE as i64;
 
 /// The PES timestamp field is 33 bits and wraps every 26.5 hours (clause
 /// 2.4.3.7), so the distance between two of them is modular.
@@ -215,15 +223,19 @@ impl VideoPipeline {
         }
     }
 
-    /// Begin again at the next picture a decoder can start on, because what
-    /// follows is coded under a description the one in force cannot serve.
+    /// Begin again at the next picture a decoder can start on.
+    ///
+    /// Asked for when what follows is coded under a description the one in
+    /// force cannot serve, and when a hole has to be held over: the sample that
+    /// does the holding is the one covering a random access point's leading
+    /// display slots, and a unit that continues the one before it has none.
     ///
     /// Nothing before the restart is thrown away: the fragments already out
     /// keep playing, and the ones after them open a new description on the same
     /// timeline. What cannot be carried across it is prediction, so the video
     /// waits for a picture that needs none -- an IDR on the transcoding path,
     /// and an intra picture on the one that carries MPEG-2 through.
-    fn restart_for_new_description(&mut self) {
+    fn request_random_access(&mut self) {
         match self {
             Self::Transcode(transcoder) => transcoder.request_random_access_point(),
             Self::Passthrough { awaiting_intra, .. } => *awaiting_intra = true,
@@ -316,6 +328,14 @@ pub struct Session {
     /// caller resuming mid-file, and worked out from the stream otherwise.
     timeline_origin: Option<i64>,
     timelines_aligned: bool,
+
+    /// Where the next unit's first display slot is expected, in the source's
+    /// own timestamps. A unit that opens later than this has a hole in front of
+    /// it -- pictures the recording lost, or ones that would not decode.
+    expected_pts: Option<i64>,
+    /// Ticks of hole waiting to be held over, which the next fragment that has
+    /// a sample to hold them with will take.
+    video_hole: u64,
 }
 
 impl Session {
@@ -406,6 +426,8 @@ impl Session {
             audio_origin_ticks: 0,
             timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
+            expected_pts: None,
+            video_hole: 0,
         }
     }
 
@@ -627,9 +649,18 @@ impl Session {
         Ok(())
     }
 
-    /// Fill a small PTS hole with copies of the next decodable access unit.
-    /// Without this, one lost AAC frame leaves every later GOP one frame short
-    /// of `wanted`, so conversion waits forever even though audio resumed.
+    /// Fill a hole in the sound, so that what follows it stays where the source
+    /// put it.
+    ///
+    /// The audio track is laid down access unit by access unit, so a frame the
+    /// recording lost is not a hole in the track: everything after it moves up
+    /// into the space, and the sound runs ahead of the picture by that much for
+    /// the rest of the stream. A few frames are covered by repeating the one
+    /// that follows them, which is less audible than a stutter of silence;
+    /// anything longer is filled with silence outright.
+    ///
+    /// The picture is held over the same hole, so the two stay together --
+    /// see [`Session::hold_over_hole`].
     fn conceal_audio_gap(&mut self, pts: Option<u64>, frames: &mut Vec<AacFrame>) {
         let Some(first) = frames.first().cloned() else {
             return;
@@ -647,8 +678,18 @@ impl Session {
         let elapsed = ticks_since(self.audio_clock_start_pts.unwrap() as i64, pts as i64) as i64;
         let expected = aac_frame_count_through_video_time(elapsed, rate).max(0) as u64;
         let missing = expected.saturating_sub(self.audio_clock_frames);
+        let held = (missing * AAC_FRAME_SAMPLES * TIMESCALE / rate as u64) as i64;
         if missing <= MAX_CONCEALED_AUDIO_FRAMES {
-            frames.splice(0..0, std::iter::repeat(first).take(missing as usize));
+            frames.splice(0..0, std::iter::repeat_n(first, missing as usize));
+        } else if held <= MAX_HELD_TICKS {
+            // Silence rather than a repeat: a stutter that long is worse than
+            // nothing, and the picture is held still over the same stretch.
+            // A configuration whose channel layout cannot be named leaves the
+            // hole unfilled, since a decoder has room only for the elements it
+            // was told to expect.
+            if let Some(silence) = silent_frame(&first.config) {
+                frames.splice(0..0, std::iter::repeat_n(silence, missing as usize));
+            }
         }
         self.audio_clock_frames += frames.len() as u64;
     }
@@ -718,7 +759,7 @@ impl Session {
         // waiting for a random access point already, and asking for one again
         // would only mean the same thing.
         if self.described.is_some() {
-            self.video.restart_for_new_description();
+            self.video.request_random_access();
         }
         self.describe_pending = true;
     }
@@ -742,10 +783,66 @@ impl Session {
         }
         // Nothing has been described yet: the first fragment does that anyway.
         if self.described_audio.is_some() {
-            self.video.restart_for_new_description();
+            self.video.request_random_access();
             self.video.describe_again();
         }
         self.describe_pending = true;
+    }
+
+    /// Where a unit's first display slot sits in the source's own timestamps.
+    ///
+    /// Not the timestamp the unit carries: that belongs to its first *coded*
+    /// picture, which an open group displays after the pictures that lead it.
+    fn unit_start_pts(gop: &Mpeg2Gop, timeline: &Mpeg2VideoTimeline) -> Option<i64> {
+        let leading = timeline.presentation_indices.first().copied().unwrap_or(1) - 1;
+        Some(gop.pts? as i64 - leading as i64 * timeline.sample_duration as i64)
+    }
+
+    /// Hold this unit's opening sample over whatever the source lost in front
+    /// of it, so that nothing after the hole moves earlier than it belongs.
+    ///
+    /// Units are otherwise timed against each other and appended end to end, so
+    /// a stretch the recording lost closes up: picture and sound keep playing,
+    /// a fraction of a second early, and every fragment after it is early by
+    /// the same amount. The captions do not move with them -- they carry the
+    /// source's own timestamps -- so they drift by the length of the hole and
+    /// stay drifted. Holding the opening sample over it puts everything back
+    /// where the source had it.
+    ///
+    /// Only a unit that opens a random access point has a sample to hold with:
+    /// the extra copy of its IDR, or its first picture on the passthrough path.
+    /// So a hole asks for one, and a unit that cannot provide it -- one with no
+    /// intra picture in it -- leaves the hole to the next.
+    fn hold_over_hole(&mut self, gop: &Mpeg2Gop, plan: &mut UnitPlan) -> Result<()> {
+        let hole = match (
+            self.expected_pts,
+            Self::unit_start_pts(gop, plan.timeline()),
+        ) {
+            (Some(expected), Some(start)) => {
+                let ahead = (start - expected).rem_euclid(PTS_MODULUS);
+                let sample = plan.timeline().sample_duration as i64;
+                // Less than a picture is the rounding of a source that does not
+                // divide evenly, not a hole.
+                if ahead < sample || ahead > MAX_HELD_TICKS {
+                    0
+                } else {
+                    ahead as u64
+                }
+            }
+            _ => 0,
+        };
+        self.video_hole += hole;
+        if self.video_hole == 0 {
+            return Ok(());
+        }
+        if !self.starts_at_idr() {
+            self.video.request_random_access();
+            // The plan was drawn for a unit that continues the one before it,
+            // and this one no longer does.
+            *plan = self.plan_unit(&gop.data, true)?;
+        }
+        plan.timeline_mut().hold_ticks = self.video_hole as u32;
+        Ok(())
     }
 
     /// How many of the frames waiting were coded under the configuration the
@@ -787,7 +884,9 @@ impl Session {
             }
             let gop = self.pending_gops.remove(0);
             self.note_description(&gop);
-            return Ok(Some(self.commit(gop, Vec::new(), None)?));
+            let mut plan = self.plan_unit(&gop.data, self.starts_at_idr())?;
+            self.hold_over_hole(&gop, &mut plan)?;
+            return Ok(Some(self.commit(gop, Vec::new(), Some(plan))?));
         }
         // Keep one GOP pending so all AAC packets up to the next GOP boundary
         // can share the same moof. MSE implementations then see both trafs per
@@ -810,8 +909,11 @@ impl Session {
         // changing calls for a new one.
         self.note_description(&gop);
         self.note_audio_description();
+        let mut plan = self.plan_unit(&gop.data, self.starts_at_idr())?;
+        // Before the audio is measured against the video, since a hole held
+        // over is part of what the fragment spans and so of what it carries.
+        self.hold_over_hole(&gop, &mut plan)?;
         let starts_at_idr = self.starts_at_idr();
-        let plan = self.plan_unit(&gop.data, starts_at_idr)?;
         self.align_timelines(&gop, plan.timeline());
         let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(starts_at_idr));
         // Audio is measured from where the audio track itself starts, not
@@ -981,6 +1083,15 @@ impl Session {
         }
         self.sequence_number += 1;
         self.video_presentation_start += fragment.duration;
+        // Where the unit after this one is expected to open, read from this
+        // one's own timestamp rather than accumulated, so that the presentation
+        // and the source cannot creep apart. The hold at the front covered the
+        // hole in front of this unit and is not part of what it spans.
+        let hold = plan.timeline().hold_ticks as u64;
+        if let Some(start) = Self::unit_start_pts(gop, plan.timeline()) {
+            self.expected_pts = Some(start + fragment.duration.saturating_sub(hold) as i64);
+        }
+        self.video_hole = 0;
         self.audio_frames_emitted += audio_frames.len() as u64;
         self.gops_emitted += 1;
 

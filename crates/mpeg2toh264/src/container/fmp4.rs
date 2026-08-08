@@ -235,6 +235,22 @@ pub struct Mpeg2VideoTimeline {
     /// [`TranscodeOptions::split_field_samples`]: crate::TranscodeOptions::split_field_samples
     pub split_field_samples: bool,
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
+    /// Extra ticks the unit's opening sample is held for, covering a hole
+    /// between the unit before it and this one.
+    ///
+    /// A unit's pictures are timed against each other, and the units are
+    /// appended end to end, so a stretch the source lost would simply close up
+    /// -- the picture and the sound would keep playing, a little earlier than
+    /// they belong, and the captions alongside them, which carry their own
+    /// timestamps, would no longer line up. Holding the opening sample over the
+    /// hole instead leaves everything where the source put it. Set by the
+    /// caller, which is the only one that knows where the unit before this
+    /// ended; zero for a unit that follows without a break.
+    ///
+    /// It goes to the sample that covers the unit's leading display slots -- an
+    /// IDR clone or the first picture -- so a caller that sets it asks for a
+    /// random access point as well.
+    pub hold_ticks: u32,
     /// What the source pictures said about their fields. Nothing in the MP4
     /// carries this -- H.264 could say it in a picture timing SEI, and the
     /// browsers that would read one do not deinterlace anyway -- so it is
@@ -478,6 +494,7 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
             field_pairs,
             split_field_samples: TranscodeOptions::default().split_field_samples,
             sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
+            hold_ticks: 0,
             interlacing: pictures_interlacing(&pictures),
         },
         samples,
@@ -617,10 +634,17 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
         .iter()
         .map(|offset| (offset + reorder_delay) as u32)
         .collect();
+    // The hole in front of the unit, which the sample covering its leading
+    // slots is held over. A unit that has no such sample cannot hold anything,
+    // and the caller keeps the hole for the next one that can.
+    let hold = match lead_in {
+        UnitLeadIn::None => 0,
+        _ => timeline.hold_ticks,
+    };
     match lead_in {
         UnitLeadIn::None => {}
         UnitLeadIn::IdrClone => {
-            durations.insert(0, ((first_index - 1) * duration).max(1) as u32);
+            durations.insert(0, (((first_index - 1) * duration) as u32 + hold).max(1));
             compositions.insert(0, reorder_delay as u32);
         }
         // The opening sample is displayed from the first empty slot through its
@@ -630,7 +654,7 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
         // composition offsets already computed still land where they should.
         UnitLeadIn::FirstPicture => {
             if let Some(first) = durations.first_mut() {
-                *first += ((first_index - 1) * duration) as u32;
+                *first += ((first_index - 1) * duration) as u32 + hold;
             }
         }
     }
@@ -1489,6 +1513,7 @@ mod tests {
             field_pairs: field_pairs.to_vec(),
             split_field_samples: split,
             sample_aspect_ratio: None,
+            hold_ticks: 0,
             interlacing: Interlacing::default(),
         }
     }

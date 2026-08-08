@@ -240,6 +240,34 @@ fn drops_a_frame_packet_loss_made_unreadable() {
     assert_eq!(frames.len(), 3, "the damaged frame is not passed on");
 }
 
+/// What a hole in the sound is filled with. Every channel the configuration
+/// names carries a long window with no scalefactor bands, which is no spectral
+/// data at all: the shortest access unit a decoder will accept for that
+/// configuration, and digital silence when it decodes it.
+#[test]
+fn builds_silence_a_decoder_can_read_for_each_configuration() {
+    use mpeg2toh264::container::adts::silent_frame;
+
+    for channels in [2u8, 6] {
+        let config = AdtsStream::new()
+            .push(&adts_frame(3, channels, 16))
+            .expect("a frame of this configuration")[0]
+            .config
+            .clone();
+        let silence = silent_frame(&config).expect("a layout with a name");
+        assert_eq!(silence.config, config);
+
+        // Read back the way the stream's own frames are, so that what is
+        // handed on is something this walker calls whole.
+        let mut framed = adts_frame(3, channels, silence.data.len());
+        framed[7..].copy_from_slice(&silence.data);
+        let read = AdtsStream::new().push(&framed).expect("silence decodes");
+        assert_eq!(read.len(), 1, "{channels} channels");
+        assert_eq!(read[0].data, silence.data);
+        assert_eq!(read[0].config.channel_count, channels);
+    }
+}
+
 /// A programme in 5.1 followed by an announcement in stereo is one stream that
 /// changes what it is, not a damaged one. The header says so, and the elements
 /// change with it, so the run of frames the walker was reading ends there.
@@ -625,6 +653,67 @@ fn audio_change_stream(copies: usize, before: usize, after: usize) -> Vec<u8> {
         ],
         &units,
     )
+}
+
+/// Both tracks with the timestamps the source would really carry: one PES per
+/// group of pictures, and the sound running alongside it access unit by access
+/// unit. `av_stream` times its PES by where the bytes fell rather than by where
+/// the pictures play, which is enough for pairing the two tracks but says
+/// nothing about a hole -- and a hole is a hole in the timestamps.
+fn timed_av_stream(copies: usize) -> Vec<u8> {
+    let one = read_fixture("ibbp.m2v");
+    let pictures = parse_elementary_stream(&one).expect("parses").len() as u64;
+    // The fixture is 25 fps, and 48 kHz AAC access units are 1024 samples.
+    const FRAME: u64 = 90_000 / 25;
+    const AAC: u64 = 1024 * 90_000 / 48_000;
+    let group = pictures * FRAME;
+    let audio = adts_stream(1, 3, 2);
+
+    let mut audio_frames = 0u64;
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let mut units: Vec<(u16, u8, usize, u64)> = Vec::new();
+    for copy in 0..copies as u64 {
+        payloads.push(one.clone());
+        units.push((VIDEO_PID, 0xe0, payloads.len() - 1, 900_000 + copy * group));
+        let through = (copy + 1) * group / AAC;
+        let mut block = Vec::new();
+        let first = audio_frames;
+        while audio_frames < through {
+            block.extend_from_slice(&audio);
+            audio_frames += 1;
+        }
+        if !block.is_empty() {
+            payloads.push(block);
+            units.push((AUDIO_PID, 0xc0, payloads.len() - 1, 900_000 + first * AAC));
+        }
+    }
+    let units: Vec<PesUnit<'_>> = units
+        .iter()
+        .map(|&(pid, stream_id, payload, pts)| PesUnit {
+            pid,
+            stream_id,
+            payload: &payloads[payload],
+            pts: Some(pts),
+        })
+        .collect();
+    mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+    )
+}
+
+/// The same transport stream with a stretch of packets missing, which is what
+/// a recording made through a failing signal has in it.
+fn with_packets_dropped(stream: &[u8], from: usize, count: usize) -> Vec<u8> {
+    stream
+        .chunks(188)
+        .enumerate()
+        .filter(|(index, _)| !(from..from + count).contains(index))
+        .flat_map(|(_, packet)| packet.iter().copied())
+        .collect()
 }
 
 fn run_session(stream: &[u8], chunk_size: usize) -> Vec<Fragment> {
@@ -1057,6 +1146,50 @@ fn sample_entry_channels(init: &[u8]) -> u16 {
     // Past the four-character code: six reserved bytes, the data reference
     // index, and eight more reserved, then the channel count.
     u16::from_be_bytes([init[at + 20], init[at + 21]])
+}
+
+/// Where the media of a run of fragments ends, and how much sound it carried.
+fn presentation_end(fragments: &[Fragment]) -> (f64, usize) {
+    let mut end = 0.0f64;
+    let mut audio = 0;
+    for fragment in fragments {
+        if let Fragment::Media {
+            start,
+            audio_samples,
+            ..
+        } = fragment
+        {
+            end = end.max(*start);
+            audio += audio_samples;
+        }
+    }
+    (end, audio)
+}
+
+#[test]
+fn a_hole_in_the_recording_does_not_move_what_follows_it() {
+    // Pictures and access units are laid down one after another, so a stretch
+    // the recording lost would close up and everything after it would play
+    // early -- by a fraction of a second here, and permanently. The captions
+    // carry the source's own timestamps and do not move with it, so they would
+    // be that far out for the rest of the stream. The picture is held over the
+    // hole and the sound filled with silence instead, which leaves the whole
+    // presentation where the source put it.
+    let stream = timed_av_stream(10);
+    let packets = stream.len() / 188;
+    let lossy = with_packets_dropped(&stream, packets / 2, packets / 20);
+
+    let (intact_end, intact_audio) = presentation_end(&run_session(&stream, 64 * 1024));
+    let (lossy_end, lossy_audio) = presentation_end(&run_session(&lossy, 64 * 1024));
+
+    assert!(
+        (intact_end - lossy_end).abs() < 0.05,
+        "the last fragment sits at {lossy_end}s where the whole recording puts it at {intact_end}s"
+    );
+    assert!(
+        intact_audio.abs_diff(lossy_audio) <= 1,
+        "the sound is {lossy_audio} access units against {intact_audio}, so the hole was not filled"
+    );
 }
 
 #[test]
