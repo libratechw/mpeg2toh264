@@ -818,6 +818,95 @@ fn fragments_advance_along_one_timeline() {
     }
 }
 
+/// The payload of the first box of this type, at any depth.
+fn find_box<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+    let mut at = 0;
+    while at + 8 <= data.len() {
+        let size = u32::from_be_bytes(data[at..at + 4].try_into().ok()?) as usize;
+        if size < 8 || at + size > data.len() {
+            return None;
+        }
+        let body = &data[at + 8..at + size];
+        if &data[at + 4..at + 8] == want {
+            return Some(body);
+        }
+        if let Some(found) = find_box(body, want) {
+            return Some(found);
+        }
+        at += size;
+    }
+    None
+}
+
+/// Where a fragment's video track begins in decode time and where its samples
+/// carry it to. The video `traf` is the first in the `moof`, and its `trun`
+/// gives every sample a duration of its own.
+fn video_decode_span(media: &[u8]) -> (u64, u64) {
+    let size = u32::from_be_bytes(media[..4].try_into().expect("a fragment opens with a box"));
+    let moof = &media[..size as usize];
+    let tfdt = find_box(moof, b"tfdt").expect("the fragment says where it decodes from");
+    let start = u64::from_be_bytes(tfdt[4..12].try_into().expect("a version 1 tfdt"));
+    let trun = find_box(moof, b"trun").expect("the fragment runs its samples");
+    let count = u32::from_be_bytes(trun[4..8].try_into().expect("a sample count")) as usize;
+    let end = (0..count).fold(start, |end, index| {
+        let at = 12 + index * 16;
+        end + u64::from(u32::from_be_bytes(
+            trun[at..at + 4].try_into().expect("a sample duration"),
+        ))
+    });
+    (start, end)
+}
+
+/// A stream whose middle group is coded without B pictures, as a broadcast is
+/// wherever the picture holds still enough not to need them.
+fn mixed_reordering_stream() -> Vec<u8> {
+    let reordered = read_fixture("ibbp.m2v");
+    let in_order = read_fixture("ip.m2v");
+    // Pictures per fixture, which is what its timestamps have to advance by.
+    let groups: [(&[u8], u64); 3] = [(&reordered, 15), (&in_order, 10), (&reordered, 15)];
+    let mut pts = 900_000;
+    let mut units: Vec<PesUnit<'_>> = Vec::new();
+    for (payload, pictures) in groups {
+        units.push(PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload,
+            pts: Some(pts),
+        });
+        pts += pictures * FRAME_TICKS;
+    }
+    mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units)
+}
+
+/// The decode timeline is one line the units are laid along end to end, and a
+/// unit that measured its own reorder delay put the group without B pictures a
+/// frame off it: a hole in front of that group and, coming out of it, its last
+/// sample landing on the decode time of the next group's first. Media Source
+/// Extensions reads the overlap as an append over frames it already holds and
+/// clears them back to a random access point, which these streams carry only
+/// every few hundred pictures, so the picture freezes until the next one.
+#[test]
+fn a_group_without_b_pictures_does_not_break_the_decode_timeline() {
+    let fragments = run_session(&mixed_reordering_stream(), 64 * 1024);
+    let (_, media) = split_fragments(&fragments);
+    assert!(media.len() >= 3, "one fragment per group: {}", media.len());
+
+    let mut previous: Option<u64> = None;
+    for (index, fragment) in media.iter().enumerate() {
+        let Fragment::Media { data, .. } = fragment else {
+            unreachable!()
+        };
+        let (start, end) = video_decode_span(data);
+        if let Some(previous) = previous {
+            assert_eq!(
+                start, previous,
+                "fragment {index} decodes from {start}, and the one before it ran to {previous}"
+            );
+        }
+        previous = Some(end);
+    }
+}
+
 /// The coded width and height of the first video sample entry in an
 /// initialization segment, read back out of the `moov` the muxer wrote.
 fn sample_entry_size(init: &[u8], sample_entry_type: &[u8; 4]) -> (u16, u16) {
@@ -1512,8 +1601,11 @@ fn spreads_audio_across_the_fragments_it_belongs_to() {
 
 // ------------------------------------------------------ resuming mid-stream
 
+/// Ticks of one picture of the fixture, at 25 Hz.
+const FRAME_TICKS: u64 = 3_600;
+
 /// Ticks of one copy of the fixture: fifteen pictures at 25 Hz.
-const GOP_TICKS: u64 = 15 * 3_600;
+const GOP_TICKS: u64 = 15 * FRAME_TICKS;
 
 /// A stream a cut can be taken out of the middle of.
 ///
@@ -1582,11 +1674,15 @@ fn midpoint(stream: &[u8]) -> usize {
 fn reports_the_origin_its_timeline_starts_from() {
     let (fragments, origin) = run_anchored(&seekable_stream(2, 0), None);
     let origin = origin.expect("the opening fragment fixes the origin");
+    // A frame before the video, not on it: decoding leads display by a frame
+    // and the opening fragment has to have somewhere to put that, or its
+    // decode timeline is clamped to zero and runs into the fragment after it.
     assert_eq!(
-        origin, 900_000,
-        "a video-only timeline starts where its video does"
+        origin,
+        900_000 - FRAME_TICKS,
+        "a video-only timeline leaves the decode lead a frame in front of its video"
     );
-    assert_eq!(media_starts(&fragments)[0], 0.0);
+    assert_eq!(media_starts(&fragments)[0], FRAME_TICKS as f64 / 90_000.0);
 }
 
 #[test]
@@ -1616,10 +1712,11 @@ fn an_anchored_session_puts_a_cut_where_the_whole_file_puts_it() {
         "cut starts at {first}, which is no fragment of {whole_starts:?}"
     );
 
-    // The control: without an origin the same bytes open at zero, which is
-    // what a player appending them over a seek would place wrongly.
+    // The control: without an origin the same bytes open where the whole file
+    // does, which is what a player appending them over a seek would place
+    // wrongly.
     let (adrift, _) = run_anchored(&stream[midpoint(&stream)..], None);
-    assert_eq!(media_starts(&adrift)[0], 0.0);
+    assert_eq!(media_starts(&adrift)[0], whole_starts[0]);
 }
 
 #[test]

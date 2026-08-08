@@ -1056,11 +1056,15 @@ impl Session {
                     Some(audio_pts) => {
                         (video_start - timeline.sample_duration as i64).min(audio_pts as i64)
                     }
-                    // A stream with no audio track to wait for begins where its
-                    // video does; one that has yet to name its audio waits,
-                    // because the origin cannot be moved afterwards.
+                    // A stream with no audio track to wait for begins a frame
+                    // before its video, for the same reason: starting on the
+                    // video leaves the decode lead nowhere to go, and the
+                    // opening fragment's decode timeline is clamped to zero and
+                    // runs a frame into the one after it. One that has yet to
+                    // name its audio waits, because the origin cannot be moved
+                    // afterwards.
                     None if self.demuxer.has_aac_audio() => return,
-                    None => video_start,
+                    None => video_start - timeline.sample_duration as i64,
                 };
                 self.timeline_origin = Some(chosen);
                 chosen

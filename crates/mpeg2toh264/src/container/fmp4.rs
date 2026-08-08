@@ -626,10 +626,25 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // An anchor picture is coded before the B pictures that display ahead of it,
     // so it reaches its display slot before its decode slot -- a negative
     // composition offset, which asks a decoder to show a picture it has not
-    // decoded yet. Holding the whole decode timeline back by the largest such
-    // lead keeps every offset at or above zero without moving a single picture
-    // relative to the audio.
-    let reorder_delay = -offsets.iter().copied().min().unwrap_or(0).min(0);
+    // decoded yet. Holding the whole decode timeline back by that lead keeps
+    // every offset at or above zero without moving a single picture relative to
+    // the audio.
+    //
+    // The lead is one frame, and it is held back by a frame whether this unit
+    // needs it or not, because the delay sets where the unit's decode timeline
+    // begins and the units are appended to one timeline. A unit that measured
+    // its own would start a frame later than its neighbours whenever it had no
+    // picture displaying ahead of its decode slot -- a group coded without B
+    // pictures, or one whose leading B pictures the transcoder dropped -- which
+    // leaves a hole in the decode timeline in front of it and lands its last
+    // sample on the decode time of the next unit's first. Media Source
+    // Extensions reads that overlap as an append over buffered frames and
+    // clears them back to a random access point, and these streams carry one
+    // every few hundred pictures, so the picture freezes until the next one.
+    // MPEG-2 never leads by more than a frame: B pictures are not references,
+    // so only one anchor is ever held.
+    let measured = -offsets.iter().copied().min().unwrap_or(0).min(0);
+    let reorder_delay = measured.max(duration);
     let mut compositions: Vec<u32> = offsets
         .iter()
         .map(|offset| (offset + reorder_delay) as u32)
@@ -1520,6 +1535,28 @@ mod tests {
 
     /// Decode order I P B B, as an open group of pictures is coded.
     const IPBB: [u32; 4] = [1, 4, 2, 3];
+
+    /// Decode order I P P P, a group coded without B pictures, which displays
+    /// in the order it was coded in.
+    const IPPP: [u32; 4] = [1, 2, 3, 4];
+
+    /// The delay is what the decode timeline of a unit is set back by, and the
+    /// units share one timeline, so a unit with nothing to reorder has to be
+    /// set back as far as its neighbours. Measuring it from this unit alone
+    /// left the group without B pictures a frame later than the group before
+    /// it, which put its last sample on the decode time of the next group's
+    /// first -- an overlap MSE resolves by dropping buffered frames back to a
+    /// random access point.
+    #[test]
+    fn a_unit_with_nothing_to_reorder_is_still_held_back_a_frame() {
+        let reordered = mpeg2_sample_timing(&timeline(&IPBB, &[false; 4], false), UnitLeadIn::None);
+        let in_order = mpeg2_sample_timing(&timeline(&IPPP, &[false; 4], false), UnitLeadIn::None);
+        assert_eq!(in_order.reorder_delay, reordered.reorder_delay);
+        assert_eq!(in_order.reorder_delay, FRAME as i64);
+        // Every picture displays a frame after it decodes, so none of them
+        // moved: the offsets carry the delay rather than cancelling it.
+        assert_eq!(in_order.compositions, vec![FRAME; 4]);
+    }
 
     #[test]
     fn field_pairs_kept_together_take_one_sample_each() {
