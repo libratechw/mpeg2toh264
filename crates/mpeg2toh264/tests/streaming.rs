@@ -54,6 +54,56 @@ fn splits_a_stream_into_one_unit_per_group() {
 }
 
 #[test]
+fn cuts_a_unit_where_the_description_changes_without_a_group_behind_it() {
+    // A unit carries one description, and normally the change comes with a
+    // group header the splitter would cut on anyway. This is the stream that
+    // puts the new sequence header somewhere else: the cut has to follow it
+    // there, or the unit's later pictures are coded at a size the parameter
+    // sets in front of them do not describe.
+    let one = read_fixture("ibbp.m2v");
+    let other = read_fixture("hd1080i.m2v");
+    let head = &other[..first_gop_offset(&other)];
+    // The second picture of the first group, which is inside it and behind no
+    // group header of its own.
+    let at = (first_gop_offset(&one)..one.len() - 4)
+        .filter(|&i| one[i] == 0 && one[i + 1] == 0 && one[i + 2] == 1 && one[i + 3] == 0)
+        .nth(1)
+        .expect("the group has a second picture");
+
+    let mut stream = one[..at].to_vec();
+    stream.extend_from_slice(head);
+    stream.extend_from_slice(&one[at..]);
+    // Something after it to cut the rest on.
+    stream.extend_from_slice(&one);
+
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = splitter.push(&stream, None);
+    units.extend(splitter.finish());
+
+    assert_eq!(
+        units[0].data.len(),
+        at,
+        "the first unit ends where the description changes"
+    );
+    for (index, unit) in units.iter().enumerate() {
+        let sizes: Vec<(u32, u32)> = parse_elementary_stream(&unit.data)
+            .expect("unit parses")
+            .iter()
+            .map(|picture| {
+                (
+                    picture.sequence.horizontal_size,
+                    picture.sequence.vertical_size,
+                )
+            })
+            .collect();
+        assert!(
+            sizes.windows(2).all(|pair| pair[0] == pair[1]),
+            "unit {index} holds one frame size, not {sizes:?}"
+        );
+    }
+}
+
+#[test]
 fn re_injects_the_sequence_header_a_later_unit_lacks() {
     // A broadcast repeats the sequence header, but a stream that carries it
     // only once still has to yield independently decodable units.
@@ -596,6 +646,134 @@ fn fragments_advance_along_one_timeline() {
             "only the opening fragment restarts the decoder, this far in"
         );
     }
+}
+
+/// The coded width and height of the first video sample entry in an
+/// initialization segment, read back out of the `moov` the muxer wrote.
+fn sample_entry_size(init: &[u8], sample_entry_type: &[u8; 4]) -> (u16, u16) {
+    // From the sample description box, since `avc1` is also a brand in `ftyp`.
+    let stsd = init
+        .windows(4)
+        .position(|window| window == b"stsd")
+        .expect("the init segment describes a track");
+    let at = stsd
+        + init[stsd..]
+            .windows(4)
+            .position(|window| window == sample_entry_type)
+            .expect("the init segment describes a video track");
+    // Past the four-character code: six reserved bytes, the data reference
+    // index, sixteen more reserved, and then the coded size.
+    let width = u16::from_be_bytes([init[at + 28], init[at + 29]]);
+    let height = u16::from_be_bytes([init[at + 30], init[at + 31]]);
+    (width, height)
+}
+
+/// Two programmes coded at different frame sizes, one after the other, which
+/// is what a station switching between its services sends.
+fn resolution_change_stream() -> Vec<u8> {
+    let mut es = repeat_fixture("ibbp.m2v", 2);
+    es.extend_from_slice(&read_fixture("hd1080i.m2v"));
+    let units: Vec<PesUnit<'_>> = es
+        .chunks(20_000)
+        .enumerate()
+        .map(|(index, payload)| PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload,
+            pts: Some(900_000 + index as u64 * 3_000),
+        })
+        .collect();
+    mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units)
+}
+
+#[test]
+fn a_new_frame_size_is_described_again_and_restarts_the_decoder() {
+    let fragments = run_session(&resolution_change_stream(), 256 * 1024);
+    let (init, _) = split_fragments(&fragments);
+
+    assert_eq!(init.len(), 2, "one description per frame size");
+    let sizes: Vec<(u16, u16)> = init
+        .iter()
+        .map(|fragment| {
+            let Fragment::Init { data, .. } = fragment else {
+                unreachable!()
+            };
+            sample_entry_size(data, b"avc1")
+        })
+        .collect();
+    assert_eq!(sizes, vec![(352, 288), (1440, 1080)]);
+
+    // The second description reaches the SourceBuffer before the media it
+    // describes, and that media opens at an IDR: H.264 activates a new
+    // sequence parameter set nowhere else.
+    let second = fragments
+        .iter()
+        .rposition(|fragment| matches!(fragment, Fragment::Init { .. }))
+        .expect("the second init segment");
+    assert!(
+        matches!(
+            fragments.get(second + 1),
+            Some(Fragment::Media {
+                random_access: true,
+                ..
+            })
+        ),
+        "the fragment after a new description restarts the decoder"
+    );
+    let restarts = fragments
+        .iter()
+        .filter(|fragment| {
+            matches!(
+                fragment,
+                Fragment::Media {
+                    random_access: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(restarts, 2, "the stream opening, and the change");
+
+    // Everything after the change is timed on the same timeline as everything
+    // before it, so a player appends it where it stands.
+    let (_, media) = split_fragments(&fragments);
+    let mut previous = -1.0;
+    for fragment in &media {
+        let Fragment::Media {
+            start,
+            video_samples,
+            ..
+        } = fragment
+        else {
+            unreachable!()
+        };
+        assert!(*start > previous, "{start} follows {previous}");
+        previous = *start;
+        assert!(*video_samples > 0);
+    }
+    assert!(media.len() > 2, "both programmes produced fragments");
+}
+
+#[test]
+fn a_new_frame_size_is_described_again_on_the_passthrough_path() {
+    let options = TranscodeOptions {
+        video: mpeg2toh264::VideoMode::Passthrough,
+        ..TranscodeOptions::default()
+    };
+    let fragments = run_session_with_options(&resolution_change_stream(), 256 * 1024, options);
+    let (init, media) = split_fragments(&fragments);
+
+    let sizes: Vec<(u16, u16)> = init
+        .iter()
+        .map(|fragment| {
+            let Fragment::Init { data, .. } = fragment else {
+                unreachable!()
+            };
+            sample_entry_size(data, b"mp4v")
+        })
+        .collect();
+    assert_eq!(sizes, vec![(352, 288), (1440, 1080)]);
+    assert!(media.len() > 2, "both programmes produced fragments");
 }
 
 #[test]

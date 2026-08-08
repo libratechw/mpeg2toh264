@@ -260,6 +260,9 @@ struct SessionTotals {
     video_samples: usize,
     audio_samples: usize,
     bytes: usize,
+    /// Initialization segments written. More than one means the stream changed
+    /// what its sequence header says; see [`write_fragment`].
+    inits: usize,
 }
 
 /// A handful of threads, each with a picture encoder of its own, taking jobs
@@ -444,8 +447,21 @@ fn write_fragment(
 ) -> Result<(), std::io::Error> {
     let data = match fragment {
         Fragment::Init { data, mime_codec } => {
+            totals.inits += 1;
             if !quiet {
                 println!("init: {mime_codec} ({} bytes)", data.len());
+                // Media Source Extensions reads each of these as it reaches it,
+                // which is what makes a stream that changes its frame size
+                // playable. A file is not read that way: a player that takes
+                // the first `moov` as the whole description decodes everything
+                // after this one against the wrong picture size.
+                if totals.inits > 1 {
+                    println!(
+                        "  the stream changed what its sequence header says. \
+                         Players that read only the first description in a file \
+                         will decode the fragments after this one wrongly."
+                    );
+                }
             }
             data
         }

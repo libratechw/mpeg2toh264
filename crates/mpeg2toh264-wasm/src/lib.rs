@@ -17,7 +17,12 @@ const FRAGMENT_TYPESCRIPT: &str = r#"
 /** One thing to hand to Media Source Extensions. */
 export type Fragment =
   | {
-      /** The initialization segment, which arrives once and before any media. */
+      /**
+       * An initialization segment, which comes before the media it describes.
+       * Normally the only one; a stream that changes its frame size, its field
+       * coding or its aspect ratio sends another, and the `SourceBuffer` takes
+       * it in the same order as everything else.
+       */
       kind: "init";
       data: Uint8Array;
       /** What to open the SourceBuffer with. */
@@ -88,8 +93,10 @@ extern "C" {
 ///
 /// Each fragment is a plain object, so there is nothing to free:
 ///
-/// - `kind` -- `"init"` for the initialization segment, which arrives once and
-///   before any media, or `"media"` for everything after.
+/// - `kind` -- `"init"` for an initialization segment, which comes before the
+///   media it describes, or `"media"` for the media itself. There is normally
+///   one init fragment; a stream that changes what its sequence header says
+///   sends another, and it is appended in the order it arrives.
 /// - `data` -- the bytes to append. Its `ArrayBuffer` is the worker's own, so
 ///   it can be transferred to the page rather than copied again.
 /// - `mimeCodec` -- what to open the `SourceBuffer` with. Init fragments only.

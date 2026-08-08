@@ -6,7 +6,10 @@
 
 mod support;
 
-use mpeg2toh264::mpeg2::headers::{parse_elementary_stream, pictures_interlacing};
+use mpeg2toh264::mpeg2::headers::{
+    parse_elementary_stream, picture_sequence_description, pictures_interlacing,
+    stream_sequence_description,
+};
 use mpeg2toh264::{
     h264_to_fmp4, mpeg2_video_timeline, transcode, IncrementalTranscoder, TranscodeOptions,
 };
@@ -108,6 +111,53 @@ fn incremental_pushes_match_one_whole_transcode() {
     actual.extend_from_slice(&session.push(&gop).expect("second push").bitstream);
 
     assert_eq!(actual, expected.bitstream);
+}
+
+#[test]
+fn reading_the_description_from_the_headers_agrees_with_the_parse() {
+    // A unit is packaged before it is planned, so what the muxer is told about
+    // a unit comes from the headers walk and what the transcoder codes comes
+    // from the parse. The two answering differently is what would leave a
+    // fragment claiming samples the H.264 stream has not got.
+    for name in FIXTURES {
+        let source = read_fixture(name);
+        let pictures = parse_elementary_stream(&source).expect("fixture parses");
+        assert_eq!(
+            stream_sequence_description(&source),
+            Some(picture_sequence_description(&pictures[0])),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_unit_carrying_two_descriptions_codes_only_the_one_it_opens_with() {
+    // A unit is described by the sequence header it opens with, and the group
+    // splitter cuts where that changes. Handed the two in one piece anyway --
+    // a whole elementary stream converted in one call, or the tail of a
+    // recording that had no group header left to cut on -- the pictures coded
+    // under the other description are dropped rather than coded against
+    // parameter sets that do not describe them. The MP4 timeline has to drop
+    // exactly the same ones, which packaging the result is what proves: it
+    // counts the samples against the access units.
+    let first = read_fixture("ibbp.m2v");
+    let second = read_fixture("hd1080i.m2v");
+    let mut combined = first.clone();
+    combined.extend_from_slice(&second);
+
+    let alone = transcode(&first, TranscodeOptions::default()).expect("one description");
+    let result = transcode(&combined, TranscodeOptions::default()).expect("two descriptions");
+    assert_eq!(
+        result.bitstream, alone.bitstream,
+        "the second description contributes nothing"
+    );
+    assert!(
+        result.pictures_skipped > alone.pictures_skipped,
+        "its pictures are skipped, not silently missing"
+    );
+
+    let timeline = mpeg2_video_timeline(&combined, false, &result.undecodable).expect("timeline");
+    h264_to_fmp4(&result.bitstream, &timeline).expect("the timeline reserves the same samples");
 }
 
 #[test]

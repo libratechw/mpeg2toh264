@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
 use crate::mpeg2::constants::start_code;
+use crate::mpeg2::headers::stream_sequence_description;
 
 /// Walk every `00 00 01 <code>` start code in `data` in order, handing each
 /// offset and its code byte to `visit`, and stop as soon as `visit` breaks.
@@ -170,6 +171,33 @@ impl Mpeg2GopStream {
         pts
     }
 
+    /// Where a unit running from the start of the buffer to `boundary` has to
+    /// be cut short because a sequence header inside it describes something
+    /// else.
+    ///
+    /// A unit carries one description: the H.264 parameter sets and the MP4
+    /// sample entry are built from the header it opens with, and every picture
+    /// in it is coded under that. A stream that changes format restarts its
+    /// groups as well, so the cut above normally lands on the change anyway --
+    /// this is for the stream that puts the new header somewhere else, and it
+    /// costs a look only when a unit holds a second header at all.
+    fn description_boundary(&self, first_gop: usize, boundary: usize) -> usize {
+        let inner = self
+            .sequences
+            .iter()
+            .copied()
+            .filter(|&at| at > first_gop && at < boundary);
+        let mut opening = None;
+        for at in inner {
+            let opening = opening
+                .get_or_insert_with(|| stream_sequence_description(&self.buffer[..boundary]));
+            if stream_sequence_description(&self.buffer[at..boundary]) != *opening {
+                return at;
+            }
+        }
+        boundary
+    }
+
     fn extract(&mut self, final_flush: bool) -> Vec<Mpeg2Gop> {
         let mut output = Vec::new();
         loop {
@@ -198,6 +226,10 @@ impl Mpeg2GopStream {
                     }
                 }
             }
+            // Every offset from here on is read back out of the deques, which
+            // the drop above has already moved; the one captured before it has
+            // to be moved to match.
+            let first_gop = first_gop - dropped;
             let Some(&second_gop) = self.gops.get(1) else {
                 break;
             };
@@ -209,8 +241,9 @@ impl Mpeg2GopStream {
                 .iter()
                 .rev()
                 .find(|&&at| at > first_gop && at < second_gop)
-                .map(|&at| at - dropped);
-            let boundary = next_sequence.unwrap_or(second_gop - dropped);
+                .copied();
+            let boundary = next_sequence.unwrap_or(second_gop);
+            let boundary = self.description_boundary(first_gop, boundary);
             let pts = self.pts_at(self.base);
             output.push(Mpeg2Gop {
                 data: self.buffer[..boundary].to_vec(),

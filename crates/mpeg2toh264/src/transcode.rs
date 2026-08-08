@@ -56,7 +56,7 @@ use crate::job::{
 };
 use crate::mpeg2::constants::{mb_flag, PictureStructure, PictureType, QUANTISER_SCALE};
 use crate::mpeg2::headers::{
-    parse_elementary_stream, picture_geometry, sequence_sample_aspect_ratio, Picture,
+    parse_elementary_stream, picture_geometry, picture_sequence_description, Picture,
 };
 use crate::mpeg2::macroblock::{decode_slice, motion_type, Macroblock, MacroblockGrid};
 
@@ -194,6 +194,11 @@ pub struct TranscodeResult {
 /// emptying does. In the browser build it costs more still, since the zeroing
 /// an allocation comes with is a memset there.
 struct PictureScratch {
+    /// What the buffers below are sized for. A stream that changes its frame
+    /// size mid-way reaches an encoder holding the ones it made for the size
+    /// before it, and every one of them is indexed by the old macroblock width.
+    mb_width: usize,
+    mb_height: usize,
     counts: CoeffCountMap,
     chroma_counts: ChromaCounts,
     motion: MotionField,
@@ -207,6 +212,8 @@ impl PictureScratch {
     fn new(mb_width: usize, mb_height: usize) -> Self {
         let field_height = mb_height >> 1;
         Self {
+            mb_width,
+            mb_height,
             counts: make_luma_counts(mb_width, mb_height),
             chroma_counts: ChromaCounts::new(mb_width, mb_height),
             motion: MotionField::new(mb_width, mb_height),
@@ -307,13 +314,21 @@ pub fn plan_unit(
         bail!("no pictures in stream");
     };
 
-    let width = first.sequence.horizontal_size;
-    let height = first.sequence.vertical_size;
-    let mbaff = !first.sequence_ext.progressive_sequence;
-    if start.initialized && (width != start.width || height != start.height || mbaff != start.mbaff)
-    {
-        bail!("MPEG-2 sequence parameters changed during incremental transcode");
-    }
+    let description = picture_sequence_description(first);
+    let width = description.width;
+    let height = description.height;
+    let mbaff = description.mbaff;
+    // A stream that changes what its sequence header says is coded under
+    // parameter sets that have not gone out. New ones can, but H.264 activates
+    // a sequence parameter set only at an IDR, so the change restarts the
+    // decoded picture buffer as well. Whoever is drawing the MP4 timeline for
+    // this unit has to have reached the same verdict already, from
+    // [`stream_sequence_description`]: the timeline is settled before the plan
+    // is made, and it is what says the fragment opens at a random access point.
+    //
+    // [`stream_sequence_description`]: crate::mpeg2::headers::stream_sequence_description
+    let redescribe = !start.initialized || description != start.description;
+    let random_access = random_access || (start.initialized && redescribe);
 
     // Interlaced coding is not handled by the frame path. A field-DCT
     // macroblock builds its 8x8 blocks from alternate lines and field motion
@@ -323,11 +338,12 @@ pub fn plan_unit(
     // Field pictures are paired below and represented as one MBAFF frame.
 
     let g = frame_geometry(width, height, !mbaff);
-    let scaling = first.quant.non_intra;
+    let scaling = description.non_intra_quant;
 
     let mut parts: Vec<Part> = Vec::new();
-    if !start.initialized {
-        parts.push(Part::Literal(write_sps(&SpsConfig {
+    let mut description_parts: Vec<Part> = Vec::new();
+    if redescribe {
+        description_parts.push(Part::Literal(write_sps(&SpsConfig {
             width,
             height,
             // Higher than the frame size alone would ask for, because a
@@ -353,9 +369,9 @@ pub fn plan_unit(
             // held back.
             max_num_reorder_frames: Some(1),
             max_dec_frame_buffering: Some(4),
-            sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
+            sample_aspect_ratio: description.sample_aspect_ratio,
         })));
-        parts.push(Part::Literal(write_pps(&PpsConfig {
+        description_parts.push(Part::Literal(write_pps(&PpsConfig {
             init_qp: PPS_INIT_QP,
             scaling_8x8_intra: Some(&scaling),
             scaling_8x8_inter: Some(&scaling),
@@ -425,6 +441,17 @@ pub fn plan_unit(
         // A lone field is no frame. The MP4 timeline drops it for the same
         // reason and has to make the identical decision.
         if mate.is_none() && pic.coding.picture_structure != PictureStructure::Frame {
+            pictures_skipped += 1;
+            continue;
+        }
+        // A unit is coded under the description it opens with, and that is what
+        // the parameter sets in front of it say. A picture coded under another
+        // one belongs to the next unit: the group splitter cuts where the
+        // description changes, so what reaches here is a change with no group
+        // boundary behind it to cut on -- the tail of a recording, or a whole
+        // stream handed over in one piece. The MP4 timeline drops it for the
+        // same reason and has to make the identical decision.
+        if picture_sequence_description(pic) != description {
             pictures_skipped += 1;
             continue;
         }
@@ -554,10 +581,15 @@ pub fn plan_unit(
         pictures_converted += 1;
     }
 
-    state.initialized = true;
-    state.width = width;
-    state.height = height;
-    state.mbaff = mbaff;
+    // The parameter sets go in front of the pictures they describe, and only
+    // if there are any: a unit that coded none is dropped whole by whoever is
+    // packaging it, and a description dropped with it was never sent. Leaving
+    // the state as it was is what makes the next unit carry it instead.
+    if redescribe && pictures_converted > 0 {
+        parts.splice(0..0, description_parts);
+        state.initialized = true;
+        state.description = description;
+    }
 
     Ok(UnitPlan {
         parts,
@@ -702,9 +734,13 @@ impl PictureEncoder {
             self.quantiser = Some((ctx.weight_scale, Quantiser8x8::new(&ctx.weight_scale)));
         }
         let (_, quant) = self.quantiser.as_ref().expect("just built");
-        let scratch = self
-            .scratch
-            .get_or_insert_with(|| PictureScratch::new(g.mb_width, g.mb_height));
+        let fits = self.scratch.as_ref().is_some_and(|scratch| {
+            scratch.mb_width == g.mb_width && scratch.mb_height == g.mb_height
+        });
+        if !fits {
+            self.scratch = Some(PictureScratch::new(g.mb_width, g.mb_height));
+        }
+        let scratch = self.scratch.as_mut().expect("sized for this picture");
         let bitstream = write_picture(
             pic,
             &self.by_address,
@@ -1971,6 +2007,7 @@ fn write_picture(
         field_counts,
         field_chroma_counts,
         field_motion,
+        ..
     } = scratch;
     let mut targets = [[0.0f32; 64]; 4];
     let mut field_targets = [[0.0f32; 64]; 4];

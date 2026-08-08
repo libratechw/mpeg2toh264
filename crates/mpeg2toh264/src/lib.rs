@@ -35,7 +35,9 @@ pub use container::mpegts::{
     extract_mpeg2_video_es, first_pts, is_mpeg_transport_stream, last_pts, ElementaryKind,
     MpegTsAvDemuxer,
 };
-pub use mpeg2::headers::{pictures_interlacing, Interlacing};
+pub use mpeg2::headers::{
+    pictures_interlacing, stream_sequence_description, Interlacing, SequenceDescription,
+};
 pub use session::{Fragment, Progress, Session};
 pub use transcode::{
     plan_unit, transcode, IncrementalTranscoder, PictureEncoder, TranscodeOptions, TranscodeResult,

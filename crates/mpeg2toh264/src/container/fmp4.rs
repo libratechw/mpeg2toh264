@@ -4,8 +4,8 @@ use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
 use crate::mpeg2::constants::{start_code, PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
-    parse_elementary_stream, pictures_interlacing, sequence_sample_aspect_ratio, Interlacing,
-    Picture, SampleAspectRatio,
+    parse_elementary_stream, picture_sequence_description, pictures_interlacing,
+    sequence_sample_aspect_ratio, Interlacing, Picture, SampleAspectRatio,
 };
 use crate::round_half_up;
 use crate::TranscodeOptions;
@@ -364,6 +364,9 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
     let numerator = base_rate.0 as f64 * (first.sequence_ext.frame_rate_extension_n + 1) as f64;
     let denominator = base_rate.1 as f64 * (first.sequence_ext.frame_rate_extension_d + 1) as f64;
     let sample_duration = round_half_up(TIMESCALE as f64 * denominator / numerator) as u32;
+    // What this unit is described by, which is what its pictures have to be
+    // coded under to belong to it.
+    let description = picture_sequence_description(first);
 
     let mut references = if has_references { 2 } else { 0 };
     // A unit that opens the decoded picture buffer can hold nothing until the
@@ -429,6 +432,12 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
         // reason. Both have to, or the timeline reserves a sample the H.264
         // stream does not hold.
         if unpaired {
+            continue;
+        }
+        // Nor is a picture coded under a description other than the one this
+        // unit opens with: the parameter sets in front of it describe that one,
+        // and the transcoder drops it for the same reason.
+        if picture_sequence_description(picture) != description {
             continue;
         }
         let kept = |index: usize, picture: &Picture| {

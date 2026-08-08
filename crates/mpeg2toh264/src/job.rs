@@ -11,6 +11,7 @@
 //! drifting.
 
 use crate::error::{bail, Result};
+use crate::mpeg2::headers::SequenceDescription;
 use crate::transcode::{TranscodeOptions, VideoMode};
 
 /// How many short-term reference frames the buffer holds, the long-term copy
@@ -118,14 +119,14 @@ pub struct PictureContext {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TranscoderState {
     /// Whether the sequence has been described yet, i.e. whether SPS and PPS
-    /// have gone out and the dimensions below mean anything.
+    /// have gone out and the description below means anything.
     pub initialized: bool,
     /// Whether the decoded picture buffer is still waiting to be opened, which
     /// only an intra picture can do.
     pub awaiting_idr: bool,
-    pub width: u32,
-    pub height: u32,
-    pub mbaff: bool,
+    /// What those parameter sets say. A unit coded under anything else needs
+    /// its own, and an IDR to activate them.
+    pub description: SequenceDescription,
     pub prev_ref_frame_num: u32,
     pub short_term_count: u32,
     /// `frame_num` of the newest short-term reference, which is not the newest
@@ -154,9 +155,7 @@ impl TranscoderState {
     pub(crate) fn restarted(self) -> Self {
         Self {
             initialized: self.initialized,
-            width: self.width,
-            height: self.height,
-            mbaff: self.mbaff,
+            description: self.description,
             ..Self::new()
         }
     }

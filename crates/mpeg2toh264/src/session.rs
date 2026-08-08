@@ -21,7 +21,7 @@ use crate::container::mpegts::{ElementaryKind, ElementaryPacket, MpegTsAvDemuxer
 use crate::error::{bail, Result};
 use crate::job::PictureOutput;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
-use crate::mpeg2::headers::Interlacing;
+use crate::mpeg2::headers::{stream_sequence_description, Interlacing, SequenceDescription};
 use crate::round_half_up;
 use crate::transcode::{IncrementalTranscoder, Step, TranscodeOptions, TranscodeResult, VideoMode};
 
@@ -44,7 +44,13 @@ fn ticks_since(origin: i64, pts: i64) -> u64 {
 /// One thing to hand to Media Source Extensions.
 #[derive(Clone, Debug)]
 pub enum Fragment {
-    /// The initialization segment, emitted once, before any media.
+    /// An initialization segment, emitted before the media it describes.
+    ///
+    /// Normally there is one, at the start. A stream that changes its frame
+    /// size, its field coding or its aspect ratio cannot be described by it
+    /// any longer, so another goes out in front of the first fragment coded
+    /// under the new description -- which is a fragment a decoder can start
+    /// on, since nothing else can activate it.
     Init {
         data: Vec<u8>,
         /// The MIME type to open the `SourceBuffer` with.
@@ -209,6 +215,21 @@ impl VideoPipeline {
         }
     }
 
+    /// Begin again at the next picture a decoder can start on, because what
+    /// follows is coded under a description the one in force cannot serve.
+    ///
+    /// Nothing before the restart is thrown away: the fragments already out
+    /// keep playing, and the ones after them open a new description on the same
+    /// timeline. What cannot be carried across it is prediction, so the video
+    /// waits for a picture that needs none -- an IDR on the transcoding path,
+    /// and an intra picture on the one that carries MPEG-2 through.
+    fn restart_for_new_description(&mut self) {
+        match self {
+            Self::Transcode(transcoder) => transcoder.request_random_access_point(),
+            Self::Passthrough { awaiting_intra, .. } => *awaiting_intra = true,
+        }
+    }
+
     fn split_field_samples(&self) -> bool {
         match self {
             Self::Transcode(transcoder) => transcoder.split_field_samples(),
@@ -242,6 +263,13 @@ pub struct Session {
     audio_frames_emitted: u64,
     gops_emitted: usize,
     initialized: bool,
+    /// What the initialization segment that went out describes, and so what a
+    /// unit has to be coded under to play against it.
+    described: Option<SequenceDescription>,
+    /// Whether the next fragment has to carry an initialization segment: the
+    /// first one does, and so does the first one after a stream changes what
+    /// its sequence header says.
+    describe_pending: bool,
 
     pending_gops: Vec<Mpeg2Gop>,
     pending_audio: Vec<AacFrame>,
@@ -342,6 +370,8 @@ impl Session {
             audio_frames_emitted: 0,
             gops_emitted: 0,
             initialized: false,
+            described: None,
+            describe_pending: true,
             pending_gops: Vec::new(),
             pending_audio: Vec::new(),
             audio_config: None,
@@ -623,6 +653,38 @@ impl Session {
         Ok(plan)
     }
 
+    /// Notice a unit coded under something other than what the initialization
+    /// segment describes, and arrange for it to be described afresh.
+    ///
+    /// A broadcast changes its frame size, its field coding or its aspect ratio
+    /// between programmes, and Media Source Extensions takes a further
+    /// initialization segment for exactly this: the fragments before it keep
+    /// playing, and the ones after it are read against the new description. So
+    /// the change costs a restart point and nothing else -- but the restart is
+    /// not optional, because H.264 activates a sequence parameter set only at
+    /// an IDR, and the MP4 sample entry is only reread at a segment boundary.
+    ///
+    /// This runs on the unit's bytes rather than on its plan because the plan
+    /// is drawn for a unit that either does or does not open a random access
+    /// point, and that is the question being answered here.
+    fn note_description(&mut self, gop: &Mpeg2Gop) {
+        let Some(description) = stream_sequence_description(&gop.data) else {
+            // Nothing in the unit says what it is coded under, so nothing here
+            // can say it differs. The parse behind the plan decides instead.
+            return;
+        };
+        if self.described == Some(description) {
+            return;
+        }
+        // The first unit of all has no description to differ from: it is
+        // waiting for a random access point already, and asking for one again
+        // would only mean the same thing.
+        if self.described.is_some() {
+            self.video.restart_for_new_description();
+        }
+        self.describe_pending = true;
+    }
+
     fn is_random_access_point(&self) -> bool {
         self.recovery_point_gop_interval != 0
             && self.gops_emitted > 0
@@ -648,6 +710,7 @@ impl Session {
                 return Ok(None);
             }
             let gop = self.pending_gops.remove(0);
+            self.note_description(&gop);
             return Ok(Some(self.commit(gop, Vec::new(), None)?));
         }
         // Keep one GOP pending so all AAC packets up to the next GOP boundary
@@ -664,6 +727,10 @@ impl Session {
             return Ok(None);
         }
         let gop = self.pending_gops[0].clone();
+        // Before the plan, because a unit the fragments so far do not describe
+        // has to open at a random access point and the plan is drawn knowing
+        // whether it does.
+        self.note_description(&gop);
         let starts_at_idr = self.starts_at_idr();
         let plan = self.plan_unit(&gop.data, starts_at_idr)?;
         self.align_timelines(&gop, plan.timeline());
@@ -833,8 +900,13 @@ impl Session {
         self.audio_frames_emitted += audio_frames.len() as u64;
         self.gops_emitted += 1;
 
-        if !self.initialized {
+        // Whichever path made the fragment describes it exactly when the
+        // pictures in it are the first coded under their description, which is
+        // the fragment a `SourceBuffer` has to be given one for.
+        if !fragment.init_segment.is_empty() {
             self.initialized = true;
+            self.describe_pending = false;
+            self.described = stream_sequence_description(&gop.data);
             out.push(Fragment::Init {
                 data: fragment.init_segment,
                 mime_codec: fragment.mime_codec,
@@ -920,7 +992,7 @@ impl Session {
                     // Every unit opens with a sequence header, so unlike the
                     // transcoded path nothing in the unit itself says which one
                     // the initialization segment should be built from.
-                    !self.initialized,
+                    self.describe_pending,
                     audio,
                     audio_track,
                 )?;
