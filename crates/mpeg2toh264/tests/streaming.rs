@@ -661,6 +661,12 @@ fn audio_change_stream(copies: usize, before: usize, after: usize) -> Vec<u8> {
 /// the pictures play, which is enough for pairing the two tracks but says
 /// nothing about a hole -- and a hole is a hole in the timestamps.
 fn timed_av_stream(copies: usize) -> Vec<u8> {
+    timed_av_stream_from(copies, 900_000)
+}
+
+/// The same, opening at a timestamp of the caller's choosing, so that a run of
+/// it can be made to cross the wrap.
+fn timed_av_stream_from(copies: usize, base: u64) -> Vec<u8> {
     let one = read_fixture("ibbp.m2v");
     let pictures = parse_elementary_stream(&one).expect("parses").len() as u64;
     // The fixture is 25 fps, and 48 kHz AAC access units are 1024 samples.
@@ -674,7 +680,13 @@ fn timed_av_stream(copies: usize) -> Vec<u8> {
     let mut units: Vec<(u16, u8, usize, u64)> = Vec::new();
     for copy in 0..copies as u64 {
         payloads.push(one.clone());
-        units.push((VIDEO_PID, 0xe0, payloads.len() - 1, 900_000 + copy * group));
+        let modulus = 1u64 << 33;
+        units.push((
+            VIDEO_PID,
+            0xe0,
+            payloads.len() - 1,
+            (base + copy * group) % modulus,
+        ));
         let through = (copy + 1) * group / AAC;
         let mut block = Vec::new();
         let first = audio_frames;
@@ -684,7 +696,12 @@ fn timed_av_stream(copies: usize) -> Vec<u8> {
         }
         if !block.is_empty() {
             payloads.push(block);
-            units.push((AUDIO_PID, 0xc0, payloads.len() - 1, 900_000 + first * AAC));
+            units.push((
+                AUDIO_PID,
+                0xc0,
+                payloads.len() - 1,
+                (base + first * AAC) % modulus,
+            ));
         }
     }
     let units: Vec<PesUnit<'_>> = units
@@ -1226,6 +1243,47 @@ fn a_join_between_recordings_is_left_where_the_source_has_it() {
         "the join is {}s where the source puts it {}s apart",
         jumped[0],
         JUMP as f64 / 90_000.0
+    );
+}
+
+#[test]
+fn timestamps_that_wrap_are_not_a_hole_or_a_join() {
+    // The timestamp field is 33 bits and comes back to zero every 26.5 hours.
+    // A unit on the far side of that opens at a smaller number than the one
+    // before it ended at, which -- measured without regard for the wrap -- is
+    // either a jump of most of a day or a gap that swallows the recording.
+    let one = read_fixture("ibbp.m2v");
+    let group = parse_elementary_stream(&one).expect("parses").len() as u64 * (90_000 / 25);
+    let modulus = 1u64 << 33;
+    let base = modulus - group * 2;
+    let units: Vec<PesUnit<'_>> = (0..6u64)
+        .map(|copy| PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload: &one,
+            pts: Some((base + copy * group) % modulus),
+        })
+        .collect();
+    let stream = mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units);
+    let starts = media_starts(&run_session(&stream, 64 * 1024));
+
+    let expected = group as f64 / 90_000.0;
+    let steps: Vec<f64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert!(steps.len() >= 4, "fragments on both sides of the wrap");
+    assert!(
+        steps.iter().all(|step| (step - expected).abs() < 0.05),
+        "the groups are {steps:?} apart where every one of them is {expected}s"
+    );
+
+    // And with sound alongside it, which is measured on a clock of its own.
+    let across = presentation_end(&run_session(
+        &timed_av_stream_from(6, modulus - group * 2),
+        64 * 1024,
+    ));
+    let ordinary = presentation_end(&run_session(&timed_av_stream(6), 64 * 1024));
+    assert_eq!(
+        across, ordinary,
+        "a run that crosses the wrap plays out exactly as one that does not"
     );
 }
 

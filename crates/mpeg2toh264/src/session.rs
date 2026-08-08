@@ -673,7 +673,19 @@ impl Session {
             self.audio_clock_frames = 0;
             self.audio_clock_sample_rate = Some(rate);
         }
-        let elapsed = ticks_since(self.audio_clock_start_pts.unwrap() as i64, pts as i64) as i64;
+        let mut elapsed =
+            ticks_since(self.audio_clock_start_pts.unwrap() as i64, pts as i64) as i64;
+        // The timestamp field wraps every 26.5 hours, so a distance measured
+        // from a fixed point stops meaning anything at half of that: past it,
+        // the reading is as likely to be a stream that has run round as one
+        // that has run long. Count from here instead, which costs the fraction
+        // of an access unit the count had accumulated and keeps a stream that
+        // plays for days measurable.
+        if elapsed > PTS_MODULUS / 2 {
+            self.audio_clock_start_pts = Some(pts);
+            self.audio_clock_frames = 0;
+            elapsed = 0;
+        }
         let expected = aac_frame_count_through_video_time(elapsed, rate).max(0) as u64;
         let missing = expected.saturating_sub(self.audio_clock_frames);
         let held = (missing * AAC_FRAME_SAMPLES * TIMESCALE / rate as u64) as i64;
