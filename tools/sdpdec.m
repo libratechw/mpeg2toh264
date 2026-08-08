@@ -24,6 +24,16 @@
 // samples removes CVFieldCount 2 from the output, so the run comes back clean --
 // which is why `split_field_samples` is the default.
 //
+// A file holding more than one initialization segment is fed the same way a
+// SourceBuffer gets one: each `ftyp`+`moov` goes into the parser where it
+// stands, and the fragments after it are read against it. The samples that
+// follow are then described by something the decompression session cannot
+// take, so the session is built again and the cached image description
+// dropped -- which is what WebKit does, and what a stream that changes its
+// frame size needs. Keeping the first session instead fails every sample after
+// the change with -12909 (kVTVideoDecoderBadDataErr), so this is measured
+// rather than assumed.
+//
 // Environment:
 //
 //   WK_REALTIME=1      add kVTDecodeFrame_1xRealTimePlayback, which WebKit sets
@@ -228,28 +238,42 @@ int main(int argc, char **argv) {
     BOOL realTime = getenv("WK_REALTIME") != NULL;
     BOOL dumpAttachments = getenv("DUMP_ATTACHMENTS") != NULL;
 
-    NSMutableArray<NSValue *> *fragments = [NSMutableArray array];
-    __block NSUInteger firstMoof = NSNotFound;
+    // Every segment the file holds, in order and each tagged with whether it
+    // is an initialization segment: a stream that changes its frame size
+    // carries more than one, and a SourceBuffer is given each where it stands.
+    NSMutableArray<NSValue *> *segments = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *isInit = [NSMutableArray array];
+    __block NSUInteger initStart = NSNotFound;
+    __block NSUInteger fragmentCount = 0;
     eachBox(data, ^(NSString *type, NSUInteger start, NSUInteger end) {
-      if ([type isEqualToString:@"moof"]) {
-        if (firstMoof == NSNotFound)
-          firstMoof = start;
-        [fragments
+      if ([type isEqualToString:@"ftyp"]) {
+        initStart = start;
+      } else if ([type isEqualToString:@"moov"]) {
+        NSUInteger from = initStart == NSNotFound ? start : initStart;
+        [segments addObject:[NSValue valueWithRange:NSMakeRange(from, end - from)]];
+        [isInit addObject:@YES];
+        initStart = NSNotFound;
+      } else if ([type isEqualToString:@"moof"]) {
+        [segments
             addObject:[NSValue valueWithRange:NSMakeRange(start, end - start)]];
-      } else if ([type isEqualToString:@"mdat"] && fragments.count) {
+        [isInit addObject:@NO];
+        fragmentCount++;
+      } else if ([type isEqualToString:@"mdat"] && segments.count &&
+                 !isInit.lastObject.boolValue) {
         // An mdat belongs to the moof in front of it, and a SourceBuffer is
         // given the two together.
-        NSRange last = fragments.lastObject.rangeValue;
+        NSRange last = segments.lastObject.rangeValue;
         last.length = end - last.location;
-        fragments[fragments.count - 1] = [NSValue valueWithRange:last];
+        segments[segments.count - 1] = [NSValue valueWithRange:last];
       }
     });
-    if (firstMoof == NSNotFound) {
+    if (fragmentCount == 0) {
       printf("%s has no fragments\n", argv[1]);
       return 1;
     }
-    printf("init segment %lu bytes, %lu fragments\n", (unsigned long)firstMoof,
-           (unsigned long)fragments.count);
+    NSUInteger initCount = segments.count - fragmentCount;
+    printf("%lu init segments, %lu fragments\n", (unsigned long)initCount,
+           (unsigned long)fragmentCount);
 
     Class parserClass = NSClassFromString(@"AVStreamDataParser");
     if (!parserClass) {
@@ -259,7 +283,6 @@ int main(int argc, char **argv) {
     AVStreamDataParser *parser = [[parserClass alloc] init];
     Collector *collector = [[Collector alloc] init];
     [parser setDelegate:collector];
-    [parser appendStreamData:[data subdataWithRange:NSMakeRange(0, firstMoof)]];
 
     VTDecompressionSessionRef session = NULL;
     int submitted = 0, images = 0, failures = 0;
@@ -267,15 +290,37 @@ int main(int argc, char **argv) {
     __block OSStatus lastStatus = noErr;
     NSCondition *lock = [[NSCondition alloc] init];
 
-    for (NSValue *fragment in fragments) {
+    for (NSUInteger index = 0; index < segments.count; index++) {
       [collector.samples removeAllObjects];
-      [parser appendStreamData:[data subdataWithRange:fragment.rangeValue]];
+      [parser appendStreamData:[data
+                                   subdataWithRange:segments[index].rangeValue]];
+      if (isInit[index].boolValue)
+        continue;
 
       for (id object in collector.samples) {
         CMSampleBufferRef sample = (__bridge CMSampleBufferRef)object;
         CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
         if (!format)
           continue;
+        // A session decodes one description. A stream that changes its frame
+        // size hands the parser another initialization segment and the samples
+        // after it arrive described by that, which is where WebKit builds a
+        // decoder again -- and drops the image description it had cached, since
+        // an image of the new size cannot be wrapped in the old one.
+        if (session &&
+            !VTDecompressionSessionCanAcceptFormatDescription(session, format)) {
+          printf("format description changed at sample %d; rebuilding the "
+                 "decoder\n",
+                 submitted);
+          VTDecompressionSessionWaitForAsynchronousFrames(session);
+          VTDecompressionSessionInvalidate(session);
+          CFRelease(session);
+          session = NULL;
+          if (gCachedDescription) {
+            CFRelease(gCachedDescription);
+            gCachedDescription = NULL;
+          }
+        }
         if (!session) {
           // What WebCoreDecompressionSession asks for: hardware if it can be
           // had, IOSurface-backed, and no pixel format of its own.
