@@ -60,7 +60,9 @@ Periodic random access uses a non-IDR I picture with a recovery-point SEI instea
 
 ### 5. Interlacing
 
-Progressive sequences are output using frame coding. Interlaced sequences are represented with MBAFF, and top and bottom field pictures are combined into one frame.
+Progressive sequences are output using frame coding. In interlaced sequences,
+frame pictures are represented with MBAFF, while field pictures remain field
+pictures. A top and bottom field pair forms one frame.
 
 ## Input and output
 
@@ -80,8 +82,10 @@ cargo build --release
 ```text
 -o, --oversample <n>          H.264 quantization-step granularity (default: 2; positive)
 -r, --recovery-interval <n>   GOPs between non-IDR recovery points (default: 24)
--s, --split-field-samples     Put each field of a pair in its own MP4 sample
+-s, --split-field-samples     Put each field in its own MP4 sample (default)
+    --no-split-field-samples  Keep a complementary field pair in one MP4 sample
 -p, --passthrough             Carry the MPEG-2 video through unconverted (MP4 only)
+-j, --threads <n>             Pictures converted in parallel (default: 1; TS-to-MP4 only)
 -q, --quiet                   Suppress progress and summary output
 -h, --help                    Show help
 ```
@@ -101,7 +105,7 @@ Interlaced-video limitations:
 - Chrome on Windows may fall back to software decoding.
   - This has been observed on at least Intel systems.
 - Chrome on macOS may fall back to software decoding.
-- Where PAFF is used, putting both fields in the same MP4 sample interferes with playback in Firefox on Windows and in Safari, so each field is written as its own sample by default.
+- Putting both pictures of a complementary field pair in the same MP4 sample interferes with playback in Firefox on Windows and in Safari, so each field is written as its own sample by default.
   - In Firefox on Windows, the field pictures freeze where frame pictures give way to them.
   - Safari raises `MEDIA_ERR_DECODE`, through MSE only, when frame and field pictures are mixed.
   - Note that with separate samples, ffmpeg reports corrupt decoded frame errors when `-thread_type frame` is used with `-threads` of 2 or more.
@@ -219,7 +223,7 @@ MPEG-2のイントラマクロブロックをH.264のイントラ予測へその
 
 ### 5. インターレース
 
-プログレッシブシーケンスはフレーム符号化で出力します。インターレースシーケンスはMBAFFとして表し、フィールドピクチャはトップ・ボトムの組を1フレームにまとめます。
+プログレッシブシーケンスはフレーム符号化で出力します。インターレースシーケンスではフレームピクチャをMBAFFで表し、フィールドピクチャはフィールドピクチャのまま出力します。トップ・ボトムのフィールドペアで1フレームを構成します。
 
 ## 入出力
 
@@ -239,8 +243,10 @@ cargo build --release
 ```text
 -o, --oversample <n>          H.264量子化刻みの細かさ (既定: 2、正の数)
 -r, --recovery-interval <n>   non-IDRリカバリーポイントのGOP間隔 (既定: 24)
--s, --split-field-samples     フィールドペアを1フィールドずつMP4サンプルに分割
+-s, --split-field-samples     各フィールドを別々のMP4サンプルにする (既定)
+    --no-split-field-samples  相補フィールドペアを1つのMP4サンプルにする
 -p, --passthrough             MPEG-2映像を変換せずそのまま格納 (MP4出力のみ)
+-j, --threads <n>             並列変換するピクチャ数 (既定: 1、TSからMP4への変換のみ)
 -q, --quiet                   進捗と概要を表示しない
 -h, --help                    ヘルプを表示
 ```
@@ -260,7 +266,7 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
 - WindowsのChromeではソフトウェアデコーダーにフォールバックされることがある
   - 少なくともIntel環境で確認
 - MacのChromeではソフトウェアデコーダーにフォールバックされることがある
-- PAFFが使われる際にMP4の同一サンプルに両方のフィールドを入れるとWindows版FirefoxとSafariで再生に支障があるため既定で別サンプルとして出力
+- フィールドペアの両ピクチャを同一のMP4サンプルに入れるとWindows版FirefoxとSafariで再生に支障があるため既定で別サンプルとして出力
   - WindowsのFirefoxではフレームピクチャからフィールドピクチャに変わるとフィールドピクチャの映像がフリーズする
   - SafariではMSE経由の場合のみフレームピクチャとフィールドピクチャが混在すると`MEDIA_ERR_DECODE`となる
   - 別サンプルとした場合ffmpegで`-thread_type frame`で`-threads`が2以上のときcorrupt decoded frameのエラーが出るため注意
