@@ -334,6 +334,43 @@ fn five_point_one_payload(tag: u8) -> Vec<u8> {
     packed_bits(&bits.replace(' ', ""))
 }
 
+/// A seek opens the stream inside a frame, and the spectral data before the
+/// first header holds the occasional run of twelve set bits that reads as a
+/// syncword: one seek in forty over a broadcast recording lands on one. The
+/// header it makes up says the sound is something else -- object type 1 or 4
+/// rather than AAC-LC -- or names an element no raw_data_block starts with, and
+/// the conversion used to stop there rather than at the frame it was really in.
+#[test]
+fn steps_over_a_syncword_the_spectral_data_made() {
+    // The tail of the frame the seek landed inside: a syncword whose header
+    // says object type 1, and whose frame length points at nothing.
+    let false_header = [0xff, 0xf0, 0x00, 0x1f, 0xff, 0xe0, 0xfc, 0x00];
+    for cut in 0..false_header.len() {
+        let mut stream = false_header[cut..].to_vec();
+        stream.extend_from_slice(&adts_stream(4, 3, 2));
+
+        let mut adts = AdtsStream::new();
+        let mut frames = adts.push(&stream).expect("the frames after it decode");
+        frames.extend(adts.finish().expect("nothing is left over"));
+        assert_eq!(frames.len(), 4, "cut {cut}");
+    }
+}
+
+/// Stepping over a header the spectral data made is not stepping over a header:
+/// the frames of a stream that is not AAC-LC follow one another the way any
+/// stream's do, so what they say about themselves is read rather than skipped.
+#[test]
+fn refuses_a_run_of_frames_that_are_not_aac_lc() {
+    let mut frame = adts_frame(3, 2, 32);
+    frame[2] = (frame[2] & 0x3f) | 0x80; // profile 2, i.e. AAC SSR
+    let stream: Vec<u8> = std::iter::repeat_n(frame, 4).flatten().collect();
+
+    let error = AdtsStream::new()
+        .push(&stream)
+        .expect_err("the stream is refused");
+    assert!(error.to_string().contains("audio object type 3"), "{error}");
+}
+
 #[test]
 fn reassembles_frames_split_across_chunks() {
     let stream = adts_stream(8, 3, 2);

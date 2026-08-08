@@ -56,6 +56,102 @@ pub struct AdtsStream {
     /// after one has, it says the frame is damaged -- and so does a frame that
     /// walks but names elements the last one did not.
     chain: Option<Vec<(u8, u8)>>,
+    /// Whether the next byte to read is known to start a frame, which it is
+    /// once a header has said where its frame ends and a header was there.
+    /// Until then every syncword is a candidate rather than a frame.
+    synced: bool,
+}
+
+/// Where an ADTS header says its frame ends -- the part of it that frames the
+/// stream, as opposed to the part that describes the sound.
+struct Framing {
+    header_length: usize,
+    frame_length: usize,
+}
+
+/// The framing of the header at `at`, or `None` where there is no header there.
+/// `at + 7` must be within `data`.
+fn framing(data: &[u8], at: usize) -> Option<Framing> {
+    if !syncword(data, at) {
+        return None;
+    }
+    let protection_absent = data[at + 1] & 1;
+    let header_length = if protection_absent != 0 { 7 } else { 9 };
+    let frame_length = (((data[at + 3] & 3) as usize) << 11)
+        | ((data[at + 4] as usize) << 3)
+        | (data[at + 5] >> 5) as usize;
+    (frame_length >= header_length).then_some(Framing {
+        header_length,
+        frame_length,
+    })
+}
+
+/// The syncword is twelve set bits; the layer bits below it must be zero, which
+/// is what the 0xf6 mask checks.
+fn syncword(data: &[u8], at: usize) -> bool {
+    at + 2 <= data.len() && data[at] == 0xff && data[at + 1] & 0xf6 == 0xf0
+}
+
+/// What a search for the start of a frame found.
+enum FrameStart {
+    /// A frame begins this far into the data.
+    At(usize),
+    /// The data does not say yet. Everything before this offset is spent; what
+    /// is left is a candidate the next read decides.
+    Spent(usize),
+}
+
+/// Where the first frame of `data` begins, for a reader that does not already
+/// know: a stream opened part way through, as a seek resumes one, starts inside
+/// a frame, and a stream whose framing has just failed is in the same position.
+///
+/// Spectral data carries a run of twelve set bits about every eight thousand
+/// bytes, which is one seek in forty opening on one. What tells such a run from
+/// a header is the frame after it: a header says where the next one begins, and
+/// there is a header there. So a candidate is taken only once the one it points
+/// at has been seen.
+///
+/// A candidate whose frame reaches past what has been read cannot be judged
+/// yet. The search carries on past it rather than stopping there, since the
+/// frames further on are wanted now and a made-up frame length is as likely to
+/// be long as short -- but a candidate the buffer ends with is taken
+/// unconfirmed, since nothing following it is what the last frame of a stream
+/// looks like as much as what a false one does.
+fn frame_start(data: &[u8]) -> FrameStart {
+    let mut ends_the_buffer = None;
+    let mut unjudged = None;
+    let mut at = 0;
+    while at + 7 <= data.len() {
+        if let Some(Framing { frame_length, .. }) = framing(data, at) {
+            if at + frame_length + 2 <= data.len() {
+                if syncword(data, at + frame_length) {
+                    return FrameStart::At(at);
+                }
+                // Judged and refused. There is nothing here to come back to.
+            } else {
+                unjudged.get_or_insert(at);
+                if at + frame_length <= data.len() {
+                    ends_the_buffer.get_or_insert(at);
+                }
+            }
+        }
+        at += 1;
+    }
+    // A syncword the read was cut in the middle of is a candidate the next one
+    // completes rather than one that failed.
+    if unjudged.is_none() {
+        while at < data.len() {
+            if data[at] == 0xff && (at + 2 > data.len() || data[at + 1] & 0xf6 == 0xf0) {
+                unjudged = Some(at);
+                break;
+            }
+            at += 1;
+        }
+    }
+    match ends_the_buffer {
+        Some(at) => FrameStart::At(at),
+        None => FrameStart::Spent(unjudged.unwrap_or(data.len())),
+    }
 }
 
 fn bit(data: &[u8], at: usize) -> u8 {
@@ -383,20 +479,33 @@ impl AdtsStream {
         let mut output = Vec::new();
         let mut at = 0;
         while at + 7 <= self.pending.len() {
-            // The syncword is twelve set bits; the layer bits below it must be
-            // zero, which is what the 0xf6 mask checks.
-            if self.pending[at] != 0xff || self.pending[at + 1] & 0xf6 != 0xf0 {
-                at += 1;
-                continue;
+            if !self.synced {
+                match frame_start(&self.pending[at..]) {
+                    FrameStart::At(start) => at += start,
+                    FrameStart::Spent(keep) => {
+                        at += keep;
+                        break;
+                    }
+                }
+                self.synced = true;
             }
-            let protection_absent = self.pending[at + 1] & 1;
+            let Some(Framing {
+                header_length,
+                frame_length,
+            }) = framing(&self.pending, at)
+            else {
+                // Whatever was being followed, this is not the rest of it, so
+                // where the frames are has to be worked out again.
+                self.synced = false;
+                continue;
+            };
+            if at + frame_length > self.pending.len() {
+                break;
+            }
+
             let audio_object_type = ((self.pending[at + 2] >> 6) & 3) + 1;
             let sampling_frequency_index = (self.pending[at + 2] >> 2) & 15;
             let channel_count = ((self.pending[at + 2] & 1) << 2) | (self.pending[at + 3] >> 6);
-            let frame_length = (((self.pending[at + 3] & 3) as usize) << 11)
-                | ((self.pending[at + 4] as usize) << 3)
-                | (self.pending[at + 5] >> 5) as usize;
-            let header_length = if protection_absent != 0 { 7 } else { 9 };
             let raw_blocks = self.pending[at + 6] & 3;
 
             if audio_object_type != 2 {
@@ -407,12 +516,6 @@ impl AdtsStream {
             };
             if raw_blocks != 0 {
                 bail!("ADTS frames with multiple raw data blocks are unsupported");
-            }
-            if frame_length < header_length {
-                bail!("invalid ADTS frame length");
-            }
-            if at + frame_length > self.pending.len() {
-                break;
             }
 
             let raw_data = &self.pending[at + header_length..at + frame_length];
@@ -555,8 +658,10 @@ impl AdtsStream {
         // middle of, which a recording that stopped mid-frame ends with. A
         // fraction of an access unit is not something a decoder can be given,
         // and refusing the whole stream over the last few milliseconds of it
-        // would be worse, so it goes.
+        // would be worse, so it goes. Whatever comes next is the start of
+        // another stream, which is not where this one left off.
         self.pending.clear();
+        self.synced = false;
         Ok(output)
     }
 }
