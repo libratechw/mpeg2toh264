@@ -160,10 +160,18 @@ pub fn sequence_sample_aspect_ratio(sequence: &SequenceHeader) -> Option<SampleA
 /// A broadcast is not one sequence from end to end: a station switching between
 /// its main service and a sub-channel, or between an HD programme and an SD
 /// commercial, sends a new sequence header and codes everything after it
-/// differently. Everything here is something the SPS, the PPS or the MP4 sample
-/// entry carries, so a stream that changes any of it has to be described again
-/// -- and nothing else in the sequence header needs a decoder to be told twice.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// differently. Everything here is something the SPS or the MP4 sample entry
+/// carries, so a stream that changes any of it has to be described again -- and
+/// nothing else in the sequence header needs a decoder to be told twice.
+///
+/// The quantiser matrices are deliberately not here, although the PPS declares
+/// the non-intra one as its scaling list. Some broadcast encoders adapt them
+/// picture by picture, several times within one group of pictures, and a
+/// picture whose matrices differ from the unit's is still coded: it is
+/// requantised against the list the decoder was given, which the search for a
+/// quantiser step already allows for. Counting them here instead would drop
+/// every picture but the one a unit opens with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SequenceDescription {
     pub width: u32,
     pub height: u32,
@@ -172,21 +180,6 @@ pub struct SequenceDescription {
     /// declares in the SPS.
     pub mbaff: bool,
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
-    /// The non-intra matrix, which the PPS declares as its 8x8 scaling lists
-    /// and which every requantised coefficient is scaled against.
-    pub non_intra_quant: [i32; 64],
-}
-
-impl Default for SequenceDescription {
-    fn default() -> Self {
-        Self {
-            width: 0,
-            height: 0,
-            mbaff: false,
-            sample_aspect_ratio: None,
-            non_intra_quant: DEFAULT_NON_INTRA_QUANT,
-        }
-    }
 }
 
 /// The description one already-parsed picture was coded under.
@@ -196,7 +189,6 @@ pub fn picture_sequence_description(picture: &Picture) -> SequenceDescription {
         height: picture.sequence.vertical_size,
         mbaff: !picture.sequence_ext.progressive_sequence,
         sample_aspect_ratio: sequence_sample_aspect_ratio(&picture.sequence),
-        non_intra_quant: picture.quant.non_intra,
     }
 }
 
@@ -215,7 +207,6 @@ pub fn picture_sequence_description(picture: &Picture) -> SequenceDescription {
 pub fn stream_sequence_description(data: &[u8]) -> Option<SequenceDescription> {
     let mut sequence: Option<SequenceHeader> = None;
     let mut sequence_ext: Option<SequenceExtension> = None;
-    let mut quant = QuantMatrices::default();
     let mut at = 0;
     while at + 3 < data.len() {
         if data[at] != 0 || data[at + 1] != 0 || data[at + 2] != 1 {
@@ -225,19 +216,14 @@ pub fn stream_sequence_description(data: &[u8]) -> Option<SequenceDescription> {
         let code = data[at + 3];
         let mut r = BitReader::at_bit(data, (at + 4) * 8);
         if code == start_code::SEQUENCE_HEADER {
-            let (header, matrices) = read_sequence_header(&mut r).ok()?;
+            let (header, _) = read_sequence_header(&mut r).ok()?;
             sequence = Some(header);
             sequence_ext = None;
-            quant = matrices;
         } else if code == start_code::EXTENSION {
-            match r.u(4) {
-                extension::SEQUENCE => {
-                    if let Some(header) = sequence.as_mut() {
-                        sequence_ext = Some(read_sequence_extension(&mut r, header).ok()?);
-                    }
+            if r.u(4) == extension::SEQUENCE {
+                if let Some(header) = sequence.as_mut() {
+                    sequence_ext = Some(read_sequence_extension(&mut r, header).ok()?);
                 }
-                extension::QUANT_MATRIX => read_quant_matrix_extension(&mut r, &mut quant),
-                _ => {}
             }
         } else if code == start_code::PICTURE {
             // Pictures no sequence header describes are discarded by the parse
@@ -253,7 +239,6 @@ pub fn stream_sequence_description(data: &[u8]) -> Option<SequenceDescription> {
                     height: sequence.vertical_size,
                     mbaff: !progressive_sequence,
                     sample_aspect_ratio: sequence_sample_aspect_ratio(&sequence),
-                    non_intra_quant: quant.non_intra,
                 });
             }
         }

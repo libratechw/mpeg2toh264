@@ -359,7 +359,13 @@ pub fn plan_unit(
     // Field pictures are paired below and represented as one MBAFF frame.
 
     let g = frame_geometry(width, height, !mbaff);
-    let scaling = description.non_intra_quant;
+    // The scaling list the PPS declares, and so what every picture in this unit
+    // is requantised against, whatever its own matrices say. A source that
+    // adapts them picture by picture -- which some broadcast encoders do,
+    // several times within one group -- is coded against this one rather than
+    // dropped, and the quantiser search absorbs the difference: the step it
+    // picks scales with the list the decoder holds.
+    let scaling = first.quant.non_intra;
 
     let mut parts: Vec<Part> = Vec::new();
     let mut description_parts: Vec<Part> = Vec::new();

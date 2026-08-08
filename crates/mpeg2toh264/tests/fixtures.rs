@@ -192,6 +192,90 @@ fn packages_each_fixture_as_a_fragmented_mp4() {
     }
 }
 
+/// A `quant_matrix_extension` loading `weights` as the non-intra matrix, which
+/// is legal anywhere between a picture's coding extension and its first slice.
+///
+/// Clause 6.2.3.2: the four-bit identifier, then a flag per matrix with the
+/// sixty-four weights of each one that is loaded. Only the non-intra matrix is
+/// loaded here, so the whole extension is 65 bytes offset six bits.
+fn quant_matrix_extension(weights: &[u8; 64]) -> Vec<u8> {
+    // 0011, then load_intra_quantiser_matrix and load_non_intra_quantiser_matrix.
+    let mut bits: Vec<u8> = vec![0, 0, 1, 1, 0, 1];
+    for weight in weights {
+        bits.extend((0..8).map(|shift| (weight >> (7 - shift)) & 1));
+    }
+    bits.extend([0, 0]);
+    let mut out = vec![0x00, 0x00, 0x01, 0xb5];
+    out.extend(bits.chunks(8).map(|byte| {
+        byte.iter()
+            .enumerate()
+            .fold(0u8, |packed, (at, bit)| packed | (bit << (7 - at)))
+    }));
+    out
+}
+
+/// Load `weights` for every picture of `source` from the second one on, which
+/// is what an encoder that adapts its quantiser matrices to the picture does.
+fn requantise_after_the_first_picture(source: &[u8], weights: &[u8; 64]) -> Vec<u8> {
+    let extension = quant_matrix_extension(weights);
+    let mut out = Vec::with_capacity(source.len());
+    let mut at = 0;
+    let mut pictures = 0;
+    while at + 4 <= source.len() {
+        if source[at..at + 3] != [0, 0, 1] {
+            out.push(source[at]);
+            at += 1;
+            continue;
+        }
+        let code = source[at + 3];
+        if code == 0x00 {
+            pictures += 1;
+        }
+        // The first slice of a picture ends the header where an extension may
+        // stand, so this is the last moment to insert one.
+        if (0x01..=0xaf).contains(&code) && pictures > 1 {
+            out.extend_from_slice(&extension);
+            out.extend_from_slice(&source[at..]);
+            return out;
+        }
+        out.extend_from_slice(&source[at..at + 4]);
+        at += 4;
+    }
+    out.extend_from_slice(&source[at..]);
+    out
+}
+
+#[test]
+fn a_matrix_that_changes_within_a_unit_codes_every_picture_anyway() {
+    // Some broadcast encoders adapt the quantiser matrices picture by picture,
+    // several times within one group. The matrices are not part of what
+    // describes a unit, so the pictures behind the change are requantised
+    // against the scaling list the parameter sets carry rather than dropped for
+    // disagreeing with it -- which is what used to happen, and left a
+    // half-hour recording playing at the two frames a second its groups opened
+    // with.
+    let source = read_fixture("ibbp.m2v");
+    let plain = transcode(&source, TranscodeOptions::default()).expect("transcode succeeds");
+    let adapted = requantise_after_the_first_picture(&source, &[24u8; 64]);
+    let result = transcode(&adapted, TranscodeOptions::default()).expect("transcode succeeds");
+
+    assert_eq!(
+        result.pictures_converted, plain.pictures_converted,
+        "a picture coded under another matrix is still coded"
+    );
+    assert_eq!(result.pictures_skipped, plain.pictures_skipped);
+    assert_ne!(
+        result.bitstream, plain.bitstream,
+        "and is dequantised by its own matrix, so the levels move"
+    );
+
+    // The MP4 timeline has to have dropped exactly the same pictures, which
+    // packaging the result is what proves: it counts samples against access
+    // units.
+    let timeline = mpeg2_video_timeline(&adapted, false, &result.undecodable).expect("timeline");
+    h264_to_fmp4(&result.bitstream, &timeline).expect("the timeline reserves the same samples");
+}
+
 /// fixture, interlaced, top field first. Checked against what ffprobe reports
 /// for the same files: `tt` for hd1080i, `bb` for altscan, progressive for the
 /// rest. A player has no other way to learn this -- the H.264 that comes out
