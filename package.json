@@ -12,8 +12,8 @@
     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
     "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "format:check": "prettier --check 'packages/**/*.{ts,js,json}' package.json",
-    "format:write": "prettier --write 'packages/**/*.{ts,js,json}' package.json"
+    "format:check": "prettier --check 'packages/**/*.{ts,js,json}' 'tools/**/*.{cjs,js,json}' package.json",
+    "format:write": "prettier --write 'packages/**/*.{ts,js,json}' 'tools/**/*.{cjs,js,json}' package.json"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
