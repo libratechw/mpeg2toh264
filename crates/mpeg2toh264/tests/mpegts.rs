@@ -642,3 +642,104 @@ fn keeps_the_chosen_sound_across_a_repeated_program_map() {
     demuxer.push(&ts).expect("demuxes the map again");
     assert_eq!(demuxer.audio_pid(), Some(0x111));
 }
+
+/// A programme boundary can take the stream a viewer picked away with it: the
+/// programme after it carries one sound where the one before carried two. There
+/// is nothing to fall back to but the sound that is there, and when the
+/// broadcast offers the second one again it is offered back -- a station that
+/// moves its streams about within a service is the same programme carrying on,
+/// and it still owes the viewer the choice they made.
+#[test]
+fn falls_back_to_the_remaining_sound_and_returns_to_the_chosen_one() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
+        STREAM_TYPE_MPEG2_VIDEO,
+    };
+
+    let video = PesUnit {
+        pid: 0x100,
+        stream_id: 0xe0,
+        pts: Some(90_000),
+        payload: &[0, 0, 1, 0xb3],
+    };
+    let map = |streams: &[(u16, u8, &[u8])]| {
+        mux_transport_stream_with_descriptors(streams, std::slice::from_ref(&video))
+    };
+    let both = map(&[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (0x110, STREAM_TYPE_AAC_ADTS, &[][..]),
+        (0x111, STREAM_TYPE_AAC_ADTS, &[][..]),
+    ]);
+    let one = map(&[
+        (0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (0x110, STREAM_TYPE_AAC_ADTS, &[][..]),
+    ]);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&both).expect("demuxes");
+    demuxer.select_audio(0x111);
+    demuxer.push(&both).expect("demuxes");
+    assert_eq!(demuxer.audio_pid(), Some(0x111), "the sound that was picked");
+
+    demuxer.push(&one).expect("demuxes the narrower map");
+    assert_eq!(
+        demuxer.audio_streams().len(),
+        1,
+        "the programme offers one sound now"
+    );
+    assert_eq!(
+        demuxer.audio_pid(),
+        Some(0x110),
+        "which is the one that is heard, there being no other"
+    );
+
+    demuxer.push(&both).expect("demuxes the wider map");
+    assert_eq!(
+        demuxer.audio_pid(),
+        Some(0x111),
+        "and the choice is honoured again as soon as it can be"
+    );
+}
+
+/// A programme that carries no sound at all is the same thing taken to its
+/// end: there is nothing to offer and nothing to read. What must not happen is
+/// the demuxer going on reading a PID the programme no longer names, which
+/// would put another programme's sound against this one's picture.
+#[test]
+fn stops_reading_the_sound_a_programme_no_longer_carries() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_AAC_ADTS,
+        STREAM_TYPE_MPEG2_VIDEO,
+    };
+
+    let video = PesUnit {
+        pid: 0x100,
+        stream_id: 0xe0,
+        pts: Some(90_000),
+        payload: &[0, 0, 1, 0xb3],
+    };
+    let with_sound = mux_transport_stream_with_descriptors(
+        &[
+            (0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+            (0x110, STREAM_TYPE_AAC_ADTS, &[][..]),
+        ],
+        std::slice::from_ref(&video),
+    );
+    let silent = mux_transport_stream_with_descriptors(
+        &[(0x100, STREAM_TYPE_MPEG2_VIDEO, &[][..])],
+        std::slice::from_ref(&video),
+    );
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&with_sound).expect("demuxes");
+    assert!(demuxer.has_aac_audio());
+    demuxer.push(&silent).expect("demuxes the silent map");
+    assert_eq!(demuxer.audio_pid(), None);
+    assert!(demuxer.audio_streams().is_empty());
+    assert!(
+        !demuxer.has_aac_audio(),
+        "so nothing downstream holds the picture back waiting for sound"
+    );
+}

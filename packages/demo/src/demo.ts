@@ -465,11 +465,20 @@ function showAudioChoices(audio: AudioTracks): void {
     forgetAudio();
     return;
   }
-  const playing = `${audio.current}${audio.dualMonoSub ? ":sub" : ""}`;
   // A choice the programme no longer offers is not one to keep showing: a
-  // programme boundary can take the stream it named away with it.
+  // programme boundary can take the stream it named away with it, and a
+  // broadcast can stop sending two services in one stream partway through.
   if (wantedAudio !== null && !choices.some((c) => c.value === wantedAudio))
     wantedAudio = null;
+  const offered = (value: string): boolean =>
+    choices.some((choice) => choice.value === value);
+  const sub = `${audio.current}:sub`;
+  // The second service of a stream that has stopped carrying one is not
+  // something to show as playing: the sound is the stream itself now. Naming
+  // it anyway would match no entry, and the control would fall back to
+  // whichever comes first -- which is not even the same stream.
+  const playing =
+    audio.dualMonoSub && offered(sub) ? sub : String(audio.current);
   const selected = wantedAudio ?? playing;
   audioSelect.replaceChildren(
     ...choices.map(({ value, text }) => {

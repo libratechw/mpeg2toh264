@@ -806,6 +806,13 @@ class Playback {
    * Both halves of that can change without anyone asking: a programme boundary
    * brings a new program map, and dual mono is turned on and off within a
    * programme. So this is sent whenever the answer moves rather than once.
+   *
+   * Including when the answer becomes nothing. A programme that carries no
+   * sound at all leaves a page that was told once showing a choice that no
+   * longer exists, so an empty list is news as much as a full one is -- but
+   * only after there has been something to empty. Before the program map
+   * arrives the list is empty because nothing is known yet, and that is not
+   * something to report.
    */
   #announceAudio(id: number, converter: Transcoder): void {
     const audio: AudioTracks = {
@@ -814,7 +821,7 @@ class Playback {
       dualMono: converter.audioIsDualMono,
       dualMonoSub: this.#dualMonoSub,
     };
-    if (audio.available.length === 0) return;
+    if (audio.available.length === 0 && this.#announcedAudio === null) return;
     const was = this.#announcedAudio;
     const same =
       was !== null &&
