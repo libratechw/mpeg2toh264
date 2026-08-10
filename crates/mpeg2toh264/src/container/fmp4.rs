@@ -609,8 +609,9 @@ pub struct SampleTiming {
     pub reorder_delay: i64,
 }
 
-/// Give the duplicate recovery picture a real decode instant without changing
-/// the unit's duration or any following presentation time.
+/// Give the duplicate recovery picture a real decode instant and a display
+/// slot after the picture it repeats, without changing the unit's duration or
+/// any following presentation time.
 fn insert_recovery_copy_timing(
     timing: &mut SampleTiming,
     index: usize,
@@ -634,12 +635,34 @@ fn insert_recovery_copy_timing(
         *next_duration -= borrowed;
         *next_composition -= borrowed;
     }
+    // Where the pictures already coded give way. The copies repeat the unit's
+    // intra picture, and everything decoded ahead of them are the leading
+    // pictures that display before it, so this is that picture's last sample.
+    let mut decode_time = 0u64;
+    let mut shown_until = 0u64;
+    for (&duration, &composition) in timing.durations[..index]
+        .iter()
+        .zip(timing.compositions.iter())
+    {
+        shown_until = shown_until.max(decode_time + u64::from(composition));
+        decode_time += u64::from(duration);
+    }
+    // A tick after their own decode instant, so the browser sees strictly
+    // increasing timestamps rather than the source intra picture's own. And a
+    // tick after that picture leaves the screen, which is what a split field
+    // pair needs: its second field displays half a frame after the first,
+    // which is after these samples decode, so timing them from their decode
+    // instant alone lands them between the two fields and leaves the pair
+    // presented top, top, bottom, frame, bottom.
+    let start = shown_until.max(decode_time) + 1;
+    let Ok(composition) = u32::try_from(start - decode_time) else {
+        bail!("recovery copies cannot reach the picture they repeat");
+    };
     for offset in 0..copies {
         timing.durations.insert(index + offset, 1);
-        // The source intra picture and the inserted IDR otherwise have the
-        // same presentation time. Place each recovery sample one tick after
-        // its decode time so the browser sees strictly increasing timestamps.
-        timing.compositions.insert(index + offset, 1);
+        // Each copy decodes a tick after the one before it, so one offset
+        // carries them all and they stay a tick apart on screen too.
+        timing.compositions.insert(index + offset, composition);
     }
     Ok(())
 }
@@ -737,8 +760,27 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     match lead_in {
         UnitLeadIn::None => {}
         UnitLeadIn::IdrClone => {
-            durations.insert(0, (((first_index - 1) * duration) as u32 + hold).max(1));
-            compositions.insert(0, reorder_delay as u32);
+            let lead = ((first_index - 1) * duration) as u32 + hold;
+            let opens_on_a_pair = timeline.split_field_samples && timeline.is_field_pair(0);
+            if let (true, [first, second, ..]) = (opens_on_a_pair, durations.as_slice()) {
+                // The clone is the unit's third sample, because the pair it
+                // repeats takes two. Holding the first field over the hole --
+                // which is what inserting the extra slot in front does -- puts
+                // the second field a whole hole after its own first, so the
+                // pair is torn across frames and every field behind it lands
+                // on the wrong half of the frame. Hold the second field
+                // instead, and give the clone the frame the pair belongs to.
+                let (first, second) = (*first, *second);
+                let total = lead + first + second;
+                let held = lead.saturating_sub(first).max(1);
+                let start = (reorder_delay as u32 + lead).max(reorder_delay as u32 + first + 1);
+                durations[1] = held;
+                durations.insert(2, (total - first - held).max(1));
+                compositions.insert(2, start - (first + held));
+            } else {
+                durations.insert(0, lead.max(1));
+                compositions.insert(0, reorder_delay as u32);
+            }
         }
         // The opening sample is displayed from the first empty slot through its
         // own, so the unit spans exactly what it would have with a clone in
@@ -1691,6 +1733,81 @@ mod tests {
             })
             .collect();
         assert_eq!(presentation_times, vec![0, 11, 12, 20]);
+    }
+
+    /// A split field pair is still on screen when its copy decodes: the second
+    /// field displays half a frame after the first, and the copy decodes at
+    /// the first field's display instant. Timing the copies from their own
+    /// decode instant put them between the two fields, which presented the
+    /// frame as top, top, bottom, copy, bottom -- two fields of one parity in
+    /// a row, at every recovery point whose source intra picture was a pair.
+    #[test]
+    fn recovery_copies_of_a_field_pair_follow_its_second_field() {
+        let mut timing = SampleTiming {
+            // A field pair, then the leading pictures that display ahead of it.
+            durations: vec![5, 5, 10, 10, 10],
+            compositions: vec![30, 30, 0, 0, 40],
+            reorder_delay: 0,
+        };
+        insert_recovery_copy_timing(&mut timing, 4, 3).expect("timing has room");
+
+        let mut decode_time = 0u32;
+        let presentation_times: Vec<u32> = timing
+            .durations
+            .iter()
+            .zip(&timing.compositions)
+            .map(|(&duration, &composition)| {
+                let presentation = decode_time + composition;
+                decode_time += duration;
+                presentation
+            })
+            .collect();
+        // The pair displays at 30 and 35, and the three copies pick up from
+        // there rather than from 30, where the second field still follows.
+        assert_eq!(presentation_times, vec![30, 35, 10, 20, 36, 37, 38, 70]);
+    }
+
+    /// The clone in front of a unit holds the empty slots an open group's
+    /// dropped leading pictures left. Holding the pair's first field over them
+    /// left its second field a whole hole later, which tore the pair across
+    /// two frames and put every field behind it on the wrong half of one.
+    #[test]
+    fn a_clone_holds_the_second_field_of_the_pair_it_opens_on() {
+        // Two empty leading slots in front of a group of field pairs.
+        let leading = [3, 6, 4, 5];
+        let timing =
+            mpeg2_sample_timing(&timeline(&leading, &[true; 4], true), UnitLeadIn::IdrClone);
+        let mut decode_time = 0u32;
+        let presentation_times: Vec<u32> = timing
+            .durations
+            .iter()
+            .zip(&timing.compositions)
+            .map(|(&duration, &composition)| {
+                let presentation = decode_time + composition;
+                decode_time += duration;
+                presentation
+            })
+            .collect();
+        let half = FRAME / 2;
+        // The pair opens the unit a field apart, and the clone takes the frame
+        // the pair belongs to, two frames on.
+        assert_eq!(presentation_times[0], FRAME);
+        assert_eq!(presentation_times[1], FRAME + half);
+        assert_eq!(presentation_times[2], FRAME * 3);
+        assert_eq!(timing.durations[2], FRAME);
+        // Nothing behind the clone moved, and the unit is as long as it was.
+        assert_eq!(
+            &presentation_times[3..],
+            &[
+                FRAME * 6,
+                FRAME * 6 + half,
+                FRAME * 4,
+                FRAME * 4 + half,
+                FRAME * 5,
+                FRAME * 5 + half
+            ]
+        );
+        assert_eq!(timing.durations.iter().sum::<u32>(), FRAME * 6);
     }
 
     #[test]
