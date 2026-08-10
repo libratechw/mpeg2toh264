@@ -541,6 +541,24 @@ fn content_sample_count(timeline: &Mpeg2VideoTimeline) -> usize {
     pictures + split_pairs
 }
 
+/// Validate the samples synthesized around a random-access point and return
+/// how many timing entries they need. An ordinary IDR has one reference clone.
+/// Recovery in IDR mode has an IDR copy plus its clone; when that copied source
+/// picture is a split field pair, the IDR copy itself occupies two samples.
+fn recovery_extra_samples(
+    sample_count: usize,
+    content_samples: usize,
+    recovery_copy: bool,
+    split_field_samples: bool,
+) -> Option<usize> {
+    let extra = sample_count.checked_sub(content_samples)?;
+    if recovery_copy {
+        (extra == 2 || (split_field_samples && extra == 3)).then_some(extra)
+    } else {
+        (extra <= 1).then_some(extra)
+    }
+}
+
 /// Where a picture's coded data ends, which is the start code that terminated
 /// its last slice. A picture with no slices at all ends where it began.
 pub(crate) fn picture_end(picture: &Picture, start: usize) -> usize {
@@ -1260,16 +1278,18 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
             .get(index)
             .is_some_and(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
     });
-    let extra_samples = if recovery_copy.is_some() { 2 } else { 1 };
-    let has_extra = samples.len() == content_samples + extra_samples;
-    let has_idr_clone = has_extra && recovery_copy.is_none();
-    let expected = content_samples + usize::from(has_extra) * extra_samples;
-    if samples.len() != expected {
+    let Some(extra_samples) = recovery_extra_samples(
+        samples.len(),
+        content_samples,
+        recovery_copy.is_some(),
+        timeline.split_field_samples,
+    ) else {
         bail!(
-            "H.264 sample count {} does not match MPEG-2 timeline {expected}",
-            samples.len()
+            "H.264 sample count {} does not match MPEG-2 timeline {content_samples}",
+            samples.len(),
         );
-    }
+    };
+    let has_idr_clone = extra_samples == 1 && recovery_copy.is_none();
     let lead_in = if has_idr_clone {
         UnitLeadIn::IdrClone
     } else {
@@ -1284,7 +1304,7 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
         sync_samples[index] = true;
     }
     if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
-        insert_recovery_copy_timing(&mut timing, index, 2)?;
+        insert_recovery_copy_timing(&mut timing, index, extra_samples)?;
     }
     if let (Some(index), Some(sei)) = (recovery, sei) {
         samples[index].insert(0, sei);
@@ -1451,16 +1471,18 @@ pub fn h264_gop_to_fmp4(
             .get(index)
             .is_some_and(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
     });
-    let extra_samples = if recovery_copy.is_some() { 2 } else { 1 };
-    let has_extra = samples.len() == content_samples + extra_samples;
-    let has_idr_clone = has_extra && recovery_copy.is_none();
-    let expected = content_samples + usize::from(has_extra) * extra_samples;
-    if samples.len() != expected {
+    let Some(extra_samples) = recovery_extra_samples(
+        samples.len(),
+        content_samples,
+        recovery_copy.is_some(),
+        timeline.split_field_samples,
+    ) else {
         bail!(
-            "H.264 GOP sample count {} does not match MPEG-2 timeline {expected}",
-            samples.len()
+            "H.264 GOP sample count {} does not match MPEG-2 timeline {content_samples}",
+            samples.len(),
         );
-    }
+    };
+    let has_idr_clone = extra_samples == 1 && recovery_copy.is_none();
     let lead_in = if has_idr_clone {
         UnitLeadIn::IdrClone
     } else {
@@ -1475,7 +1497,7 @@ pub fn h264_gop_to_fmp4(
         sync_samples[index] = true;
     }
     if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
-        insert_recovery_copy_timing(&mut timing, index, 2)?;
+        insert_recovery_copy_timing(&mut timing, index, extra_samples)?;
     }
     if let (Some(index), Some(sei)) = (recovery, sei) {
         samples[index].insert(0, sei);
@@ -1621,6 +1643,12 @@ mod tests {
     /// Decode order I P P P, a group coded without B pictures, which displays
     /// in the order it was coded in.
     const IPPP: [u32; 4] = [1, 2, 3, 4];
+
+    #[test]
+    fn a_split_field_recovery_copy_adds_three_samples() {
+        assert_eq!(recovery_extra_samples(33, 30, true, true), Some(3));
+        assert_eq!(recovery_extra_samples(33, 30, true, false), None);
+    }
 
     /// The delay is what the decode timeline of a unit is set back by, and the
     /// units share one timeline, so a unit with nothing to reorder has to be

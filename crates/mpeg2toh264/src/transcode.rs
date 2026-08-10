@@ -2283,21 +2283,29 @@ fn write_picture(
             SliceType::B
         };
         // The short-term run the slice would otherwise leave a decoder to work
-        // out. Two slices keep the default lists: an I slice has none, and the
-        // second field of a reference pair has its own first field standing in
-        // its list, which decoders do agree about and which cannot be named
-        // without naming a field of the picture being coded.
-        let explicit_ref_lists = (output_slice_type != SliceType::I
-            && !anchor_second_field
-            && !second_field_of_reference_pair)
-            .then(|| {
+        // out. A recovery pair is decoded while the old DPB is still present,
+        // so its second field cannot rely on the default list putting the first
+        // field of this pair ahead of those older references. Name that field
+        // explicitly: it has this frame_num and the opposite parity.
+        let explicit_ref_lists = if anchor_second_field {
+            let mut lists = [RefPicList::default(), RefPicList::default()];
+            for list in &mut lists {
+                list.push(RefPicListEntry {
+                    frames_back: 0,
+                    same_parity: false,
+                });
+            }
+            Some(lists)
+        } else {
+            (output_slice_type != SliceType::I && !second_field_of_reference_pair).then(|| {
                 short_term_ref_lists(
                     &ctx.short_term,
                     ctx.frame_num,
                     layout.bwd_l0 >= 0,
                     direct_field_pair,
                 )
-            });
+            })
+        };
         debug_assert!(
             explicit_ref_lists.is_none_or(|lists| lists.iter().all(|list| list.len()
                 == if direct_field_pair {

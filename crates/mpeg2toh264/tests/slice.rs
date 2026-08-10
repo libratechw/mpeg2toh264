@@ -188,6 +188,19 @@ fn a_field_slice_names_every_short_term_field_of_both_lists() {
 }
 
 #[test]
+fn a_second_recovery_field_names_the_first_field_of_its_pair() {
+    let frame_num = 107;
+    let first_field = [(0, false)];
+    let read = slice_lists(
+        frame_num,
+        [list_of(&first_field), list_of(&first_field)],
+        true,
+    );
+    let expected = vec![pic_num(frame_num, 0, false, true)];
+    assert_eq!(read, [expected.clone(), expected]);
+}
+
+#[test]
 fn a_field_slice_list_survives_the_frame_num_wrapping_to_zero() {
     // frame_num has just wrapped, so every reference sits above the current
     // picture and its FrameNumWrap is negative.
