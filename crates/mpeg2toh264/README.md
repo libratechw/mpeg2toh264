@@ -21,7 +21,7 @@ println!(
 
 GOP単位で状態を維持して変換する場合は`IncrementalTranscoder`を使います。`request_random_access_point()`を呼ぶと、次に変換可能なIピクチャから新しいIDR区間を開始します。
 
-`Session`は`recovery_interval`ごとにnon-IDRのリカバリーポイントを生成します。DPBをフラッシュしないため、連続再生ではOpen GOPのleading Bピクチャも表示されます。その位置から再生を開始する場合はleading Bを捨て、Iピクチャ以降から復旧します。
+`Session`は`recovery_interval`ごとにリカバリーポイントを生成します。`OpenGopRecovery::Idr`はOpen GOPの先頭Bピクチャを保持した後にIDRと参照用のクローンを追加し、`OpenGopRecovery::RecoveryPoint`は先頭Bピクチャを保持してnon-IDRリカバリーポイントを使い、`OpenGopRecovery::Discard`は先頭Bピクチャを捨ててIDRから開始します。既定値は`OpenGopRecovery::Idr`です。
 
 ## ストリーミング
 

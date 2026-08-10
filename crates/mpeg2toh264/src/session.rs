@@ -24,7 +24,9 @@ use crate::job::PictureOutput;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
 use crate::mpeg2::headers::{stream_sequence_description, Interlacing, SequenceDescription};
 use crate::round_half_up;
-use crate::transcode::{IncrementalTranscoder, Step, TranscodeOptions, TranscodeResult, VideoMode};
+use crate::transcode::{
+    IncrementalTranscoder, OpenGopRecovery, Step, TranscodeOptions, TranscodeResult, VideoMode,
+};
 
 const TIMESCALE: u64 = 90_000;
 
@@ -284,6 +286,7 @@ pub struct Session {
     adts: AdtsStream,
     video: VideoPipeline,
     recovery_point_gop_interval: usize,
+    open_gop_recovery: OpenGopRecovery,
 
     sequence_number: u32,
     /// Where the next fragment starts, in 90 kHz ticks.
@@ -452,6 +455,7 @@ impl Session {
                 },
             },
             recovery_point_gop_interval: options.recovery_interval,
+            open_gop_recovery: options.open_gop_recovery,
             sequence_number: 1,
             video_presentation_start: 0,
             audio_frames_emitted: 0,
@@ -782,11 +786,12 @@ impl Session {
         self.audio_clock_frames += frames.len() as u64;
     }
 
-    /// Whether the fragment about to be emitted opens at an IDR. Periodic
-    /// recovery points deliberately do not count: they retain the prior DPB so
-    /// an open GOP's leading B pictures remain codeable.
+    /// Whether the fragment about to be emitted opens at an IDR. This includes
+    /// periodic recovery in discard mode so the timeline and transcoder omit
+    /// the same leading pictures.
     fn starts_at_idr(&self) -> bool {
         self.video.awaiting_random_access()
+            || (self.open_gop_recovery == OpenGopRecovery::Discard && self.is_random_access_point())
     }
 
     /// Work out what one unit turns into, on whichever path this session is on.
@@ -1071,7 +1076,12 @@ impl Session {
         plan: Option<UnitPlan>,
     ) -> Result<Ready> {
         if self.is_random_access_point() {
-            self.video.request_recovery_point();
+            match self.open_gop_recovery {
+                OpenGopRecovery::Idr | OpenGopRecovery::RecoveryPoint => {
+                    self.video.request_recovery_point();
+                }
+                OpenGopRecovery::Discard => self.video.request_random_access(),
+            }
         }
         let starts_at_idr = self.video.awaiting_random_access();
         let plan = match plan {

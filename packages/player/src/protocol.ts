@@ -140,6 +140,7 @@ export interface LoadCommand {
   wasmUrl: string | null;
   oversample: number | undefined;
   recoveryInterval: number | undefined;
+  openGopRecovery: "idr" | "recovery-point" | "discard" | undefined;
   /** Give each field of a complementary pair its own MP4 sample. */
   splitFieldSamples: boolean | undefined;
   /**

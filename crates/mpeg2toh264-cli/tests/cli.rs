@@ -123,6 +123,13 @@ fn accepts_a_recovery_interval() {
 }
 
 #[test]
+fn rejects_an_unknown_open_gop_mode() {
+    let result = run(&["--open-gop=closed", "a", "b"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("open GOP mode"));
+}
+
+#[test]
 fn rejects_a_nonsensical_thread_count() {
     let result = run(&["--threads=0", "a", "b"]);
     assert_eq!(result.status.code(), Some(2));

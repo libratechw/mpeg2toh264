@@ -99,13 +99,30 @@ pub enum VideoMode {
     Passthrough,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OpenGopRecovery {
+    /// Preserve every leading picture, then emit a real IDR and its reference
+    /// clone after them. This costs two additional samples at each recovery
+    /// boundary, but gives hardware decoders an unambiguous restart point.
+    #[default]
+    Idr,
+    /// Preserve every leading picture and use the independently coded source
+    /// intra picture as a non-IDR recovery point.
+    RecoveryPoint,
+    /// Discard leading pictures and restart the decoded picture buffer at the
+    /// source intra picture.
+    Discard,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct TranscodeOptions {
     pub oversample: f64,
-    /// Put a recovery point at every this many GOPs. The recovery picture is
-    /// independently coded without flushing the decoded picture buffer, so an
-    /// open GOP's leading B pictures remain available during continuous play.
+    /// Put a recovery point at every this many GOPs. Its handling is selected
+    /// by [`Self::open_gop_recovery`].
     pub recovery_interval: usize,
+    /// How an open GOP becomes independently decodable at a periodic recovery
+    /// boundary.
+    pub open_gop_recovery: OpenGopRecovery,
     /// Put the two coded fields of a complementary pair in separate access
     /// units, and so in separate MP4 samples. On by default, because both
     /// break where frame pictures give way to field pictures: Firefox on
@@ -125,6 +142,7 @@ impl Default for TranscodeOptions {
         Self {
             oversample: DEFAULT_OVERSAMPLE,
             recovery_interval: 24,
+            open_gop_recovery: OpenGopRecovery::default(),
             split_field_samples: true,
             video: VideoMode::default(),
         }
@@ -410,6 +428,7 @@ pub fn plan_unit(
     let mut pictures_converted = 0usize;
     let mut pictures_skipped = 0usize;
     let mut recovery_emitted = false;
+    let mut pending_recovery_copy: Option<(usize, Option<usize>, u32)> = None;
 
     // A stream restarting at a random access point has an empty decoded picture
     // buffer and an unstarted display order, so it begins from nothing.
@@ -450,9 +469,82 @@ pub fn plan_unit(
     }
     let has_field_pairs = logical_pictures.iter().any(|(_, mate)| mate.is_some());
 
+    let emit_recovery_copy = |parts: &mut Vec<Part>,
+                              jobs: &mut Vec<PictureJob>,
+                              state: &mut TranscoderState,
+                              source: usize,
+                              mate: Option<usize>,
+                              _poc: u32| {
+        let layout = RefLayout {
+            count: 1,
+            fwd_l0: 0,
+            fwd_l1: 0,
+            bwd_l0: -1,
+            bwd_l1: -1,
+            flat: 0,
+            l1_short_term_delta: None,
+            anchor_second_field: false,
+        };
+        let ctx = PictureContext {
+            frame_num: 0,
+            poc: 0,
+            is_reference: true,
+            layout,
+            short_term: ShortTermFrames::default(),
+            options,
+            mbaff,
+            real_idr: true,
+            recovery_intra: false,
+            weight_scale: scaling,
+            picture_count: if mate.is_some() { 2 } else { 1 },
+        };
+        if has_field_pairs {
+            parts.push(Part::Literal(write_access_unit_delimiter()));
+        }
+        parts.push(Part::Literal(write_recovery_point_sei()));
+        parts.push(Part::Picture(jobs.len()));
+        jobs.push(PictureJob {
+            index: jobs.len(),
+            source,
+            mate,
+            data: job_bytes(data, &pics, &starts, source, mate, &ctx),
+        });
+        // Keep the IDR in the long-term slot and put a skipped-P clone in the
+        // short-term chain. For a field pair the frame-coded clone marks the
+        // complete pair long-term.
+        if has_field_pairs {
+            parts.push(Part::Literal(write_access_unit_delimiter()));
+        }
+        parts.push(Part::Literal(write_reference_clone(
+            &g,
+            mbaff,
+            mate.is_some(),
+        )));
+        state.prev_ref_frame_num = 1;
+        state.short_term_count = 1;
+        state.newest_short_term = 1;
+        state.short_term.clear();
+        state.short_term.push(1);
+    };
+
     for &(source, mate) in &logical_pictures {
         let pic = &pics[source];
         let picture_type = pic.header.picture_coding_type;
+        if let Some((copy_source, copy_mate, copy_poc)) = pending_recovery_copy {
+            let leading = picture_type == PictureType::B
+                && pic.header.temporal_reference < pics[copy_source].header.temporal_reference;
+            if !leading {
+                emit_recovery_copy(
+                    &mut parts,
+                    &mut jobs,
+                    &mut state,
+                    copy_source,
+                    copy_mate,
+                    copy_poc,
+                );
+                pending_recovery_copy = None;
+            }
+        }
         if !picture_type.is_ipb() {
             pictures_skipped += 1;
             continue;
@@ -568,7 +660,7 @@ pub fn plan_unit(
         if has_field_pairs {
             parts.push(Part::Literal(write_access_unit_delimiter()));
         }
-        if recovery_intra {
+        if recovery_intra && options.open_gop_recovery == OpenGopRecovery::RecoveryPoint {
             parts.push(Part::Literal(write_recovery_point_sei()));
         }
         parts.push(Part::Picture(jobs.len()));
@@ -579,6 +671,9 @@ pub fn plan_unit(
             data: job_bytes(data, &pics, &starts, source, mate, &ctx),
         });
         recovery_emitted |= recovery_intra;
+        if recovery_intra && options.open_gop_recovery == OpenGopRecovery::Idr {
+            pending_recovery_copy = Some((source, mate, ctx.poc));
+        }
 
         if real_idr {
             // A field pair cannot mark itself long-term, so the copy behind
@@ -606,6 +701,10 @@ pub fn plan_unit(
             state.short_term.push(frame_num);
         }
         pictures_converted += 1;
+    }
+
+    if let Some((source, mate, poc)) = pending_recovery_copy {
+        emit_recovery_copy(&mut parts, &mut jobs, &mut state, source, mate, poc);
     }
 
     // The parameter sets go in front of the pictures they describe, and only

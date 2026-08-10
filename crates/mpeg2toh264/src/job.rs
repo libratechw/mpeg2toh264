@@ -12,7 +12,7 @@
 
 use crate::error::{bail, Result};
 use crate::mpeg2::headers::SequenceDescription;
-use crate::transcode::{TranscodeOptions, VideoMode};
+use crate::transcode::{OpenGopRecovery, TranscodeOptions, VideoMode};
 
 /// How many short-term reference frames the buffer holds, the long-term copy
 /// taking the remaining slot.
@@ -217,6 +217,7 @@ const FLAG_RECOVERY_INTRA: u8 = 1 << 3;
 const FLAG_ANCHOR_SECOND_FIELD: u8 = 1 << 4;
 const FLAG_HAS_L1_DELTA: u8 = 1 << 5;
 const FLAG_SPLIT_FIELD_SAMPLES: u8 = 1 << 6;
+const FLAG_NON_IDR_OPEN_GOP_RECOVERY: u8 = 1 << 7;
 
 fn put_u32(out: &mut [u8], at: usize, value: u32) {
     out[at..at + 4].copy_from_slice(&value.to_le_bytes());
@@ -255,12 +256,19 @@ impl PictureContext {
         flags |= u8::from(self.layout.anchor_second_field) * FLAG_ANCHOR_SECOND_FIELD;
         flags |= u8::from(self.layout.l1_short_term_delta.is_some()) * FLAG_HAS_L1_DELTA;
         flags |= u8::from(self.options.split_field_samples) * FLAG_SPLIT_FIELD_SAMPLES;
+        flags |= u8::from(self.options.open_gop_recovery == OpenGopRecovery::RecoveryPoint)
+            * FLAG_NON_IDR_OPEN_GOP_RECOVERY;
         out[0] = ENCODING_VERSION;
         out[1] = flags;
         out[2] = self.short_term.len as u8;
-        out[3] = match self.options.video {
-            VideoMode::Transcode => 0,
-            VideoMode::Passthrough => 1,
+        out[3] = match (
+            self.options.video,
+            self.options.open_gop_recovery == OpenGopRecovery::Discard,
+        ) {
+            (VideoMode::Transcode, false) => 0,
+            (VideoMode::Passthrough, false) => 1,
+            (VideoMode::Transcode, true) => 2,
+            (VideoMode::Passthrough, true) => 3,
         };
         out[PICTURE_COUNT_AT] = self.picture_count;
         put_u32(out, 4, self.frame_num);
@@ -331,10 +339,17 @@ impl PictureContext {
             options: TranscodeOptions {
                 oversample: f64::from_bits(get_u64(data, 52)),
                 recovery_interval: get_u32(data, 60) as usize,
+                open_gop_recovery: if matches!(data[3], 2 | 3) {
+                    OpenGopRecovery::Discard
+                } else if flags & FLAG_NON_IDR_OPEN_GOP_RECOVERY != 0 {
+                    OpenGopRecovery::RecoveryPoint
+                } else {
+                    OpenGopRecovery::Idr
+                },
                 split_field_samples: flags & FLAG_SPLIT_FIELD_SAMPLES != 0,
                 video: match data[3] {
-                    0 => VideoMode::Transcode,
-                    1 => VideoMode::Passthrough,
+                    0 | 2 => VideoMode::Transcode,
+                    1 | 3 => VideoMode::Passthrough,
                     other => bail!("picture job names video mode {other}"),
                 },
             },
@@ -428,6 +443,7 @@ mod tests {
             options: TranscodeOptions {
                 oversample: 2.5,
                 recovery_interval: 24,
+                open_gop_recovery: OpenGopRecovery::Idr,
                 split_field_samples: true,
                 video: VideoMode::Transcode,
             },
@@ -525,6 +541,20 @@ mod tests {
             PictureContext {
                 options: TranscodeOptions {
                     split_field_samples: false,
+                    ..base.options
+                },
+                ..base
+            },
+            PictureContext {
+                options: TranscodeOptions {
+                    open_gop_recovery: OpenGopRecovery::RecoveryPoint,
+                    ..base.options
+                },
+                ..base
+            },
+            PictureContext {
+                options: TranscodeOptions {
+                    open_gop_recovery: OpenGopRecovery::Discard,
                     ..base.options
                 },
                 ..base

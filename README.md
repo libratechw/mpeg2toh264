@@ -57,7 +57,27 @@ I_PCM could avoid all but the inverse transform, but it caused QSV decoding prob
 
 Immediately after the opening IDR, a copy of the same image is emitted as a long-term reference to reserve the index used for subsequent constant predictions.
 
-Periodic random access uses a non-IDR I picture with a recovery-point SEI instead of flushing the decoded-picture buffer. References from the previous GOP therefore remain available during continuous playback, and an open GOP's leading B pictures are preserved. A decoder starting at the recovery point discards those leading pictures, whose presentation times precede the I picture, and recovers from the independently coded I picture onward. The interval defaults to 24 GOPs and can be changed with `--recovery-interval`.
+Periodic random access is controlled by `--open-gop`. `idr` preserves the leading B pictures and the I picture that closes their GOP, then begins the next GOP with an IDR and long-term reference clone. `recovery-point` preserves the leading B pictures and uses a non-IDR I picture with a recovery-point SEI. `discard` drops the leading B pictures to close the GOP, then begins the next GOP with an IDR and clone as in `idr`. The interval defaults to 24 GOPs and can be changed with `--recovery-interval`.
+
+For example, the access units around an open-GOP boundary are arranged as follows. `B` is a leading B picture whose presentation time precedes the I picture, and `I(r)` is an independently coded non-IDR I picture carrying a recovery-point SEI.
+
+Decode order:
+
+| Mode | | | | | | |
+| --- | --- | --- | --- | --- | --- | --- |
+| MPEG-2 input | `I` | `B` | `B` | - | - | `P ...` |
+| `idr` | `I` | `B` | `B` | `IDR` | `clone` | `P ...` |
+| `recovery-point` | `I(r)` | `B` | `B` | - | - | `P ...` |
+| `discard` | - | - | - | `IDR` | `clone` | `P ...` |
+
+Display order:
+
+| Mode | | | | | | |
+| --- | --- | --- | --- | --- | --- | --- |
+| MPEG-2 input | `B` | `B` | `I` | - | - | `P ...` |
+| `idr` | `B` | `B` | `I` | `IDR` | `clone` | `P ...` |
+| `recovery-point` | `B` | `B` | `I(r)` | - | - | `P ...` |
+| `discard` | - | - | - | `IDR` | `clone` | `P ...` |
 
 ### 5. Interlacing
 
@@ -82,7 +102,8 @@ cargo build --release
 
 ```text
 -o, --oversample <n>          H.264 quantization-step granularity (default: 2; positive)
--r, --recovery-interval <n>   GOPs between non-IDR recovery points (default: 24)
+-r, --recovery-interval <n>   GOPs between recovery points (default: 24)
+    --open-gop <mode>         idr (default), recovery-point, or discard
 -s, --split-field-samples     Put each field in its own MP4 sample (default)
     --no-split-field-samples  Keep a complementary field pair in one MP4 sample
 -p, --passthrough             Carry the MPEG-2 video through unconverted (MP4 only)
@@ -220,7 +241,27 @@ MPEG-2のイントラマクロブロックをH.264のイントラ予測へその
 
 先頭IDRの直後には同じ画像の長期参照用コピーを置き、以後の一定値予測用インデックスを確保します。
 
-周期的なランダムアクセス点ではDPBをフラッシュするIDRではなく、リカバリーポイントSEIを付けたnon-IDR Iピクチャを使います。そのため連続再生では前GOPの参照が維持され、Open GOPの先頭Bピクチャも表示されます。リカバリーポイントからデコードを開始する場合、Iピクチャより表示時刻が前の先頭Bピクチャは捨て、独立符号化したIピクチャ以降から復旧します。間隔の既定値は24 GOPで、`--recovery-interval`で変更できます。
+周期的なランダムアクセス点の処理は`--open-gop`で指定します。`idr`は先頭Bピクチャを保持してIピクチャを配置してclosed GOPにし、次のGOPにはIDRと長期参照用コピーを配置します。`recovery-point`は先頭Bピクチャを保持してnon-IDR IピクチャとリカバリーポイントSEIを使います。`discard`は先頭Bピクチャを捨てることでclosed GOPにし、`idr`同様IDRと長期参照用コピーを配置します。間隔の既定値は24 GOPで、`--recovery-interval`で変更できます。
+
+Open GOP境界付近のアクセスユニットは次のようになります。`B`はIピクチャより表示時刻が前の先頭Bピクチャ、`I(r)`はリカバリーポイントSEIを伴う独立符号化されたnon-IDR Iピクチャです。
+
+デコード順:
+
+| モード | | | | | | |
+| --- | --- | --- | --- | --- | --- | --- |
+| MPEG-2入力 | `I` | `b` | `b` | - | - | `P` |
+| `idr` | `I` | `b` | `b` | `IDR` | `clone` | `P` |
+| `recovery-point` | `I(r)` | `b` | `b` | - | - | `P` |
+| `discard` | - | - | - | `IDR` | `clone` | `P` |
+
+表示順:
+
+| モード | | | | | | |
+| --- | --- | --- | --- | --- | --- | --- |
+| MPEG-2入力 | `b` | `b` | `I` | - | - | `P` |
+| `idr` | `b` | `b` | `I` | `IDR` | `clone` | `P` |
+| `recovery-point` | `b` | `b` | `I(r)` | - | - | `P` |
+| `discard` | - | - | - | `IDR` | `clone` | `P` |
 
 ### 5. インターレース
 
@@ -243,7 +284,8 @@ cargo build --release
 
 ```text
 -o, --oversample <n>          H.264量子化刻みの細かさ (既定: 2、正の数)
--r, --recovery-interval <n>   non-IDRリカバリーポイントのGOP間隔 (既定: 24)
+-r, --recovery-interval <n>   リカバリーポイントのGOP間隔 (既定: 24)
+    --open-gop <mode>         idr (既定)、recovery-point、discard
 -s, --split-field-samples     各フィールドを別々のMP4サンプルにする (既定)
     --no-split-field-samples  相補フィールドペアを1つのMP4サンプルにする
 -p, --passthrough             MPEG-2映像を変換せずそのまま格納 (MP4出力のみ)

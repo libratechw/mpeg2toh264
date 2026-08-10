@@ -215,6 +215,31 @@ fn video_samples<'a>(nals: &[&'a [u8]]) -> Vec<VideoSample<'a>> {
     samples
 }
 
+/// The access unit immediately following a recovery-point SEI.
+fn recovery_sample_index(nals: &[&[u8]]) -> Option<usize> {
+    let has_aud = nals.iter().any(|nal| nal[0] & 0x1f == 9);
+    let mut completed = 0usize;
+    let mut current_vcl = false;
+    for nal in nals {
+        match nal[0] & 0x1f {
+            9 if has_aud => {
+                completed += usize::from(current_vcl);
+                current_vcl = false;
+            }
+            1 | 5 => {
+                if !has_aud {
+                    completed += 1;
+                } else {
+                    current_vcl = true;
+                }
+            }
+            6 if nal.get(1) == Some(&6) => return Some(completed),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug)]
 pub struct Mpeg2VideoTimeline {
     pub width: u32,
@@ -564,6 +589,41 @@ pub struct SampleTiming {
     pub compositions: Vec<u32>,
     /// How far decoding runs ahead of display.
     pub reorder_delay: i64,
+}
+
+/// Give the duplicate recovery picture a real decode instant without changing
+/// the unit's duration or any following presentation time.
+fn insert_recovery_copy_timing(
+    timing: &mut SampleTiming,
+    index: usize,
+    copies: usize,
+) -> Result<()> {
+    let borrowed = copies as u32;
+    if index == timing.durations.len() {
+        let Some(previous_duration) = timing.durations.last_mut() else {
+            bail!("recovery copy has no content sample to borrow from");
+        };
+        if *previous_duration <= borrowed {
+            bail!("recovery copies cannot borrow time from their preceding sample");
+        }
+        *previous_duration -= borrowed;
+    } else {
+        let next_duration = &mut timing.durations[index];
+        let next_composition = &mut timing.compositions[index];
+        if *next_duration <= borrowed || *next_composition < borrowed {
+            bail!("recovery copies cannot borrow time from their following sample");
+        }
+        *next_duration -= borrowed;
+        *next_composition -= borrowed;
+    }
+    for offset in 0..copies {
+        timing.durations.insert(index + offset, 1);
+        // The source intra picture and the inserted IDR otherwise have the
+        // same presentation time. Place each recovery sample one tick after
+        // its decode time so the browser sees strictly increasing timestamps.
+        timing.compositions.insert(index + offset, 1);
+    }
+    Ok(())
 }
 
 /// What the sample that opens a unit has to stand in for.
@@ -1189,13 +1249,21 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
     let sps = nals.iter().find(|nal| nal_type(nal) == 7).copied();
     let pps = nals.iter().find(|nal| nal_type(nal) == 8).copied();
     let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
-    let samples = video_samples(&nals);
+    let mut samples = video_samples(&nals);
     let (Some(sps), Some(pps)) = (sps, pps) else {
         bail!("H.264 stream lacks SPS or PPS");
     };
     let content_samples = content_sample_count(timeline);
-    let has_idr_clone = samples.len() == content_samples + 1;
-    let expected = content_samples + usize::from(has_idr_clone);
+    let recovery = recovery_sample_index(&nals);
+    let recovery_copy = recovery.filter(|&index| {
+        samples
+            .get(index)
+            .is_some_and(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
+    });
+    let extra_samples = if recovery_copy.is_some() { 2 } else { 1 };
+    let has_extra = samples.len() == content_samples + extra_samples;
+    let has_idr_clone = has_extra && recovery_copy.is_none();
+    let expected = content_samples + usize::from(has_extra) * extra_samples;
     if samples.len() != expected {
         bail!(
             "H.264 sample count {} does not match MPEG-2 timeline {expected}",
@@ -1207,17 +1275,21 @@ pub fn h264_to_fmp4(h264: &[u8], timeline: &Mpeg2VideoTimeline) -> Result<Fmp4Ou
     } else {
         UnitLeadIn::None
     };
-    let timing = mpeg2_sample_timing(timeline, lead_in);
-    let recovery_point = sei.is_some_and(|nal| nal.get(1) == Some(&6));
+    let mut timing = mpeg2_sample_timing(timeline, lead_in);
     let mut sync_samples: Vec<bool> = samples
         .iter()
         .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
         .collect();
-    if recovery_point && !sync_samples.is_empty() {
-        sync_samples[0] = true;
+    if let Some(index) = recovery.filter(|&index| index < sync_samples.len()) {
+        sync_samples[index] = true;
     }
-    let prefixes: Vec<&[u8]> = sei.into_iter().collect();
-    let video = VideoPayload::avc(samples, &prefixes);
+    if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
+        insert_recovery_copy_timing(&mut timing, index, 2)?;
+    }
+    if let (Some(index), Some(sei)) = (recovery, sei) {
+        samples[index].insert(0, sei);
+    }
+    let video = VideoPayload::avc(samples, &[]);
     let (init_segment, mime_codec) = make_init_segment(
         VideoCodec::Avc { sps, pps },
         timeline.width,
@@ -1370,11 +1442,19 @@ pub fn h264_gop_to_fmp4(
     let sps = nals.iter().find(|nal| nal_type(nal) == 7).copied();
     let pps = nals.iter().find(|nal| nal_type(nal) == 8).copied();
     let sei = nals.iter().find(|nal| nal_type(nal) == 6).copied();
-    let samples = video_samples(&nals);
+    let mut samples = video_samples(&nals);
 
     let content_samples = content_sample_count(timeline);
-    let has_idr_clone = samples.len() == content_samples + 1;
-    let expected = content_samples + usize::from(has_idr_clone);
+    let recovery = recovery_sample_index(&nals);
+    let recovery_copy = recovery.filter(|&index| {
+        samples
+            .get(index)
+            .is_some_and(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
+    });
+    let extra_samples = if recovery_copy.is_some() { 2 } else { 1 };
+    let has_extra = samples.len() == content_samples + extra_samples;
+    let has_idr_clone = has_extra && recovery_copy.is_none();
+    let expected = content_samples + usize::from(has_extra) * extra_samples;
     if samples.len() != expected {
         bail!(
             "H.264 GOP sample count {} does not match MPEG-2 timeline {expected}",
@@ -1386,18 +1466,20 @@ pub fn h264_gop_to_fmp4(
     } else {
         UnitLeadIn::None
     };
-    let timing = mpeg2_sample_timing(timeline, lead_in);
-    let recovery_point = sei.is_some_and(|nal| nal.get(1) == Some(&6));
+    let mut timing = mpeg2_sample_timing(timeline, lead_in);
     let mut sync_samples: Vec<bool> = samples
         .iter()
         .map(|sample| sample.iter().any(|nal| nal[0] & 0x1f == 5))
         .collect();
-    if recovery_point && !sync_samples.is_empty() {
-        sync_samples[0] = true;
+    if let Some(index) = recovery.filter(|&index| index < sync_samples.len()) {
+        sync_samples[index] = true;
     }
-    let prefixes: Vec<&[u8]> = sei.into_iter().collect();
-    let video = VideoPayload::avc(samples, &prefixes);
-
+    if let Some(index) = recovery_copy.filter(|&index| index < sync_samples.len()) {
+        insert_recovery_copy_timing(&mut timing, index, 2)?;
+    }
+    if let (Some(index), Some(sei)) = (recovery, sei) {
+        samples[index].insert(0, sei);
+    }
     // The parameter sets are written once, by the unit that opens the stream,
     // so that is the unit that has an initialization segment to describe.
     let describe = match (sps, pps) {
@@ -1405,7 +1487,7 @@ pub fn h264_gop_to_fmp4(
         _ => None,
     };
     make_fragment(
-        video,
+        VideoPayload::avc(samples, &[]),
         timeline,
         &timing,
         &sync_samples,
@@ -1556,6 +1638,31 @@ mod tests {
         // Every picture displays a frame after it decodes, so none of them
         // moved: the offsets carry the delay rather than cancelling it.
         assert_eq!(in_order.compositions, vec![FRAME; 4]);
+    }
+
+    #[test]
+    fn recovery_samples_have_distinct_presentation_times() {
+        let mut timing = SampleTiming {
+            durations: vec![10, 10],
+            compositions: vec![0, 10],
+            reorder_delay: 0,
+        };
+        insert_recovery_copy_timing(&mut timing, 1, 2).expect("timing has room");
+
+        assert_eq!(timing.durations, vec![10, 1, 1, 8]);
+        assert_eq!(timing.compositions, vec![0, 1, 1, 8]);
+        let mut decode_time = 0u32;
+        let presentation_times: Vec<u32> = timing
+            .durations
+            .iter()
+            .zip(&timing.compositions)
+            .map(|(&duration, &composition)| {
+                let presentation = decode_time + composition;
+                decode_time += duration;
+                presentation
+            })
+            .collect();
+        assert_eq!(presentation_times, vec![0, 11, 12, 20]);
     }
 
     #[test]

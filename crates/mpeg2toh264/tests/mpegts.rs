@@ -680,7 +680,11 @@ fn falls_back_to_the_remaining_sound_and_returns_to_the_chosen_one() {
     demuxer.push(&both).expect("demuxes");
     demuxer.select_audio(0x111);
     demuxer.push(&both).expect("demuxes");
-    assert_eq!(demuxer.audio_pid(), Some(0x111), "the sound that was picked");
+    assert_eq!(
+        demuxer.audio_pid(),
+        Some(0x111),
+        "the sound that was picked"
+    );
 
     demuxer.push(&one).expect("demuxes the narrower map");
     assert_eq!(

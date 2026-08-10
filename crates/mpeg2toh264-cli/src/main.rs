@@ -10,8 +10,8 @@ use std::time::Instant;
 use mpeg2toh264::job::PictureOutput;
 use mpeg2toh264::{
     extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_passthrough_unit,
-    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, Fragment, PictureEncoder, Progress, Session,
-    TranscodeOptions, VideoMode,
+    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, Fragment, OpenGopRecovery, PictureEncoder,
+    Progress, Session, TranscodeOptions, VideoMode,
 };
 
 const USAGE: &str = "\
@@ -30,6 +30,10 @@ Options:
   -o, --oversample <n>      Quantiser search oversampling factor (default: 2)
   -r, --recovery-interval <n>
                             GOPs between recovery points (default: 24)
+      --open-gop <idr|recovery-point|discard>
+                            Preserve leading pictures, then use a real IDR
+                            (default) or a non-IDR recovery point; discard drops
+                            leading pictures and begins at an IDR
   -s, --split-field-samples Give each field of a complementary pair its own MP4
                             sample (default). A pair sharing one sample breaks
                             Firefox on Windows and Safari where frame pictures
@@ -70,6 +74,7 @@ fn parse_args(args: &[String]) -> Invocation {
     let mut positional: Vec<&str> = Vec::new();
     let mut oversample: f64 = 2.0;
     let mut recovery_interval: usize = 24;
+    let mut open_gop_recovery = OpenGopRecovery::Idr;
     let mut split_field_samples = true;
     let mut quiet = false;
     let mut passthrough = false;
@@ -103,6 +108,16 @@ fn parse_args(args: &[String]) -> Invocation {
             }
             _ if arg.starts_with("--recovery-interval=") => {
                 recovery_interval = arg["--recovery-interval=".len()..].parse().unwrap_or(0);
+            }
+            "--open-gop" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    fail(&format!("{arg} requires a value"));
+                };
+                open_gop_recovery = parse_open_gop(value);
+            }
+            _ if arg.starts_with("--open-gop=") => {
+                open_gop_recovery = parse_open_gop(&arg["--open-gop=".len()..]);
             }
             "-j" | "--threads" => {
                 i += 1;
@@ -155,6 +170,7 @@ fn parse_args(args: &[String]) -> Invocation {
         transcode: TranscodeOptions {
             oversample,
             recovery_interval,
+            open_gop_recovery,
             split_field_samples,
             video: if passthrough {
                 VideoMode::Passthrough
@@ -163,6 +179,15 @@ fn parse_args(args: &[String]) -> Invocation {
             },
         },
     }))
+}
+
+fn parse_open_gop(value: &str) -> OpenGopRecovery {
+    match value {
+        "idr" => OpenGopRecovery::Idr,
+        "recovery-point" => OpenGopRecovery::RecoveryPoint,
+        "discard" => OpenGopRecovery::Discard,
+        _ => fail("open GOP mode must be 'idr', 'recovery-point', or 'discard'"),
+    }
 }
 
 fn absolute(path: &Path) -> PathBuf {

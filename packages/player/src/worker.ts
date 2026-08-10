@@ -537,6 +537,7 @@ class Playback {
         this.#command.serviceId,
         this.#command.splitFieldSamples,
         this.#command.passthrough,
+        this.#command.openGopRecovery,
       );
       converter.usePool(this.#pool);
       // A PID the program map has yet to name is remembered until it does, so

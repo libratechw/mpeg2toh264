@@ -6,7 +6,7 @@ mod support;
 use mpeg2toh264::container::adts::AdtsStream;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use mpeg2toh264::{DualMono, Fragment, Session, TranscodeOptions};
+use mpeg2toh264::{DualMono, Fragment, OpenGopRecovery, Session, TranscodeOptions};
 use support::{
     adts_frame, adts_frame_with_payload, adts_stream, mux_programs, mux_transport_stream,
     read_fixture, wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS,
@@ -1207,19 +1207,23 @@ fn continuous_playback_does_not_restart_at_an_open_gop() {
                 .windows(4)
                 .position(|bytes| bytes == b"trun")
                 .expect("fragment has a video trun");
-            let first_sample_flags = u32::from_be_bytes(
-                data[trun + 24..trun + 28]
-                    .try_into()
-                    .expect("first sample flags"),
-            );
+            let flags: Vec<u32> = (0..*video_samples)
+                .map(|sample| {
+                    let at = trun + 24 + sample * 16;
+                    u32::from_be_bytes(data[at..at + 4].try_into().expect("sample flags"))
+                })
+                .collect();
             assert_eq!(
-                first_sample_flags, 0x0200_0000,
-                "the recovery picture is an ISO-BMFF sync sample"
+                flags.iter().filter(|&&flags| flags == 0x0200_0000).count(),
+                1,
+                "only the IDR after the leading pictures is a sync sample"
             );
+            assert_ne!(flags[0], 0x0200_0000, "the first intra is only pre-roll");
         }
         assert_eq!(
-            *video_samples, pictures_per_gop,
-            "GOP {index} lost an open-GOP picture"
+            *video_samples,
+            pictures_per_gop + 2 * usize::from(index == 24),
+            "GOP {index} preserves its pictures and adds the recovery IDR and clone"
         );
     }
 }
@@ -1242,7 +1246,7 @@ fn audio_pending_timeline_keeps_open_gop_pictures_at_a_recovery_point() {
     };
 
     assert!(*random_access);
-    assert_eq!(*video_samples, pictures_per_gop);
+    assert_eq!(*video_samples, pictures_per_gop + 2);
 }
 
 #[test]
@@ -1269,9 +1273,89 @@ fn recovery_points_preserve_distinct_leading_b_pictures() {
         })
         .sum();
 
-    // The opening IDR has its reference clone; every source picture, including
-    // each red/blue leading-B pair, must still have its own sample.
+    // One clone belongs to the opening IDR, and two samples belong to each
+    // periodic IDR and its clone. Every source picture is retained.
+    assert_eq!(video_samples, source_pictures + 1 + 2 * (media.len() - 1));
+    assert!(media.iter().skip(1).all(|fragment| matches!(
+        fragment,
+        Fragment::Media {
+            random_access: true,
+            ..
+        }
+    )));
+    assert!(media.iter().skip(1).all(|fragment| match fragment {
+        Fragment::Media { data, .. } => data
+            .windows(9)
+            .any(|bytes| bytes == [0, 0, 0, 5, 6, 6, 1, 0xe4, 0x80]),
+        _ => false,
+    }));
+}
+
+#[test]
+fn non_idr_open_gop_recovery_preserves_pictures_without_adding_copies() {
+    let source = read_fixture("open_gop_leading_bb.m2v");
+    let source_pictures = parse_elementary_stream(&source)
+        .expect("fixture parses")
+        .len();
+    let options = TranscodeOptions {
+        recovery_interval: 1,
+        open_gop_recovery: OpenGopRecovery::RecoveryPoint,
+        ..TranscodeOptions::default()
+    };
+    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000));
+    let fragments = run_session_with_options(&stream, 64 * 1024, options);
+    let (_, media) = split_fragments(&fragments);
+    let video_samples: usize = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { video_samples, .. } => *video_samples,
+            _ => unreachable!(),
+        })
+        .sum();
+
+    // The opening IDR contributes one clone; periodic non-IDR recovery points
+    // contribute no additional samples. Every source picture is retained.
     assert_eq!(video_samples, source_pictures + 1);
+    assert!(media.iter().skip(1).all(|fragment| matches!(
+        fragment,
+        Fragment::Media {
+            random_access: true,
+            ..
+        }
+    )));
+    assert!(media.iter().skip(1).all(|fragment| match fragment {
+        Fragment::Media { data, .. } => data
+            .windows(9)
+            .any(|bytes| bytes == [0, 0, 0, 5, 6, 6, 1, 0xe4, 0x80]),
+        _ => false,
+    }));
+}
+
+#[test]
+fn discard_open_gop_recovery_drops_only_the_leading_pictures() {
+    let source = read_fixture("open_gop_leading_bb.m2v");
+    let source_pictures = parse_elementary_stream(&source)
+        .expect("fixture parses")
+        .len();
+    let options = TranscodeOptions {
+        recovery_interval: 1,
+        open_gop_recovery: OpenGopRecovery::Discard,
+        ..TranscodeOptions::default()
+    };
+    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000));
+    let fragments = run_session_with_options(&stream, 64 * 1024, options);
+    let (_, media) = split_fragments(&fragments);
+    let video_samples: usize = media
+        .iter()
+        .map(|fragment| match fragment {
+            Fragment::Media { video_samples, .. } => *video_samples,
+            _ => unreachable!(),
+        })
+        .sum();
+
+    // Each periodic boundary drops one leading logical B picture (the
+    // fixture's red/blue pair is its two fields). The opening IDR has one clone.
+    assert_eq!(video_samples, source_pictures + 1 - (media.len() - 1));
     assert!(media.iter().skip(1).all(|fragment| matches!(
         fragment,
         Fragment::Media {

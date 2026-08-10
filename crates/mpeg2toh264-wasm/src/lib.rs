@@ -7,7 +7,7 @@
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use mpeg2toh264::job::PictureOutput;
-use mpeg2toh264::{DualMono, Fragment, Progress, TranscodeOptions, VideoMode};
+use mpeg2toh264::{DualMono, Fragment, OpenGopRecovery, Progress, TranscodeOptions, VideoMode};
 use wasm_bindgen::prelude::*;
 
 /// The shape of what [`Session::push`] returns, declared so the browser sources
@@ -176,6 +176,7 @@ impl Session {
         recovery_interval: Option<u32>,
         split_field_samples: Option<bool>,
         passthrough: Option<bool>,
+        open_gop_recovery: Option<String>,
     ) -> Result<Session, JsError> {
         let defaults = TranscodeOptions::default();
         let oversample = oversample.unwrap_or(defaults.oversample);
@@ -193,11 +194,22 @@ impl Session {
             Some(ticks) => Some(ticks as u64),
             None => None,
         };
+        let open_gop_recovery = match open_gop_recovery.as_deref() {
+            None | Some("idr") => OpenGopRecovery::Idr,
+            Some("recovery-point") => OpenGopRecovery::RecoveryPoint,
+            Some("discard") => OpenGopRecovery::Discard,
+            Some(_) => {
+                return Err(JsError::new(
+                    "openGopRecovery must be 'idr', 'recovery-point', or 'discard'",
+                ))
+            }
+        };
         Ok(Self {
             inner: mpeg2toh264::Session::for_service(
                 TranscodeOptions {
                     oversample,
                     recovery_interval: recovery_interval as usize,
+                    open_gop_recovery,
                     split_field_samples: split_field_samples
                         .unwrap_or(defaults.split_field_samples),
                     video: if passthrough.unwrap_or(false) {

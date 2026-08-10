@@ -87,8 +87,15 @@ export interface Mpeg2TsPlayerOptions {
   preferManagedMediaSource?: boolean;
   /** The quantiser search factor. Higher is slower and closer to the source. */
   oversample?: number;
-  /** Number of MPEG-2 GOPs between non-IDR recovery points. */
+  /** Number of MPEG-2 GOPs between recovery points. */
   recoveryInterval?: number;
+  /**
+   * How an open GOP becomes independently decodable. `idr` preserves leading
+   * pictures and follows them with a real IDR; `recovery-point` preserves them
+   * and uses a non-IDR recovery point; `discard` drops them and starts at an
+   * IDR.
+   */
+  openGopRecovery?: "idr" | "recovery-point" | "discard";
   /**
    * Give each field of a complementary pair its own MP4 sample. On by default,
    * because both break where frame pictures give way to field pictures:
@@ -496,6 +503,7 @@ export class Mpeg2TsPlayer extends EventTarget {
           : String(this.#options.wasmUrl),
       oversample: this.#options.oversample,
       recoveryInterval: this.#options.recoveryInterval,
+      openGopRecovery: this.#options.openGopRecovery,
       splitFieldSamples: this.#options.splitFieldSamples,
       passthrough: this.#options.passthrough ?? false,
       pictureWorkers: this.#options.pictureWorkers,

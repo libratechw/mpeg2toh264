@@ -263,14 +263,14 @@ fn both_paths_place_the_same_pictures_on_the_same_timeline() {
         assert_eq!(transcoded_scan, carried_scan, "fragment {index} scan");
         // The fragment that opens the presentation is the one the transcoder
         // adds a copy of its IDR to, to hang the flat prediction on.
-        // Passthrough needs no such thing, so it holds one sample fewer and
-        // shows its first picture for that much longer instead. A periodic
-        // recovery point adds nothing on either path.
-        let clone = usize::from(index == 0);
-        opening_clones += clone as i64;
+        // Passthrough needs neither the opening reference clone nor the IDR
+        // and reference clone at a periodic recovery boundary.
+        let opening_clone = usize::from(index == 0);
+        let recovery_copies = 2 * usize::from(index != 0 && *transcoded_restart);
+        opening_clones += opening_clone as i64;
         assert_eq!(
             *transcoded_samples,
-            carried_samples + clone,
+            carried_samples + opening_clone + recovery_copies,
             "fragment {index} sample count"
         );
     }
