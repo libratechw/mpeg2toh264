@@ -525,6 +525,11 @@ pub fn plan_unit(
         state.newest_short_term = 1;
         state.short_term.clear();
         state.short_term.push(1);
+        // The IDR resets PicOrderCntMsb and PicOrderCntLsb. Keep the pictures
+        // after it in that new POC epoch too: leaving the stream-wide GOP base
+        // in place crosses half of MaxPicOrderCntLsb after about 4.5 minutes,
+        // at which point clause 8.2.1 derives the preceding POC cycle.
+        state.gop_base = 0;
     };
 
     for &(source, mate) in &logical_pictures {
@@ -3209,9 +3214,40 @@ fn write_picture(
 #[cfg(test)]
 mod tests {
     use super::{
-        dual_prime_opposite, field_picture_ref_index, field_picture_selected_parity, rounded_half,
+        dual_prime_opposite, field_picture_ref_index, field_picture_selected_parity, plan_unit,
+        rounded_half, TranscodeOptions, TranscoderState, UnitRequest,
     };
     use crate::mpeg2::constants::mb_flag;
+
+    #[test]
+    fn a_recovery_idr_starts_a_new_picture_order_epoch() {
+        let data = include_bytes!("../../../testdata/ibbp.m2v");
+        let first = plan_unit(
+            data,
+            &TranscoderState::new(),
+            TranscodeOptions::default(),
+            UnitRequest::default(),
+            &[],
+        )
+        .expect("the opening unit plans");
+        let mut state = first.state;
+        state.gop_base = 1 << 13;
+
+        let recovery = plan_unit(
+            data,
+            &state,
+            TranscodeOptions::default(),
+            UnitRequest {
+                recovery_point: true,
+                ..UnitRequest::default()
+            },
+            &[],
+        )
+        .expect("the recovery unit plans");
+
+        assert!(recovery.recovery_emitted);
+        assert_eq!(recovery.state.gop_base, 0);
+    }
 
     #[test]
     fn an_uncoded_p_field_vector_infers_same_parity() {
