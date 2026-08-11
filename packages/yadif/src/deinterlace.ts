@@ -94,9 +94,12 @@ void main() {
 const BLIT_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 uniform sampler2D uField;
+uniform bool uFlip;
 out vec4 fragColor;
 void main() {
-  fragColor = texelFetch(uField, ivec2(gl_FragCoord.xy), 0);
+  ivec2 position = ivec2(gl_FragCoord.xy);
+  if (uFlip) position.y = textureSize(uField, 0).y - 1 - position.y;
+  fragColor = texelFetch(uField, position, 0);
 }
 `;
 
@@ -233,6 +236,10 @@ export interface Scan {
   topFieldFirst: boolean;
 }
 
+export interface TimedScan extends Scan {
+  start: number;
+}
+
 /** Whether this browser has the two things the deinterlacer is built on. */
 export function supportsDeinterlace(): boolean {
   return (
@@ -269,6 +276,7 @@ export class Deinterlacer {
   /** The program that copies a filtered picture onto the canvas. */
   readonly #blit: WebGLProgram;
   readonly #blitField: WebGLUniformLocation | null;
+  readonly #blitFlip: WebGLUniformLocation | null;
   #textures: WebGLTexture[] = [];
   /** Somewhere to filter a field into, and to read it back out of. */
   #outputs: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
@@ -306,6 +314,7 @@ export class Deinterlacer {
   #running = false;
   #enabled = false;
   #scan: Scan | null = null;
+  #scanTimeline: readonly TimedScan[] = [];
   #lost = false;
   /** Coded sizes waiting for the media time at which their init takes effect. */
   #codedSizes: { width: number; height: number; start: number }[] = [];
@@ -352,6 +361,7 @@ export class Deinterlacer {
     ) as Record<keyof typeof YADIF_UNIFORMS, WebGLUniformLocation | null>;
     this.#blit = createProgram(gl, BLIT_FRAGMENT_SHADER);
     this.#blitField = gl.getUniformLocation(this.#blit, "uField");
+    this.#blitFlip = gl.getUniformLocation(this.#blit, "uFlip");
     this.canvas.addEventListener("webglcontextlost", this.#onContextLost);
     // The canvas is placed in pixels rather than in percentages, because where
     // the picture sits inside the element is arithmetic the browser does not
@@ -371,7 +381,7 @@ export class Deinterlacer {
   }
 
   get running(): boolean {
-    return this.#running;
+    return this.#running && (this.#scan?.interlaced ?? true);
   }
 
   set codedSize(size: { width: number; height: number; start: number } | null) {
@@ -407,6 +417,17 @@ export class Deinterlacer {
 
   get scan(): Scan | null {
     return this.#scan;
+  }
+
+  set scanTimeline(scans: readonly TimedScan[]) {
+    this.#scanTimeline = scans;
+    if (scans.length === 0) this.#scan = null;
+    this.#selectScan(this.#video.currentTime);
+    this.#apply();
+  }
+
+  get scanTimeline(): readonly TimedScan[] {
+    return this.#scanTimeline;
   }
 
   /**
@@ -457,7 +478,11 @@ export class Deinterlacer {
   }
 
   #apply(): void {
-    if (this.#enabled && (this.#scan?.interlaced ?? true)) this.start();
+    if (
+      this.#enabled &&
+      (this.#scanTimeline.length > 0 || (this.#scan?.interlaced ?? true))
+    )
+      this.start();
     else this.stop();
   }
 
@@ -467,7 +492,7 @@ export class Deinterlacer {
     this.#resetStats();
     this.#mount();
     this.#request();
-    this.#startLoop();
+    if (this.#scan?.interlaced ?? true) this.#startLoop();
   }
 
   /** Take the deinterlaced picture away, leaving the element's own showing. */
@@ -511,6 +536,7 @@ export class Deinterlacer {
   ): void => {
     this.#handle = null;
     if (!this.#running || this.#lost) return;
+    this.#selectScan(metadata.mediaTime);
     if (metadata.width > 0 && metadata.height > 0) {
       // An init segment reaches the SourceBuffer before the sample it
       // describes. Do not resize on that notification: the element may still
@@ -532,6 +558,11 @@ export class Deinterlacer {
       // callback dimensions remain the best available fallback.
       if (this.#width === 0 || this.#height === 0)
         this.#resize(metadata.width, metadata.height);
+      if (this.#scan && !this.#scan.interlaced) {
+        this.#showVideo();
+        this.#request();
+        return;
+      }
       // A seek, or a stream that starts again somewhere else, leaves the held
       // frames belonging to a different moment. Timing says so before any
       // event does, and playback that merely dropped a frame is left alone:
@@ -592,6 +623,36 @@ export class Deinterlacer {
     }
     this.#request();
   };
+
+  #selectScan(mediaTime: number): void {
+    let selected: TimedScan | undefined;
+    for (let index = this.#scanTimeline.length - 1; index >= 0; index--) {
+      const scan = this.#scanTimeline[index]!;
+      if (scan.start <= mediaTime + 1e-6) {
+        selected = scan;
+        break;
+      }
+    }
+    if (
+      !selected ||
+      (this.#scan?.interlaced === selected.interlaced &&
+        this.#scan.topFieldFirst === selected.topFieldFirst)
+    )
+      return;
+    this.#scan = {
+      interlaced: selected.interlaced,
+      topFieldFirst: selected.topFieldFirst,
+    };
+    this.#topFieldFirst = selected.topFieldFirst;
+    this.#frames = 0;
+    this.#queue.length = 0;
+    this.#clocked = false;
+    if (selected.interlaced) {
+      if (this.#doubleRate) this.#startLoop();
+    } else {
+      this.#stopLoop();
+    }
+  }
 
   /**
    * Whether fields are being filtered ahead of time and queued, rather than
@@ -759,12 +820,26 @@ export class Deinterlacer {
   #show(slot: number): void {
     const output = this.#outputs[slot];
     if (!output) return;
+    this.#showTexture(output.texture);
+  }
+
+  /** Put a progressive frame through unchanged, keeping one display surface. */
+  #showVideo(): void {
+    this.#push();
+    const texture = this.#textures[this.#head];
+    if (texture) this.#showTexture(texture, true);
+    // Progressive frames are not neighbours of the next interlaced frame.
+    this.#frames = 0;
+  }
+
+  #showTexture(texture: WebGLTexture, flip = false): void {
     const gl = this.#gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.useProgram(this.#blit);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, output.texture);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.uniform1i(this.#blitField, 0);
+    gl.uniform1i(this.#blitFlip, flip ? 1 : 0);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.canvas.style.visibility = "visible";

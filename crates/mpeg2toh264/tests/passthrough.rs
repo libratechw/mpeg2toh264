@@ -230,14 +230,14 @@ fn both_paths_place_the_same_pictures_on_the_same_timeline() {
                 start: transcoded_start,
                 random_access: transcoded_restart,
                 video_samples: transcoded_samples,
-                interlacing: transcoded_scan,
+                scans: transcoded_scans,
                 ..
             },
             Fragment::Media {
                 start: carried_start,
                 random_access: carried_restart,
                 video_samples: carried_samples,
-                interlacing: carried_scan,
+                scans: carried_scans,
                 ..
             },
         ) = (left, right)
@@ -260,7 +260,18 @@ fn both_paths_place_the_same_pictures_on_the_same_timeline() {
             transcoded_restart, carried_restart,
             "fragment {index} restart point"
         );
-        assert_eq!(transcoded_scan, carried_scan, "fragment {index} scan");
+        assert_eq!(
+            transcoded_scans.len(),
+            carried_scans.len(),
+            "fragment {index} scan count"
+        );
+        for (transcoded, carried) in transcoded_scans.iter().zip(carried_scans) {
+            assert_eq!(transcoded.scan, carried.scan);
+            assert!(
+                (0..=opening_clones).contains(&(ticks(&transcoded.start) - ticks(&carried.start))),
+                "fragment {index} scan time"
+            );
+        }
         // The fragment that opens the presentation is the one the transcoder
         // adds a copy of its IDR to, to hang the flat prediction on.
         // Passthrough needs neither the opening reference clone nor the IDR

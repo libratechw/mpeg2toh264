@@ -52,6 +52,13 @@ fn ticks_since(origin: i64, pts: i64) -> u64 {
     (pts - origin).rem_euclid(PTS_MODULUS) as u64
 }
 
+/// Field metadata taking effect at one media time.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct VideoScan {
+    pub start: f64,
+    pub scan: Interlacing,
+}
+
 /// One thing to hand to Media Source Extensions.
 #[derive(Clone, Debug)]
 pub enum Fragment {
@@ -80,11 +87,8 @@ pub enum Fragment {
         random_access: bool,
         video_samples: usize,
         audio_samples: usize,
-        /// What the source pictures of this fragment said about their fields.
-        /// A player deinterlacing the picture itself has nowhere else to learn
-        /// it: the H.264 this produces is decoded into frames, and by then the
-        /// two moments in one are indistinguishable from one.
-        interlacing: Interlacing,
+        /// Picture-accurate field changes in presentation order.
+        scans: Vec<VideoScan>,
     },
     /// A private PES payload selected from the same service as the media.
     /// It is kept out of fMP4 and exposed to browser consumers as an event.
@@ -1187,7 +1191,20 @@ impl Session {
         // Aligning can still move the origin, so read the start after it.
         self.align_timelines(gop, plan.timeline());
         let start = self.video_presentation_start as f64 / TIMESCALE as f64;
-        let interlacing = plan.timeline().interlacing;
+        let first_time = plan.timeline().first_presentation_time();
+        let mut scans: Vec<VideoScan> = (0..plan.timeline().presentation_indices.len())
+            .map(|index| {
+                let scan = plan.timeline().sample_scans[index];
+                VideoScan {
+                    start: start
+                        + (plan.timeline().presentation_times[index] - first_time) as f64
+                            / TIMESCALE as f64,
+                    scan,
+                }
+            })
+            .collect();
+        scans.sort_by(|a, b| a.start.total_cmp(&b.start));
+        scans.dedup_by(|next, previous| next.scan == previous.scan);
 
         let config = audio_frames
             .first()
@@ -1260,7 +1277,7 @@ impl Session {
             random_access,
             video_samples: fragment.sample_count,
             audio_samples: audio_frames.len(),
-            interlacing,
+            scans,
         });
         Ok(())
     }

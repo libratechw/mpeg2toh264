@@ -39,14 +39,12 @@ export type Fragment =
       randomAccess: boolean;
       videoSamples: number;
       audioSamples: number;
-      /**
-       * Whether the source pictures of this fragment hold two moments each.
-       * Nothing downstream can work this out: the H.264 is decoded into
-       * frames, and a frame of two moments looks like a frame of one.
-       */
-      interlaced: boolean;
-      /** Which of the two came first. Only meaningful with `interlaced`. */
-      topFieldFirst: boolean;
+      /** Picture-accurate field changes, in presentation order. */
+      scans: {
+        start: number;
+        interlaced: boolean;
+        topFieldFirst: boolean;
+      }[];
     }
   | {
       kind: "private-stream";
@@ -482,7 +480,7 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
             random_access,
             video_samples,
             audio_samples,
-            interlacing,
+            scans,
         } => {
             set(&object, "kind", &"media".into())?;
             set(&object, "data", &copy_out(&data))?;
@@ -490,12 +488,15 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
             set(&object, "randomAccess", &random_access.into())?;
             set(&object, "videoSamples", &(video_samples as f64).into())?;
             set(&object, "audioSamples", &(audio_samples as f64).into())?;
-            set(&object, "interlaced", &interlacing.interlaced.into())?;
-            set(
-                &object,
-                "topFieldFirst",
-                &interlacing.top_field_first.into(),
-            )?;
+            let js_scans = Array::new_with_length(scans.len() as u32);
+            for (index, scan) in scans.into_iter().enumerate() {
+                let item = Object::new();
+                set(&item, "start", &scan.start.into())?;
+                set(&item, "interlaced", &scan.scan.interlaced.into())?;
+                set(&item, "topFieldFirst", &scan.scan.top_field_first.into())?;
+                js_scans.set(index as u32, item.into());
+            }
+            set(&object, "scans", &js_scans.into())?;
         }
         Fragment::PrivateStream {
             stream_id,

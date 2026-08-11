@@ -218,6 +218,18 @@ function setDetails() {
       .join(" ") || IDLE_DETAILS;
 }
 
+function updateScan(): void {
+  const fields = yadif?.scan;
+  const next = fields
+    ? fields.interlaced
+      ? `インターレース (${fields.topFieldFirst ? "TFF" : "BFF"})`
+      : "プログレッシブ"
+    : "";
+  if (next === scan) return;
+  scan = next;
+  setDetails();
+}
+
 /** Whether MPEG-2 can reach the decoder at all, which is for the browser to say. */
 const canPassthrough = supportsPassthrough();
 
@@ -320,21 +332,6 @@ function createPlayer(): Mpeg2TsPlayer {
       `[timing] ${sinceLoad.toFixed(0).padStart(6)}ms  ${name.padEnd(14)} ` +
         `(+${sincePrevious.toFixed(0)}ms)`,
     );
-  });
-  // What the MPEG-2 headers said about the fields. The player has already
-  // pointed the filter at the right ones by the time this arrives; showing it
-  // is how a viewer can tell a stream that is worth filtering from one that
-  // is not.
-  created.addEventListener("scan", (event) => {
-    const { interlaced, topFieldFirst } = event.detail;
-    scan = interlaced
-      ? `インターレース (${topFieldFirst ? "TFF" : "BFF"})`
-      : "プログレッシブ";
-    if (!interlaced && deinterlace.checked) scan += " (yadifは停止)";
-    setDetails();
-    // A progressive source stops the filter, which uncovers the element and
-    // its controls with it.
-    syncControls();
   });
   // A recording of one programme announces one service and the control stays
   // out of the way. One that carries a broadcaster's sub-channel as well is
@@ -691,6 +688,7 @@ function scrubbedTime(): number {
 }
 
 function setPlayhead() {
+  updateScan();
   const total = reach();
   const current = scrubbing ? scrubbedTime() : video.currentTime;
   // An input whose length is not known -- a live stream, a server that will
@@ -919,7 +917,8 @@ function applyDeinterlace() {
  */
 function syncControls() {
   video.controls =
-    document.fullscreenElement !== stage && !(player?.deinterlace ?? false);
+    document.fullscreenElement !== stage &&
+    !(player?.deinterlaceWanted && player.deinterlacer);
 }
 /**
  * Put the service picker away and stop asking for what was picked.

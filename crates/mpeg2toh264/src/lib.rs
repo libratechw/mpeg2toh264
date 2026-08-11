@@ -39,6 +39,7 @@ pub use container::mpegts::{
 pub use mpeg2::headers::{
     pictures_interlacing, stream_sequence_description, Interlacing, SequenceDescription,
 };
+pub use session::VideoScan;
 pub use session::{Fragment, Progress, Session};
 pub use transcode::{
     plan_unit, transcode, IncrementalTranscoder, OpenGopRecovery, PictureEncoder, TranscodeOptions,

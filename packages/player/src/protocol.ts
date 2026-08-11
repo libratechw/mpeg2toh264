@@ -110,6 +110,10 @@ export interface Scan {
   topFieldFirst: boolean;
 }
 
+export interface TimedScan extends Scan {
+  start: number;
+}
+
 /** A private PES payload from the selected service. */
 export interface PrivateStream {
   /** Elementary stream PID from the program map. */
@@ -246,7 +250,7 @@ export type Notification =
    * What the source said about its fields, when it first says it and whenever
    * it changes. See `Scan`.
    */
-  | { type: "scan"; id: number; scan: Scan }
+  | { type: "scans"; id: number; scans: TimedScan[] }
   /** A step of the load happened, for whoever is measuring. See `TimingMark`. */
   | { type: "mark"; id: number; name: TimingMark; at: number }
   /** Put the playhead here; the media does not begin at zero. See MseSink. */

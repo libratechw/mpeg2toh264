@@ -304,9 +304,17 @@ fn reads_the_field_order_of_every_fixture() {
                 "{name} top field first"
             );
         }
-        // The timeline is where a session reads it from, so it has to agree.
+        // The first retained picture is what a player applies when playback
+        // enters the fixture; later pictures carry their own scan separately.
         let timeline = mpeg2_video_timeline(&source, false, &[]).expect("timeline");
-        assert_eq!(timeline.interlacing, interlacing, "{name} timeline");
+        let first = timeline.sample_scans.first().expect("picture scan");
+        assert_eq!(first.interlaced, interlaced, "{name} timeline interlaced");
+        if interlaced {
+            assert_eq!(
+                first.top_field_first, top_field_first,
+                "{name} timeline top field first"
+            );
+        }
     }
 }
 

@@ -23,6 +23,7 @@ import {
   type PrivateStream,
   type Progress,
   type Scan,
+  type TimedScan,
   type Services,
   type SinkKind,
   type Stats,
@@ -55,11 +56,13 @@ const TIMED_EVENTS: TimingMark[] = [
   "waiting",
 ];
 
-/** A replaceable deinterlacer controlled by the player's scan notifications. */
+/** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {
   readonly running: boolean;
+  /** Field information selected for the picture most recently presented. */
+  readonly scan: Scan | null;
   enabled: boolean;
-  scan: Scan | null;
+  scanTimeline: readonly TimedScan[];
   codedSize?: { width: number; height: number; start: number } | null;
   destroy(): void;
 }
@@ -163,12 +166,6 @@ export interface Mpeg2TsPlayerEventMap {
   statechange: CustomEvent<{ state: PlayerState }>;
   progress: CustomEvent<Progress>;
   stats: CustomEvent<Stats>;
-  /**
-   * What the source said about its fields: whether the pictures are
-   * interlaced, and which field came first. Arrives with the first fragment
-   * converted and again whenever it changes. See `Scan`.
-   */
-  scan: CustomEvent<Scan>;
   /**
    * What services the transport stream announced, and which of them is being
    * converted. A recording of one programme announces one and there is nothing
@@ -298,8 +295,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     null;
   /** How long the input is, when it turned out to be one that can be seeked. */
   #duration: number | null = null;
-  /** What the source last said about its fields. See `Scan`. */
-  #scan: Scan | null = null;
+  /** Source scan changes indexed by presentation time. */
+  #scanTimeline: TimedScan[] = [];
   /** What sound the programme last said it was carrying. See `AudioTracks`. */
   #audio: AudioTracks | null = null;
   /** When `load()` was called, as epoch milliseconds; every mark counts from it. */
@@ -309,7 +306,7 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Built the first time deinterlacing is turned on, and kept after that. */
   #deinterlacer: PlayerDeinterlacer | null = null;
   #codedSize: { width: number; height: number; start: number } | null = null;
-  /** Whether deinterlacing was asked for; whether it runs also needs `#scan`. */
+  /** Whether deinterlacing was asked for. */
   #wanted = false;
   #destroyed = false;
 
@@ -340,14 +337,6 @@ export class Mpeg2TsPlayer extends EventTarget {
    */
   get duration(): number | null {
     return this.#duration;
-  }
-
-  /**
-   * What the source last said about its fields, or null before the first
-   * fragment of a load has been converted. See `Scan`.
-   */
-  get scan(): Scan | null {
-    return this.#scan;
   }
 
   /**
@@ -450,7 +439,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       }
       if (this.#deinterlacer) {
         if (this.#codedSize) this.#deinterlacer.codedSize = this.#codedSize;
-        this.#deinterlacer.scan = this.#scan;
+        this.#deinterlacer.scanTimeline = this.#scanTimeline;
         this.#deinterlacer.enabled = this.#wanted;
       }
     } catch (error) {
@@ -464,6 +453,41 @@ export class Mpeg2TsPlayer extends EventTarget {
     if (width <= 0 || height <= 0) return;
     this.#codedSize = { width, height, start };
     if (this.#deinterlacer) this.#deinterlacer.codedSize = this.#codedSize;
+  }
+
+  /** Add source metadata now, but apply it only when its picture is shown. */
+  #addScans(scans: TimedScan[]): void {
+    this.#scanTimeline.push(...scans);
+    this.#scanTimeline.sort((a, b) => a.start - b.start);
+    const changes: TimedScan[] = [];
+    for (const scan of this.#scanTimeline) {
+      if (changes.at(-1)?.start === scan.start) changes.pop();
+      const previous = changes.at(-1);
+      if (
+        previous?.interlaced === scan.interlaced &&
+        previous.topFieldFirst === scan.topFieldFirst
+      )
+        continue;
+      changes.push(scan);
+    }
+    if (this.video.buffered.length > 0) {
+      const oldest = this.video.buffered.start(0);
+      let anchor = 0;
+      while (
+        anchor + 1 < changes.length &&
+        changes[anchor + 1]!.start <= oldest
+      )
+        anchor++;
+      if (anchor > 0) changes.splice(0, anchor);
+    }
+    this.#scanTimeline = changes;
+    if (this.#deinterlacer)
+      this.#deinterlacer.scanTimeline = this.#scanTimeline;
+  }
+
+  #clearScanTimeline(): void {
+    this.#scanTimeline = [];
+    if (this.#deinterlacer) this.#deinterlacer.scanTimeline = [];
   }
 
   load(url: string | URL): Promise<void> {
@@ -484,7 +508,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#duration = null;
     // Nothing is known about this source yet, so it gets whatever was asked
     // for until its first fragment says what it is.
-    this.#scan = null;
+    this.#clearScanTimeline();
     this.#applyDeinterlace();
     this.#loadedAt = now();
     this.#markedAt = this.#loadedAt;
@@ -636,15 +660,11 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#emit("seekable", { duration: notification.duration });
         break;
       case "reset":
+        this.#clearScanTimeline();
         this.#sink?.reset();
         break;
-      case "scan":
-        this.#scan = notification.scan;
-        // The one setting the filter cannot guess at. Everything else about it
-        // is a preference; this is a fact about the picture, and getting it
-        // wrong moves every other line half a field the wrong way.
-        this.#applyDeinterlace();
-        this.#emit("scan", notification.scan);
+      case "scans":
+        this.#addScans(notification.scans);
         break;
       case "workers":
         this.#emit("workers", {
@@ -819,6 +839,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     const time = this.video.currentTime;
     if (this.#isBuffered(time)) return;
     this.#setState("seeking");
+    this.#clearScanTimeline();
     // A load that had run to the end stopped reporting the playhead, and the
     // buffer it left behind is about to start filling again.
     this.#startPlayhead();
@@ -936,6 +957,7 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #teardown(): void {
     this.#stopPlayhead();
+    this.#clearScanTimeline();
     this.#sink?.close();
     this.#sink = null;
     if (this.#objectUrl) URL.revokeObjectURL(this.#objectUrl);

@@ -23,7 +23,6 @@ import {
   type Command,
   type LoadCommand,
   type Notification,
-  type Scan,
   type Services,
   type TimingMark,
 } from "./protocol.js";
@@ -260,8 +259,6 @@ class Playback {
   #waitingMs = 0;
 
   #totalBytes: number | null = null;
-  /** What the last fragment said about its fields, so only changes are sent. */
-  #scan: Scan | null = null;
   /** Whether the end of the file has been asked for; see `#measure`. */
   #measured = false;
   /** The PES timestamp presentation time zero stands for. */
@@ -737,7 +734,7 @@ class Playback {
         mark(this.#command.id, "opened");
         post({ type: "opened", id: this.#command.id });
       } else if (fragment.kind === "media") {
-        this.#tellScan(fragment.interlaced, fragment.topFieldFirst);
+        post({ type: "scans", id: this.#command.id, scans: fragment.scans });
         this.#sink.push(
           detach(fragment),
           fragment.start,
@@ -750,23 +747,6 @@ class Playback {
       }
     }
     return true;
-  }
-
-  /**
-   * Pass on what the source pictures said about their fields, the first time
-   * and every time it changes after that. Every fragment carries it, and it is
-   * the same answer for hours at a time, so only the changes are worth a
-   * message.
-   */
-  #tellScan(interlaced: boolean, topFieldFirst: boolean): void {
-    if (
-      this.#scan?.interlaced === interlaced &&
-      this.#scan.topFieldFirst === topFieldFirst
-    ) {
-      return;
-    }
-    this.#scan = { interlaced, topFieldFirst };
-    post({ type: "scan", id: this.#command.id, scan: this.#scan });
   }
 
   /**

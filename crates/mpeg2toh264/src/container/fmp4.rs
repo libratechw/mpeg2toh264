@@ -4,8 +4,8 @@ use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
 use crate::mpeg2::constants::{start_code, PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
-    parse_elementary_stream, picture_sequence_description, pictures_interlacing,
-    sequence_sample_aspect_ratio, Interlacing, Picture, SampleAspectRatio,
+    parse_elementary_stream, picture_sequence_description, sequence_sample_aspect_ratio,
+    Interlacing, Picture, SampleAspectRatio,
 };
 use crate::round_half_up;
 use crate::TranscodeOptions;
@@ -252,6 +252,9 @@ pub struct Mpeg2VideoTimeline {
     /// makes this longer than `sample_duration` for telecined material.
     /// Parallel with `presentation_indices`.
     pub sample_durations: Vec<u32>,
+    /// Field metadata of each coded picture, parallel with
+    /// `presentation_indices` and still in decode order.
+    pub sample_scans: Vec<Interlacing>,
     /// Presentation index for each coded picture, excluding the IDR clone.
     pub presentation_indices: Vec<u32>,
     /// Whether each coded picture is a complementary field pair rather than a
@@ -283,12 +286,6 @@ pub struct Mpeg2VideoTimeline {
     /// IDR clone or the first picture -- so a caller that sets it asks for a
     /// random access point as well.
     pub hold_ticks: u32,
-    /// What the source pictures said about their fields. Nothing in the MP4
-    /// carries this -- H.264 could say it in a picture timing SEI, and the
-    /// browsers that would read one do not deinterlace anyway -- so it is
-    /// reported alongside instead, for a player that filters the picture
-    /// itself.
-    pub interlacing: Interlacing,
 }
 
 impl Mpeg2VideoTimeline {
@@ -463,6 +460,7 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
     let mut seen_picture = false;
     let mut max_tr_in_gop: u32 = 0;
     let mut presentation_indices = Vec::new();
+    let mut sample_scans = Vec::new();
     // Indexed by the one-based presentation index. Missing entries retain two
     // ordinary fields: temporal_reference can have holes where damaged source
     // pictures were absent altogether.
@@ -557,6 +555,22 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
             continue;
         }
         presentation_indices.push(gop_base + tr + 1);
+        let interlacing = match picture.coding.picture_structure {
+            PictureStructure::TopField => Interlacing {
+                interlaced: true,
+                top_field_first: true,
+            },
+            PictureStructure::BottomField => Interlacing {
+                interlaced: true,
+                top_field_first: false,
+            },
+            PictureStructure::Frame => Interlacing {
+                interlaced: !picture.coding.progressive_frame,
+                top_field_first: picture.coding.top_field_first,
+            },
+            PictureStructure::Reserved => Interlacing::default(),
+        };
+        sample_scans.push(interlacing);
         field_pairs.push(mate.is_some());
         samples.push(Mpeg2Sample {
             start,
@@ -597,12 +611,12 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
             sample_duration,
             presentation_times,
             sample_durations,
+            sample_scans,
             presentation_indices,
             field_pairs,
             split_field_samples: TranscodeOptions::default().split_field_samples,
             sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
             hold_ticks: 0,
-            interlacing: pictures_interlacing(&pictures),
         },
         samples,
         sequence_header_len: sequence_header_len(data),
@@ -1756,12 +1770,12 @@ mod tests {
             sample_duration: FRAME,
             presentation_times: Vec::new(),
             sample_durations: Vec::new(),
+            sample_scans: Vec::new(),
             presentation_indices: indices.to_vec(),
             field_pairs: field_pairs.to_vec(),
             split_field_samples: split,
             sample_aspect_ratio: None,
             hold_ticks: 0,
-            interlacing: Interlacing::default(),
         }
     }
 

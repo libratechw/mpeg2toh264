@@ -498,13 +498,14 @@ fn write_fragment(
             random_access,
             video_samples,
             audio_samples,
-            interlacing,
+            scans,
         } => {
             totals.fragments += 1;
             totals.video_samples += video_samples;
             totals.audio_samples += audio_samples;
             if !quiet && random_access {
-                let scan = match (interlacing.interlaced, interlacing.top_field_first) {
+                let first = scans.first().expect("media fragment has a video scan");
+                let scan = match (first.scan.interlaced, first.scan.top_field_first) {
                     (false, _) => "progressive",
                     (true, true) => "interlaced tff",
                     (true, false) => "interlaced bff",
