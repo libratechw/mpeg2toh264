@@ -236,8 +236,10 @@ export interface Scan {
   topFieldFirst: boolean;
 }
 
-export interface TimedScan extends Scan {
+export interface VideoState {
   start: number;
+  codedSize?: { width: number; height: number };
+  scan?: Scan;
 }
 
 /** Whether this browser has the two things the deinterlacer is built on. */
@@ -314,10 +316,8 @@ export class Deinterlacer {
   #running = false;
   #enabled = false;
   #scan: Scan | null = null;
-  #scanTimeline: readonly TimedScan[] = [];
+  #videoTimeline: readonly VideoState[] = [];
   #lost = false;
-  /** Coded sizes waiting for the media time at which their init takes effect. */
-  #codedSizes: { width: number; height: number; start: number }[] = [];
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
   /** Everything the next report is counted from. See DeinterlaceStats. */
   #stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0, late: 0 };
@@ -384,20 +384,6 @@ export class Deinterlacer {
     return this.#running && (this.#scan?.interlaced ?? true);
   }
 
-  set codedSize(size: { width: number; height: number; start: number } | null) {
-    if (!size) {
-      this.#codedSizes = [];
-      return;
-    }
-    if (size.width <= 0 || size.height <= 0 || !Number.isFinite(size.start))
-      return;
-    const at = this.#codedSizes.findIndex((item) => item.start >= size.start);
-    if (at >= 0 && this.#codedSizes[at]!.start === size.start)
-      this.#codedSizes[at] = size;
-    else
-      this.#codedSizes.splice(at < 0 ? this.#codedSizes.length : at, 0, size);
-  }
-
   /** Whether the caller wants filtering, independently of the current source. */
   get enabled(): boolean {
     return this.#enabled;
@@ -419,15 +405,14 @@ export class Deinterlacer {
     return this.#scan;
   }
 
-  set scanTimeline(scans: readonly TimedScan[]) {
-    this.#scanTimeline = scans;
-    if (scans.length === 0) this.#scan = null;
-    this.#selectScan(this.#video.currentTime);
+  set videoTimeline(timeline: readonly VideoState[]) {
+    this.#videoTimeline = timeline;
+    if (timeline.length === 0) this.#scan = null;
     this.#apply();
   }
 
-  get scanTimeline(): readonly TimedScan[] {
-    return this.#scanTimeline;
+  get videoTimeline(): readonly VideoState[] {
+    return this.#videoTimeline;
   }
 
   /**
@@ -480,7 +465,7 @@ export class Deinterlacer {
   #apply(): void {
     if (
       this.#enabled &&
-      (this.#scanTimeline.length > 0 || (this.#scan?.interlaced ?? true))
+      (this.#videoTimeline.length > 0 || (this.#scan?.interlaced ?? true))
     )
       this.start();
     else this.stop();
@@ -536,24 +521,8 @@ export class Deinterlacer {
   ): void => {
     this.#handle = null;
     if (!this.#running || this.#lost) return;
-    this.#selectScan(metadata.mediaTime);
+    this.#selectVideoState(metadata.mediaTime);
     if (metadata.width > 0 && metadata.height > 0) {
-      // An init segment reaches the SourceBuffer before the sample it
-      // describes. Do not resize on that notification: the element may still
-      // be presenting the old resolution. Switch on the first callback at or
-      // beyond the media boundary instead, so the texture and its source move
-      // together even when the display dimensions happen to stay unchanged.
-      let coded: { width: number; height: number; start: number } | undefined;
-      while (
-        this.#codedSizes.length > 0 &&
-        this.#codedSizes[0]!.start <= metadata.mediaTime + 1e-6
-      )
-        coded = this.#codedSizes.shift();
-      if (
-        coded &&
-        (coded.width !== this.#width || coded.height !== this.#height)
-      )
-        this.#resize(coded.width, coded.height);
       // Standalone users do not have a container feeding coded sizes. Their
       // callback dimensions remain the best available fallback.
       if (this.#width === 0 || this.#height === 0)
@@ -624,30 +593,36 @@ export class Deinterlacer {
     this.#request();
   };
 
-  #selectScan(mediaTime: number): void {
-    let selected: TimedScan | undefined;
-    for (let index = this.#scanTimeline.length - 1; index >= 0; index--) {
-      const scan = this.#scanTimeline[index]!;
-      if (scan.start <= mediaTime + 1e-6) {
-        selected = scan;
+  #selectVideoState(mediaTime: number): void {
+    let selected: VideoState | undefined;
+    for (let index = this.#videoTimeline.length - 1; index >= 0; index--) {
+      const state = this.#videoTimeline[index]!;
+      if (state.start <= mediaTime + 1e-6) {
+        selected = state;
         break;
       }
     }
+    // An init reaches the SourceBuffer before its first sample. Applying the
+    // size here keeps the texture change on that sample's frame callback.
     if (
-      !selected ||
-      (this.#scan?.interlaced === selected.interlaced &&
-        this.#scan.topFieldFirst === selected.topFieldFirst)
+      selected?.codedSize &&
+      (selected.codedSize.width !== this.#width ||
+        selected.codedSize.height !== this.#height)
+    )
+      this.#resize(selected.codedSize.width, selected.codedSize.height);
+    const scan = selected?.scan;
+    if (
+      !scan ||
+      (this.#scan?.interlaced === scan.interlaced &&
+        this.#scan.topFieldFirst === scan.topFieldFirst)
     )
       return;
-    this.#scan = {
-      interlaced: selected.interlaced,
-      topFieldFirst: selected.topFieldFirst,
-    };
-    this.#topFieldFirst = selected.topFieldFirst;
+    this.#scan = scan;
+    this.#topFieldFirst = scan.topFieldFirst;
     this.#frames = 0;
     this.#queue.length = 0;
     this.#clocked = false;
-    if (selected.interlaced) {
+    if (scan.interlaced) {
       if (this.#doubleRate) this.#startLoop();
     } else {
       this.#stopLoop();

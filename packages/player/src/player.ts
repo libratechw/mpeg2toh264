@@ -24,6 +24,7 @@ import {
   type Progress,
   type Scan,
   type TimedScan,
+  type VideoState,
   type Services,
   type SinkKind,
   type Stats,
@@ -62,8 +63,7 @@ export interface PlayerDeinterlacer {
   /** Field information selected for the picture most recently presented. */
   readonly scan: Scan | null;
   enabled: boolean;
-  scanTimeline: readonly TimedScan[];
-  codedSize?: { width: number; height: number; start: number } | null;
+  videoTimeline: readonly VideoState[];
   destroy(): void;
 }
 
@@ -295,8 +295,8 @@ export class Mpeg2TsPlayer extends EventTarget {
     null;
   /** How long the input is, when it turned out to be one that can be seeked. */
   #duration: number | null = null;
-  /** Source scan changes indexed by presentation time. */
-  #scanTimeline: TimedScan[] = [];
+  /** Source video properties indexed by presentation time. */
+  #videoTimeline: VideoState[] = [];
   /** What sound the programme last said it was carrying. See `AudioTracks`. */
   #audio: AudioTracks | null = null;
   /** When `load()` was called, as epoch milliseconds; every mark counts from it. */
@@ -305,7 +305,6 @@ export class Mpeg2TsPlayer extends EventTarget {
   #markedAt = 0;
   /** Built the first time deinterlacing is turned on, and kept after that. */
   #deinterlacer: PlayerDeinterlacer | null = null;
-  #codedSize: { width: number; height: number; start: number } | null = null;
   /** Whether deinterlacing was asked for. */
   #wanted = false;
   #destroyed = false;
@@ -438,8 +437,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#deinterlacer = this.#options.deinterlacer(this.video);
       }
       if (this.#deinterlacer) {
-        if (this.#codedSize) this.#deinterlacer.codedSize = this.#codedSize;
-        this.#deinterlacer.scanTimeline = this.#scanTimeline;
+        this.#deinterlacer.videoTimeline = this.#videoTimeline;
         this.#deinterlacer.enabled = this.#wanted;
       }
     } catch (error) {
@@ -451,50 +449,56 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #setCodedSize(width: number, height: number, start: number): void {
     if (width <= 0 || height <= 0) return;
-    this.#codedSize = { width, height, start };
-    if (this.#deinterlacer) this.#deinterlacer.codedSize = this.#codedSize;
+    this.#addVideoState({ start, codedSize: { width, height } });
   }
 
   /** Add source metadata now, but apply it only when its picture is shown. */
   #addScans(scans: TimedScan[]): void {
-    this.#scanTimeline.push(...scans);
-    this.#scanTimeline.sort((a, b) => a.start - b.start);
-    const changes: TimedScan[] = [];
-    for (const scan of this.#scanTimeline) {
-      if (changes.at(-1)?.start === scan.start) changes.pop();
-      const previous = changes.at(-1);
-      if (
-        previous?.interlaced === scan.interlaced &&
-        previous.topFieldFirst === scan.topFieldFirst
-      )
-        continue;
-      changes.push(scan);
-    }
+    for (const { start, interlaced, topFieldFirst } of scans)
+      this.#addVideoState({
+        start,
+        scan: { interlaced, topFieldFirst },
+      });
+  }
+
+  #addVideoState(change: VideoState): void {
+    const previous = this.#videoTimeline.at(-1);
+    const state: VideoState = {
+      start: change.start,
+      codedSize: change.codedSize ?? previous?.codedSize,
+      scan: change.scan ?? previous?.scan,
+    };
+    if (previous?.start === state.start) this.#videoTimeline.pop();
+    else if (
+      previous?.codedSize?.width === state.codedSize?.width &&
+      previous?.codedSize?.height === state.codedSize?.height &&
+      previous?.scan?.interlaced === state.scan?.interlaced &&
+      previous?.scan?.topFieldFirst === state.scan?.topFieldFirst
+    )
+      return;
+    this.#videoTimeline.push(state);
     if (this.video.buffered.length > 0) {
       const oldest = this.video.buffered.start(0);
       let anchor = 0;
       while (
-        anchor + 1 < changes.length &&
-        changes[anchor + 1]!.start <= oldest
+        anchor + 1 < this.#videoTimeline.length &&
+        this.#videoTimeline[anchor + 1]!.start <= oldest
       )
         anchor++;
-      if (anchor > 0) changes.splice(0, anchor);
+      if (anchor > 0) this.#videoTimeline.splice(0, anchor);
     }
-    this.#scanTimeline = changes;
     if (this.#deinterlacer)
-      this.#deinterlacer.scanTimeline = this.#scanTimeline;
+      this.#deinterlacer.videoTimeline = this.#videoTimeline;
   }
 
-  #clearScanTimeline(): void {
-    this.#scanTimeline = [];
-    if (this.#deinterlacer) this.#deinterlacer.scanTimeline = [];
+  #clearVideoTimeline(): void {
+    this.#videoTimeline = [];
+    if (this.#deinterlacer) this.#deinterlacer.videoTimeline = [];
   }
 
   load(url: string | URL): Promise<void> {
     if (this.#destroyed)
       return Promise.reject(new Error("the player has been destroyed"));
-    this.#codedSize = null;
-    if (this.#deinterlacer) this.#deinterlacer.codedSize = null;
     if (
       this.#sinkKind === "worker" &&
       !supportsWorkerMediaSource(this.#options.preferManagedMediaSource)
@@ -508,7 +512,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#duration = null;
     // Nothing is known about this source yet, so it gets whatever was asked
     // for until its first fragment says what it is.
-    this.#clearScanTimeline();
+    this.#clearVideoTimeline();
     this.#applyDeinterlace();
     this.#loadedAt = now();
     this.#markedAt = this.#loadedAt;
@@ -660,7 +664,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#emit("seekable", { duration: notification.duration });
         break;
       case "reset":
-        this.#clearScanTimeline();
+        this.#clearVideoTimeline();
         this.#sink?.reset();
         break;
       case "scans":
@@ -839,7 +843,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     const time = this.video.currentTime;
     if (this.#isBuffered(time)) return;
     this.#setState("seeking");
-    this.#clearScanTimeline();
+    this.#clearVideoTimeline();
     // A load that had run to the end stopped reporting the playhead, and the
     // buffer it left behind is about to start filling again.
     this.#startPlayhead();
@@ -957,7 +961,7 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #teardown(): void {
     this.#stopPlayhead();
-    this.#clearScanTimeline();
+    this.#clearVideoTimeline();
     this.#sink?.close();
     this.#sink = null;
     if (this.#objectUrl) URL.revokeObjectURL(this.#objectUrl);

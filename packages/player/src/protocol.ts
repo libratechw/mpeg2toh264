@@ -114,6 +114,13 @@ export interface TimedScan extends Scan {
   start: number;
 }
 
+/** Video properties that take effect together at one presentation time. */
+export interface VideoState {
+  start: number;
+  codedSize?: { width: number; height: number };
+  scan?: Scan;
+}
+
 /** A private PES payload from the selected service. */
 export interface PrivateStream {
   /** Elementary stream PID from the program map. */
