@@ -290,6 +290,104 @@ fn waits_for_the_first_announced_services_pmt_before_emitting() {
     assert!(packets.iter().all(|packet| packet.pid == 0x100));
 }
 
+/// An empty first service must not leave a later playable service waiting
+/// forever when their program maps arrive in announcement order.
+#[test]
+fn takes_a_playable_service_after_the_first_services_empty_pmt() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::{PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO};
+
+    let empty: &[(u16, u8)] = &[];
+    let playable: &[(u16, u8)] = &[
+        (0x200, STREAM_TYPE_MPEG2_VIDEO),
+        (0x210, STREAM_TYPE_AAC_ADTS),
+    ];
+    let tables = mux_programs(&[(201, 0x110, empty), (202, 0x120, playable)], &[]);
+    let pes = mux_programs(
+        &[(201, 0x110, empty), (202, 0x120, playable)],
+        &[PesUnit {
+            pid: 0x200,
+            stream_id: 0xe0,
+            pts: Some(9000),
+            payload: &[1],
+        }],
+    );
+
+    // mux_programs deliberately emits PMTs in reverse order; put the empty
+    // service first to reproduce this stream's ordering.
+    let mut stream = tables[..188].to_vec();
+    stream.extend_from_slice(&tables[2 * 188..3 * 188]);
+    stream.extend_from_slice(&tables[188..2 * 188]);
+    stream.extend_from_slice(&pes[3 * 188..]);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let packets = demuxer.push(&stream).expect("demuxes");
+    assert_eq!(demuxer.service_id(), Some(202));
+    assert!(packets.iter().all(|packet| packet.pid == 0x200));
+}
+
+/// A later playable PMT must wait for every service ahead of it, not just for
+/// the first one. Otherwise PMT arrival order can override PAT order.
+#[test]
+fn waits_for_every_earlier_service_before_choosing_a_later_one() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::STREAM_TYPE_MPEG2_VIDEO;
+
+    let empty: &[(u16, u8)] = &[];
+    let second: &[(u16, u8)] = &[(0x200, STREAM_TYPE_MPEG2_VIDEO)];
+    let third: &[(u16, u8)] = &[(0x300, STREAM_TYPE_MPEG2_VIDEO)];
+    let tables = mux_programs(
+        &[
+            (201, 0x110, empty),
+            (202, 0x120, second),
+            (203, 0x130, third),
+        ],
+        &[],
+    );
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&tables[..188]).expect("reads PAT");
+    // mux_programs emits PMTs as 203, 202, 201. Inspect 201, then 203: 203
+    // still cannot be chosen because the preferred 202 has not been seen.
+    demuxer
+        .push(&tables[3 * 188..4 * 188])
+        .expect("reads empty 201 PMT");
+    demuxer
+        .push(&tables[188..2 * 188])
+        .expect("reads playable 203 PMT");
+    assert_eq!(demuxer.service_id(), None);
+
+    demuxer
+        .push(&tables[2 * 188..3 * 188])
+        .expect("reads playable 202 PMT");
+    assert_eq!(demuxer.service_id(), Some(202));
+}
+
+#[test]
+fn skips_multiple_empty_services_in_pat_order() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::STREAM_TYPE_MPEG2_VIDEO;
+
+    let empty: &[(u16, u8)] = &[];
+    let playable: &[(u16, u8)] = &[(0x300, STREAM_TYPE_MPEG2_VIDEO)];
+    let tables = mux_programs(
+        &[
+            (201, 0x110, empty),
+            (202, 0x120, empty),
+            (203, 0x130, playable),
+        ],
+        &[],
+    );
+    let mut stream = tables[..188].to_vec();
+    stream.extend_from_slice(&tables[3 * 188..4 * 188]);
+    stream.extend_from_slice(&tables[2 * 188..3 * 188]);
+    stream.extend_from_slice(&tables[188..2 * 188]);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&stream).expect("demuxes");
+    assert_eq!(demuxer.service_id(), Some(203));
+}
+
 #[test]
 fn emits_private_stream_pes_from_the_selected_service() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};

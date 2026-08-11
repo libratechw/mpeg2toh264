@@ -350,6 +350,10 @@ struct ProgramMap {
     /// Best playable map seen while waiting for the PAT's first service. It is
     /// only a fallback for the case where that first service has no picture.
     deferred: Option<DeferredProgram>,
+    /// Services whose program maps have been read. PMTs may arrive in a
+    /// different order from the PAT, so a playable service is not selected
+    /// until every service announced ahead of it has been inspected.
+    inspected_services: HashSet<u16>,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
     /// Which sound the caller has asked for. It is a choice about the service
@@ -387,6 +391,7 @@ impl Default for ProgramMap {
             service: None,
             rank: usize::MAX,
             deferred: None,
+            inspected_services: HashSet::new(),
             video_pid: None,
             audio_pid: None,
             wanted_audio: None,
@@ -517,12 +522,20 @@ impl ProgramMap {
                     self.changed_pids.insert(*pid);
                 }
             }
+            self.inspected_services.insert(service);
             // A service with no picture in it is not the one being watched,
             // unless the caller named it.
             if video.is_none() && self.wanted_service.is_none() {
-                // Once the first announced service has been inspected, a
-                // playable service encountered ahead of its PMT may be used.
-                if rank == 0 {
+                // A playable service encountered ahead of this PMT may now be
+                // used if every service before it has also proved empty.
+                let deferred_is_ready = self.deferred.as_ref().is_some_and(|deferred| {
+                    self.services.get(..deferred.rank).is_some_and(|services| {
+                        services
+                            .iter()
+                            .all(|service| self.inspected_services.contains(service))
+                    })
+                });
+                if deferred_is_ready {
                     if let Some(deferred) = self.deferred.take() {
                         self.service = Some(deferred.service);
                         self.rank = deferred.rank;
@@ -538,7 +551,15 @@ impl ProgramMap {
             // start emitting a lower-ranked programme merely because its PMT
             // arrived before the first programme's PMT; by the time that map
             // arrives, switching may already have been locked out.
-            if self.wanted_service.is_none() && rank > 0 && self.rank == usize::MAX {
+            let preceding_services_inspected = self.services.get(..rank).is_some_and(|services| {
+                services
+                    .iter()
+                    .all(|service| self.inspected_services.contains(service))
+            });
+            if self.wanted_service.is_none()
+                && self.rank == usize::MAX
+                && !preceding_services_inspected
+            {
                 if self
                     .deferred
                     .as_ref()
