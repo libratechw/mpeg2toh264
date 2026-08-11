@@ -29,6 +29,8 @@ use crate::transcode::{
 };
 
 const TIMESCALE: u64 = 90_000;
+/// Put a restart point before one MSE eviction span grows beyond this size.
+const MAX_RECOVERY_BYTES: usize = 32 * 1024 * 1024;
 
 /// A hole this short is packet loss at its smallest, and repeating the
 /// following access unit across it is less audible than the silence that would
@@ -293,6 +295,7 @@ pub struct Session {
     video_presentation_start: u64,
     audio_frames_emitted: u64,
     gops_emitted: usize,
+    media_bytes_since_random_access: usize,
     initialized: bool,
     /// What the initialization segment that went out describes, and so what a
     /// unit has to be coded under to play against it.
@@ -460,6 +463,7 @@ impl Session {
             video_presentation_start: 0,
             audio_frames_emitted: 0,
             gops_emitted: 0,
+            media_bytes_since_random_access: 0,
             initialized: false,
             described: None,
             described_audio: None,
@@ -983,9 +987,10 @@ impl Session {
     }
 
     fn is_random_access_point(&self) -> bool {
-        self.recovery_point_gop_interval != 0
-            && self.gops_emitted > 0
-            && self.gops_emitted % self.recovery_point_gop_interval == 0
+        self.gops_emitted > 0
+            && ((self.recovery_point_gop_interval != 0
+                && self.gops_emitted % self.recovery_point_gop_interval == 0)
+                || self.media_bytes_since_random_access >= MAX_RECOVERY_BYTES)
     }
 
     fn flush_pending(&mut self, final_flush: bool, out: &mut Vec<Fragment>) -> Result<()> {
@@ -1241,10 +1246,18 @@ impl Session {
                 height: description.map_or(0, |description| description.height),
             });
         }
+        let random_access = starts_at_idr || recovery_point;
+        if random_access {
+            self.media_bytes_since_random_access = fragment.media_segment.len();
+        } else {
+            self.media_bytes_since_random_access = self
+                .media_bytes_since_random_access
+                .saturating_add(fragment.media_segment.len());
+        }
         out.push(Fragment::Media {
             data: fragment.media_segment,
             start,
-            random_access: starts_at_idr || recovery_point,
+            random_access,
             video_samples: fragment.sample_count,
             audio_samples: audio_frames.len(),
             interlacing,
@@ -1337,5 +1350,25 @@ impl Session {
 impl Default for Session {
     fn default() -> Self {
         Self::new(TranscodeOptions::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_is_due_at_the_gop_or_media_byte_limit() {
+        let mut session = Session::default();
+        session.gops_emitted = 1;
+        session.media_bytes_since_random_access = MAX_RECOVERY_BYTES - 1;
+        assert!(!session.is_random_access_point());
+
+        session.media_bytes_since_random_access = MAX_RECOVERY_BYTES;
+        assert!(session.is_random_access_point());
+
+        session.media_bytes_since_random_access = 0;
+        session.gops_emitted = session.recovery_point_gop_interval;
+        assert!(session.is_random_access_point());
     }
 }

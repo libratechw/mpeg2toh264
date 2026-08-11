@@ -581,7 +581,6 @@ export class MseSink implements FragmentSink {
     )
       return;
     if (this.#clearing || sourceBuffer.buffered.length === 0) return;
-    const removeStart = sourceBuffer.buffered.start(0);
     // Removing a range takes the frames after it as well, up to the next random
     // access point, so that nothing is left behind depending on what went away.
     // Restart points here are several times further apart than the margin kept
@@ -597,7 +596,7 @@ export class MseSink implements FragmentSink {
       stopAt = at;
     }
     const removeEnd = stopAt - REMOVE_MARGIN_SECONDS;
-    if (removeEnd <= removeStart) return;
+    if (removeEnd <= 0) return;
     while (
       this.#randomAccessPoints.length > 0 &&
       this.#randomAccessPoints[0]! < stopAt
@@ -605,7 +604,7 @@ export class MseSink implements FragmentSink {
       this.#randomAccessPoints.shift();
     }
     this.#operation = "remove";
-    sourceBuffer.remove(removeStart, removeEnd);
+    sourceBuffer.remove(0, removeEnd);
   }
 
   /** How far past the playhead the buffer reaches, in seconds. */
