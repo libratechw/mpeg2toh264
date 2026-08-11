@@ -65,19 +65,19 @@ Decode order:
 
 | Mode | | | | | | |
 | --- | --- | --- | --- | --- | --- | --- |
-| MPEG-2 input | `I` | `B` | `B` | - | - | `P ...` |
-| `idr` | `I` | `B` | `B` | `IDR` | `clone` | `P ...` |
-| `recovery-point` | `I(r)` | `B` | `B` | - | - | `P ...` |
-| `discard` | - | - | - | `IDR` | `clone` | `P ...` |
+| MPEG-2 input | `I` | `B` | `B` | - | - | `P` |
+| `idr` | `I` | `B` | `B` | `IDR` | `clone` | `P` |
+| `recovery-point` | `I(r)` | `B` | `B` | - | - | `P` |
+| `discard` | - | - | - | `IDR` | `clone` | `P` |
 
 Display order:
 
 | Mode | | | | | | |
 | --- | --- | --- | --- | --- | --- | --- |
-| MPEG-2 input | `B` | `B` | `I` | - | - | `P ...` |
-| `idr` | `B` | `B` | `I` | `IDR` | `clone` | `P ...` |
-| `recovery-point` | `B` | `B` | `I(r)` | - | - | `P ...` |
-| `discard` | - | - | - | `IDR` | `clone` | `P ...` |
+| MPEG-2 input | `B` | `B` | `I` | - | - | `P` |
+| `idr` | `B` | `B` | `I` | `IDR` | `clone` | `P` |
+| `recovery-point` | `B` | `B` | `I(r)` | - | - | `P` |
+| `discard` | - | - | - | `IDR` | `clone` | `P` |
 
 ### 5. Interlacing
 
@@ -131,6 +131,7 @@ Interlaced-video limitations:
   - In Firefox on Windows, the field pictures freeze where frame pictures give way to them.
   - Safari raises `MEDIA_ERR_DECODE`, through MSE only, when frame and field pictures are mixed.
   - Note that with separate samples, ffmpeg reports corrupt decoded frame errors when `-thread_type frame` is used with `-threads` of 2 or more.
+  - When decoded with VideoToolbox, a single field is played in bob mode, stretched vertically.
 
 ## WebAssembly and MSE player
 
@@ -249,18 +250,18 @@ Open GOP境界付近のアクセスユニットは次のようになります。
 
 | モード | | | | | | |
 | --- | --- | --- | --- | --- | --- | --- |
-| MPEG-2入力 | `I` | `b` | `b` | - | - | `P` |
-| `idr` | `I` | `b` | `b` | `IDR` | `clone` | `P` |
-| `recovery-point` | `I(r)` | `b` | `b` | - | - | `P` |
+| MPEG-2入力 | `I` | `B` | `B` | - | - | `P` |
+| `idr` | `I` | `B` | `B` | `IDR` | `clone` | `P` |
+| `recovery-point` | `I(r)` | `B` | `B` | - | - | `P` |
 | `discard` | - | - | - | `IDR` | `clone` | `P` |
 
 表示順:
 
 | モード | | | | | | |
 | --- | --- | --- | --- | --- | --- | --- |
-| MPEG-2入力 | `b` | `b` | `I` | - | - | `P` |
-| `idr` | `b` | `b` | `I` | `IDR` | `clone` | `P` |
-| `recovery-point` | `b` | `b` | `I(r)` | - | - | `P` |
+| MPEG-2入力 | `B` | `B` | `I` | - | - | `P` |
+| `idr` | `B` | `B` | `I` | `IDR` | `clone` | `P` |
+| `recovery-point` | `B` | `B` | `I(r)` | - | - | `P` |
 | `discard` | - | - | - | `IDR` | `clone` | `P` |
 
 ### 5. インターレース
@@ -313,6 +314,7 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
   - WindowsのFirefoxではフレームピクチャからフィールドピクチャに変わるとフィールドピクチャの映像がフリーズする
   - SafariではMSE経由の場合のみフレームピクチャとフィールドピクチャが混在すると`MEDIA_ERR_DECODE`となる
   - 別サンプルとした場合ffmpegで`-thread_type frame`で`-threads`が2以上のときcorrupt decoded frameのエラーが出るため注意
+  - また、VideoToolboxでデコードする際は片フィールドが縦に引き伸ばされるbobの状態で再生される
 
 ## WebAssemblyとMSEプレイヤー
 
