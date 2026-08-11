@@ -887,8 +887,7 @@ impl Session {
     /// Not the timestamp the unit carries: that belongs to its first *coded*
     /// picture, which an open group displays after the pictures that lead it.
     fn unit_start_pts(gop: &Mpeg2Gop, timeline: &Mpeg2VideoTimeline) -> Option<i64> {
-        let leading = timeline.presentation_indices.first().copied().unwrap_or(1) - 1;
-        Some(gop.pts? as i64 - leading as i64 * timeline.sample_duration as i64)
+        Some(gop.pts? as i64 - timeline.first_coded_presentation_time() as i64)
     }
 
     /// Hold this unit's opening sample over whatever the source lost in front
@@ -1124,9 +1123,7 @@ impl Session {
         // runs on the opening fragment, where those pictures are missing and
         // the IDR covers their display slots, so the presentation still starts
         // where they would.
-        let leading_slots = timeline.presentation_indices.first().copied().unwrap_or(1) - 1;
-        let video_start =
-            video_pts as i64 - (leading_slots as i64 * timeline.sample_duration as i64);
+        let video_start = video_pts as i64 - timeline.first_coded_presentation_time() as i64;
         let origin = match self.timeline_origin {
             Some(origin) => origin,
             None => {

@@ -245,6 +245,13 @@ pub struct Mpeg2VideoTimeline {
     pub width: u32,
     pub height: u32,
     pub sample_duration: u32,
+    /// Presentation time of each coded picture, relative to the first display
+    /// slot in the unit. Parallel with `presentation_indices`.
+    pub presentation_times: Vec<u64>,
+    /// Display duration of each coded picture. MPEG-2 `repeat_first_field`
+    /// makes this longer than `sample_duration` for telecined material.
+    /// Parallel with `presentation_indices`.
+    pub sample_durations: Vec<u32>,
     /// Presentation index for each coded picture, excluding the IDR clone.
     pub presentation_indices: Vec<u32>,
     /// Whether each coded picture is a complementary field pair rather than a
@@ -290,6 +297,41 @@ impl Mpeg2VideoTimeline {
     /// what it would have got before the field ever existed: frames.
     fn is_field_pair(&self, decode_index: usize) -> bool {
         self.field_pairs.get(decode_index).copied().unwrap_or(false)
+    }
+
+    fn duration_at(&self, decode_index: usize) -> u32 {
+        self.sample_durations
+            .get(decode_index)
+            .copied()
+            .unwrap_or(self.sample_duration)
+    }
+
+    fn presentation_time_at(&self, decode_index: usize) -> u64 {
+        self.presentation_times
+            .get(decode_index)
+            .copied()
+            .unwrap_or_else(|| {
+                u64::from(
+                    self.presentation_indices
+                        .get(decode_index)
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_sub(1),
+                ) * u64::from(self.sample_duration)
+            })
+    }
+
+    pub(crate) fn first_presentation_time(&self) -> u64 {
+        (0..self.presentation_indices.len())
+            .map(|index| self.presentation_time_at(index))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Presentation time of the first picture in coding order. A GOP's PES
+    /// timestamp belongs here, even when leading B pictures display earlier.
+    pub(crate) fn first_coded_presentation_time(&self) -> u64 {
+        self.presentation_time_at(0)
     }
 }
 
@@ -421,6 +463,10 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
     let mut seen_picture = false;
     let mut max_tr_in_gop: u32 = 0;
     let mut presentation_indices = Vec::new();
+    // Indexed by the one-based presentation index. Missing entries retain two
+    // ordinary fields: temporal_reference can have holes where damaged source
+    // pictures were absent altogether.
+    let mut display_fields = vec![2u8];
     let mut field_pairs = Vec::new();
     let mut samples = Vec::new();
     let mut picture_index = 0;
@@ -469,6 +515,18 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
         }
         seen_picture = true;
         max_tr_in_gop = max_tr_in_gop.max(tr);
+        let presentation_index = (gop_base + tr + 1) as usize;
+        if display_fields.len() <= presentation_index {
+            display_fields.resize(presentation_index + 1, 2);
+        }
+        display_fields[presentation_index] = if picture.coding.picture_structure
+            == PictureStructure::Frame
+            && picture.coding.repeat_first_field
+        {
+            3
+        } else {
+            2
+        };
         // A lone field is no frame, and the transcoder drops it for the same
         // reason. Both have to, or the timeline reserves a sample the H.264
         // stream does not hold.
@@ -510,11 +568,35 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
             references = (references + 1).min(2);
         }
     }
+    // Round positions on the continuous field clock, not every RFF picture in
+    // isolation. At 30000/1001 fps a field is 1501.5 ticks, so successive
+    // three-field pictures must alternate between 4505 and 4504 ticks instead
+    // of gaining half a tick apiece.
+    let field_ticks = TIMESCALE as f64 * denominator / numerator / 2.0;
+    let mut starts = vec![0u64; display_fields.len()];
+    let mut display_durations = vec![sample_duration; display_fields.len()];
+    let mut fields = 0u64;
+    for index in 1..display_fields.len() {
+        starts[index] = round_half_up(fields as f64 * field_ticks) as u64;
+        fields += u64::from(display_fields[index]);
+        let end = round_half_up(fields as f64 * field_ticks) as u64;
+        display_durations[index] = (end - starts[index]) as u32;
+    }
+    let presentation_times = presentation_indices
+        .iter()
+        .map(|&index| starts[index as usize])
+        .collect();
+    let sample_durations = presentation_indices
+        .iter()
+        .map(|&index| display_durations[index as usize])
+        .collect();
     Ok(Mpeg2Unit {
         timeline: Mpeg2VideoTimeline {
             width: first.sequence.horizontal_size,
             height: first.sequence.vertical_size,
             sample_duration,
+            presentation_times,
+            sample_durations,
             presentation_indices,
             field_pairs,
             split_field_samples: TranscodeOptions::default().split_field_samples,
@@ -698,20 +780,22 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // The slot the unit starts on, which is not the first picture in decode
     // order: an I picture is coded ahead of the B pictures that display before
     // it, and at a random access point those B pictures are missing entirely.
-    let first_index = indices.iter().copied().min().unwrap_or(1) as i64;
+    let first_presentation_time = timeline.first_presentation_time() as i64;
     let duration = timeline.sample_duration as i64;
     let mut offsets: Vec<i64> = Vec::with_capacity(indices.len());
     let mut durations: Vec<u32> = Vec::with_capacity(indices.len());
     let mut decode_time = 0i64;
-    for (decode_index, &presentation_index) in indices.iter().enumerate() {
-        let presentation_time = (presentation_index as i64 - first_index) * duration;
+    for decode_index in 0..indices.len() {
+        let presentation_time =
+            timeline.presentation_time_at(decode_index) as i64 - first_presentation_time;
+        let sample_duration = timeline.duration_at(decode_index);
         if timeline.split_field_samples && timeline.is_field_pair(decode_index) {
             // Each field takes half the frame's slot, in the order it displays
             // in. Splitting the duration rather than leaving the second sample
             // at zero keeps every sample on an instant of its own, which is
             // what the decoders this works around want to see.
-            let first_duration = timeline.sample_duration / 2;
-            let second_duration = timeline.sample_duration - first_duration;
+            let first_duration = sample_duration / 2;
+            let second_duration = sample_duration - first_duration;
             offsets.push(presentation_time - decode_time);
             durations.push(first_duration);
             decode_time += i64::from(first_duration);
@@ -720,8 +804,8 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
             decode_time += i64::from(second_duration);
         } else {
             offsets.push(presentation_time - decode_time);
-            durations.push(timeline.sample_duration);
-            decode_time += duration;
+            durations.push(sample_duration);
+            decode_time += i64::from(sample_duration);
         }
     }
     // An anchor picture is coded before the B pictures that display ahead of it,
@@ -760,7 +844,7 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     match lead_in {
         UnitLeadIn::None => {}
         UnitLeadIn::IdrClone => {
-            let lead = ((first_index - 1) * duration) as u32 + hold;
+            let lead = first_presentation_time as u32 + hold;
             let opens_on_a_pair = timeline.split_field_samples && timeline.is_field_pair(0);
             if let (true, [first, second, ..]) = (opens_on_a_pair, durations.as_slice()) {
                 // The clone is the unit's third sample, because the pair it
@@ -789,7 +873,7 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
         // composition offsets already computed still land where they should.
         UnitLeadIn::FirstPicture => {
             if let Some(first) = durations.first_mut() {
-                *first += ((first_index - 1) * duration) as u32 + hold;
+                *first += first_presentation_time as u32 + hold;
             }
         }
     }
@@ -1670,6 +1754,8 @@ mod tests {
             width: 720,
             height: 480,
             sample_duration: FRAME,
+            presentation_times: Vec::new(),
+            sample_durations: Vec::new(),
             presentation_indices: indices.to_vec(),
             field_pairs: field_pairs.to_vec(),
             split_field_samples: split,
@@ -1681,6 +1767,19 @@ mod tests {
 
     /// Decode order I P B B, as an open group of pictures is coded.
     const IPBB: [u32; 4] = [1, 4, 2, 3];
+
+    #[test]
+    fn repeated_first_fields_extend_their_own_samples() {
+        let mut timeline = timeline(&IPBB, &[false; 4], false);
+        timeline.presentation_times = vec![0, 10_511, 3_003, 7_508];
+        timeline.sample_durations = vec![3_003, 4_505, 4_505, 3_003];
+
+        let timing = mpeg2_sample_timing(&timeline, UnitLeadIn::None);
+
+        assert_eq!(timing.durations, [3_003, 4_505, 4_505, 3_003]);
+        assert_eq!(timing.compositions, [4_505, 12_013, 0, 0]);
+        assert_eq!(timing.reorder_delay, 4_505);
+    }
 
     /// Decode order I P P P, a group coded without B pictures, which displays
     /// in the order it was coded in.
