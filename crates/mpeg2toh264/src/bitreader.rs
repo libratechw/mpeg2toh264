@@ -157,17 +157,6 @@ impl<'a> BitReader<'a> {
         self.reservoir = 0;
         self.reservoir_bits = 0;
     }
-
-    /// MPEG-2 `nextbits() == '0000 0000 0000 0000 0000 0001'`: true when the
-    /// upcoming (byte-aligned) data is a start code prefix. Used to detect the
-    /// end of a slice, since slices are terminated by whatever start code
-    /// follows.
-    pub fn at_start_code(&self) -> bool {
-        let byte = ((self.pos + 7) & !7) >> 3;
-        self.data.get(byte) == Some(&0x00)
-            && self.data.get(byte + 1) == Some(&0x00)
-            && self.data.get(byte + 2) == Some(&0x01)
-    }
 }
 
 /// A `00 00 01 xx` start code located in the stream.

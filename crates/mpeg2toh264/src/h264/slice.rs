@@ -114,8 +114,6 @@ pub struct SliceHeaderConfig {
     /// Number of active L0 references, when it differs from the PPS default.
     pub num_ref_idx_l0_active: Option<u32>,
     pub num_ref_idx_l1_active: Option<u32>,
-    /// Put this long-term picture first in list 0.
-    pub l0_first_long_term: Option<u32>,
     /// The short-term run of both reference lists, written out entry by entry,
     /// which replaces `l0_first_long_term` and `l1_first_short_term_delta` for
     /// the slices that use it.
@@ -183,7 +181,6 @@ impl Default for SliceHeaderConfig {
             disable_deblocking_filter_idc: 1,
             num_ref_idx_l0_active: None,
             num_ref_idx_l1_active: None,
-            l0_first_long_term: None,
             explicit_ref_lists: None,
             l1_first_short_term_delta: None,
             flat_pred_ref_idx: [None; 2],
@@ -313,12 +310,7 @@ pub fn write_slice_header(w: &mut BitWriter, cfg: &SliceHeaderConfig) {
         if let Some(lists) = &cfg.explicit_ref_lists {
             write_ref_pic_list_modification(w, &lists[0], cfg.frame_num, field);
         } else {
-            w.flag(cfg.l0_first_long_term.is_some());
-            if let Some(long_term) = cfg.l0_first_long_term {
-                w.ue(2); // modification_of_pic_nums_idc 2: select a long-term picture
-                w.ue(long_term);
-                w.ue(3); // modification_of_pic_nums_idc 3: end of the list
-            }
+            w.flag(false);
         }
     }
     if is_b {

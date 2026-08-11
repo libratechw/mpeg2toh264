@@ -103,7 +103,8 @@ export class Transcoder {
     serviceId: number | null,
     splitFieldSamples: boolean | undefined,
     passthrough = false,
-    openGopRecovery: "idr" | "recovery-point" | "discard" | undefined = undefined,
+    openGopRecovery:
+      "idr" | "recovery-point" | "discard" | undefined = undefined,
   ) {
     this.#session = new Session(
       oversample,
