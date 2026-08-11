@@ -354,6 +354,9 @@ struct ProgramMap {
     /// different order from the PAT, so a playable service is not selected
     /// until every service announced ahead of it has been inspected.
     inspected_services: HashSet<u16>,
+    /// PAT sections already read, used to distinguish another section of a
+    /// large PAT from the next transmission of the same section.
+    seen_pat_sections: HashSet<(u16, u8, u8)>,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
     /// Which sound the caller has asked for. It is a choice about the service
@@ -392,6 +395,7 @@ impl Default for ProgramMap {
             rank: usize::MAX,
             deferred: None,
             inspected_services: HashSet::new(),
+            seen_pat_sections: HashSet::new(),
             video_pid: None,
             audio_pid: None,
             wanted_audio: None,
@@ -409,6 +413,17 @@ impl Default for ProgramMap {
 }
 
 impl ProgramMap {
+    fn activate_deferred(&mut self) {
+        if let Some(deferred) = self.deferred.take() {
+            self.service = Some(deferred.service);
+            self.rank = deferred.rank;
+            self.video_pid = deferred.video;
+            self.audio_pid = deferred.audio;
+            self.audio_streams = deferred.audio_streams;
+            self.private_pids = deferred.private;
+        }
+    }
+
     fn wants(&self, pid: u16) -> bool {
         pid == 0 || self.pmt_pids.contains(&pid)
     }
@@ -433,6 +448,15 @@ impl ProgramMap {
             return;
         }
         if pid == 0 && section[0] == 0x00 {
+            // A service can remain in the PAT after its PMT has disappeared.
+            // Once the PAT repeats after a playable candidate was seen, the
+            // absent earlier map must not leave that candidate waiting forever.
+            let transport_stream_id = ((section[3] as u16) << 8) | section[4] as u16;
+            let version = (section[5] >> 1) & 0x1f;
+            let repeated_pat =
+                !self
+                    .seen_pat_sections
+                    .insert((transport_stream_id, version, section[6]));
             let end = section.len() - 4;
             let mut i = 8;
             while i + 3 < end {
@@ -445,6 +469,9 @@ impl ProgramMap {
                         .insert((((section[i + 2] & 0x1f) as u16) << 8) | section[i + 3] as u16);
                 }
                 i += 4;
+            }
+            if repeated_pat && self.service.is_none() && self.deferred.is_some() {
+                self.activate_deferred();
             }
         } else if section[0] == 0x02 {
             // The service this map describes, which is the table's own id
@@ -536,14 +563,7 @@ impl ProgramMap {
                     })
                 });
                 if deferred_is_ready {
-                    if let Some(deferred) = self.deferred.take() {
-                        self.service = Some(deferred.service);
-                        self.rank = deferred.rank;
-                        self.video_pid = deferred.video;
-                        self.audio_pid = deferred.audio;
-                        self.audio_streams = deferred.audio_streams;
-                        self.private_pids = deferred.private;
-                    }
+                    self.activate_deferred();
                 }
                 return;
             }

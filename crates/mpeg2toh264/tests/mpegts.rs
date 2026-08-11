@@ -388,6 +388,25 @@ fn skips_multiple_empty_services_in_pat_order() {
     assert_eq!(demuxer.service_id(), Some(203));
 }
 
+/// A PAT entry may outlive the PMT it points to. A later playable service must
+/// not wait forever for a map that remains absent across PAT repetitions.
+#[test]
+fn skips_an_earlier_service_whose_pmt_is_missing() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::STREAM_TYPE_MPEG2_VIDEO;
+
+    let missing: &[(u16, u8)] = &[];
+    let playable: &[(u16, u8)] = &[(0x200, STREAM_TYPE_MPEG2_VIDEO)];
+    let tables = mux_programs(&[(201, 0x110, missing), (202, 0x120, playable)], &[]);
+    // PAT, 202 PMT, then the next PAT. The 201 PMT is never transmitted.
+    let mut stream = tables[..2 * 188].to_vec();
+    stream.extend_from_slice(&tables[..188]);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer.push(&stream).expect("demuxes");
+    assert_eq!(demuxer.service_id(), Some(202));
+}
+
 #[test]
 fn emits_private_stream_pes_from_the_selected_service() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
