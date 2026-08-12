@@ -103,8 +103,9 @@
     <main>
       <header>
         <h1>mpeg2toh264 demo</h1>
+        <p>MPEG-2 TSに含まれるMPEG-2をブラウザ内でH.264へ変換し再生するデモ</p>
         <p><a href="https://github.com/otya128/mpeg2toh264">https://github.com/otya128/mpeg2toh264</a></p>
-        <p>MPEG-2 TSに含まれるMPEG-2をブラウザ内でH.264へ変換し再生</p>
+        <p>一般的なトランスコーダーではMPEG-2をデコードしてH.264エンコーダーで1からエンコードするという処理を行いますが、この実装はMPEG-2が持つ量子化係数、マクロブロック種別、動きベクトル、ピクチャ参照関係を再利用し、動き補償などの処理を行わずに対応するH.264のビットストリームへ直接変換します。</p>
       </header>
       <section>
         <div id="stage">
