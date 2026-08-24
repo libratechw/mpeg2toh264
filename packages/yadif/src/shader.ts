@@ -235,7 +235,7 @@ void main() {
 }
 `;
 
-/** Uniforms shared by the film-cadence analysis and field-weave shaders. */
+/** Uniforms shared by the reduced luma and field-weave shaders. */
 export const FILM_UNIFORMS = {
   prev: "uPrev",
   cur: "uCur",
@@ -245,13 +245,18 @@ export const FILM_UNIFORMS = {
   match: "uMatch",
 } as const;
 
+/** Width of the reduced fieldmatch and decimate inputs. */
+export const FILM_ANALYSIS_WIDTH = 160;
+
+/** Height of the reduced fieldmatch and decimate inputs. */
+export const FILM_ANALYSIS_HEIGHT = 90;
+
 /**
- * Measures combing in the three field matches available from the frame ring.
- *
- * Each output pixel samples one source location and stores the p/c/n comb
- * contribution in RGB. Reading the small 160 by 90 target therefore transfers
- * only aggregate evidence to JavaScript while the full-size frames stay on the
- * GPU.
+ * Reads reduced luma from the three frames available to fieldmatch.
+ * RGB stores previous/current/next luma so one fixed-size readback supplies
+ * the 8-bit analysis frames used by the CPU port of FFmpeg fieldmatch and
+ * decimate. Scaling the two fields independently preserves their alternating
+ * rows while the clean full-size frames stay on the GPU.
  */
 export const FILM_ANALYSIS_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
@@ -261,24 +266,10 @@ uniform sampler2D uPrev;
 uniform sampler2D uCur;
 uniform sampler2D uNext;
 uniform ivec2 uSize;
-uniform int uTopFieldFirst;
-
 out vec4 fragColor;
 
 float luma(vec3 rgb) {
   return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-}
-
-vec3 candidate(int x, int y, int match) {
-  // fieldmatch keeps the opposite rows from the current frame and borrows the
-  // selected field from its neighbour: odd rows for TFF and even rows for BFF.
-  int borrowedParity = uTopFieldFirst != 0 ? 1 : 0;
-  if ((y & 1) != borrowedParity || match == 1) {
-    return texelFetch(uCur, ivec2(x, y), 0).rgb;
-  }
-  return match == 0
-    ? texelFetch(uPrev, ivec2(x, y), 0).rgb
-    : texelFetch(uNext, ivec2(x, y), 0).rgb;
 }
 
 int sourceY(int targetY, int targetHeight) {
@@ -292,35 +283,19 @@ int sourceY(int targetY, int targetHeight) {
   return clamp(fieldY * 2 + parity, 0, uSize.y - 1);
 }
 
-float reducedCandidate(int x, int y, int match, ivec2 targetSize) {
-  int sourceX = clamp(x * uSize.x / targetSize.x, 0, uSize.x - 1);
-  return luma(candidate(sourceX, sourceY(y, targetSize.y), match));
-}
-
-float comb(int x, int y, int match, ivec2 targetSize) {
-  // Apply the comb mask after the field-aware reduction. The three-row block
-  // test in JavaScript can then use neighbouring target rows on the same scale
-  // as FFmpeg's field-aware validation image.
-  float minus2 = reducedCandidate(x, max(0, y - 2), match, targetSize);
-  float minus1 = reducedCandidate(x, max(0, y - 1), match, targetSize);
-  float pixel = reducedCandidate(x, y, match, targetSize);
-  float plus1 = reducedCandidate(x, min(targetSize.y - 1, y + 1), match, targetSize);
-  float plus2 = reducedCandidate(x, min(targetSize.y - 1, y + 2), match, targetSize);
-  float threshold = 9.0 / 255.0;
-  float vertical = abs(4.0 * pixel - 3.0 * (minus1 + plus1) + minus2 + plus2);
-  return abs(pixel - minus1) > threshold &&
-         abs(pixel - plus1) > threshold &&
-         vertical > threshold * 6.0 ? 1.0 : 0.0;
-}
-
 void main() {
-  ivec2 targetSize = ivec2(160, 90);
+  ivec2 targetSize = ivec2(${FILM_ANALYSIS_WIDTH}, ${FILM_ANALYSIS_HEIGHT});
   ivec2 target = ivec2(gl_FragCoord.xy);
-  int y = targetSize.y - 1 - target.y;
+  // readPixels returns the framebuffer's bottom row first, so writing the
+  // source's top row there gives JavaScript a conventional top-origin image.
+  int y = target.y;
+  int sourceX = clamp(target.x * uSize.x / targetSize.x, 0, uSize.x - 1);
+  int sourceRow = sourceY(y, targetSize.y);
+  ivec2 source = ivec2(sourceX, sourceRow);
   fragColor = vec4(
-    comb(target.x, y, 0, targetSize),
-    comb(target.x, y, 1, targetSize),
-    comb(target.x, y, 2, targetSize),
+    luma(texelFetch(uPrev, source, 0).rgb),
+    luma(texelFetch(uCur, source, 0).rgb),
+    luma(texelFetch(uNext, source, 0).rgb),
     1.0
   );
 }
@@ -356,7 +331,7 @@ void main() {
 }
 `;
 
-/** Produces a reduced copy of the selected weave for duplicate detection. */
+/** Produces a reduced RGB copy of the selected weave for decimate metrics. */
 export const FILM_SAMPLE_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
@@ -371,17 +346,15 @@ uniform int uMatch;
 out vec4 fragColor;
 
 void main() {
-  ivec2 targetSize = ivec2(160, 90);
+  ivec2 targetSize = ivec2(${FILM_ANALYSIS_WIDTH}, ${FILM_ANALYSIS_HEIGHT});
   ivec2 target = ivec2(gl_FragCoord.xy);
   int x = clamp(target.x * uSize.x / targetSize.x, 0, uSize.x - 1);
-  int targetY = targetSize.y - 1 - target.y;
-  // Reduce the top and bottom fields independently, preserving both parities
-  // in the cadence sample for any even source-to-target height ratio.
+  // The bottom framebuffer row becomes the first readPixels row, so it holds
+  // the source's top row for the CPU's top-origin decimate blocks.
+  int targetY = target.y;
   int parity = targetY & 1;
   int fieldY = (targetY / 2) * (uSize.y / 2) / (targetSize.y / 2);
   int y = clamp(fieldY * 2 + parity, 0, uSize.y - 1);
-  // Keep this reduced candidate identical to the full-size weave so duplicate
-  // scores describe the picture that the renderer will actually present.
   int borrowedParity = uTopFieldFirst != 0 ? 1 : 0;
   if ((y & 1) != borrowedParity || uMatch == 1) {
     fragColor = texelFetch(uCur, ivec2(x, y), 0);

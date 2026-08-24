@@ -33,13 +33,16 @@
  * callback is absorbed by, and `bufferFields` is how much of it there is.
  */
 import {
+  FILM_ANALYSIS_HEIGHT,
   FILM_ANALYSIS_FRAGMENT_SHADER,
+  FILM_ANALYSIS_WIDTH,
   FILM_SAMPLE_FRAGMENT_SHADER,
   FILM_UNIFORMS,
   FILM_WEAVE_FRAGMENT_SHADER,
   YADIF_FRAGMENT_SHADER,
   YADIF_UNIFORMS,
 } from "./shader.js";
+import { FFmpegIVTC } from "./ivtc.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
@@ -57,21 +60,8 @@ const HISTORY = 3;
  */
 const OUTPUTS = 4;
 
-/** The reduced target used for cadence analysis. */
-const ANALYSIS_WIDTH = 160;
-const ANALYSIS_HEIGHT = 90;
-
-/** Low-comb frames required to enter film mode, covering two telecine cycles. */
-const FILM_ENTER_FRAMES = 10;
-
-/** A high-comb match returns the current frame to the YADIF render path. */
-const FILM_EXIT_FRAMES = 1;
-
 /** FFmpeg fieldmatch's default combed-pixel limit in a 16 by 16 block. */
 const FILM_SCORE_THRESHOLD = 80;
-
-/** FFmpeg decimate's default 1.1 percent duplicate threshold on 8-bit samples. */
-const FILM_DUPLICATE_THRESHOLD = 255 * 0.011;
 
 /** How often the filter says how it is getting on, in milliseconds. */
 const STATS_INTERVAL_MS = 1000;
@@ -201,9 +191,9 @@ export interface DeinterlaceStats {
   combScore: number;
   /** Pictures actually copied to the canvas per second. */
   outputFps: number;
-  /** Mean 8-bit sample difference of the strongest duplicate phase. */
+  /** Smallest block difference in the most recently completed decimate cycle. */
   duplicateScore: number;
-  /** Mean 8-bit sample difference of the next-best duplicate phase. */
+  /** Next-smallest block difference in the most recently completed cycle. */
   duplicateRunnerUp: number;
 }
 
@@ -235,9 +225,10 @@ export interface DeinterlacerOptions {
   doubleRate?: boolean;
   /**
    * Whether hard-telecined film is reconstructed and shown at its native
-   * 24000/1001 cadence. Two clean p/c/n field-match cycles must contain one
-   * stable duplicate phase before film mode starts. A high-comb frame returns
-   * to yadif so live action and commercial breaks retain field-rate motion.
+   * 24000/1001 cadence. Matching follows FFmpeg's `fieldmatch=mode=pc_n:
+   * combmatch=full:mchroma=0`, and duplicate decisions follow `decimate=cycle=5:
+   * mixed=1`. Only a clean match inside a decimated cycle uses the film path;
+   * every other frame continues through yadif.
    */
   autoFilm?: boolean;
   /**
@@ -328,10 +319,10 @@ export class Deinterlacer {
   readonly #blit: WebGLProgram;
   readonly #blitField: WebGLUniformLocation | null;
   readonly #blitFlip: WebGLUniformLocation | null;
-  /** The reduced pass that scores the three possible film field matches. */
+  /** The reduced pass that reads previous, current and next luma together. */
   #filmAnalysis: WebGLProgram | null = null;
   #filmAnalysisLocation: Record<
-    Exclude<keyof typeof FILM_UNIFORMS, "match">,
+    Exclude<keyof typeof FILM_UNIFORMS, "match" | "topFieldFirst">,
     WebGLUniformLocation | null
   > | null = null;
   /** The pass that weaves the selected pair of fields into one film picture. */
@@ -340,6 +331,7 @@ export class Deinterlacer {
     keyof typeof FILM_UNIFORMS,
     WebGLUniformLocation | null
   > | null = null;
+  /** The selected weave reduced to RGB for FFmpeg decimate's block metrics. */
   #filmSample: WebGLProgram | null = null;
   #filmSampleLocation: Record<
     keyof typeof FILM_UNIFORMS,
@@ -374,12 +366,8 @@ export class Deinterlacer {
   #mode: "film" | "video" = "video";
   #match: "p" | "c" | "n" = "c";
   #combScore = 0;
-  #filmRun = 0;
-  #videoRun = 0;
-  #cadenceFrame = 0;
-  #dropPhase = 0;
-  #previousFilmSample: Uint8Array | null = null;
-  #duplicateScores: { frame: number; score: number }[] = [];
+  #isCombed = true;
+  readonly #ivtc = new FFmpegIVTC(FILM_ANALYSIS_WIDTH, FILM_ANALYSIS_HEIGHT);
   #duplicateScore = Infinity;
   #duplicateRunnerUp = Infinity;
   #filmNextAt = 0;
@@ -735,31 +723,34 @@ export class Deinterlacer {
       }
       this.#lastFrameAt = at;
       this.#push();
-      if (this.#autoFilm && this.#frames === HISTORY) this.#analyseFilm();
-      if (
-        this.#mode === "film" &&
+      const shouldDropFilmFrame =
+        this.#autoFilm && this.#frames === HISTORY && this.#analyseFilm();
+      if (shouldDropFilmFrame) {
+        // decimate removes this duplicate before yadif, so it contributes no
+        // output picture and the next film deadline remains unchanged
+      } else if (
+        this.#autoFilm &&
+        !this.#isCombed &&
         this.#frames === HISTORY &&
-        this.#scheduling()
+        this.#mode === "film"
       ) {
-        // Film pictures are reconstructed from the chosen field pair and
-        // presented at equal 24000/1001 intervals. The fifth input frame is
-        // the duplicate phase measured during the two-cycle entry window.
-        const base =
-          this.#clock(metadata.mediaTime, metadata.expectedDisplayTime) +
-          this.#periodMs * (1 + this.#bufferFields / 2);
-        const isDuplicate = this.#cadenceFrame % 5 === this.#dropPhase;
-        // Across a five-frame cycle the next 24p deadline moves from the
-        // current input time to one frame ahead. Re-anchor only outside that
-        // range, so a media-clock correction cannot leave every later output
-        // permanently early or late while ordinary cadence remains even.
-        const tolerance = this.#periodMs / 2;
-        if (
-          this.#filmNextAt === 0 ||
-          this.#filmNextAt < base - tolerance ||
-          this.#filmNextAt > base + this.#periodMs + tolerance
-        )
-          this.#filmNextAt = base + (isDuplicate ? this.#periodMs : 0);
-        if (!isDuplicate) {
+        if (!this.#scheduling()) {
+          // A framebuffer allocation failure still presents the reconstructed
+          // picture directly instead of hiding the underlying video
+          this.#renderFilm(null);
+        } else {
+          // Four reconstructed film pictures are presented at equal intervals
+          // over the five input-frame cycle selected by decimate
+          const base =
+            this.#clock(metadata.mediaTime, metadata.expectedDisplayTime) +
+            this.#periodMs * (1 + this.#bufferFields / 2);
+          const tolerance = this.#periodMs / 2;
+          if (
+            this.#filmNextAt === 0 ||
+            this.#filmNextAt < base - tolerance ||
+            this.#filmNextAt > base + this.#periodMs + tolerance
+          )
+            this.#filmNextAt = base;
           this.#filterFilm(this.#filmNextAt);
           this.#filmNextAt += (this.#periodMs * 5) / 4;
         }
@@ -909,10 +900,10 @@ export class Deinterlacer {
     this.#filmAnalysis = filmAnalysis;
     this.#filmAnalysisLocation = Object.fromEntries(
       Object.entries(FILM_UNIFORMS)
-        .filter(([key]) => key !== "match")
+        .filter(([key]) => key !== "match" && key !== "topFieldFirst")
         .map(([key, name]) => [key, gl.getUniformLocation(filmAnalysis, name)]),
     ) as Record<
-      Exclude<keyof typeof FILM_UNIFORMS, "match">,
+      Exclude<keyof typeof FILM_UNIFORMS, "match" | "topFieldFirst">,
       WebGLUniformLocation | null
     >;
     this.#filmWeave = filmWeave;
@@ -932,14 +923,13 @@ export class Deinterlacer {
   }
 
   /**
-   * Select the least-combed p/c/n field match and update the render mode.
-   *
-   * The analysis target is deliberately small, but every sample compares
-   * adjacent source lines. This keeps the comb measurement sensitive to the
-   * interlaced structure while reducing the synchronous GPU readback to a
-   * fixed 160 by 90 buffer.
+   * Run FFmpeg's fieldmatch and mixed decimate decisions on reduced luma.
+   * Full decoded frames remain in GPU textures, while the first readback packs
+   * the previous, current and next luma proxies into RGB. The CPU stage is a
+   * direct port of the 8-bit FFmpeg arithmetic, and a second readback supplies
+   * the selected RGB weave to its chroma-sensitive decimate metric.
    */
-  #analyseFilm(): void {
+  #analyseFilm(): boolean {
     const target = this.#analysisTarget;
     const analysis = this.#filmAnalysis;
     const analysisLocation = this.#filmAnalysisLocation;
@@ -952,13 +942,14 @@ export class Deinterlacer {
       !sampleProgram ||
       !sampleLocation
     )
-      return;
+      return false;
     const gl = this.#gl;
     const newest = this.#head;
     const cur = (this.#head + HISTORY - 1) % HISTORY;
     const prev = (this.#head + 1) % HISTORY;
 
-    // Score all three field matches in one draw, with one score per channel.
+    // One GPU draw and readback supplies the three luma frames without moving
+    // full-resolution RGBA pictures through JavaScript
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
     gl.useProgram(analysis);
     for (const [unit, texture] of [prev, cur, newest].entries()) {
@@ -969,177 +960,78 @@ export class Deinterlacer {
     gl.uniform1i(analysisLocation.cur, 1);
     gl.uniform1i(analysisLocation.next, 2);
     gl.uniform2i(analysisLocation.size, this.#width, this.#height);
-    gl.uniform1i(analysisLocation.topFieldFirst, this.#topFieldFirst ? 1 : 0);
-    gl.viewport(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+    gl.viewport(0, 0, FILM_ANALYSIS_WIDTH, FILM_ANALYSIS_HEIGHT);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.readPixels(
       0,
       0,
-      ANALYSIS_WIDTH,
-      ANALYSIS_HEIGHT,
+      FILM_ANALYSIS_WIDTH,
+      FILM_ANALYSIS_HEIGHT,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
       target.pixels,
     );
-
-    // fieldmatch classifies a frame by the densest overlapping 16 by 16 block
-    // whose comb mask remains set on three vertical pixels. Repeating that
-    // reduction here keeps the public threshold on FFmpeg's `combpel` scale.
-    const scores: [number, number, number] = [0, 0, 0];
-    for (let channel = 0; channel < 3; channel++) {
-      for (const yOffset of [0, 8]) {
-        for (const xOffset of [0, 8]) {
-          for (let blockY = yOffset; blockY < ANALYSIS_HEIGHT; blockY += 16) {
-            for (let blockX = xOffset; blockX < ANALYSIS_WIDTH; blockX += 16) {
-              let combed = 0;
-              for (
-                let y = Math.max(1, blockY);
-                y < Math.min(ANALYSIS_HEIGHT - 1, blockY + 16);
-                y++
-              ) {
-                for (
-                  let x = blockX;
-                  x < Math.min(ANALYSIS_WIDTH, blockX + 16);
-                  x++
-                ) {
-                  const offset = (y * ANALYSIS_WIDTH + x) * 4 + channel;
-                  if (
-                    target.pixels[offset - ANALYSIS_WIDTH * 4] === 255 &&
-                    target.pixels[offset] === 255 &&
-                    target.pixels[offset + ANALYSIS_WIDTH * 4] === 255
-                  )
-                    combed++;
-                }
-              }
-              const score = scores[channel] ?? 0;
-              scores[channel] = Math.max(score, combed);
-            }
-          }
-        }
-      }
+    const previousLuma = new Uint8Array(
+      FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT,
+    );
+    const currentLuma = new Uint8Array(
+      FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT,
+    );
+    const nextLuma = new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT);
+    for (let pixel = 0; pixel < previousLuma.length; pixel++) {
+      const offset = pixel * 4;
+      previousLuma[pixel] = target.pixels[offset] ?? 0;
+      currentLuma[pixel] = target.pixels[offset + 1] ?? 0;
+      nextLuma[pixel] = target.pixels[offset + 2] ?? 0;
     }
-    // FFmpeg's default pc_n strategy selects between p and c first. The n
-    // candidate is a rescue match only when it removes substantially more
-    // combing, which keeps clean cadence from jumping ahead by one film frame.
-    let matchIndex = scores[0] < scores[1] ? 0 : 1;
-    if (
-      scores[2] * 3 < (scores[matchIndex] ?? Infinity) &&
-      scores[2] <= this.#filmCombThreshold
-    )
-      matchIndex = 2;
-    this.#match = (["p", "c", "n"] as const)[matchIndex] ?? "c";
-    this.#combScore = scores[matchIndex] ?? 0;
-    this.#cadenceFrame++;
-
-    // A reduced copy of the chosen weave identifies which position in the
-    // five-frame telecine cycle repeats the preceding film picture.
+    const fieldMatch = this.#ivtc.fieldMatch(
+      previousLuma,
+      currentLuma,
+      nextLuma,
+      this.#topFieldFirst,
+      this.#filmCombThreshold,
+    );
+    // Decimate returns the selected RGB weave to YUV 4:2:0 sample density, so
+    // brightness noise and colour-only changes share FFmpeg's metric scale
     gl.useProgram(sampleProgram);
     gl.uniform1i(sampleLocation.prev, 0);
     gl.uniform1i(sampleLocation.cur, 1);
     gl.uniform1i(sampleLocation.next, 2);
     gl.uniform2i(sampleLocation.size, this.#width, this.#height);
     gl.uniform1i(sampleLocation.topFieldFirst, this.#topFieldFirst ? 1 : 0);
-    gl.uniform1i(sampleLocation.match, matchIndex);
+    gl.uniform1i(
+      sampleLocation.match,
+      fieldMatch.match === "p" ? 0 : fieldMatch.match === "c" ? 1 : 2,
+    );
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.readPixels(
       0,
       0,
-      ANALYSIS_WIDTH,
-      ANALYSIS_HEIGHT,
+      FILM_ANALYSIS_WIDTH,
+      FILM_ANALYSIS_HEIGHT,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
       target.pixels,
     );
-    if (this.#previousFilmSample) {
-      let difference = 0;
-      for (let offset = 0; offset < target.pixels.length; offset += 4) {
-        difference += Math.abs(
-          (target.pixels[offset] ?? 0) -
-            (this.#previousFilmSample[offset] ?? 0),
-        );
-        difference += Math.abs(
-          (target.pixels[offset + 1] ?? 0) -
-            (this.#previousFilmSample[offset + 1] ?? 0),
-        );
-        difference += Math.abs(
-          (target.pixels[offset + 2] ?? 0) -
-            (this.#previousFilmSample[offset + 2] ?? 0),
-        );
-      }
-      this.#duplicateScores.push({
-        frame: this.#cadenceFrame,
-        score: difference / (ANALYSIS_WIDTH * ANALYSIS_HEIGHT * 3),
-      });
-      if (this.#duplicateScores.length > FILM_ENTER_FRAMES)
-        this.#duplicateScores.shift();
-    }
-    this.#previousFilmSample = target.pixels.slice();
+    const decimate = this.#ivtc.decimate(target.pixels);
+    this.#match = fieldMatch.match;
+    this.#combScore = fieldMatch.combScore;
+    this.#isCombed = fieldMatch.isCombed;
+    this.#duplicateScore = decimate.lowestCycleDifference;
+    this.#duplicateRunnerUp = decimate.runnerUpCycleDifference;
 
-    // A film decision needs both clean field matches and one repeat position
-    // in each five-frame cycle. Low comb scores alone also occur in static
-    // interlaced video, where discarding an arbitrary frame would be unsafe.
-    if (this.#combScore <= this.#filmCombThreshold) {
-      this.#filmRun++;
-      this.#videoRun = 0;
-      if (this.#filmRun >= FILM_ENTER_FRAMES) {
-        const phaseScores = Array.from({ length: 5 }, () => ({
-          total: 0,
-          count: 0,
-        }));
-        for (const sample of this.#duplicateScores) {
-          const phase = phaseScores[sample.frame % 5];
-          if (!phase) continue;
-          phase.total += sample.score;
-          phase.count++;
-        }
-        const averages = phaseScores
-          .map((phase, index) => ({
-            index,
-            average: phase.count === 0 ? Infinity : phase.total / phase.count,
-          }))
-          .sort((first, second) => first.average - second.average);
-        const duplicate = averages[0];
-        const runnerUp = averages[1];
-        this.#duplicateScore = duplicate?.average ?? Infinity;
-        this.#duplicateRunnerUp = runnerUp?.average ?? Infinity;
-        // Ten analysed frames contain only nine differences. Wait until all
-        // five phases have two observations, so one quiet edit cannot choose
-        // a drop phase from a single sample.
-        const hasFullCadenceWindow = phaseScores.every(
-          (phase) => phase.count >= 2,
-        );
-        const hasFilmCadence =
-          hasFullCadenceWindow &&
-          duplicate !== undefined &&
-          runnerUp !== undefined &&
-          duplicate.average <= FILM_DUPLICATE_THRESHOLD &&
-          runnerUp.average >= Math.max(1, duplicate.average * 2);
-        if (hasFilmCadence) {
-          this.#dropPhase = duplicate.index;
-          if (this.#mode === "video") {
-            this.#mode = "film";
-            this.#filmNextAt = 0;
-            this.#queue.length = 0;
-          }
-        } else if (this.#mode === "film") {
-          // Clean progressive video also has little combing, but without one
-          // repeated phase it carries five distinct pictures. Return this
-          // frame to YADIF before a stale film phase discards any of them.
-          this.#resetFilm();
-        }
-      }
-      return;
-    }
-
-    // A high-comb match means the source carries distinct fields, so the
-    // current frame resumes the field-rate YADIF path with its motion intact.
-    this.#videoRun++;
-    this.#filmRun = 0;
-    if (this.#mode === "film" && this.#videoRun >= FILM_EXIT_FRAMES) {
-      this.#mode = "video";
+    // This is the deliberate composition beyond FFmpeg's independent filters:
+    // only a clean match inside a decimated cycle enters film mode. Every
+    // non-decimated cycle retains the original field-rate YADIF path, while a
+    // combed frame can never be dropped even when its position was predicted.
+    const isFilmCycle = decimate.dropIndex !== null && !fieldMatch.isCombed;
+    if ((isFilmCycle ? "film" : "video") !== this.#mode) {
+      this.#mode = isFilmCycle ? "film" : "video";
       this.#filmNextAt = 0;
-      this.#queue.length = 0;
+      // Both rates keep their already reconstructed pictures in one ordered
+      // queue, so a cadence transition reaches every unique captured moment
     }
+    return decimate.shouldDrop && !fieldMatch.isCombed;
   }
 
   /** Weave the selected film fields into an output texture and queue it. */
@@ -1148,16 +1040,12 @@ export class Deinterlacer {
     const output = this.#outputs[slot];
     if (!output) return;
     this.#outputHead = slot;
-    while (this.#queue.length > 0 && this.#queue[0]?.slot === slot) {
-      this.#queue.shift();
-      this.#stats.late++;
-    }
     this.#renderFilm(output.framebuffer);
-    this.#queue.push({ slot, at });
+    this.#enqueue(slot, at);
   }
 
   /** Draw the selected p/c/n field weave into a full-size output texture. */
-  #renderFilm(target: WebGLFramebuffer): void {
+  #renderFilm(target: WebGLFramebuffer | null): void {
     const program = this.#filmWeave;
     const location = this.#filmWeaveLocation;
     if (!program || !location) return;
@@ -1182,6 +1070,10 @@ export class Deinterlacer {
     );
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (target === null) {
+      this.canvas.style.visibility = "visible";
+      this.#outputSinceReport++;
+    }
   }
 
   /**
@@ -1197,15 +1089,25 @@ export class Deinterlacer {
     const output = this.#outputs[slot];
     if (!output) return;
     this.#outputHead = slot;
-    // Whatever this slot held has been waiting two frames for a turn it never
-    // got, and its moment is far enough past that showing it now would be a
-    // step backwards. Slots are taken in order, so it can only be the oldest.
-    while (this.#queue.length > 0 && this.#queue[0]?.slot === slot) {
-      this.#queue.shift();
+    this.#render(false, second, output.framebuffer);
+    this.#enqueue(slot, at);
+  }
+
+  /** Add a completed picture to the shared film and field-rate schedule. */
+  #enqueue(slot: number, at: number): void {
+    // Reusing a framebuffer retires the picture whose pixels it replaces,
+    // leaving every surviving queue entry backed by its own immutable texture
+    const occupied = this.#queue.findIndex((ready) => ready.slot === slot);
+    if (occupied !== -1) {
+      this.#queue.splice(occupied, 1);
       this.#stats.late++;
     }
-    this.#render(false, second, output.framebuffer);
-    this.#queue.push({ slot, at });
+
+    // Mode changes can make the new deadline earlier than a film picture that
+    // is already waiting, so insertion order follows presentation time
+    const later = this.#queue.findIndex((ready) => ready.at > at);
+    if (later === -1) this.#queue.push({ slot, at });
+    else this.#queue.splice(later, 0, { slot, at });
   }
 
   /** The loop that puts filtered fields up, and the only thing that draws. */
@@ -1529,8 +1431,8 @@ export class Deinterlacer {
       gl.TEXTURE_2D,
       0,
       gl.RGBA,
-      ANALYSIS_WIDTH,
-      ANALYSIS_HEIGHT,
+      FILM_ANALYSIS_WIDTH,
+      FILM_ANALYSIS_HEIGHT,
       0,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
@@ -1556,7 +1458,7 @@ export class Deinterlacer {
     this.#analysisTarget = {
       texture,
       framebuffer,
-      pixels: new Uint8Array(ANALYSIS_WIDTH * ANALYSIS_HEIGHT * 4),
+      pixels: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT * 4),
     };
   }
 
@@ -1693,20 +1595,16 @@ export class Deinterlacer {
     this.#outputSinceReport = 0;
   }
 
-  /** Return cadence detection to the conservative field-rate render path. */
+  /** Return FFmpeg's fieldmatch and decimate windows to their initial state. */
   #resetFilm(): void {
     this.#queue.length = 0;
     this.#clocked = false;
     this.#mode = "video";
     this.#match = "c";
     this.#combScore = 0;
-    this.#filmRun = 0;
-    this.#videoRun = 0;
-    this.#cadenceFrame = 0;
-    this.#dropPhase = 0;
+    this.#isCombed = true;
     this.#filmNextAt = 0;
-    this.#previousFilmSample = null;
-    this.#duplicateScores = [];
+    this.#ivtc.reset();
     this.#duplicateScore = Infinity;
     this.#duplicateRunnerUp = Infinity;
   }
