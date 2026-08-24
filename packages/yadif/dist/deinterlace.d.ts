@@ -57,6 +57,18 @@ export interface DeinterlaceStats {
      * deinterlacer takes away from everything else.
      */
     frameMs: number;
+    /** The render path currently selected by automatic cadence detection. */
+    mode: "film" | "video";
+    /** The field match selected for the most recently analysed frame. */
+    match: "p" | "c" | "n";
+    /** Largest 16 by 16 block count of vertically adjacent combed pixels. */
+    combScore: number;
+    /** Pictures actually copied to the canvas per second. */
+    outputFps: number;
+    /** Mean 8-bit sample difference of the strongest duplicate phase. */
+    duplicateScore: number;
+    /** Mean 8-bit sample difference of the next-best duplicate phase. */
+    duplicateRunnerUp: number;
 }
 export interface DeinterlacerOptions {
     /**
@@ -85,6 +97,19 @@ export interface DeinterlacerOptions {
      */
     doubleRate?: boolean;
     /**
+     * Whether hard-telecined film is reconstructed and shown at its native
+     * 24000/1001 cadence. Two clean p/c/n field-match cycles must contain one
+     * stable duplicate phase before film mode starts. A high-comb frame returns
+     * to yadif so live action and commercial breaks retain field-rate motion.
+     */
+    autoFilm?: boolean;
+    /**
+     * Largest combed-pixel block count accepted as a clean film field match.
+     * The default 80 matches FFmpeg fieldmatch's `combpel` default. Duplicate
+     * cadence must still be established independently before film mode starts.
+     */
+    filmCombThreshold?: number;
+    /**
      * How many field intervals of slack to hold a picture for every field back
      * by, on top of the half a frame the second field is late by anyway.
      *
@@ -99,8 +124,9 @@ export interface DeinterlacerOptions {
      * is the least delay and the least tolerance. Raising it past one or two
      * buys nothing a viewer will see and costs delay a viewer might.
      *
-     * It has no effect at all without `doubleRate`, where a frame's one picture
-     * goes up as the frame after it arrives and there is nothing to schedule.
+     * It affects the queued field-rate output from `doubleRate` and the queued
+     * native-cadence output from `autoFilm`. With both features off, a frame's
+     * one picture goes up as the frame after it arrives and nothing is queued.
      */
     bufferFields?: number;
     /**
@@ -170,6 +196,12 @@ export declare class Deinterlacer {
     /** Whether a picture goes up for every field rather than every frame. */
     get doubleRate(): boolean;
     set doubleRate(doubleRate: boolean);
+    /** Whether hard-telecined material is reconstructed at film cadence. */
+    get autoFilm(): boolean;
+    set autoFilm(autoFilm: boolean);
+    /** The combed-pixel boundary between clean field matches and field motion. */
+    get filmCombThreshold(): number;
+    set filmCombThreshold(filmCombThreshold: number);
     /** How many field intervals of slack the field schedule is held back by. */
     get bufferFields(): number;
     set bufferFields(fields: number);
