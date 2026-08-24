@@ -65,9 +65,9 @@ export interface DeinterlaceStats {
     combScore: number;
     /** Pictures actually copied to the canvas per second. */
     outputFps: number;
-    /** Mean 8-bit sample difference of the strongest duplicate phase. */
+    /** Smallest block difference in the most recently completed decimate cycle. */
     duplicateScore: number;
-    /** Mean 8-bit sample difference of the next-best duplicate phase. */
+    /** Next-smallest block difference in the most recently completed cycle. */
     duplicateRunnerUp: number;
 }
 export interface DeinterlacerOptions {
@@ -98,9 +98,10 @@ export interface DeinterlacerOptions {
     doubleRate?: boolean;
     /**
      * Whether hard-telecined film is reconstructed and shown at its native
-     * 24000/1001 cadence. Two clean p/c/n field-match cycles must contain one
-     * stable duplicate phase before film mode starts. A high-comb frame returns
-     * to yadif so live action and commercial breaks retain field-rate motion.
+     * 24000/1001 cadence. Matching follows FFmpeg's `fieldmatch=mode=pc_n:
+     * combmatch=full:mchroma=0`, and duplicate decisions follow `decimate=cycle=5:
+     * mixed=1`. Only a clean match inside a decimated cycle uses the film path;
+     * every other frame continues through yadif.
      */
     autoFilm?: boolean;
     /**
