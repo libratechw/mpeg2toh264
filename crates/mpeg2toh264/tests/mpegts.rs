@@ -57,6 +57,304 @@ fn transcoding_through_a_transport_stream_matches_the_bare_stream() {
 }
 
 #[test]
+fn marks_an_unbounded_pes_boundary_after_packet_loss_as_damaged() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // The first PES spans three transport packets. Losing its last packet is
+    // observed only when the next PES starts with a skipped continuity count,
+    // so that replacement must carry the damage marker for the flushed tail.
+    let first = vec![0xaa; 400];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(90_000),
+                payload: &first,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(93_000),
+                payload: &second,
+            },
+        ],
+    );
+    // Video commonly leaves PES_packet_length at zero. A skipped continuity
+    // count still proves that the missing packet cut the preceding payload.
+    stream.drain(4 * 188..5 * 188);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes around the hole");
+    packets.extend(demuxer.finish().expect("flushes the replacement"));
+    let video: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
+
+    assert_eq!(video.len(), 2);
+    assert!(!video[0].damaged_previous_pes);
+    assert!(
+        video[1].damaged_previous_pes,
+        "the complete PES after the hole discards the damaged GOP prefix"
+    );
+}
+
+#[test]
+fn marks_packet_loss_ending_at_counter_zero_as_damaged() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // The continuity counter wraps after fifteen, so zero can follow either a
+    // complete packet fifteen or a hole where packet fifteen was lost. The
+    // missing counter still proves damage even though the received value is zero.
+    let first = vec![0xaa; 16 * 184 - 9];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: None,
+                payload: &first,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: None,
+                payload: &second,
+            },
+        ],
+    );
+    stream.drain(17 * 188..18 * 188);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes around the wrap");
+    packets.extend(demuxer.finish().expect("flushes the replacement"));
+    let replacement = packets
+        .iter()
+        .find(|packet| packet.kind == ElementaryKind::Video && packet.data == second)
+        .expect("complete PES after the hole");
+
+    assert!(replacement.damaged_previous_pes);
+    assert_eq!(demuxer.dropped(), 1);
+}
+
+#[test]
+fn detects_loss_immediately_after_a_payload_discontinuity_marker() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // A payload-bearing marker resets comparison with the packet before it,
+    // then becomes the baseline for detecting loss in the new continuity run.
+    let first = vec![0xaa; 700];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: None,
+                payload: &first,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: None,
+                payload: &second,
+            },
+        ],
+    );
+    // Make the first video packet carry a one-byte adaptation field and retain
+    // the first 182 payload bytes after its discontinuity marker.
+    stream[2 * 188 + 3] = 0x30;
+    stream.copy_within(2 * 188 + 4..2 * 188 + 186, 2 * 188 + 6);
+    stream[2 * 188 + 4] = 1;
+    stream[2 * 188 + 5] = 0x80;
+    // Counter one is now missing, so counter two must damage the open PES.
+    stream.drain(3 * 188..4 * 188);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes after the marker");
+    packets.extend(demuxer.finish().expect("flushes the replacement"));
+    let replacement = packets
+        .iter()
+        .find(|packet| packet.kind == ElementaryKind::Video && packet.data == second)
+        .expect("complete PES after the hole");
+
+    assert!(replacement.damaged_previous_pes);
+    assert_eq!(demuxer.dropped(), 1);
+}
+
+#[test]
+fn ignores_a_retransmitted_payload_discontinuity_marker() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // Repeating the marker packet repeats payload already accepted into the
+    // new continuity run, so the marker changes state only on its first arrival.
+    let payload = vec![0xaa; 400];
+    let mut marked = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            pts: Some(90_000),
+            payload: &payload,
+        }],
+    );
+    marked[2 * 188 + 3] = 0x30;
+    marked.copy_within(2 * 188 + 4..2 * 188 + 186, 2 * 188 + 6);
+    marked[2 * 188 + 4] = 1;
+    marked[2 * 188 + 5] = 0x80;
+    let mut repeated = marked.clone();
+    let marker = repeated[2 * 188..3 * 188].to_vec();
+    repeated.splice(3 * 188..3 * 188, marker);
+
+    let demux = |stream: &[u8]| {
+        let mut demuxer = MpegTsAvDemuxer::new();
+        let mut packets = demuxer.push(stream).expect("demuxes the marked PES");
+        packets.extend(demuxer.finish().expect("flushes the marked PES"));
+        packets
+            .into_iter()
+            .find(|packet| packet.kind == ElementaryKind::Video)
+            .expect("one video PES")
+            .data
+    };
+
+    assert_eq!(demux(&repeated), demux(&marked));
+}
+
+#[test]
+fn carries_an_adaptation_only_discontinuity_to_the_next_pes() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{
+        mux_transport_stream, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO,
+        VIDEO_PID,
+    };
+
+    // Adaptation-only packets do not advance the continuity counter, but their
+    // marker still separates stateful access-unit parsing across a clean join.
+    let first = vec![0xaa; 32];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &[
+            PesUnit {
+                pid: AUDIO_PID,
+                stream_id: 0xc0,
+                pts: Some(90_000),
+                payload: &first,
+            },
+            PesUnit {
+                pid: AUDIO_PID,
+                stream_id: 0xc0,
+                pts: Some(93_000),
+                payload: &second,
+            },
+        ],
+    );
+    let mut marker = vec![0xff; 188];
+    marker[..6].copy_from_slice(&[
+        0x47,
+        (AUDIO_PID >> 8) as u8,
+        AUDIO_PID as u8,
+        0x20,
+        183,
+        0x80,
+    ]);
+    stream.splice(3 * 188..3 * 188, marker);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes the marker");
+    packets.extend(demuxer.finish().expect("flushes both PES packets"));
+    let audio: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Audio)
+        .collect();
+
+    assert_eq!(audio.len(), 2);
+    assert_eq!(audio[0].data, first);
+    assert_eq!(audio[1].data, second);
+    assert!(audio[1].discontinuity);
+}
+
+#[test]
+fn ignores_a_retransmitted_transport_packet() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // The video PES spans three transport packets. Repeating its middle packet
+    // must leave both the elementary payload and the loss count unchanged.
+    let payload = vec![0xaa; 400];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            pts: Some(90_000),
+            payload: &payload,
+        }],
+    );
+    let duplicate = stream[3 * 188..4 * 188].to_vec();
+    stream.splice(4 * 188..4 * 188, duplicate);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes the retransmission");
+    packets.extend(demuxer.finish().expect("flushes the video PES"));
+    let video = packets
+        .iter()
+        .find(|packet| packet.kind == ElementaryKind::Video)
+        .expect("one video PES");
+
+    assert_eq!(video.data, payload);
+    assert_eq!(demuxer.dropped(), 0);
+}
+
+#[test]
+fn ignores_a_retransmitted_packet_after_another_pid() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // Packet order is global while continuity is per PID. A packet from an
+    // unrelated PID may sit between a payload and its retransmission without
+    // changing which video payload was most recently accepted.
+    let payload = vec![0xaa; 400];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            pts: Some(90_000),
+            payload: &payload,
+        }],
+    );
+    let duplicate = stream[3 * 188..4 * 188].to_vec();
+    let mut null_packet = vec![0xff; 188];
+    null_packet[..4].copy_from_slice(&[0x47, 0x1f, 0xff, 0x10]);
+    stream.splice(4 * 188..4 * 188, null_packet.into_iter().chain(duplicate));
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes the retransmission");
+    packets.extend(demuxer.finish().expect("flushes the video PES"));
+    let video = packets
+        .iter()
+        .find(|packet| packet.kind == ElementaryKind::Video)
+        .expect("one video PES");
+
+    assert_eq!(video.data, payload);
+    assert_eq!(demuxer.dropped(), 0);
+}
+
+#[test]
 fn rejects_a_transport_stream_with_no_video() {
     // A PAT and PMT that advertise nothing, with no elementary stream behind them.
     let empty = wrap_mpeg2_es_in_ts(&[], None);
@@ -206,6 +504,69 @@ fn follows_the_chosen_services_own_map_to_other_streams() {
          being left sent after the map changed"
     );
     assert_eq!(demuxer.service_id(), Some(101), "and it is one service");
+}
+
+#[test]
+fn a_superseded_stream_recovers_after_packet_loss() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{PesUnit, STREAM_TYPE_MPEG2_VIDEO};
+
+    let before: &[(u16, u8)] = &[(0x200, STREAM_TYPE_MPEG2_VIDEO)];
+    let after: &[(u16, u8)] = &[(0x100, STREAM_TYPE_MPEG2_VIDEO)];
+    let mut stream = mux_programs(
+        &[(101, 0x1f0, before)],
+        &[PesUnit {
+            pid: 0x200,
+            stream_id: 0xe0,
+            pts: Some(9000),
+            payload: &[0xaa],
+        }],
+    );
+    let damaged = vec![0xcc; 400];
+    stream.extend_from_slice(&mux_programs(
+        &[(101, 0x1f0, after)],
+        &[
+            PesUnit {
+                pid: 0x200,
+                stream_id: 0xe0,
+                pts: Some(13_500),
+                payload: &damaged,
+            },
+            PesUnit {
+                pid: 0x200,
+                stream_id: 0xe0,
+                pts: Some(18_000),
+                payload: &[0xdd],
+            },
+            PesUnit {
+                pid: 0x100,
+                stream_id: 0xe0,
+                pts: Some(22_500),
+                payload: &[0xbb],
+            },
+        ],
+    ));
+    // The middle packet of the first PES sent on the old PID is lost after the
+    // PMT moves the programme, while a later complete PES still precedes the new PID.
+    stream.drain(6 * 188..7 * 188);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes across the move");
+    packets.extend(demuxer.finish().expect("flushes the new stream"));
+    let video: Vec<(u16, Vec<u8>)> = packets
+        .into_iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .map(|packet| (packet.pid, packet.data))
+        .collect();
+
+    assert_eq!(
+        video,
+        vec![
+            (0x200, vec![0xaa]),
+            (0x200, vec![0xdd]),
+            (0x100, vec![0xbb]),
+        ]
+    );
 }
 
 /// A data service sits alongside the television it belongs to and names the
@@ -400,10 +761,40 @@ fn skips_an_earlier_service_whose_pmt_is_missing() {
     let tables = mux_programs(&[(201, 0x110, missing), (202, 0x120, playable)], &[]);
     // PAT, 202 PMT, then the next PAT. The 201 PMT is never transmitted.
     let mut stream = tables[..2 * 188].to_vec();
-    stream.extend_from_slice(&tables[..188]);
+    let mut repeated_pat = tables[..188].to_vec();
+    // The low nibble is the TS continuity counter, not the PAT version number.
+    // Advancing it makes this a new transport packet rather than a retransmission.
+    repeated_pat[3] = (repeated_pat[3] & 0xf0) | 1;
+    stream.extend_from_slice(&repeated_pat);
 
     let mut demuxer = MpegTsAvDemuxer::new();
     demuxer.push(&stream).expect("demuxes");
+    assert_eq!(demuxer.service_id(), Some(202));
+}
+
+#[test]
+fn a_retransmitted_pat_does_not_end_the_pmt_wait() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+    use support::STREAM_TYPE_MPEG2_VIDEO;
+
+    let missing: &[(u16, u8)] = &[];
+    let playable: &[(u16, u8)] = &[(0x200, STREAM_TYPE_MPEG2_VIDEO)];
+    let tables = mux_programs(&[(201, 0x110, missing), (202, 0x120, playable)], &[]);
+    let mut demuxer = MpegTsAvDemuxer::new();
+    demuxer
+        .push(&tables[..2 * 188])
+        .expect("reads PAT and 202 PMT");
+
+    demuxer
+        .push(&tables[..188])
+        .expect("ignores retransmitted PAT");
+    assert_eq!(demuxer.service_id(), None);
+
+    let mut next_pat = tables[..188].to_vec();
+    // Advance the TS continuity counter so duplicate suppression admits the
+    // next PAT cycle; the section and its version number remain unchanged.
+    next_pat[3] = (next_pat[3] & 0xf0) | 1;
+    demuxer.push(&next_pat).expect("reads the next PAT cycle");
     assert_eq!(demuxer.service_id(), Some(202));
 }
 

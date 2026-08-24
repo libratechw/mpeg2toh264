@@ -661,10 +661,16 @@ impl Session {
         {
             match packet.kind {
                 ElementaryKind::Video => {
+                    if packet.damaged_previous_pes {
+                        self.gops.discard_pending();
+                    }
                     let units = self.gops.push(&packet.data, packet.pts);
                     self.pending_gops.extend(units);
                 }
                 ElementaryKind::Audio => {
+                    if packet.discontinuity {
+                        self.adts.discard_pending();
+                    }
                     if self.audio_start_pts.is_none() {
                         self.audio_start_pts = packet.pts;
                     }

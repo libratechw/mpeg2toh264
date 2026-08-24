@@ -531,6 +531,14 @@ impl AdtsStream {
         self.is_dual_mono
     }
 
+    /// Drop an access unit cut by transport loss and search for framing anew.
+    /// The last complete frame's configuration and element chain still
+    /// describe the service after a short reception dropout, so they remain.
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.synced = false;
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<AacFrame>> {
         self.pending.extend_from_slice(chunk);
         let mut output = Vec::new();

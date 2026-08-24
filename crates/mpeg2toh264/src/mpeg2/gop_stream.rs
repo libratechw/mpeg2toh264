@@ -110,6 +110,19 @@ impl Mpeg2GopStream {
         self.extract(true)
     }
 
+    /// Drop the unfinished GOP at a transport discontinuity while retaining
+    /// the last sequence header needed to describe the next complete GOP.
+    pub fn discard_pending(&mut self) {
+        self.base += self.buffer.len().saturating_sub(self.prefix_length);
+        self.buffer.clear();
+        self.prefix_length = 0;
+        self.marks.clear();
+        self.sequences.clear();
+        self.gops.clear();
+        self.pictures.clear();
+        self.scan_pos = 0;
+    }
+
     /// Drop bytes from the front, keeping the offset mapping in step.
     fn consume(&mut self, count: usize) {
         let from_prefix = count.min(self.prefix_length);

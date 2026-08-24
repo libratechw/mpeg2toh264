@@ -203,15 +203,73 @@ pub struct ElementaryPacket {
     /// Video and audio rarely start at the same timestamp in a broadcast
     /// stream, so this is what puts the two tracks on a common timeline.
     pub pts: Option<u64>,
+    /// Bytes belonging to this elementary stream were lost before this PES.
+    /// Stateful parsers must discard any unfinished access unit before reading
+    /// this packet, since its first bytes cannot complete the old unit.
+    pub discontinuity: bool,
+    /// The preceding PES itself lost bytes, so a video parser must also drop
+    /// the unfinished GOP it was assembling before reading this packet.
+    pub damaged_previous_pes: bool,
 }
 
 struct TsPayload<'a> {
     pid: u16,
+    has_payload: bool,
     payload_unit_start: bool,
     continuity_counter: u8,
     discontinuity: bool,
     scrambled: bool,
     data: &'a [u8],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContinuityChange {
+    None,
+    /// A retransmitted packet repeats the preceding continuity counter.
+    Duplicate,
+    /// A discontinuity marker opened a new time base.
+    Reset,
+    /// The continuity counter proves that transport packets were lost.
+    Loss,
+}
+
+struct ContinuityState {
+    counter: u8,
+    payload_unit_start: bool,
+    scrambled: bool,
+    data: Vec<u8>,
+    /// Whether this payload entered a PSI assembler or elementary PES state.
+    accepted: bool,
+}
+
+impl ContinuityState {
+    /// Reuse the preceding payload allocation while retaining accepted bytes for retransmission checks.
+    fn from_packet(packet: &TsPayload<'_>, accepted: bool, previous: Option<Self>) -> Self {
+        let mut state = previous.unwrap_or_else(|| Self {
+            counter: 0,
+            payload_unit_start: false,
+            scrambled: false,
+            data: Vec::new(),
+            accepted: false,
+        });
+        state.counter = packet.continuity_counter;
+        state.payload_unit_start = packet.payload_unit_start;
+        state.scrambled = packet.scrambled;
+        state.data.clear();
+        if accepted {
+            state.data.extend_from_slice(packet.data);
+        }
+        state.accepted = accepted;
+        state
+    }
+
+    /// Whether the current packet repeats the payload already handed downstream.
+    fn is_duplicate(&self, packet: &TsPayload<'_>) -> bool {
+        self.counter == packet.continuity_counter
+            && self.payload_unit_start == packet.payload_unit_start
+            && self.scrambled == packet.scrambled
+            && self.data == packet.data
+    }
 }
 
 /// Find the first packet boundary, by requiring several sync bytes 188 apart.
@@ -240,7 +298,7 @@ pub fn is_mpeg_transport_stream(data: &[u8]) -> bool {
     data.len() >= TS_PACKET_SIZE && sync_offset(data).is_some()
 }
 
-fn payload_at(data: &[u8], at: usize) -> Result<Option<TsPayload<'_>>> {
+fn payload_at(data: &[u8], at: usize) -> Result<TsPayload<'_>> {
     if data[at] != SYNC_BYTE {
         bail!("MPEG-TS sync lost at byte {at}");
     }
@@ -255,9 +313,7 @@ fn payload_at(data: &[u8], at: usize) -> Result<Option<TsPayload<'_>>> {
     if adaptation_control == 0 {
         bail!("invalid adaptation_field_control at byte {at}");
     }
-    if adaptation_control & 1 == 0 {
-        return Ok(None);
-    }
+    let has_payload = adaptation_control & 1 != 0;
     let mut payload = at + 4;
     let mut discontinuity = false;
     if adaptation_control & 2 != 0 {
@@ -270,14 +326,15 @@ fn payload_at(data: &[u8], at: usize) -> Result<Option<TsPayload<'_>>> {
     if payload > end {
         bail!("invalid MPEG-TS adaptation field at byte {at}");
     }
-    Ok(Some(TsPayload {
+    Ok(TsPayload {
         pid,
+        has_payload,
         payload_unit_start,
         continuity_counter,
         discontinuity,
         scrambled,
         data: &data[payload..end],
-    }))
+    })
 }
 
 /// Reassembles PSI sections, which are length-prefixed and may straddle packets.
@@ -721,9 +778,22 @@ struct PesState {
     collecting: bool,
     /// Timestamp of the accompanying media when this private PES began.
     fallback_pts: Option<u64>,
+    /// Whether the next complete PES follows a transport-stream continuity gap.
+    discontinuity_before: bool,
+    /// Whether packet loss cut the preceding PES rather than falling between PES packets.
+    damaged_before: bool,
 }
 
 impl PesState {
+    /// Whether a bounded PES ended before reaching the length in its header.
+    fn is_declared_pes_incomplete(&self) -> bool {
+        let Some(length) = self.parts.get(4..6) else {
+            return !self.parts.is_empty();
+        };
+        let length = u16::from_be_bytes([length[0], length[1]]) as usize;
+        length != 0 && self.parts.len() < 6 + length
+    }
+
     fn flush(
         &mut self,
         kind: ElementaryKind,
@@ -747,10 +817,21 @@ impl PesState {
             pid,
             data,
             pts,
+            discontinuity: std::mem::take(&mut self.discontinuity_before),
+            damaged_previous_pes: std::mem::take(&mut self.damaged_before),
         });
         self.collecting = false;
         self.fallback_pts = None;
         Ok(())
+    }
+
+    /// Forget a PES cut by packet loss and mark the first complete replacement.
+    fn discard_at_discontinuity(&mut self) {
+        self.parts.clear();
+        self.collecting = false;
+        self.fallback_pts = None;
+        self.discontinuity_before = true;
+        self.damaged_before = true;
     }
 }
 
@@ -790,7 +871,11 @@ pub struct MpegTsAvDemuxer {
     scrambled: u64,
     errors: u64,
     dropped: u64,
-    continuity: HashMap<u16, u8>,
+    continuity: HashMap<u16, ContinuityState>,
+    /// PIDs whose adaptation-only marker applies to their next payload.
+    pending_discontinuities: HashSet<u16>,
+    /// Evidence that PAT and PMT counters restarted before the media counters.
+    implicit_restart_tables: u8,
 }
 
 impl MpegTsAvDemuxer {
@@ -925,16 +1010,42 @@ impl MpegTsAvDemuxer {
         self.take_audio_switch(&mut output)?;
         let mut sections = Vec::new();
         while at + TS_PACKET_SIZE <= input.len() {
-            match payload_at(&input, at) {
+            let packet_offset = at;
+            at += TS_PACKET_SIZE;
+            match payload_at(&input, packet_offset) {
                 Err(_) => {
                     self.errors += 1;
                 }
-                Ok(Some(packet)) if packet.scrambled => {
-                    self.note_continuity(&packet);
+                Ok(packet) if !packet.has_payload => {
+                    // An adaptation-only marker separates the payloads on its
+                    // two sides while leaving the continuity counter unchanged.
+                    if packet.discontinuity {
+                        self.continuity.remove(&packet.pid);
+                        self.pending_discontinuities.insert(packet.pid);
+                    }
+                }
+                Ok(packet) if packet.scrambled => {
+                    if self.note_continuity(&packet) == ContinuityChange::Duplicate {
+                        continue;
+                    }
+                    // A skipped payload leaves the PES on either side unrelated,
+                    // so the next payload-unit start becomes the new assembly point.
+                    self.discard_partial(packet.pid);
                     self.scrambled += 1;
                 }
-                Ok(Some(packet)) => {
-                    self.note_continuity(&packet);
+                Ok(packet) => {
+                    let continuity_change = self.note_continuity(&packet);
+                    // Transport retransmission repeats bytes already accepted;
+                    // periodic PAT and PMT cycles advance their own counters.
+                    if continuity_change == ContinuityChange::Duplicate {
+                        continue;
+                    }
+                    if continuity_change != ContinuityChange::None && !packet.payload_unit_start {
+                        // Bytes after a continuity hole are the tail of a PES whose
+                        // middle is gone. Keeping its head would manufacture a valid-
+                        // looking AAC frame or video slice that a decoder later rejects.
+                        self.discard_partial(packet.pid);
+                    }
                     if self.program.wants(packet.pid) {
                         // Which streams the programme was being read from, in
                         // case its map moves it to others: what is half
@@ -1072,12 +1183,28 @@ impl MpegTsAvDemuxer {
                             ) => self.private.entry(packet.pid).or_default(),
                         };
                         if packet.payload_unit_start {
+                            // A counter gap proves packet loss even where video uses
+                            // an unbounded PES. An explicit reset may instead mark a
+                            // clean recording join, so only a short bounded PES turns
+                            // that reset into proof that the preceding payload was cut.
+                            let was_previous_pes_damaged = match continuity_change {
+                                ContinuityChange::Loss => true,
+                                ContinuityChange::Reset => state.is_declared_pes_incomplete(),
+                                ContinuityChange::None | ContinuityChange::Duplicate => false,
+                            };
                             let previous_kind = match state.parts.get(3) {
                                 Some(0xbd) => ElementaryKind::PrivateStream1,
                                 Some(0xbf) => ElementaryKind::PrivateStream2,
                                 _ => kind,
                             };
                             state.flush(previous_kind, packet.pid, &mut output)?;
+                            // An AAC access unit may cross even a clean PES boundary,
+                            // while video needs the stronger proof above before its
+                            // pending GOP is discarded.
+                            if continuity_change != ContinuityChange::None {
+                                state.discontinuity_before = true;
+                                state.damaged_before = was_previous_pes_damaged;
+                            }
                             state.collecting = is_pes_start(packet.data, kind);
                             if matches!(
                                 kind,
@@ -1097,9 +1224,7 @@ impl MpegTsAvDemuxer {
                         }
                     }
                 }
-                Ok(None) => {}
             }
-            at += TS_PACKET_SIZE;
         }
         self.pending = input[at..].to_vec();
         Ok(output)
@@ -1111,20 +1236,136 @@ impl MpegTsAvDemuxer {
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
-    fn note_continuity(&mut self, packet: &TsPayload<'_>) {
-        if packet.discontinuity {
-            self.continuity.remove(&packet.pid);
-            return;
-        }
-        if let Some(previous) = self
-            .continuity
-            .insert(packet.pid, packet.continuity_counter)
+    /// Record one payload's continuity and classify any break before it.
+    fn note_continuity(&mut self, packet: &TsPayload<'_>) -> ContinuityChange {
+        let is_elementary_pid = self.program.video_pid == Some(packet.pid)
+            || self.program.audio_pid == Some(packet.pid)
+            || self.program.private_pids.contains(&packet.pid)
+            || self
+                .superseded_video
+                .as_ref()
+                .is_some_and(|stream| stream.pid == packet.pid)
+            || self
+                .superseded_audio
+                .as_ref()
+                .is_some_and(|stream| stream.pid == packet.pid);
+        let is_accepted_pid = is_elementary_pid || self.program.wants(packet.pid);
+        let previous = self.continuity.remove(&packet.pid);
+        // A retransmitted marker repeats payload already accepted into the new
+        // continuity run, so only its first arrival changes parser state.
+        if packet.discontinuity
+            && previous
+                .as_ref()
+                .is_some_and(|previous| previous.accepted && previous.is_duplicate(packet))
         {
-            let expected = (previous + 1) & 0x0f;
-            if packet.continuity_counter != expected {
-                self.dropped += (packet.continuity_counter as u16 + 16 - expected as u16) as u64;
-            }
+            self.continuity
+                .insert(packet.pid, previous.expect("just matched"));
+            return ContinuityChange::Duplicate;
         }
+        let has_pending_discontinuity = self.pending_discontinuities.remove(&packet.pid);
+        let continuity_change = if packet.discontinuity || has_pending_discontinuity {
+            // A stream commonly marks its very first packet discontinuous to
+            // open a new time base. There is no earlier access unit to cut in
+            // that case; only a marker inside a stream asks downstream state
+            // to be discarded.
+            let had_previous = previous.is_some();
+            self.implicit_restart_tables = 0;
+            if had_previous || has_pending_discontinuity {
+                ContinuityChange::Reset
+            } else {
+                ContinuityChange::None
+            }
+        } else if let Some(previous) = previous.as_ref() {
+            let expected = (previous.counter + 1) & 0x0f;
+            if packet.continuity_counter != expected {
+                // Independently muxed recording stretches restart their table
+                // counters before restarting the media counters themselves.
+                if packet.continuity_counter == 0 && packet.pid == 0 {
+                    self.implicit_restart_tables = 1;
+                } else if packet.continuity_counter == 0
+                    && self.program.pmt_pids.contains(&packet.pid)
+                    && self.implicit_restart_tables & 1 != 0
+                {
+                    self.implicit_restart_tables |= 2;
+                }
+                // A coordinated table restart distinguishes a recording join
+                // from loss that merely happens to end at counter zero.
+                let is_implicit_restart = if is_elementary_pid {
+                    let is_implicit_restart =
+                        packet.continuity_counter == 0 && self.implicit_restart_tables == 3;
+                    self.implicit_restart_tables = 0;
+                    is_implicit_restart
+                } else {
+                    false
+                };
+                // Continuity belongs to each PID independently, so packets
+                // from other streams may separate a payload from its repeat.
+                if is_implicit_restart {
+                    ContinuityChange::Reset
+                } else if previous.accepted && previous.is_duplicate(packet) {
+                    ContinuityChange::Duplicate
+                } else if !previous.accepted && previous.counter == packet.continuity_counter {
+                    // A payload that was not handed downstream remains eligible
+                    // when the PID becomes relevant before its next counter.
+                    ContinuityChange::None
+                } else {
+                    self.dropped +=
+                        ((packet.continuity_counter as u16 + 16 - expected as u16) & 0x0f) as u64;
+                    ContinuityChange::Loss
+                }
+            } else {
+                ContinuityChange::None
+            }
+        } else {
+            ContinuityChange::None
+        };
+        if is_elementary_pid {
+            // Continuous media disproves any incomplete table-only restart signal.
+            self.implicit_restart_tables = 0;
+        }
+        if continuity_change == ContinuityChange::Duplicate {
+            self.continuity
+                .insert(packet.pid, previous.expect("duplicate has a predecessor"));
+        } else {
+            self.continuity.insert(
+                packet.pid,
+                ContinuityState::from_packet(packet, is_accepted_pid, previous),
+            );
+        }
+        continuity_change
+    }
+
+    /// Drop the unfinished PES owned by one PID after its payload loses continuity.
+    fn discard_partial(&mut self, pid: u16) {
+        if self.program.video_pid == Some(pid) {
+            self.video.discard_at_discontinuity();
+        }
+        if self.program.audio_pid == Some(pid) {
+            self.audio.discard_at_discontinuity();
+        }
+        if self
+            .superseded_video
+            .as_mut()
+            .is_some_and(|stream| stream.pid == pid)
+        {
+            self.superseded_video
+                .as_mut()
+                .expect("just matched")
+                .state
+                .discard_at_discontinuity();
+        }
+        if self
+            .superseded_audio
+            .as_mut()
+            .is_some_and(|stream| stream.pid == pid)
+        {
+            self.superseded_audio
+                .as_mut()
+                .expect("just matched")
+                .state
+                .discard_at_discontinuity();
+        }
+        self.private.remove(&pid);
     }
     pub fn errors(&self) -> u64 {
         self.errors
@@ -1186,7 +1427,7 @@ fn walk_pts(data: &[u8], mut visit: impl FnMut(u64) -> ControlFlow<()>) {
         // A payload the sync check walked past is worth stepping over rather
         // than giving up on: a slice is a fragment of a file, and one damaged
         // packet says nothing about the ones after it.
-        if let Ok(Some(packet)) = payload_at(data, at) {
+        if let Ok(packet) = payload_at(data, at) {
             if packet.payload_unit_start
                 && (is_pes_start(packet.data, ElementaryKind::Video)
                     || is_pes_start(packet.data, ElementaryKind::Audio))

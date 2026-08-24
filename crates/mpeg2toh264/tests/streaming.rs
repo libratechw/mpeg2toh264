@@ -300,6 +300,28 @@ fn drops_a_frame_packet_loss_made_unreadable() {
     assert_eq!(frames.len(), 3, "the damaged frame is not passed on");
 }
 
+#[test]
+fn a_transport_discontinuity_does_not_join_two_aac_frames() {
+    // A continuity hole can cut one ADTS access unit between PES packets. The
+    // next PES starts with a complete frame, and joining its bytes to the old
+    // prefix creates a structurally plausible frame that a browser refuses.
+    // Discarding the parser's pending prefix makes the complete replacement
+    // frame the next unit handed to the decoder.
+    let frame = adts_frame_with_payload(3, 6, &five_point_one_payload(0));
+    let split = frame.len() / 2;
+    let mut adts = AdtsStream::new();
+    assert!(adts
+        .push(&frame[..split])
+        .expect("a partial frame is held")
+        .is_empty());
+
+    adts.discard_pending();
+    let frames = adts
+        .push(&frame)
+        .expect("the complete frame after the hole decodes");
+    assert_eq!(frames.len(), 1);
+}
+
 /// What a hole in the sound is filled with. Every channel the configuration
 /// names carries a long window with no scalefactor bands, which is no spectral
 /// data at all: the shortest access unit a decoder will accept for that
