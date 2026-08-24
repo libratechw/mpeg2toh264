@@ -32,7 +32,14 @@
  * thing drawing on the canvas. The queue between the two is what a late
  * callback is absorbed by, and `bufferFields` is how much of it there is.
  */
-import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
+import {
+  FILM_ANALYSIS_FRAGMENT_SHADER,
+  FILM_SAMPLE_FRAGMENT_SHADER,
+  FILM_UNIFORMS,
+  FILM_WEAVE_FRAGMENT_SHADER,
+  YADIF_FRAGMENT_SHADER,
+  YADIF_UNIFORMS,
+} from "./shader.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
@@ -49,6 +56,22 @@ const HISTORY = 3;
  * of showing it, which is back to having the two tied together.
  */
 const OUTPUTS = 4;
+
+/** The reduced target used for cadence analysis. */
+const ANALYSIS_WIDTH = 160;
+const ANALYSIS_HEIGHT = 90;
+
+/** Low-comb frames required to enter film mode, covering two telecine cycles. */
+const FILM_ENTER_FRAMES = 10;
+
+/** A high-comb match returns the current frame to the YADIF render path. */
+const FILM_EXIT_FRAMES = 1;
+
+/** FFmpeg fieldmatch's default combed-pixel limit in a 16 by 16 block. */
+const FILM_SCORE_THRESHOLD = 80;
+
+/** FFmpeg decimate's default 1.1 percent duplicate threshold on 8-bit samples. */
+const FILM_DUPLICATE_THRESHOLD = 255 * 0.011;
 
 /** How often the filter says how it is getting on, in milliseconds. */
 const STATS_INTERVAL_MS = 1000;
@@ -170,6 +193,18 @@ export interface DeinterlaceStats {
    * deinterlacer takes away from everything else.
    */
   frameMs: number;
+  /** The render path currently selected by automatic cadence detection. */
+  mode: "film" | "video";
+  /** The field match selected for the most recently analysed frame. */
+  match: "p" | "c" | "n";
+  /** Largest 16 by 16 block count of vertically adjacent combed pixels. */
+  combScore: number;
+  /** Pictures actually copied to the canvas per second. */
+  outputFps: number;
+  /** Mean 8-bit sample difference of the strongest duplicate phase. */
+  duplicateScore: number;
+  /** Mean 8-bit sample difference of the next-best duplicate phase. */
+  duplicateRunnerUp: number;
 }
 
 export interface DeinterlacerOptions {
@@ -199,6 +234,19 @@ export interface DeinterlacerOptions {
    */
   doubleRate?: boolean;
   /**
+   * Whether hard-telecined film is reconstructed and shown at its native
+   * 24000/1001 cadence. Two clean p/c/n field-match cycles must contain one
+   * stable duplicate phase before film mode starts. A high-comb frame returns
+   * to yadif so live action and commercial breaks retain field-rate motion.
+   */
+  autoFilm?: boolean;
+  /**
+   * Largest combed-pixel block count accepted as a clean film field match.
+   * The default 80 matches FFmpeg fieldmatch's `combpel` default. Duplicate
+   * cadence must still be established independently before film mode starts.
+   */
+  filmCombThreshold?: number;
+  /**
    * How many field intervals of slack to hold a picture for every field back
    * by, on top of the half a frame the second field is late by anyway.
    *
@@ -213,8 +261,9 @@ export interface DeinterlacerOptions {
    * is the least delay and the least tolerance. Raising it past one or two
    * buys nothing a viewer will see and costs delay a viewer might.
    *
-   * It has no effect at all without `doubleRate`, where a frame's one picture
-   * goes up as the frame after it arrives and there is nothing to schedule.
+   * It affects the queued field-rate output from `doubleRate` and the queued
+   * native-cadence output from `autoFilm`. With both features off, a frame's
+   * one picture goes up as the frame after it arrives and nothing is queued.
    */
   bufferFields?: number;
   /**
@@ -279,6 +328,28 @@ export class Deinterlacer {
   readonly #blit: WebGLProgram;
   readonly #blitField: WebGLUniformLocation | null;
   readonly #blitFlip: WebGLUniformLocation | null;
+  /** The reduced pass that scores the three possible film field matches. */
+  #filmAnalysis: WebGLProgram | null = null;
+  #filmAnalysisLocation: Record<
+    Exclude<keyof typeof FILM_UNIFORMS, "match">,
+    WebGLUniformLocation | null
+  > | null = null;
+  /** The pass that weaves the selected pair of fields into one film picture. */
+  #filmWeave: WebGLProgram | null = null;
+  #filmWeaveLocation: Record<
+    keyof typeof FILM_UNIFORMS,
+    WebGLUniformLocation | null
+  > | null = null;
+  #filmSample: WebGLProgram | null = null;
+  #filmSampleLocation: Record<
+    keyof typeof FILM_UNIFORMS,
+    WebGLUniformLocation | null
+  > | null = null;
+  #analysisTarget: {
+    texture: WebGLTexture;
+    framebuffer: WebGLFramebuffer;
+    pixels: Uint8Array;
+  } | null = null;
   #textures: WebGLTexture[] = [];
   /** Somewhere to filter a field into, and to read it back out of. */
   #outputs: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
@@ -296,8 +367,23 @@ export class Deinterlacer {
   readonly #resizes: ResizeObserver;
   #topFieldFirst: boolean;
   #doubleRate: boolean;
+  #autoFilm: boolean;
+  #filmCombThreshold: number;
   #bufferFields: number;
   #spatialCheck: boolean;
+  #mode: "film" | "video" = "video";
+  #match: "p" | "c" | "n" = "c";
+  #combScore = 0;
+  #filmRun = 0;
+  #videoRun = 0;
+  #cadenceFrame = 0;
+  #dropPhase = 0;
+  #previousFilmSample: Uint8Array | null = null;
+  #duplicateScores: { frame: number; score: number }[] = [];
+  #duplicateScore = Infinity;
+  #duplicateRunnerUp = Infinity;
+  #filmNextAt = 0;
+  #outputSinceReport = 0;
   /** How long a frame lasts in wall time, from what the frames themselves say. */
   #periodMs = 0;
   /** Where the media timeline was last pinned to the wall clock, and when. */
@@ -333,6 +419,11 @@ export class Deinterlacer {
     this.#video = video;
     this.#topFieldFirst = options.topFieldFirst ?? true;
     this.#doubleRate = options.doubleRate ?? false;
+    this.#autoFilm = options.autoFilm ?? false;
+    this.#filmCombThreshold = Math.max(
+      0,
+      options.filmCombThreshold ?? FILM_SCORE_THRESHOLD,
+    );
     this.#bufferFields = Math.max(0, options.bufferFields ?? 1);
     this.#spatialCheck = options.spatialCheck ?? true;
     this.#onStats = options.onStats;
@@ -362,6 +453,7 @@ export class Deinterlacer {
     this.#blit = createProgram(gl, BLIT_FRAGMENT_SHADER);
     this.#blitField = gl.getUniformLocation(this.#blit, "uField");
     this.#blitFlip = gl.getUniformLocation(this.#blit, "uFlip");
+    if (this.#autoFilm) this.#ensureFilmPrograms();
     this.canvas.addEventListener("webglcontextlost", this.#onContextLost);
     // The canvas is placed in pixels rather than in percentages, because where
     // the picture sits inside the element is arithmetic the browser does not
@@ -396,8 +488,17 @@ export class Deinterlacer {
 
   /** Update whether the source needs filtering and which field comes first. */
   set scan(scan: Scan | null) {
+    const scanChanged =
+      this.#scan?.interlaced !== scan?.interlaced ||
+      this.#scan?.topFieldFirst !== scan?.topFieldFirst;
     this.#scan = scan;
     if (scan) this.#topFieldFirst = scan.topFieldFirst;
+    if (scanChanged) {
+      // Standalone callers can replace scan metadata without a timeline event.
+      // Refill the history under the new field structure before filtering it.
+      this.#frames = 0;
+      this.#resetFilm();
+    }
     this.#apply();
   }
 
@@ -431,7 +532,12 @@ export class Deinterlacer {
   }
 
   set topFieldFirst(topFieldFirst: boolean) {
+    if (topFieldFirst === this.#topFieldFirst) return;
     this.#topFieldFirst = topFieldFirst;
+    // Every p/n match borrows the parity selected here. Discard matches and
+    // queued pictures measured with the former order before using the new one.
+    this.#frames = 0;
+    this.#resetFilm();
   }
 
   /** Whether a picture goes up for every field rather than every frame. */
@@ -442,15 +548,58 @@ export class Deinterlacer {
   set doubleRate(doubleRate: boolean) {
     if (doubleRate === this.#doubleRate) return;
     this.#doubleRate = doubleRate;
+    // Output queued at the former rate has deadlines and picture counts that
+    // do not belong to the new path. Rebuild its schedule from the next frame.
+    this.#queue.length = 0;
+    this.#clocked = false;
     if (doubleRate) {
       if (this.#width > 0) this.#allocateOutputs();
-      this.#startLoop();
-    } else {
+      // Unknown scan metadata may still resolve to interlaced on the next
+      // frame. A known progressive section has no queued fields to present.
+      if (this.#scan?.interlaced ?? true) this.#startLoop();
+    } else if (!this.#autoFilm) {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
       this.#stopLoop();
       this.#freeOutputs();
     }
+  }
+
+  /** Whether hard-telecined material is reconstructed at film cadence. */
+  get autoFilm(): boolean {
+    return this.#autoFilm;
+  }
+
+  set autoFilm(autoFilm: boolean) {
+    if (autoFilm === this.#autoFilm) return;
+    this.#autoFilm = autoFilm;
+    this.#resetFilm();
+    if (autoFilm) {
+      this.#ensureFilmPrograms();
+      if (this.#width > 0) {
+        this.#allocateAnalysisTarget();
+        this.#allocateOutputs();
+      }
+      // Cadence analysis is fed by interlaced frames. Leave a known progressive
+      // section asleep until its timeline selects an interlaced scan state.
+      if (this.#scan?.interlaced ?? true) this.#startLoop();
+    } else {
+      this.#freeAnalysisTarget();
+      if (!this.#doubleRate) {
+        this.#stopLoop();
+        this.#freeOutputs();
+      }
+    }
+  }
+
+  /** The combed-pixel boundary between clean field matches and field motion. */
+  get filmCombThreshold(): number {
+    return this.#filmCombThreshold;
+  }
+
+  set filmCombThreshold(filmCombThreshold: number) {
+    this.#filmCombThreshold = Math.max(0, filmCombThreshold);
+    if (this.#autoFilm) this.#resetFilm();
   }
 
   /** How many field intervals of slack the field schedule is held back by. */
@@ -505,8 +654,12 @@ export class Deinterlacer {
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
     this.#freeOutputs();
+    this.#freeAnalysisTarget();
     this.#gl.deleteProgram(this.#program);
     this.#gl.deleteProgram(this.#blit);
+    if (this.#filmAnalysis) this.#gl.deleteProgram(this.#filmAnalysis);
+    if (this.#filmWeave) this.#gl.deleteProgram(this.#filmWeave);
+    if (this.#filmSample) this.#gl.deleteProgram(this.#filmSample);
     this.#gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 
@@ -534,9 +687,8 @@ export class Deinterlacer {
       }
       // A seek, or a stream that starts again somewhere else, leaves the held
       // frames belonging to a different moment. Timing says so before any
-      // event does, and playback that merely dropped a frame is left alone:
-      // the neighbours are then further apart than they should be, which is
-      // worth less than filtering nothing at all.
+      // event does. A callback gap is tolerated by ordinary YADIF, but an IVTC
+      // cycle cannot retain its five-frame phase across an unseen picture.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
       const stale = elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
       if (stale) {
@@ -547,8 +699,19 @@ export class Deinterlacer {
         // place. Both start again from where playback actually is.
         this.#queue.length = 0;
         this.#clocked = false;
+        this.#resetFilm();
       }
+      const skippedFilmFrame =
+        this.#autoFilm &&
+        this.#lastPresented !== 0 &&
+        metadata.presentedFrames - this.#lastPresented > 1;
       this.#count(metadata.presentedFrames, stale);
+      if (!stale && skippedFilmFrame) {
+        // Refill all three history slots before matching fields again. This
+        // also returns directly to YADIF while a fresh cadence is established.
+        this.#frames = 0;
+        this.#resetFilm();
+      }
       // The same picture presented again, which the compositor does whenever
       // nothing new has been decoded: paused, stalled, or stopped at the end
       // of a stream, and at the display's rate rather than the video's.
@@ -572,7 +735,35 @@ export class Deinterlacer {
       }
       this.#lastFrameAt = at;
       this.#push();
-      if (this.#scheduling()) {
+      if (this.#autoFilm && this.#frames === HISTORY) this.#analyseFilm();
+      if (
+        this.#mode === "film" &&
+        this.#frames === HISTORY &&
+        this.#scheduling()
+      ) {
+        // Film pictures are reconstructed from the chosen field pair and
+        // presented at equal 24000/1001 intervals. The fifth input frame is
+        // the duplicate phase measured during the two-cycle entry window.
+        const base =
+          this.#clock(metadata.mediaTime, metadata.expectedDisplayTime) +
+          this.#periodMs * (1 + this.#bufferFields / 2);
+        const isDuplicate = this.#cadenceFrame % 5 === this.#dropPhase;
+        // Across a five-frame cycle the next 24p deadline moves from the
+        // current input time to one frame ahead. Re-anchor only outside that
+        // range, so a media-clock correction cannot leave every later output
+        // permanently early or late while ordinary cadence remains even.
+        const tolerance = this.#periodMs / 2;
+        if (
+          this.#filmNextAt === 0 ||
+          this.#filmNextAt < base - tolerance ||
+          this.#filmNextAt > base + this.#periodMs + tolerance
+        )
+          this.#filmNextAt = base + (isDuplicate ? this.#periodMs : 0);
+        if (!isDuplicate) {
+          this.#filterFilm(this.#filmNextAt);
+          this.#filmNextAt += (this.#periodMs * 5) / 4;
+        }
+      } else if (this.#doubleRate && this.#scheduling()) {
         // The moment this frame reaches the screen is the moment the frame
         // before it stops standing for, so both of that one's fields hang off
         // it: the first half a frame later, and the second half a frame after
@@ -622,8 +813,9 @@ export class Deinterlacer {
     this.#frames = 0;
     this.#queue.length = 0;
     this.#clocked = false;
+    this.#resetFilm();
     if (scan.interlaced) {
-      if (this.#doubleRate) this.#startLoop();
+      if (this.#doubleRate || this.#autoFilm) this.#startLoop();
     } else {
       this.#stopLoop();
     }
@@ -639,7 +831,9 @@ export class Deinterlacer {
    */
   #scheduling(): boolean {
     return (
-      this.#doubleRate && this.#periodMs > 0 && this.#outputs.length === OUTPUTS
+      (this.#doubleRate || this.#autoFilm) &&
+      this.#periodMs > 0 &&
+      this.#outputs.length === OUTPUTS
     );
   }
 
@@ -705,6 +899,291 @@ export class Deinterlacer {
     return at;
   }
 
+  /** Build the optional film passes only for callers that enable them. */
+  #ensureFilmPrograms(): void {
+    if (this.#filmAnalysis && this.#filmWeave && this.#filmSample) return;
+    const gl = this.#gl;
+    const filmAnalysis = createProgram(gl, FILM_ANALYSIS_FRAGMENT_SHADER);
+    const filmWeave = createProgram(gl, FILM_WEAVE_FRAGMENT_SHADER);
+    const filmSample = createProgram(gl, FILM_SAMPLE_FRAGMENT_SHADER);
+    this.#filmAnalysis = filmAnalysis;
+    this.#filmAnalysisLocation = Object.fromEntries(
+      Object.entries(FILM_UNIFORMS)
+        .filter(([key]) => key !== "match")
+        .map(([key, name]) => [key, gl.getUniformLocation(filmAnalysis, name)]),
+    ) as Record<
+      Exclude<keyof typeof FILM_UNIFORMS, "match">,
+      WebGLUniformLocation | null
+    >;
+    this.#filmWeave = filmWeave;
+    this.#filmWeaveLocation = Object.fromEntries(
+      Object.entries(FILM_UNIFORMS).map(([key, name]) => [
+        key,
+        gl.getUniformLocation(filmWeave, name),
+      ]),
+    ) as Record<keyof typeof FILM_UNIFORMS, WebGLUniformLocation | null>;
+    this.#filmSample = filmSample;
+    this.#filmSampleLocation = Object.fromEntries(
+      Object.entries(FILM_UNIFORMS).map(([key, name]) => [
+        key,
+        gl.getUniformLocation(filmSample, name),
+      ]),
+    ) as Record<keyof typeof FILM_UNIFORMS, WebGLUniformLocation | null>;
+  }
+
+  /**
+   * Select the least-combed p/c/n field match and update the render mode.
+   *
+   * The analysis target is deliberately small, but every sample compares
+   * adjacent source lines. This keeps the comb measurement sensitive to the
+   * interlaced structure while reducing the synchronous GPU readback to a
+   * fixed 160 by 90 buffer.
+   */
+  #analyseFilm(): void {
+    const target = this.#analysisTarget;
+    const analysis = this.#filmAnalysis;
+    const analysisLocation = this.#filmAnalysisLocation;
+    const sampleProgram = this.#filmSample;
+    const sampleLocation = this.#filmSampleLocation;
+    if (
+      !target ||
+      !analysis ||
+      !analysisLocation ||
+      !sampleProgram ||
+      !sampleLocation
+    )
+      return;
+    const gl = this.#gl;
+    const newest = this.#head;
+    const cur = (this.#head + HISTORY - 1) % HISTORY;
+    const prev = (this.#head + 1) % HISTORY;
+
+    // Score all three field matches in one draw, with one score per channel.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
+    gl.useProgram(analysis);
+    for (const [unit, texture] of [prev, cur, newest].entries()) {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, this.#textures[texture] ?? null);
+    }
+    gl.uniform1i(analysisLocation.prev, 0);
+    gl.uniform1i(analysisLocation.cur, 1);
+    gl.uniform1i(analysisLocation.next, 2);
+    gl.uniform2i(analysisLocation.size, this.#width, this.#height);
+    gl.uniform1i(analysisLocation.topFieldFirst, this.#topFieldFirst ? 1 : 0);
+    gl.viewport(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.readPixels(
+      0,
+      0,
+      ANALYSIS_WIDTH,
+      ANALYSIS_HEIGHT,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      target.pixels,
+    );
+
+    // fieldmatch classifies a frame by the densest overlapping 16 by 16 block
+    // whose comb mask remains set on three vertical pixels. Repeating that
+    // reduction here keeps the public threshold on FFmpeg's `combpel` scale.
+    const scores: [number, number, number] = [0, 0, 0];
+    for (let channel = 0; channel < 3; channel++) {
+      for (const yOffset of [0, 8]) {
+        for (const xOffset of [0, 8]) {
+          for (let blockY = yOffset; blockY < ANALYSIS_HEIGHT; blockY += 16) {
+            for (let blockX = xOffset; blockX < ANALYSIS_WIDTH; blockX += 16) {
+              let combed = 0;
+              for (
+                let y = Math.max(1, blockY);
+                y < Math.min(ANALYSIS_HEIGHT - 1, blockY + 16);
+                y++
+              ) {
+                for (
+                  let x = blockX;
+                  x < Math.min(ANALYSIS_WIDTH, blockX + 16);
+                  x++
+                ) {
+                  const offset = (y * ANALYSIS_WIDTH + x) * 4 + channel;
+                  if (
+                    target.pixels[offset - ANALYSIS_WIDTH * 4] === 255 &&
+                    target.pixels[offset] === 255 &&
+                    target.pixels[offset + ANALYSIS_WIDTH * 4] === 255
+                  )
+                    combed++;
+                }
+              }
+              const score = scores[channel] ?? 0;
+              scores[channel] = Math.max(score, combed);
+            }
+          }
+        }
+      }
+    }
+    // FFmpeg's default pc_n strategy selects between p and c first. The n
+    // candidate is a rescue match only when it removes substantially more
+    // combing, which keeps clean cadence from jumping ahead by one film frame.
+    let matchIndex = scores[0] < scores[1] ? 0 : 1;
+    if (
+      scores[2] * 3 < (scores[matchIndex] ?? Infinity) &&
+      scores[2] <= this.#filmCombThreshold
+    )
+      matchIndex = 2;
+    this.#match = (["p", "c", "n"] as const)[matchIndex] ?? "c";
+    this.#combScore = scores[matchIndex] ?? 0;
+    this.#cadenceFrame++;
+
+    // A reduced copy of the chosen weave identifies which position in the
+    // five-frame telecine cycle repeats the preceding film picture.
+    gl.useProgram(sampleProgram);
+    gl.uniform1i(sampleLocation.prev, 0);
+    gl.uniform1i(sampleLocation.cur, 1);
+    gl.uniform1i(sampleLocation.next, 2);
+    gl.uniform2i(sampleLocation.size, this.#width, this.#height);
+    gl.uniform1i(sampleLocation.topFieldFirst, this.#topFieldFirst ? 1 : 0);
+    gl.uniform1i(sampleLocation.match, matchIndex);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.readPixels(
+      0,
+      0,
+      ANALYSIS_WIDTH,
+      ANALYSIS_HEIGHT,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      target.pixels,
+    );
+    if (this.#previousFilmSample) {
+      let difference = 0;
+      for (let offset = 0; offset < target.pixels.length; offset += 4) {
+        difference += Math.abs(
+          (target.pixels[offset] ?? 0) -
+            (this.#previousFilmSample[offset] ?? 0),
+        );
+        difference += Math.abs(
+          (target.pixels[offset + 1] ?? 0) -
+            (this.#previousFilmSample[offset + 1] ?? 0),
+        );
+        difference += Math.abs(
+          (target.pixels[offset + 2] ?? 0) -
+            (this.#previousFilmSample[offset + 2] ?? 0),
+        );
+      }
+      this.#duplicateScores.push({
+        frame: this.#cadenceFrame,
+        score: difference / (ANALYSIS_WIDTH * ANALYSIS_HEIGHT * 3),
+      });
+      if (this.#duplicateScores.length > FILM_ENTER_FRAMES)
+        this.#duplicateScores.shift();
+    }
+    this.#previousFilmSample = target.pixels.slice();
+
+    // A film decision needs both clean field matches and one repeat position
+    // in each five-frame cycle. Low comb scores alone also occur in static
+    // interlaced video, where discarding an arbitrary frame would be unsafe.
+    if (this.#combScore <= this.#filmCombThreshold) {
+      this.#filmRun++;
+      this.#videoRun = 0;
+      if (this.#filmRun >= FILM_ENTER_FRAMES) {
+        const phaseScores = Array.from({ length: 5 }, () => ({
+          total: 0,
+          count: 0,
+        }));
+        for (const sample of this.#duplicateScores) {
+          const phase = phaseScores[sample.frame % 5];
+          if (!phase) continue;
+          phase.total += sample.score;
+          phase.count++;
+        }
+        const averages = phaseScores
+          .map((phase, index) => ({
+            index,
+            average: phase.count === 0 ? Infinity : phase.total / phase.count,
+          }))
+          .sort((first, second) => first.average - second.average);
+        const duplicate = averages[0];
+        const runnerUp = averages[1];
+        this.#duplicateScore = duplicate?.average ?? Infinity;
+        this.#duplicateRunnerUp = runnerUp?.average ?? Infinity;
+        // Ten analysed frames contain only nine differences. Wait until all
+        // five phases have two observations, so one quiet edit cannot choose
+        // a drop phase from a single sample.
+        const hasFullCadenceWindow = phaseScores.every(
+          (phase) => phase.count >= 2,
+        );
+        const hasFilmCadence =
+          hasFullCadenceWindow &&
+          duplicate !== undefined &&
+          runnerUp !== undefined &&
+          duplicate.average <= FILM_DUPLICATE_THRESHOLD &&
+          runnerUp.average >= Math.max(1, duplicate.average * 2);
+        if (hasFilmCadence) {
+          this.#dropPhase = duplicate.index;
+          if (this.#mode === "video") {
+            this.#mode = "film";
+            this.#filmNextAt = 0;
+            this.#queue.length = 0;
+          }
+        } else if (this.#mode === "film") {
+          // Clean progressive video also has little combing, but without one
+          // repeated phase it carries five distinct pictures. Return this
+          // frame to YADIF before a stale film phase discards any of them.
+          this.#resetFilm();
+        }
+      }
+      return;
+    }
+
+    // A high-comb match means the source carries distinct fields, so the
+    // current frame resumes the field-rate YADIF path with its motion intact.
+    this.#videoRun++;
+    this.#filmRun = 0;
+    if (this.#mode === "film" && this.#videoRun >= FILM_EXIT_FRAMES) {
+      this.#mode = "video";
+      this.#filmNextAt = 0;
+      this.#queue.length = 0;
+    }
+  }
+
+  /** Weave the selected film fields into an output texture and queue it. */
+  #filterFilm(at: number): void {
+    const slot = (this.#outputHead + 1) % OUTPUTS;
+    const output = this.#outputs[slot];
+    if (!output) return;
+    this.#outputHead = slot;
+    while (this.#queue.length > 0 && this.#queue[0]?.slot === slot) {
+      this.#queue.shift();
+      this.#stats.late++;
+    }
+    this.#renderFilm(output.framebuffer);
+    this.#queue.push({ slot, at });
+  }
+
+  /** Draw the selected p/c/n field weave into a full-size output texture. */
+  #renderFilm(target: WebGLFramebuffer): void {
+    const program = this.#filmWeave;
+    const location = this.#filmWeaveLocation;
+    if (!program || !location) return;
+    const gl = this.#gl;
+    const newest = this.#head;
+    const cur = (this.#head + HISTORY - 1) % HISTORY;
+    const prev = (this.#head + 1) % HISTORY;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target);
+    gl.useProgram(program);
+    for (const [unit, texture] of [prev, cur, newest].entries()) {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, this.#textures[texture] ?? null);
+    }
+    gl.uniform1i(location.prev, 0);
+    gl.uniform1i(location.cur, 1);
+    gl.uniform1i(location.next, 2);
+    gl.uniform2i(location.size, this.#width, this.#height);
+    gl.uniform1i(location.topFieldFirst, this.#topFieldFirst ? 1 : 0);
+    gl.uniform1i(
+      location.match,
+      this.#match === "p" ? 0 : this.#match === "c" ? 1 : 2,
+    );
+    gl.viewport(0, 0, this.#width, this.#height);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
   /**
    * Filter one field into an output texture and put it in the queue.
    *
@@ -732,7 +1211,8 @@ export class Deinterlacer {
   /** The loop that puts filtered fields up, and the only thing that draws. */
   #startLoop(): void {
     if (this.#loopHandle !== null) return;
-    if (!this.#running || this.#lost || !this.#doubleRate) return;
+    if (!this.#running || this.#lost || (!this.#doubleRate && !this.#autoFilm))
+      return;
     this.#lastLoopAt = 0;
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   }
@@ -745,7 +1225,8 @@ export class Deinterlacer {
 
   #onLoop = (now: DOMHighResTimeStamp): void => {
     this.#loopHandle = null;
-    if (!this.#running || this.#lost || !this.#doubleRate) return;
+    if (!this.#running || this.#lost || (!this.#doubleRate && !this.#autoFilm))
+      return;
     // Animation frames are as near as a page gets to seeing the screen, and
     // the gap between two of them is a refresh whenever neither was late.
     // Taking the shortest gap seen and letting it climb back slowly finds the
@@ -818,6 +1299,7 @@ export class Deinterlacer {
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.canvas.style.visibility = "visible";
+    this.#outputSinceReport++;
   }
 
   /**
@@ -848,10 +1330,17 @@ export class Deinterlacer {
       dropped: this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
       fps: (frames * 1000) / elapsed,
       frameMs: frames === 0 ? 0 : this.#msSinceReport / frames,
+      mode: this.#mode,
+      match: this.#match,
+      combScore: this.#combScore,
+      outputFps: (this.#outputSinceReport * 1000) / elapsed,
+      duplicateScore: this.#duplicateScore,
+      duplicateRunnerUp: this.#duplicateRunnerUp,
     });
     this.#reportedAt = at;
     this.#framesSinceReport = 0;
     this.#msSinceReport = 0;
+    this.#outputSinceReport = 0;
   }
 
   /** Take the newest frame into the ring. */
@@ -947,7 +1436,10 @@ export class Deinterlacer {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     // A picture filtered into a texture is not on the screen yet, and showing
     // the canvas for it would put up whatever was drawn on it last.
-    if (target === null) this.canvas.style.visibility = "visible";
+    if (target === null) {
+      this.canvas.style.visibility = "visible";
+      this.#outputSinceReport++;
+    }
   }
 
   /**
@@ -987,6 +1479,9 @@ export class Deinterlacer {
     this.#width = width;
     this.#height = height;
     this.#frames = 0;
+    // A coded-size change replaces every history texture. Restart cadence
+    // detection so no field match or duplicate phase spans two geometries.
+    this.#resetFilm();
     this.#layout();
     for (const texture of this.#textures) gl.deleteTexture(texture);
     this.#textures = [];
@@ -1015,7 +1510,61 @@ export class Deinterlacer {
       this.#textures.push(texture);
     }
     this.#freeOutputs();
-    if (this.#doubleRate) this.#allocateOutputs();
+    this.#freeAnalysisTarget();
+    if (this.#autoFilm) this.#allocateAnalysisTarget();
+    if (this.#doubleRate || this.#autoFilm) this.#allocateOutputs();
+  }
+
+  /** Allocate the fixed-size framebuffer used by both cadence passes. */
+  #allocateAnalysisTarget(): void {
+    if (this.#analysisTarget) return;
+    const gl = this.#gl;
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      ANALYSIS_WIDTH,
+      ANALYSIS_HEIGHT,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      null,
+    );
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      texture,
+      0,
+    );
+    const complete =
+      gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!complete) {
+      gl.deleteFramebuffer(framebuffer);
+      gl.deleteTexture(texture);
+      return;
+    }
+    this.#analysisTarget = {
+      texture,
+      framebuffer,
+      pixels: new Uint8Array(ANALYSIS_WIDTH * ANALYSIS_HEIGHT * 4),
+    };
+  }
+
+  #freeAnalysisTarget(): void {
+    if (!this.#analysisTarget) return;
+    this.#gl.deleteFramebuffer(this.#analysisTarget.framebuffer);
+    this.#gl.deleteTexture(this.#analysisTarget.texture);
+    this.#analysisTarget = null;
   }
 
   /**
@@ -1121,6 +1670,7 @@ export class Deinterlacer {
     this.#queue.length = 0;
     this.#clocked = false;
     this.#periodMs = 0;
+    this.#resetFilm();
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
     this.#resetStats();
@@ -1140,6 +1690,25 @@ export class Deinterlacer {
     this.#lastFrameAt = 0;
     this.#framesSinceReport = 0;
     this.#msSinceReport = 0;
+    this.#outputSinceReport = 0;
+  }
+
+  /** Return cadence detection to the conservative field-rate render path. */
+  #resetFilm(): void {
+    this.#queue.length = 0;
+    this.#clocked = false;
+    this.#mode = "video";
+    this.#match = "c";
+    this.#combScore = 0;
+    this.#filmRun = 0;
+    this.#videoRun = 0;
+    this.#cadenceFrame = 0;
+    this.#dropPhase = 0;
+    this.#filmNextAt = 0;
+    this.#previousFilmSample = null;
+    this.#duplicateScores = [];
+    this.#duplicateScore = Infinity;
+    this.#duplicateRunnerUp = Infinity;
   }
 
   /**
