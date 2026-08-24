@@ -1,9 +1,19 @@
 {
-  "name": "mpeg2toh264-workspace",
+  "name": "mpeg2toh264",
   "version": "0.0.1",
   "description": "Browser packages for the mpeg2toh264 transcoder",
   "type": "module",
   "private": true,
+  "exports": {
+    "./player": {
+      "types": "./packages/player/dist/index.d.ts",
+      "import": "./packages/player/dist/index.js"
+    },
+    "./yadif": {
+      "types": "./packages/yadif/dist/index.d.ts",
+      "import": "./packages/yadif/dist/index.js"
+    }
+  },
   "workspaces": [
     "packages/*"
   ],

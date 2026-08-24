@@ -1,3 +1,5 @@
+/// <reference types="vite/client" />
+
 /**
  * The page's half: a media element, a worker, and the wiring between them.
  *
@@ -31,6 +33,10 @@ import {
   type Timing,
   type TimingMark,
 } from "./protocol.js";
+import bundledWorkerURL from "./worker.ts?worker&url";
+
+/** The Worker URL emitted with this package for consumers that re-bundle the player. */
+const mpeg2TsPlayerWorkerURL = bundledWorkerURL;
 
 /**
  * How far from the edge of a buffered range still counts as being at it.
@@ -74,6 +80,8 @@ export type PlayerDeinterlacerFactory = (
 export interface Mpeg2TsPlayerOptions {
   /** Where the `.wasm` is. Defaults to the copy sitting beside the worker. */
   wasmUrl?: string | URL;
+  /** Where the module Worker is. Defaults to the copy emitted beside this package. */
+  workerUrl?: string | URL;
   /**
    * Which side runs MediaSource. `'auto'` takes the worker wherever the
    * browser has MSE in Workers, and the page otherwise.
@@ -611,9 +619,12 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #ensureWorker(): Worker {
     if (!this.#worker) {
-      const worker = new Worker(new URL("./worker.ts", import.meta.url), {
-        type: "module",
-      });
+      const worker = new Worker(
+        this.#options.workerUrl ?? mpeg2TsPlayerWorkerURL,
+        {
+          type: "module",
+        },
+      );
       worker.onmessage = this.#onMessage;
       worker.onerror = (event) =>
         this.#fail(new Error(event.message || "the worker failed"));

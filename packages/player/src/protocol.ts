@@ -215,8 +215,8 @@ export type Command =
   | { type: "stop"; id: number };
 
 export type Notification =
-  /** Attach this to the media element. Worker-sink loads only. */
   | {
+      /** Attach this to the media element. Worker-sink loads only. */
       type: "handle";
       id: number;
       handle: MediaSourceHandle;
@@ -273,12 +273,12 @@ export type Notification =
    * converted. Sent once the program tables have been read, and again after a
    * seek re-reads them.
    */
+  | { type: "services"; id: number; services: Services }
   /**
    * How many picture workers came up, which is zero where this browser would
    * not have them and the conversion runs in one worker as before.
    */
   | { type: "workers"; id: number; pictureWorkers: number }
-  | { type: "services"; id: number; services: Services }
   /**
    * What sound the programme is carrying and which of it is being taken. Sent
    * once the program map has been read, and again whenever either changes --
@@ -303,10 +303,9 @@ export type Notification =
  * the browser's -- and either can be the slow one, so the names cover both:
  * everything up to `opened` is the worker's, and the rest is the media
  * element saying what it made of what it was given. A seek starts the sequence
- * again from `seek`.
+ * again from `seek`. The `load` mark is emitted when the worker takes the load.
  */
 export type TimingMark =
-  /** The worker took the load. */
   | "load"
   /** The WebAssembly module is instantiated. Only the first load pays this. */
   | "wasm"

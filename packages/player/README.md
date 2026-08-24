@@ -17,6 +17,7 @@ await player.load('https://example.com/video.ts');
 `Mpeg2TsPlayer`の第2引数で次を指定できます。
 
 - `wasmUrl`: WASMファイルのURL
+- `workerUrl`: モジュール Worker の URL。既定ではパッケージと同時に出力された Worker を使う
 - `mediaSource`: MSEを`worker`と`main`のどちらで動かすか。既定の`auto`はブラウザー機能から選ぶ
 - `preferManagedMediaSource`: `MediaSource`と`ManagedMediaSource`の両方があるブラウザーで後者を使う。`MediaSource`がないiPhoneではこの指定によらず`ManagedMediaSource`を使うため、指定は主に他の環境での動作確認用。`requiresManagedMediaSource()`でそのブラウザーに`ManagedMediaSource`しかないかを判定できる
 - `oversample`: 変換時の量子化刻み
