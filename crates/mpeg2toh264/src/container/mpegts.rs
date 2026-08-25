@@ -9,6 +9,7 @@ const TS_PACKET_SIZE: usize = 188;
 const SYNC_BYTE: u8 = 0x47;
 const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
+const MIN_SYNC_COUNT: usize = 6;
 
 /// The body of the first descriptor carrying this tag, without its own two
 /// bytes of tag and length.
@@ -105,7 +106,7 @@ impl AudioStream {
     }
 }
 
-fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
+fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<PrivateStream> {
     let caption = streams
         .iter()
         .find(|(_, tag)| matches!(tag, Some(0x30 | 0x87)))
@@ -114,7 +115,10 @@ fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
                 .iter()
                 .find(|(_, tag)| matches!(tag, Some(0x30..=0x37 | 0x87)))
         })
-        .map(|(pid, _)| *pid);
+        .map(|(pid, _)| PrivateStream {
+            is_async: false,
+            pid: *pid,
+        });
     let superimpose = streams
         .iter()
         .find(|(_, tag)| matches!(tag, Some(0x38 | 0x88)))
@@ -123,7 +127,10 @@ fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
                 .iter()
                 .find(|(_, tag)| matches!(tag, Some(0x38..=0x3f | 0x88)))
         })
-        .map(|(pid, _)| *pid);
+        .map(|(pid, _)| PrivateStream {
+            is_async: true,
+            pid: *pid,
+        });
 
     let mut selected = Vec::new();
     selected.extend(caption);
@@ -134,6 +141,7 @@ fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
 #[cfg(test)]
 mod private_stream_tests {
     use super::select_private_streams;
+    use super::PrivateStream;
 
     #[test]
     fn prefers_default_caption_and_superimpose_component_tags() {
@@ -143,7 +151,19 @@ mod private_stream_tests {
             (0x130, Some(0x30)),
             (0x138, Some(0x38)),
         ];
-        assert_eq!(select_private_streams(streams), [0x130, 0x138]);
+        assert_eq!(
+            select_private_streams(streams),
+            [
+                PrivateStream {
+                    is_async: false,
+                    pid: 0x130
+                },
+                PrivateStream {
+                    is_async: true,
+                    pid: 0x138
+                }
+            ]
+        );
     }
 
     #[test]
@@ -154,7 +174,19 @@ mod private_stream_tests {
             (0x13a, Some(0x3a)),
             (0x139, Some(0x39)),
         ];
-        assert_eq!(select_private_streams(streams), [0x132, 0x13a]);
+        assert_eq!(
+            select_private_streams(streams),
+            [
+                PrivateStream {
+                    is_async: false,
+                    pid: 0x132
+                },
+                PrivateStream {
+                    is_async: true,
+                    pid: 0x13a
+                }
+            ]
+        );
     }
 
     #[test]
@@ -183,15 +215,6 @@ impl ElementaryKind {
             Self::PrivateStream2 => stream_id == 0xbf,
         }
     }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Video => "video",
-            Self::Audio => "audio",
-            Self::PrivateStream1 => "private_stream_1",
-            Self::PrivateStream2 => "private_stream_2",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -204,16 +227,16 @@ pub struct ElementaryPacket {
     /// stream, so this is what puts the two tracks on a common timeline.
     pub pts: Option<u64>,
     /// Bytes belonging to this elementary stream were lost before this PES.
-    /// Stateful parsers must discard any unfinished access unit before reading
-    /// this packet, since its first bytes cannot complete the old unit.
+    /// Stateful parsers discard unfinished access units before reading it.
     pub discontinuity: bool,
-    /// The preceding PES itself lost bytes, so a video parser must also drop
-    /// the unfinished GOP it was assembling before reading this packet.
+    /// The preceding PES itself lost bytes, so video parsing also discards the
+    /// unfinished GOP before reading this packet.
     pub damaged_previous_pes: bool,
 }
 
 struct TsPayload<'a> {
     pid: u16,
+    transport_error_indicator: bool,
     has_payload: bool,
     payload_unit_start: bool,
     continuity_counter: u8,
@@ -225,7 +248,7 @@ struct TsPayload<'a> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContinuityChange {
     None,
-    /// A retransmitted packet repeats the preceding continuity counter.
+    /// A retransmitted packet repeats the preceding accepted payload.
     Duplicate,
     /// A discontinuity marker opened a new time base.
     Reset,
@@ -244,15 +267,10 @@ struct ContinuityState {
 }
 
 impl ContinuityState {
-    /// Reuse the preceding payload allocation while retaining accepted bytes for retransmission checks.
+    /// Retain accepted bytes so a later retransmission can be distinguished
+    /// from different data that reused the same continuity counter.
     fn from_packet(packet: &TsPayload<'_>, accepted: bool, previous: Option<Self>) -> Self {
-        let mut state = previous.unwrap_or_else(|| Self {
-            counter: 0,
-            payload_unit_start: false,
-            scrambled: false,
-            data: Vec::new(),
-            accepted: false,
-        });
+        let mut state = previous.unwrap_or_default();
         state.counter = packet.continuity_counter;
         state.payload_unit_start = packet.payload_unit_start;
         state.scrambled = packet.scrambled;
@@ -264,7 +282,6 @@ impl ContinuityState {
         state
     }
 
-    /// Whether the current packet repeats the payload already handed downstream.
     fn is_duplicate(&self, packet: &TsPayload<'_>) -> bool {
         self.counter == packet.continuity_counter
             && self.payload_unit_start == packet.payload_unit_start
@@ -274,21 +291,18 @@ impl ContinuityState {
 }
 
 /// Find the first packet boundary, by requiring several sync bytes 188 apart.
-fn sync_offset(data: &[u8]) -> Option<usize> {
+fn sync_offset(data: &[u8], min_sync_count: usize) -> Option<usize> {
     for offset in 0..TS_PACKET_SIZE.min(data.len()) {
-        if data[offset] != SYNC_BYTE {
-            continue;
-        }
         let mut matches = 0;
         let mut at = offset;
-        while at < data.len() && matches < 4 {
+        while at < data.len() && matches < min_sync_count {
             if data[at] != SYNC_BYTE {
                 break;
             }
             matches += 1;
             at += TS_PACKET_SIZE;
         }
-        if matches >= 4.min((data.len() - offset) / TS_PACKET_SIZE) {
+        if matches >= min_sync_count {
             return Some(offset);
         }
     }
@@ -296,23 +310,21 @@ fn sync_offset(data: &[u8]) -> Option<usize> {
 }
 
 pub fn is_mpeg_transport_stream(data: &[u8]) -> bool {
-    data.len() >= TS_PACKET_SIZE && sync_offset(data).is_some()
+    data.len() >= TS_PACKET_SIZE * MIN_SYNC_COUNT && sync_offset(data, MIN_SYNC_COUNT).is_some()
 }
 
-fn payload_at(data: &[u8], at: usize) -> Result<TsPayload<'_>> {
+fn payload_at(data: &[u8], at: usize) -> Option<TsPayload<'_>> {
     if data[at] != SYNC_BYTE {
-        bail!("MPEG-TS sync lost at byte {at}");
+        return None;
     }
-    if data[at + 1] & 0x80 != 0 {
-        bail!("MPEG-TS transport error at byte {at}");
-    }
+    let transport_error_indicator = data[at + 1] & 0x80 != 0;
     let payload_unit_start = data[at + 1] & 0x40 != 0;
     let scrambled = data[at + 3] >> 6 != 0;
     let continuity_counter = data[at + 3] & 0x0f;
     let pid = (((data[at + 1] & 0x1f) as u16) << 8) | data[at + 2] as u16;
     let adaptation_control = (data[at + 3] >> 4) & 3;
     if adaptation_control == 0 {
-        bail!("invalid adaptation_field_control at byte {at}");
+        return None;
     }
     let has_payload = adaptation_control & 1 != 0;
     let mut payload = at + 4;
@@ -325,10 +337,11 @@ fn payload_at(data: &[u8], at: usize) -> Result<TsPayload<'_>> {
     }
     let end = at + TS_PACKET_SIZE;
     if payload > end {
-        bail!("invalid MPEG-TS adaptation field at byte {at}");
+        return None;
     }
-    Ok(TsPayload {
+    Some(TsPayload {
         pid,
+        transport_error_indicator,
         has_payload,
         payload_unit_start,
         continuity_counter,
@@ -390,7 +403,13 @@ struct DeferredProgram {
     video: Option<u16>,
     audio: Option<u16>,
     audio_streams: Vec<AudioStream>,
-    private: Vec<u16>,
+    private_streams: Vec<PrivateStream>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct PrivateStream {
+    is_async: bool,
+    pid: u16,
 }
 
 /// The elementary stream PIDs a program advertises.
@@ -425,20 +444,10 @@ struct ProgramMap {
     /// Every sound stream the chosen service's map advertises, in the order it
     /// lists them.
     audio_streams: Vec<AudioStream>,
-    private_pids: Vec<u16>,
+    private_streams: Vec<PrivateStream>,
     /// Every service seen in the program association table, in the order they
     /// were announced.
     services: Vec<u16>,
-    /// Whether the streams may still be changed, which they may until the
-    /// first of their packets has been handed on.
-    may_switch_streams: bool,
-    /// Set when a scan moved to a service with different streams, so that what
-    /// was gathered from the old ones can be thrown away.
-    changed_streams: bool,
-    /// Set when the service being read moved its own streams to other PIDs.
-    /// What was gathered from the old ones is the end of the same programme,
-    /// so it goes out rather than being thrown away.
-    moved_streams: bool,
     all_service_pids: HashMap<u16, Vec<u16>>,
     changed_pids: HashSet<u16>,
     assemblers: HashMap<u16, SectionAssembler>,
@@ -458,11 +467,8 @@ impl Default for ProgramMap {
             audio_pid: None,
             wanted_audio: None,
             audio_streams: Vec::new(),
-            private_pids: Vec::new(),
+            private_streams: Vec::new(),
             services: Vec::new(),
-            may_switch_streams: true,
-            changed_streams: false,
-            moved_streams: false,
             all_service_pids: HashMap::new(),
             changed_pids: HashSet::new(),
             assemblers: HashMap::new(),
@@ -478,7 +484,7 @@ impl ProgramMap {
             self.video_pid = deferred.video;
             self.audio_pid = deferred.audio;
             self.audio_streams = deferred.audio_streams;
-            self.private_pids = deferred.private;
+            self.private_streams = deferred.private_streams;
         }
     }
 
@@ -595,7 +601,7 @@ impl ProgramMap {
                 .wanted_audio
                 .filter(|wanted| audio_streams.iter().any(|stream| stream.pid == *wanted))
                 .or_else(|| audio_streams.first().map(|stream| stream.pid));
-            let private = select_private_streams(private);
+            let private_streams = select_private_streams(private);
             all_pids.sort_unstable();
             all_pids.dedup();
             let old = self
@@ -649,58 +655,27 @@ impl ProgramMap {
                         video,
                         audio,
                         audio_streams,
-                        private,
+                        private_streams,
                     });
                 }
                 return;
-            }
-            // Moving to a better-placed service is free while it names the
-            // streams already being read -- which is what an accompanying data
-            // service does -- and is only a matter of calling them by the right
-            // name. Where it names different ones, the packets gathered so far
-            // belong to the wrong programme and have to go, so it is only worth
-            // doing before any of them have been handed on.
-            let same_streams =
-                self.video_pid == video && self.audio_pid == audio && self.private_pids == private;
-            // Unless the service saying so is the one being read. A station
-            // that leaves a multi-channel block sends a new version of its own
-            // program map naming different elementary PIDs -- in Japan the
-            // standard-definition sub-channel's video gives way to the
-            // high-definition one -- and that is the same programme carrying
-            // on, not another one being spliced onto it. Refusing it stops the
-            // video where the map changed. The lock is against being pulled
-            // onto a *different* service once its packets have gone out, and
-            // that is left alone.
-            let continues_this_service = self.service == Some(service);
-            if self.service.is_some()
-                && !same_streams
-                && !self.may_switch_streams
-                && !continues_this_service
-            {
-                return;
-            }
-            if !same_streams && self.service.is_some() {
-                if continues_this_service {
-                    self.moved_streams = true;
-                } else {
-                    self.changed_streams = true;
-                }
             }
             self.service = Some(service);
             self.rank = rank;
             self.video_pid = video;
             self.audio_pid = audio;
             self.audio_streams = audio_streams;
-            self.private_pids = private;
+            self.private_streams = private_streams;
         }
     }
 }
 
-/// The 33-bit presentation timestamp, in 90 kHz units, or `None` when the PES
-/// packet carries none. It is spread over five bytes with a marker bit after
-/// every group (clause 2.4.3.7).
 fn pes_pts(packet: &[u8]) -> Option<u64> {
-    if packet.len() < 14 || packet[6] & 0xc0 != 0x80 || packet[7] & 0x80 == 0 {
+    if packet.len() < 14 {
+        return None;
+    } else if packet[3] == 0xbf {
+        return None;
+    } else if packet[6] & 0xc0 != 0x80 || packet[7] & 0x80 == 0 {
         return None;
     }
     Some(
@@ -712,13 +687,13 @@ fn pes_pts(packet: &[u8]) -> Option<u64> {
     )
 }
 
-fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
+fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Option<&[u8]> {
     if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 || packet[2] != 1 {
-        bail!("invalid MPEG-TS {} PES start code", kind.name());
+        return None;
     }
     let stream_id = packet[3];
     if !kind.accepts_stream_id(stream_id) {
-        bail!("unexpected {} stream_id 0x{stream_id:02x}", kind.name());
+        return None;
     }
     let pes_length = ((packet[4] as usize) << 8) | packet[5] as usize;
     let start = if kind == ElementaryKind::PrivateStream2 {
@@ -734,19 +709,19 @@ fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
             start += 1;
         }
         let Some(&first) = packet.get(start) else {
-            bail!("truncated MPEG-1 PES header");
+            return None;
         };
         if first & 0xc0 == 0x40 {
             start += 2;
         }
         let Some(&marker) = packet.get(start) else {
-            bail!("truncated MPEG-1 PES header");
+            return None;
         };
         match marker & 0xf0 {
             0x20 => start += 5,
             0x30 => start += 10,
             _ if marker == 0x0f => start += 1,
-            _ => bail!("invalid MPEG-1 PES header"),
+            _ => return None,
         }
         start
     };
@@ -756,9 +731,16 @@ fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
         packet.len().min(6 + pes_length)
     };
     if start > end {
-        bail!("truncated MPEG-TS {} PES header", kind.name());
+        return None;
     }
-    Ok(&packet[start..end])
+    Some(&packet[start..end])
+}
+
+fn pes_packet_length(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 || packet[2] != 1 {
+        return None;
+    }
+    return Some(((packet[4] as usize) << 8) | packet[5] as usize);
 }
 
 /// Whether a packet payload opens a PES packet of the given kind. A payload
@@ -776,9 +758,6 @@ fn is_pes_start(packet: &[u8], kind: ElementaryKind) -> bool {
 #[derive(Default)]
 struct PesState {
     parts: Vec<u8>,
-    collecting: bool,
-    /// Timestamp of the accompanying media when this private PES began.
-    fallback_pts: Option<u64>,
     /// Whether the next complete PES follows a transport-stream continuity gap.
     discontinuity_before: bool,
     /// Whether packet loss cut the preceding PES rather than falling between PES packets.
@@ -800,19 +779,18 @@ impl PesState {
         kind: ElementaryKind,
         pid: u16,
         output: &mut Vec<ElementaryPacket>,
-    ) -> Result<()> {
+        fallback_pts: Option<u64>,
+    ) {
         if self.parts.is_empty() {
-            return Ok(());
+            return;
         }
-        let packet = std::mem::take(&mut self.parts);
-        let data = pes_payload(&packet, kind)?.to_vec();
-        let pts = match kind {
-            ElementaryKind::PrivateStream2 => self.fallback_pts,
-            ElementaryKind::PrivateStream1 if data.first() == Some(&0x81) => {
-                pes_pts(&packet).or(self.fallback_pts)
-            }
-            _ => pes_pts(&packet),
+        let Some(data) = pes_payload(&self.parts, kind) else {
+            self.parts.clear();
+            return;
         };
+        let data = data.to_vec();
+        let pts = pes_pts(&self.parts).or(fallback_pts);
+        self.parts.clear();
         output.push(ElementaryPacket {
             kind,
             pid,
@@ -821,30 +799,62 @@ impl PesState {
             discontinuity: std::mem::take(&mut self.discontinuity_before),
             damaged_previous_pes: std::mem::take(&mut self.damaged_before),
         });
-        self.collecting = false;
-        self.fallback_pts = None;
-        Ok(())
     }
 
     /// Forget a PES cut by packet loss and mark the first complete replacement.
     fn discard_at_discontinuity(&mut self) {
         self.parts.clear();
-        self.collecting = false;
-        self.fallback_pts = None;
         self.discontinuity_before = true;
         self.damaged_before = true;
     }
+
+    fn push(
+        &mut self,
+        kind: ElementaryKind,
+        pid: u16,
+        payload: &TsPayload,
+        continuity_change: ContinuityChange,
+        output: &mut Vec<ElementaryPacket>,
+        fallback_pts: Option<u64>,
+    ) {
+        if payload.payload_unit_start {
+            let was_previous_pes_incomplete = self.is_declared_pes_incomplete();
+            let was_previous_pes_damaged = match continuity_change {
+                ContinuityChange::Loss => true,
+                ContinuityChange::Reset => was_previous_pes_incomplete,
+                ContinuityChange::None | ContinuityChange::Duplicate => false,
+            };
+            // A partially received PES may still contain complete video units
+            // or AAC frames, so hand its usable prefix to the stateful parser.
+            if !self.parts.is_empty() {
+                self.flush(kind, pid, output, fallback_pts);
+            }
+            if continuity_change != ContinuityChange::None {
+                self.discontinuity_before = true;
+                self.damaged_before |= was_previous_pes_damaged;
+            }
+        } else if continuity_change == ContinuityChange::Loss {
+            self.discard_at_discontinuity();
+            return;
+        } else if continuity_change == ContinuityChange::Reset {
+            // A clean marker within one PES changes the transport time base
+            // while leaving all elementary-stream bytes intact.
+            self.discontinuity_before = true;
+        }
+        self.parts.extend_from_slice(payload.data);
+        if let Some(length) = pes_packet_length(&self.parts) {
+            if length == 0 {
+            } else if length + 6 == self.parts.len() {
+                self.flush(kind, pid, output, fallback_pts);
+            } else if length + 6 < self.parts.len() {
+                self.parts.clear();
+            }
+        }
+    }
 }
 
-/// A stream the programme has moved off but which is still sending.
-///
-/// A multiplexer does not cut the old stream where the program map changes: it
-/// keeps sending for a fraction of a second, and the stream that replaces it
-/// has not started yet. Everything in between is the programme, so it is read
-/// until the new one's first packet -- a third of a second of picture and
-/// sound, on the recording this was measured against. Its own PES state,
-/// because the two can overlap in the multiplex and a shared one would
-/// interleave them.
+/// A stream the chosen service has moved off but which is still sending.
+/// Its state remains separate because old and new PIDs may overlap briefly.
 struct Superseded {
     pid: u16,
     state: PesState,
@@ -855,12 +865,10 @@ struct Superseded {
 #[derive(Default)]
 pub struct MpegTsAvDemuxer {
     pending: Vec<u8>,
-    synced: bool,
+    unsynced: bool,
     program: ProgramMap,
     video: PesState,
     audio: PesState,
-    /// The streams the programme has moved off, still being read; see
-    /// [`Superseded`].
     superseded_video: Option<Superseded>,
     superseded_audio: Option<Superseded>,
     /// A sound stream the caller has asked to be read instead, which takes
@@ -954,25 +962,10 @@ impl MpegTsAvDemuxer {
         }
     }
 
-    /// Move to the sound stream [`Self::select_audio`] asked for, at a packet
-    /// boundary rather than in the middle of one.
-    ///
-    /// What has been gathered from the stream being left goes out under its own
-    /// PID, so that whoever is reading the access units sees where one stream
-    /// ended and the next began. Joined instead, the two would make one access
-    /// unit belonging to neither -- which a browser's audio decoder refuses
-    /// outright rather than concealing, and that ends playback.
-    fn take_audio_switch(&mut self, output: &mut Vec<ElementaryPacket>) -> Result<()> {
+    fn take_audio_switch(&mut self) -> Result<()> {
         let Some(pid) = self.audio_switch.take() else {
             return Ok(());
         };
-        if let Some(mut old) = self.superseded_audio.take() {
-            old.state
-                .flush(ElementaryKind::Audio, old.pid, &mut *output)?;
-        }
-        if let Some(old) = self.program.audio_pid {
-            self.audio.flush(ElementaryKind::Audio, old, &mut *output)?;
-        }
         self.audio = PesState::default();
         self.program.audio_pid = Some(pid);
         self.audio_pts = None;
@@ -981,7 +974,7 @@ impl MpegTsAvDemuxer {
 
     /// ARIB character superimpose is timed by the accompanying audio PES, or
     /// by video when the service has no audio. Its own PES commonly has no PTS.
-    fn superimpose_pts(&self) -> Option<u64> {
+    fn fallback_pts(&self) -> Option<u64> {
         if self.program.audio_pid.is_some() {
             self.audio_pts
         } else {
@@ -994,241 +987,224 @@ impl MpegTsAvDemuxer {
         let input = std::mem::take(&mut self.pending);
 
         let mut at = 0;
-        if !self.synced {
-            match sync_offset(&input) {
-                Some(offset) => {
-                    at = offset;
-                    self.synced = true;
-                }
-                None => {
-                    self.pending = input;
-                    return Ok(Vec::new());
-                }
-            }
-        }
-
         let mut output = Vec::new();
-        self.take_audio_switch(&mut output)?;
+        self.take_audio_switch()?;
         let mut sections = Vec::new();
         while at + TS_PACKET_SIZE <= input.len() {
-            let packet_offset = at;
-            at += TS_PACKET_SIZE;
-            match payload_at(&input, packet_offset) {
-                Err(_) => {
-                    self.errors += 1;
+            if input[at] != 0x47 || self.unsynced {
+                if input[at..].len() < TS_PACKET_SIZE * MIN_SYNC_COUNT {
+                    break;
                 }
-                Ok(packet) if !packet.has_payload => {
-                    // An adaptation-only marker anchors the counter of the new
-                    // run even though it contributes no elementary-stream bytes.
-                    if packet.discontinuity {
-                        self.continuity.entry(packet.pid).or_default().counter =
-                            packet.continuity_counter;
-                        self.pending_discontinuities.insert(packet.pid);
+                match sync_offset(&input[at..], MIN_SYNC_COUNT) {
+                    Some(offset) => {
+                        at += offset;
+                        self.unsynced = false;
                     }
-                }
-                Ok(packet) if packet.scrambled => {
-                    if self.note_continuity(&packet) == ContinuityChange::Duplicate {
+                    None => {
+                        at += TS_PACKET_SIZE * MIN_SYNC_COUNT;
+                        self.unsynced = true;
                         continue;
-                    }
-                    // A skipped payload leaves the PES on either side unrelated,
-                    // so the next payload-unit start becomes the new assembly point.
-                    self.discard_partial(packet.pid);
-                    self.scrambled += 1;
-                }
-                Ok(packet) => {
-                    let continuity_change = self.note_continuity(&packet);
-                    // Transport retransmission repeats bytes already accepted;
-                    // periodic PAT and PMT cycles advance their own counters.
-                    if continuity_change == ContinuityChange::Duplicate {
-                        continue;
-                    }
-                    if continuity_change == ContinuityChange::Loss && !packet.payload_unit_start {
-                        // Bytes after a continuity hole are the tail of a PES whose
-                        // middle is gone. Keeping its head would manufacture a valid-
-                        // looking AAC frame or video slice that a decoder later rejects.
-                        self.discard_partial(packet.pid);
-                    }
-                    if self.program.wants(packet.pid) {
-                        // Which streams the programme was being read from, in
-                        // case its map moves it to others: what is half
-                        // gathered from these belongs to them and not to
-                        // whatever the new PIDs carry.
-                        let previous = (self.program.video_pid, self.program.audio_pid);
-                        let changed_pids = self.program.push(&packet, &mut sections);
-                        for pid in changed_pids {
-                            self.continuity.remove(&pid);
-                        }
-                        if std::mem::take(&mut self.program.moved_streams) {
-                            // The same programme, carried by other streams from
-                            // here on. The old ones are still sending, and what
-                            // they send until the new ones start belongs to the
-                            // programme too, so they are read on until then --
-                            // with what has been gathered from them so far.
-                            if previous.0 != self.program.video_pid {
-                                self.superseded_video = previous.0.map(|pid| Superseded {
-                                    pid,
-                                    state: std::mem::take(&mut self.video),
-                                });
-                            }
-                            if previous.1 != self.program.audio_pid {
-                                self.superseded_audio = previous.1.map(|pid| Superseded {
-                                    pid,
-                                    state: std::mem::take(&mut self.audio),
-                                });
-                            }
-                            for (pid, state) in self.private.iter_mut() {
-                                if self.program.private_pids.contains(pid) {
-                                    continue;
-                                }
-                                // Which of the two private streams this is, read
-                                // where the ordinary path reads it: out of the
-                                // PES header already gathered.
-                                let kind = match state.parts.get(3) {
-                                    Some(0xbf) => ElementaryKind::PrivateStream2,
-                                    _ => ElementaryKind::PrivateStream1,
-                                };
-                                state.flush(kind, *pid, &mut output)?;
-                            }
-                            self.private
-                                .retain(|pid, _| self.program.private_pids.contains(pid));
-                            self.video_pts = None;
-                            self.audio_pts = None;
-                        }
-                        if std::mem::take(&mut self.program.changed_streams) {
-                            // The streams belong to a different programme now, and
-                            // what was gathered from the old ones is not the start
-                            // of anything.
-                            self.video = PesState::default();
-                            self.audio = PesState::default();
-                            self.private.clear();
-                            self.video_pts = None;
-                            self.audio_pts = None;
-                        }
-                    }
-                    // Whether this packet belongs to a stream the programme has
-                    // moved off, which is read into its own state until the one
-                    // that replaced it starts.
-                    let mut superseded = false;
-                    let kind = if Some(packet.pid) == self.program.video_pid {
-                        // The old stream's last access unit goes out in front of
-                        // the new stream's first bytes, which is here.
-                        if let Some(mut old) = self.superseded_video.take() {
-                            old.state
-                                .flush(ElementaryKind::Video, old.pid, &mut output)?;
-                        }
-                        Some(ElementaryKind::Video)
-                    } else if Some(packet.pid) == self.program.audio_pid {
-                        if let Some(mut old) = self.superseded_audio.take() {
-                            old.state
-                                .flush(ElementaryKind::Audio, old.pid, &mut output)?;
-                        }
-                        Some(ElementaryKind::Audio)
-                    } else if self
-                        .superseded_video
-                        .as_ref()
-                        .is_some_and(|old| old.pid == packet.pid)
-                    {
-                        superseded = true;
-                        Some(ElementaryKind::Video)
-                    } else if self
-                        .superseded_audio
-                        .as_ref()
-                        .is_some_and(|old| old.pid == packet.pid)
-                    {
-                        superseded = true;
-                        Some(ElementaryKind::Audio)
-                    } else if self.program.private_pids.contains(&packet.pid) {
-                        let stream_id = if packet.payload_unit_start {
-                            packet.data.get(3)
-                        } else {
-                            self.private
-                                .get(&packet.pid)
-                                .and_then(|state| state.parts.get(3))
-                        };
-                        stream_id.and_then(|stream_id| match stream_id {
-                            0xbd => Some(ElementaryKind::PrivateStream1),
-                            0xbf => Some(ElementaryKind::PrivateStream2),
-                            _ => None,
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(kind) = kind {
-                        if packet.payload_unit_start {
-                            match kind {
-                                ElementaryKind::Video => {
-                                    if let Some(pts) = pes_pts(packet.data) {
-                                        self.video_pts = Some(pts);
-                                    }
-                                }
-                                ElementaryKind::Audio => {
-                                    if let Some(pts) = pes_pts(packet.data) {
-                                        self.audio_pts = Some(pts);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        let superimpose_pts = self.superimpose_pts();
-                        let state = match (kind, superseded) {
-                            (ElementaryKind::Video, false) => &mut self.video,
-                            (ElementaryKind::Audio, false) => &mut self.audio,
-                            (ElementaryKind::Video, true) => {
-                                &mut self.superseded_video.as_mut().expect("just matched").state
-                            }
-                            (ElementaryKind::Audio, true) => {
-                                &mut self.superseded_audio.as_mut().expect("just matched").state
-                            }
-                            (
-                                ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2,
-                                _,
-                            ) => self.private.entry(packet.pid).or_default(),
-                        };
-                        if packet.payload_unit_start {
-                            // A counter gap proves packet loss even where video uses
-                            // an unbounded PES. An explicit reset may instead mark a
-                            // clean recording join, so only a short bounded PES turns
-                            // that reset into proof that the preceding payload was cut.
-                            let was_previous_pes_damaged = match continuity_change {
-                                ContinuityChange::Loss => true,
-                                ContinuityChange::Reset => state.is_declared_pes_incomplete(),
-                                ContinuityChange::None | ContinuityChange::Duplicate => false,
-                            };
-                            let previous_kind = match state.parts.get(3) {
-                                Some(0xbd) => ElementaryKind::PrivateStream1,
-                                Some(0xbf) => ElementaryKind::PrivateStream2,
-                                _ => kind,
-                            };
-                            state.flush(previous_kind, packet.pid, &mut output)?;
-                            // An AAC access unit may cross even a clean PES boundary,
-                            // while video needs the stronger proof above before its
-                            // pending GOP is discarded.
-                            if continuity_change != ContinuityChange::None {
-                                state.discontinuity_before = true;
-                                state.damaged_before = was_previous_pes_damaged;
-                            }
-                            state.collecting = is_pes_start(packet.data, kind);
-                            if matches!(
-                                kind,
-                                ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2
-                            ) {
-                                state.fallback_pts = superimpose_pts;
-                            }
-                        }
-                        if state.collecting {
-                            state.parts.extend_from_slice(packet.data);
-                        }
-                        // Once a packet of these streams is on its way out, the
-                        // choice of service is made: switching would splice one
-                        // programme onto another.
-                        if !output.is_empty() {
-                            self.program.may_switch_streams = false;
-                        }
                     }
                 }
             }
+            let Some(packet) = payload_at(&input, at) else {
+                at += TS_PACKET_SIZE;
+                continue;
+            };
+            at += TS_PACKET_SIZE;
+            if packet.transport_error_indicator {
+                self.errors += 1;
+                continue;
+            }
+            if !packet.has_payload {
+                // An adaptation-only marker anchors the counter of the new
+                // run even though it contributes no elementary-stream bytes.
+                if packet.discontinuity {
+                    self.continuity.entry(packet.pid).or_default().counter =
+                        packet.continuity_counter;
+                    self.pending_discontinuities.insert(packet.pid);
+                }
+                continue;
+            }
+            if packet.scrambled {
+                if self.note_continuity(&packet) == ContinuityChange::Duplicate {
+                    continue;
+                }
+                // A skipped payload leaves the PES on either side unrelated,
+                // so the next payload-unit start becomes the new assembly point.
+                self.discard_partial(packet.pid);
+                self.scrambled += 1;
+                continue;
+            }
+            let continuity_change = self.note_continuity(&packet);
+            if continuity_change == ContinuityChange::Duplicate {
+                continue;
+            }
+            if continuity_change == ContinuityChange::Loss && !packet.payload_unit_start {
+                // Bytes after a continuity hole are the tail of a PES whose
+                // middle is gone, so the next complete PES becomes the recovery point.
+                self.discard_partial(packet.pid);
+            }
+            if self.program.wants(packet.pid) {
+                let prev_service = self.program.service;
+                let prev_video_pid = self.program.video_pid;
+                let prev_audio_pid = self.program.audio_pid;
+                let changed_pids = self.program.push(&packet, &mut sections);
+                for pid in changed_pids {
+                    // The old PID remains live until the replacement starts,
+                    // so its continuity history still belongs to its own state.
+                    if Some(pid) != prev_video_pid && Some(pid) != prev_audio_pid {
+                        self.continuity.remove(&pid);
+                    }
+                }
+                if prev_video_pid != self.program.video_pid {
+                    if let Some(prev_video_pid) = prev_video_pid {
+                        if prev_service == self.program.service {
+                            self.superseded_video = Some(Superseded {
+                                pid: prev_video_pid,
+                                state: std::mem::take(&mut self.video),
+                            });
+                        } else {
+                            self.video.flush(
+                                ElementaryKind::Video,
+                                prev_video_pid,
+                                &mut output,
+                                None,
+                            );
+                            self.video = PesState::default();
+                        }
+                        self.video_pts = None;
+                    }
+                }
+                if prev_audio_pid != self.program.audio_pid {
+                    if let Some(prev_audio_pid) = prev_audio_pid {
+                        if prev_service == self.program.service {
+                            self.superseded_audio = Some(Superseded {
+                                pid: prev_audio_pid,
+                                state: std::mem::take(&mut self.audio),
+                            });
+                        } else {
+                            self.audio.flush(
+                                ElementaryKind::Audio,
+                                prev_audio_pid,
+                                &mut output,
+                                None,
+                            );
+                            self.audio = PesState::default();
+                        }
+                        self.audio_pts = None;
+                    }
+                }
+                let fallback_pts = self.fallback_pts();
+                for (pid, state) in &mut self.private {
+                    if self
+                        .program
+                        .private_streams
+                        .iter()
+                        .any(|stream| stream.pid == *pid)
+                    {
+                        continue;
+                    }
+                    // A removed private PID keeps the kind named by the PES
+                    // already gathered, so its final payload remains decodable.
+                    let kind = match state.parts.get(3) {
+                        Some(0xbf) => ElementaryKind::PrivateStream2,
+                        _ => ElementaryKind::PrivateStream1,
+                    };
+                    state.flush(kind, *pid, &mut output, fallback_pts);
+                }
+                self.private.retain(|pid, _| {
+                    self.program
+                        .private_streams
+                        .iter()
+                        .any(|stream| stream.pid == *pid)
+                });
+            }
+            let fallback_pts = self.fallback_pts();
+            let (kind, state) = if Some(packet.pid) == self.program.video_pid {
+                // Everything the old PID sent before this first replacement
+                // packet precedes the new stream in the same programme.
+                if let Some(mut old) = self.superseded_video.take() {
+                    old.state
+                        .flush(ElementaryKind::Video, old.pid, &mut output, None);
+                }
+                (ElementaryKind::Video, &mut self.video)
+            } else if Some(packet.pid) == self.program.audio_pid {
+                if let Some(mut old) = self.superseded_audio.take() {
+                    old.state
+                        .flush(ElementaryKind::Audio, old.pid, &mut output, None);
+                }
+                (ElementaryKind::Audio, &mut self.audio)
+            } else if self
+                .superseded_video
+                .as_ref()
+                .is_some_and(|stream| stream.pid == packet.pid)
+            {
+                (
+                    ElementaryKind::Video,
+                    &mut self.superseded_video.as_mut().expect("just matched").state,
+                )
+            } else if self
+                .superseded_audio
+                .as_ref()
+                .is_some_and(|stream| stream.pid == packet.pid)
+            {
+                (
+                    ElementaryKind::Audio,
+                    &mut self.superseded_audio.as_mut().expect("just matched").state,
+                )
+            } else if self.program.private_streams.contains(&PrivateStream {
+                is_async: false,
+                pid: packet.pid,
+            }) {
+                (
+                    ElementaryKind::PrivateStream1,
+                    self.private.entry(packet.pid).or_default(),
+                )
+            } else if self.program.private_streams.contains(&PrivateStream {
+                is_async: true,
+                pid: packet.pid,
+            }) {
+                (
+                    ElementaryKind::PrivateStream2,
+                    self.private.entry(packet.pid).or_default(),
+                )
+            } else {
+                continue;
+            };
+            if packet.payload_unit_start {
+                match kind {
+                    ElementaryKind::Video => {
+                        if let Some(pts) = pes_pts(packet.data) {
+                            self.video_pts = Some(pts);
+                        }
+                    }
+                    ElementaryKind::Audio => {
+                        if let Some(pts) = pes_pts(packet.data) {
+                            self.audio_pts = Some(pts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            state.push(
+                kind,
+                packet.pid,
+                &packet,
+                continuity_change,
+                &mut output,
+                if kind == ElementaryKind::PrivateStream2 {
+                    fallback_pts
+                } else {
+                    None
+                },
+            );
         }
-        self.pending = input[at..].to_vec();
+        if at >= input.len() {
+            self.pending.clear();
+        } else {
+            self.pending = input[at..].to_vec();
+        }
         Ok(output)
     }
 
@@ -1242,7 +1218,11 @@ impl MpegTsAvDemuxer {
     fn note_continuity(&mut self, packet: &TsPayload<'_>) -> ContinuityChange {
         let is_elementary_pid = self.program.video_pid == Some(packet.pid)
             || self.program.audio_pid == Some(packet.pid)
-            || self.program.private_pids.contains(&packet.pid)
+            || self
+                .program
+                .private_streams
+                .iter()
+                .any(|stream| stream.pid == packet.pid)
             || self
                 .superseded_video
                 .as_ref()
@@ -1253,6 +1233,7 @@ impl MpegTsAvDemuxer {
                 .is_some_and(|stream| stream.pid == packet.pid);
         let is_accepted_pid = is_elementary_pid || self.program.wants(packet.pid);
         let previous = self.continuity.remove(&packet.pid);
+
         // A retransmitted marker repeats payload already accepted into the new
         // continuity run, so only its first arrival changes parser state.
         if packet.discontinuity
@@ -1264,12 +1245,9 @@ impl MpegTsAvDemuxer {
                 .insert(packet.pid, previous.expect("just matched"));
             return ContinuityChange::Duplicate;
         }
+
         let has_pending_discontinuity = self.pending_discontinuities.remove(&packet.pid);
         let continuity_change = if packet.discontinuity {
-            // A stream commonly marks its very first packet discontinuous to
-            // open a new time base. There is no earlier access unit to cut in
-            // that case; only a marker inside a stream asks downstream state
-            // to be discarded.
             let had_previous = previous.is_some();
             self.implicit_restart_tables = 0;
             if had_previous {
@@ -1293,9 +1271,11 @@ impl MpegTsAvDemuxer {
             }
         } else if let Some(previous) = previous.as_ref() {
             let expected = (previous.counter + 1) & 0x0f;
-            if packet.continuity_counter != expected {
-                // Independently muxed recording stretches restart their table
-                // counters before restarting the media counters themselves.
+            if packet.continuity_counter == expected {
+                ContinuityChange::None
+            } else {
+                // Independently muxed recording stretches restart table
+                // counters before their media counters restart.
                 if packet.continuity_counter == 0 && packet.pid == 0 {
                     self.implicit_restart_tables = 1;
                 } else if packet.continuity_counter == 0
@@ -1304,39 +1284,31 @@ impl MpegTsAvDemuxer {
                 {
                     self.implicit_restart_tables |= 2;
                 }
-                // A coordinated table restart distinguishes a recording join
-                // from loss that merely happens to end at counter zero.
                 let is_implicit_restart = if is_elementary_pid {
-                    let is_implicit_restart =
+                    let is_restart =
                         packet.continuity_counter == 0 && self.implicit_restart_tables == 3;
                     self.implicit_restart_tables = 0;
-                    is_implicit_restart
+                    is_restart
                 } else {
                     false
                 };
-                // Continuity belongs to each PID independently, so packets
-                // from other streams may separate a payload from its repeat.
                 if is_implicit_restart {
                     ContinuityChange::Reset
                 } else if previous.accepted && previous.is_duplicate(packet) {
                     ContinuityChange::Duplicate
                 } else if !previous.accepted && previous.counter == packet.continuity_counter {
-                    // A payload that was not handed downstream remains eligible
-                    // when the PID becomes relevant before its next counter.
                     ContinuityChange::None
                 } else {
                     self.dropped +=
                         ((packet.continuity_counter as u16 + 16 - expected as u16) & 0x0f) as u64;
                     ContinuityChange::Loss
                 }
-            } else {
-                ContinuityChange::None
             }
         } else {
             ContinuityChange::None
         };
+
         if is_elementary_pid {
-            // Continuous media disproves any incomplete table-only restart signal.
             self.implicit_restart_tables = 0;
         }
         if continuity_change == ContinuityChange::Duplicate {
@@ -1381,7 +1353,12 @@ impl MpegTsAvDemuxer {
                 .state
                 .discard_at_discontinuity();
         }
-        self.private.remove(&pid);
+        if self.private.contains_key(&pid) {
+            self.private
+                .entry(pid)
+                .or_default()
+                .discard_at_discontinuity();
+        }
     }
     pub fn errors(&self) -> u64 {
         self.errors
@@ -1389,40 +1366,39 @@ impl MpegTsAvDemuxer {
 
     /// Flush whatever PES packets were still accumulating at end of input.
     pub fn finish(&mut self) -> Result<Vec<ElementaryPacket>> {
-        if !self.synced {
-            bail!("input is not a 188-byte MPEG transport stream");
-        }
-        if self.program.video_pid.is_none() {
-            bail!("MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)");
-        }
         let mut output = Vec::new();
-        // A stream the programme moved off, which the input ended before the
-        // one that replaced it started, still holds the end of the programme.
-        if let Some(mut old) = self.superseded_video.take() {
-            old.state
-                .flush(ElementaryKind::Video, old.pid, &mut output)?;
+        let fallback_pts = self.fallback_pts();
+        if let Some(mut video) = self.superseded_video.take() {
+            video
+                .state
+                .flush(ElementaryKind::Video, video.pid, &mut output, None);
         }
-        if let Some(mut old) = self.superseded_audio.take() {
-            old.state
-                .flush(ElementaryKind::Audio, old.pid, &mut output)?;
+        if let Some(mut audio) = self.superseded_audio.take() {
+            audio
+                .state
+                .flush(ElementaryKind::Audio, audio.pid, &mut output, None);
         }
-        self.video.flush(
-            ElementaryKind::Video,
-            self.program.video_pid.unwrap_or(0),
-            &mut output,
-        )?;
-        self.audio.flush(
-            ElementaryKind::Audio,
-            self.program.audio_pid.unwrap_or(0),
-            &mut output,
-        )?;
-        for (&pid, state) in self.private.iter_mut() {
-            let kind = match state.parts.get(3) {
-                Some(0xbd) => ElementaryKind::PrivateStream1,
-                Some(0xbf) => ElementaryKind::PrivateStream2,
-                _ => continue,
-            };
-            state.flush(kind, pid, &mut output)?;
+        if let Some(video_pid) = self.program.video_pid {
+            self.video
+                .flush(ElementaryKind::Video, video_pid, &mut output, None);
+        }
+        if let Some(audio_pid) = self.program.audio_pid {
+            self.audio
+                .flush(ElementaryKind::Audio, audio_pid, &mut output, None);
+        }
+        for private in &mut self.program.private_streams {
+            if let Some(state) = self.private.get_mut(&private.pid) {
+                state.flush(
+                    if private.is_async {
+                        ElementaryKind::PrivateStream2
+                    } else {
+                        ElementaryKind::PrivateStream1
+                    },
+                    private.pid,
+                    &mut output,
+                    fallback_pts,
+                );
+            }
         }
         Ok(output)
     }
@@ -1436,14 +1412,14 @@ impl MpegTsAvDemuxer {
 /// may open mid-packet, and a program map it happens to miss would leave a
 /// PID-driven demuxer with nothing to report.
 fn walk_pts(data: &[u8], mut visit: impl FnMut(u64) -> ControlFlow<()>) {
-    let Some(mut at) = sync_offset(data) else {
+    let Some(mut at) = sync_offset(data, 6) else {
         return;
     };
     while at + TS_PACKET_SIZE <= data.len() {
         // A payload the sync check walked past is worth stepping over rather
         // than giving up on: a slice is a fragment of a file, and one damaged
         // packet says nothing about the ones after it.
-        if let Ok(packet) = payload_at(data, at) {
+        if let Some(packet) = payload_at(data, at) {
             if packet.payload_unit_start
                 && (is_pes_start(packet.data, ElementaryKind::Video)
                     || is_pes_start(packet.data, ElementaryKind::Audio))
@@ -1496,7 +1472,7 @@ pub fn extract_mpeg2_video_es(data: &[u8]) -> Result<Vec<u8>> {
             saw_video = true;
         }
     }
-    if !demuxer.synced {
+    if demuxer.unsynced {
         bail!("input is not a 188-byte MPEG transport stream");
     }
     if demuxer.program.pmt_pids.is_empty() {

@@ -8,6 +8,7 @@
 
 mod support;
 
+use std::collections::HashMap;
 use std::sync::mpsc;
 
 use mpeg2toh264::job::PictureOutput;
@@ -282,6 +283,7 @@ fn broadcast_stream(name: &str, audio_frames: usize) -> Vec<u8> {
             (PRIVATE_PID, STREAM_TYPE_PRIVATE_DATA),
         ],
         &units,
+        &mut HashMap::new(),
     )
 }
 
@@ -292,7 +294,7 @@ fn a_session_driven_picture_by_picture_produces_the_same_fragments() {
         .map(|name| {
             (
                 *name,
-                wrap_mpeg2_es_in_ts(&read_fixture(name), Some(900_000)),
+                wrap_mpeg2_es_in_ts(&read_fixture(name), Some(900_000), &mut HashMap::new()),
             )
         })
         .chain(

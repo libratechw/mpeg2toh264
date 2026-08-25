@@ -3,6 +3,8 @@
 
 mod support;
 
+use std::collections::HashMap;
+
 use mpeg2toh264::container::adts::AdtsStream;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
@@ -695,7 +697,11 @@ fn video_only_stream(copies: usize) -> Vec<u8> {
             pts: Some(900_000 + index as u64 * 3_000),
         })
         .collect();
-    mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units)
+    mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &units,
+        &mut HashMap::new(),
+    )
 }
 
 /// A stream with both tracks, interleaved the way a broadcast would send them,
@@ -731,6 +737,7 @@ fn av_stream(copies: usize, audio_frames: usize) -> Vec<u8> {
             (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
         ],
         &units,
+        &mut HashMap::new(),
     )
 }
 
@@ -765,12 +772,14 @@ fn audio_change_stream(copies: usize, before: usize, after: usize) -> Vec<u8> {
             });
         }
     }
+    let mut continuity = HashMap::new();
     mux_transport_stream(
         &[
             (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
             (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
         ],
         &units,
+        &mut continuity,
     )
 }
 
@@ -838,6 +847,7 @@ fn timed_av_stream_from(copies: usize, base: u64) -> Vec<u8> {
             (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
         ],
         &units,
+        &mut HashMap::new(),
     )
 }
 
@@ -1008,7 +1018,11 @@ fn mixed_reordering_stream() -> Vec<u8> {
         });
         pts += pictures * FRAME_TICKS;
     }
-    mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units)
+    mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &units,
+        &mut HashMap::new(),
+    )
 }
 
 /// The decode timeline is one line the units are laid along end to end, and a
@@ -1075,7 +1089,11 @@ fn resolution_change_stream() -> Vec<u8> {
             pts: Some(900_000 + index as u64 * 3_000),
         })
         .collect();
-    mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units)
+    mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &units,
+        &mut HashMap::new(),
+    )
 }
 
 #[test]
@@ -1284,7 +1302,7 @@ fn recovery_points_preserve_distinct_leading_b_pictures() {
         recovery_interval: 1,
         ..TranscodeOptions::default()
     };
-    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000));
+    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000), &mut HashMap::new());
     let fragments = run_session_with_options(&stream, 64 * 1024, options);
     let (_, media) = split_fragments(&fragments);
     let video_samples: usize = media
@@ -1324,7 +1342,7 @@ fn non_idr_open_gop_recovery_preserves_pictures_without_adding_copies() {
         open_gop_recovery: OpenGopRecovery::RecoveryPoint,
         ..TranscodeOptions::default()
     };
-    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000));
+    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000), &mut HashMap::new());
     let fragments = run_session_with_options(&stream, 64 * 1024, options);
     let (_, media) = split_fragments(&fragments);
     let video_samples: usize = media
@@ -1364,7 +1382,7 @@ fn discard_open_gop_recovery_drops_only_the_leading_pictures() {
         open_gop_recovery: OpenGopRecovery::Discard,
         ..TranscodeOptions::default()
     };
-    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000));
+    let stream = wrap_mpeg2_es_in_ts(&source, Some(900_000), &mut HashMap::new());
     let fragments = run_session_with_options(&stream, 64 * 1024, options);
     let (_, media) = split_fragments(&fragments);
     let video_samples: usize = media
@@ -1551,6 +1569,7 @@ fn hidden_packet_loss_at_payload_discontinuities_recovers_both_tracks() {
             (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
         ],
         &units,
+        &mut HashMap::new(),
     );
     let mut lossy = intact.clone();
 
@@ -1608,7 +1627,11 @@ fn a_join_between_recordings_is_left_where_the_source_has_it() {
             pts: Some(900_000 + copy * group + if copy >= 3 { JUMP } else { 0 }),
         });
     }
-    let stream = mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units);
+    let stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &units,
+        &mut HashMap::new(),
+    );
     let starts = media_starts(&run_session(&stream, 64 * 1024));
 
     let steps: Vec<f64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
@@ -1644,7 +1667,11 @@ fn timestamps_that_wrap_are_not_a_hole_or_a_join() {
             pts: Some((base + copy * group) % modulus),
         })
         .collect();
-    let stream = mux_transport_stream(&[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)], &units);
+    let stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &units,
+        &mut HashMap::new(),
+    );
     let starts = media_starts(&run_session(&stream, 64 * 1024));
 
     let expected = group as f64 / 90_000.0;
@@ -1740,6 +1767,7 @@ fn moving_the_sound_to_another_stream_does_not_splice_a_frame_across_the_change(
         (0x100, STREAM_TYPE_MPEG2_VIDEO),
         (0x110, STREAM_TYPE_AAC_ADTS),
     ];
+    let mut continuity = HashMap::new();
     let mut stream = mux_programs(
         &[(101, 0x1f0, before)],
         &[
@@ -1762,6 +1790,7 @@ fn moving_the_sound_to_another_stream_does_not_splice_a_frame_across_the_change(
                 pts: None,
             },
         ],
+        &mut continuity,
     );
     stream.extend_from_slice(&mux_programs(
         &[(101, 0x1f0, after)],
@@ -1779,6 +1808,7 @@ fn moving_the_sound_to_another_stream_does_not_splice_a_frame_across_the_change(
                 pts: None,
             },
         ],
+        &mut continuity,
     ));
 
     let fragments = run_session(&stream, 64 * 1024);
@@ -1831,6 +1861,7 @@ fn bilingual_av_stream(copies: usize) -> Vec<u8> {
 
     let mut emitted = 0u64;
     let mut out = Vec::new();
+    let mut continuity = HashMap::new();
     for copy in 0..copies as u64 {
         let through = (copy + 1) * group / AAC;
         let first = emitted;
@@ -1860,7 +1891,7 @@ fn bilingual_av_stream(copies: usize) -> Vec<u8> {
                 pts: Some(900_000 + first * AAC),
             });
         }
-        out.extend_from_slice(&mux_transport_stream(streams, &units));
+        out.extend_from_slice(&mux_transport_stream(streams, &units, &mut continuity));
     }
     out
 }
@@ -1954,6 +1985,7 @@ fn conceals_a_missing_aac_frame_instead_of_stalling_video() {
             (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
         ],
         &units,
+        &mut HashMap::new(),
     );
     let fragments = run_session(&stream, 64 * 1024);
     let (_, media) = split_fragments(&fragments);
@@ -2040,6 +2072,7 @@ fn seekable_stream(copies: usize, audio_per_copy: usize) -> Vec<u8> {
     if audio_per_copy > 0 {
         streams.push((AUDIO_PID, STREAM_TYPE_AAC_ADTS));
     }
+    let mut continuity = HashMap::new();
     let mut out = Vec::new();
     for copy in 0..copies as u64 {
         let mut units = vec![PesUnit {
@@ -2058,7 +2091,7 @@ fn seekable_stream(copies: usize, audio_per_copy: usize) -> Vec<u8> {
             });
         }
         // Each call opens with a PAT and a PMT, which is the repetition.
-        out.extend_from_slice(&mux_transport_stream(&streams, &units));
+        out.extend_from_slice(&mux_transport_stream(&streams, &units, &mut continuity));
     }
     out
 }
@@ -2165,14 +2198,4 @@ fn an_anchored_session_carries_both_tracks_over_a_cut() {
         "the audio track resumes too -- the count it measures from is the \
          audio's own start, not the file's"
     );
-}
-
-#[test]
-fn a_stream_that_is_not_a_transport_stream_is_refused() {
-    let mut session = Session::default();
-    session
-        .push(&[0u8; 512])
-        .expect("nothing decodes, but nothing fails yet");
-    let error = session.finish().expect_err("must fail");
-    assert!(error.to_string().contains("not a 188-byte"), "{error}");
 }

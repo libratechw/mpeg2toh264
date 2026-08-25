@@ -1,5 +1,6 @@
 //! The command line front end, driven as a user would.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -108,8 +109,11 @@ fn accepts_a_recovery_interval() {
     let input = temp.join("input.ts");
     let output = temp.join("output.mp4");
     let video = std::fs::read(fixture("open_gop_leading_bb.m2v")).expect("video fixture");
-    std::fs::write(&input, wrap_mpeg2_es_in_ts(&video, Some(900_000)))
-        .expect("transport stream fixture");
+    std::fs::write(
+        &input,
+        wrap_mpeg2_es_in_ts(&video, Some(900_000), &mut HashMap::new()),
+    )
+    .expect("transport stream fixture");
 
     let result = run(&["--recovery-interval", "1", path(&input), path(&output)]);
     assert!(result.status.success(), "{:?}", result);
@@ -144,8 +148,11 @@ fn converting_on_several_threads_writes_the_same_file() {
     let temp = TempDir::new("threads");
     let input = temp.join("input.ts");
     let video = std::fs::read(fixture("open_gop_leading_bb.m2v")).expect("video fixture");
-    std::fs::write(&input, wrap_mpeg2_es_in_ts(&video, Some(900_000)))
-        .expect("transport stream fixture");
+    std::fs::write(
+        &input,
+        wrap_mpeg2_es_in_ts(&video, Some(900_000), &mut HashMap::new()),
+    )
+    .expect("transport stream fixture");
 
     let mut written = Vec::new();
     for threads in ["1", "4"] {
@@ -247,6 +254,7 @@ fn ts_mp4_carries_its_aac_audio_track() {
             (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
         ],
         &units,
+        &mut HashMap::new(),
     );
     std::fs::write(&input, ts).expect("transport stream fixture");
 

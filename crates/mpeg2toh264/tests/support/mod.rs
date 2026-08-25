@@ -40,15 +40,17 @@ pub fn fnv1a(data: &[u8]) -> u64 {
     hash
 }
 
-fn psi_packet(pid: u16, section: &[u8]) -> Vec<u8> {
+fn psi_packet(pid: u16, section: &[u8], continuity: &mut HashMap<u16, u8>) -> Vec<u8> {
     let mut packet = vec![0xff; PACKET_SIZE];
+    let counter = continuity.entry(pid).or_insert(0);
     packet[..5].copy_from_slice(&[
         0x47,
         0x40 | (pid >> 8) as u8,
         (pid & 0xff) as u8,
-        0x10,
+        0x10 | *counter,
         0x00,
     ]);
+    *counter = (*counter + 1) & 15;
     packet[5..5 + section.len()].copy_from_slice(section);
     packet
 }
@@ -66,12 +68,17 @@ fn pts_field(pts: u64) -> [u8; 5] {
 
 /// Wrap an MPEG-2 elementary stream in a single-program transport stream, so the
 /// demuxer can be exercised without a multi-megabyte broadcast capture.
-pub fn wrap_mpeg2_es_in_ts(es: &[u8], pts: Option<u64>) -> Vec<u8> {
+pub fn wrap_mpeg2_es_in_ts(
+    es: &[u8],
+    pts: Option<u64>,
+    continuity: &mut HashMap<u16, u8>,
+) -> Vec<u8> {
     let pat = psi_packet(
         0,
         &[
             0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00, 0, 0, 0, 0,
         ],
+        continuity,
     );
     let pmt = psi_packet(
         0x100,
@@ -79,6 +86,7 @@ pub fn wrap_mpeg2_es_in_ts(es: &[u8], pts: Option<u64>) -> Vec<u8> {
             0x02, 0xb0, 0x12, 0x00, 0x01, 0xc1, 0x00, 0x00, 0xe1, 0x01, 0xf0, 0x00, 0x02, 0xe1,
             0x01, 0xf0, 0x00, 0, 0, 0, 0,
         ],
+        continuity,
     );
 
     let mut pes: Vec<u8> = match pts {
@@ -94,13 +102,13 @@ pub fn wrap_mpeg2_es_in_ts(es: &[u8], pts: Option<u64>) -> Vec<u8> {
     let mut out = pat;
     out.extend_from_slice(&pmt);
     let mut at = 0;
-    let mut continuity: u8 = 0;
+    let continuity = continuity.entry(0x101).or_insert(0);
     while at < pes.len() {
         let size = 184.min(pes.len() - at);
         let mut packet = vec![0xff; PACKET_SIZE];
         let start = if at == 0 { 0x40 } else { 0x00 };
         if size == 184 {
-            packet[..4].copy_from_slice(&[0x47, start | 0x01, 0x01, 0x10 | continuity]);
+            packet[..4].copy_from_slice(&[0x47, start | 0x01, 0x01, 0x10 | *continuity]);
             packet[4..4 + size].copy_from_slice(&pes[at..at + size]);
         } else {
             let adaptation_length = 183 - size;
@@ -108,7 +116,7 @@ pub fn wrap_mpeg2_es_in_ts(es: &[u8], pts: Option<u64>) -> Vec<u8> {
                 0x47,
                 start | 0x01,
                 0x01,
-                0x30 | continuity,
+                0x30 | *continuity,
                 adaptation_length as u8,
             ]);
             if adaptation_length > 0 {
@@ -118,7 +126,7 @@ pub fn wrap_mpeg2_es_in_ts(es: &[u8], pts: Option<u64>) -> Vec<u8> {
             packet[payload..payload + size].copy_from_slice(&pes[at..at + size]);
         }
         out.extend_from_slice(&packet);
-        continuity = (continuity + 1) & 15;
+        *continuity = (*continuity + 1) & 15;
         at += size;
     }
     out
@@ -159,8 +167,12 @@ pub struct PesUnit<'a> {
 ///
 /// `streams` names the elementary streams the PMT advertises, as
 /// `(pid, stream_type)`.
-pub fn mux_transport_stream(streams: &[(u16, u8)], units: &[PesUnit<'_>]) -> Vec<u8> {
-    mux_programs(&[(1, 0x100, streams)], units)
+pub fn mux_transport_stream(
+    streams: &[(u16, u8)],
+    units: &[PesUnit<'_>],
+    continuity: &mut HashMap<u16, u8>,
+) -> Vec<u8> {
+    mux_programs(&[(1, 0x100, streams)], units, continuity)
 }
 
 /// Build a single-program stream whose elementary streams carry explicit PMT
@@ -168,6 +180,7 @@ pub fn mux_transport_stream(streams: &[(u16, u8)], units: &[PesUnit<'_>]) -> Vec
 pub fn mux_transport_stream_with_descriptors(
     streams: &[(u16, u8, &[u8])],
     units: &[PesUnit<'_>],
+    continuity: &mut HashMap<u16, u8>,
 ) -> Vec<u8> {
     let pat = [
         0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe1, 0x00, 0, 0, 0, 0,
@@ -202,9 +215,9 @@ pub fn mux_transport_stream_with_descriptors(
         pmt.extend_from_slice(descriptors);
     }
     pmt.extend_from_slice(&[0, 0, 0, 0]);
-    let mut out = psi_packet(0, &pat);
-    out.extend_from_slice(&psi_packet(0x100, &pmt));
-    mux_payloads(out, units)
+    let mut out = psi_packet(0, &pat, continuity);
+    out.extend_from_slice(&psi_packet(0x100, &pmt, continuity));
+    mux_payloads(out, units, continuity)
 }
 
 /// One service of a transport stream: its program number, the PID its program
@@ -218,7 +231,11 @@ pub type Program<'a> = (u16, u16, &'a [(u16, u8)]);
 /// program maps go out in the opposite order. Which map a multiplexer sends
 /// first says nothing about which service anyone is watching, and putting the
 /// two orders at odds here is what keeps that from being assumed.
-pub fn mux_programs(programs: &[Program<'_>], units: &[PesUnit<'_>]) -> Vec<u8> {
+pub fn mux_programs(
+    programs: &[Program<'_>],
+    units: &[PesUnit<'_>],
+    continuity: &mut HashMap<u16, u8>,
+) -> Vec<u8> {
     let mut pat_section = vec![0x00, 0xb0, 0x00, 0x00, 0x01, 0xc1, 0x00, 0x00];
     for &(program, pmt_pid, _) in programs {
         pat_section.extend_from_slice(&[
@@ -230,7 +247,7 @@ pub fn mux_programs(programs: &[Program<'_>], units: &[PesUnit<'_>]) -> Vec<u8> 
     }
     pat_section.extend_from_slice(&[0, 0, 0, 0]);
     pat_section[2] = (pat_section.len() - 3) as u8;
-    let mut out = psi_packet(0, &pat_section);
+    let mut out = psi_packet(0, &pat_section, continuity);
 
     for &(program, pmt_pid, streams) in programs.iter().rev() {
         let pcr_pid = streams.first().map_or(0x100, |&(pid, _)| pid);
@@ -258,13 +275,16 @@ pub fn mux_programs(programs: &[Program<'_>], units: &[PesUnit<'_>]) -> Vec<u8> 
             ]);
         }
         pmt_section.extend_from_slice(&[0, 0, 0, 0]);
-        out.extend_from_slice(&psi_packet(pmt_pid, &pmt_section));
+        out.extend_from_slice(&psi_packet(pmt_pid, &pmt_section, continuity));
     }
-    mux_payloads(out, units)
+    mux_payloads(out, units, continuity)
 }
 
-fn mux_payloads(mut out: Vec<u8>, units: &[PesUnit<'_>]) -> Vec<u8> {
-    let mut continuity: HashMap<u16, u8> = HashMap::new();
+fn mux_payloads(
+    mut out: Vec<u8>,
+    units: &[PesUnit<'_>],
+    continuity: &mut HashMap<u16, u8>,
+) -> Vec<u8> {
     for unit in units {
         let mut pes: Vec<u8> = if unit.stream_id == 0xbf {
             vec![0, 0, 1, unit.stream_id, 0, 0]
@@ -279,6 +299,10 @@ fn mux_payloads(mut out: Vec<u8>, units: &[PesUnit<'_>]) -> Vec<u8> {
             }
         };
         pes.extend_from_slice(unit.payload);
+        if pes.len() - 6 <= 65535 {
+            pes[4] = ((pes.len() - 6) >> 8) as u8;
+            pes[5] = ((pes.len() - 6) & 0xff) as u8;
+        }
 
         let mut at = 0;
         while at < pes.len() {
