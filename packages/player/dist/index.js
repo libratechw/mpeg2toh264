@@ -128,7 +128,7 @@ class E {
         e !== this.#f && (this.#a = e);
       else {
         const i = this.mediaSource.addSourceBuffer(e);
-        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#N), this.#t = i, this.#f = e;
+        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#O), this.#t = i, this.#f = e;
       }
       this.#U({ data: t, init: !0 }), this.#T();
     }
@@ -171,7 +171,7 @@ class E {
     ), this.mediaSource.removeEventListener(
       "endstreaming",
       this.#B
-    )), this.#t?.removeEventListener("updateend", this.#I), this.#t?.removeEventListener("error", this.#N), this.#t = null, this.#o = [], this.#g = 0, this.#c = [], this.#R.abandon(), this.#v(!0));
+    )), this.#t?.removeEventListener("updateend", this.#I), this.#t?.removeEventListener("error", this.#O), this.#t = null, this.#o = [], this.#g = 0, this.#c = [], this.#R.abandon(), this.#v(!0));
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(e) {
@@ -241,7 +241,7 @@ class E {
   #B = () => {
     this.#S = !1, this.#m(), this.#y();
   };
-  #N = () => {
+  #O = () => {
     this.#w(new Error("the SourceBuffer rejected what was appended"));
   };
   /**
@@ -305,12 +305,12 @@ class E {
     }
   }
   /** How far past the playhead the buffer reaches, in seconds. */
-  #O() {
+  #N() {
     const e = this.#t?.buffered;
     return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#b;
   }
   #m() {
-    const e = !this.#u && this.#S && this.#O() < this.#i.maxAheadSeconds && this.#g < this.#i.queueHighWaterMark && this.#o.length < 2;
+    const e = !this.#u && this.#S && this.#N() < this.#i.maxAheadSeconds && this.#g < this.#i.queueHighWaterMark && this.#o.length < 2;
     this.#R.set(e) && this.#i.onReadyChange?.(e);
   }
   /**
@@ -336,7 +336,7 @@ class E {
     );
   }
 }
-const v = "" + new URL("assets/worker-DT20N9di.js", import.meta.url).href, S = v, d = 0.1, c = [
+const v = "" + new URL("assets/worker-CjEd_t59.js", import.meta.url).href, S = v, d = 0.1, c = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
@@ -391,7 +391,7 @@ class T extends EventTarget {
   constructor(e, t = {}) {
     super(), this.video = e, this.#e = t;
     const i = t.mediaSource ?? "auto";
-    this.#i = i === "auto" ? l(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#O);
+    this.#i = i === "auto" ? l(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#N);
     for (const s of c)
       this.video.addEventListener(s, this.#m);
     t.deinterlace && (this.deinterlace = !0);
@@ -569,7 +569,7 @@ class T extends EventTarget {
   /** Stop, and give up the worker. The player cannot be loaded again. */
   destroy() {
     if (!this.#d) {
-      this.stop(), this.#d = !0, this.video.removeEventListener("seeking", this.#O);
+      this.stop(), this.#d = !0, this.video.removeEventListener("seeking", this.#N);
       for (const e of c)
         this.video.removeEventListener(e, this.#m);
       this.#n?.destroy(), this.#n = null, this.#s?.terminate(), this.#s = null;
@@ -678,7 +678,7 @@ class T extends EventTarget {
     const i = this.#t;
     let s;
     try {
-      s = this.#a ?? this.#N(i);
+      s = this.#a ?? this.#O(i);
     } catch (r) {
       this.#L(o(r));
       return;
@@ -693,7 +693,7 @@ class T extends EventTarget {
       }
     );
   }
-  #N(e) {
+  #O(e) {
     const t = new E({
       preferManaged: this.#e.preferManagedMediaSource,
       queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
@@ -755,7 +755,7 @@ class T extends EventTarget {
    * What is left is a real seek: the worker throws the buffer away and reads
    * the input again from where the viewer asked to be.
    */
-  #O = () => {
+  #N = () => {
     if (this.#E === null || this.#f === "idle" || this.#f === "error") return;
     const e = this.video.currentTime;
     this.#w(e) || (this.#M("seeking"), this.#p(), this.#G(), this.#s?.postMessage({
