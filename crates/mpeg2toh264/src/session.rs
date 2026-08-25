@@ -438,6 +438,9 @@ impl Session {
     pub fn errors(&self) -> u64 {
         self.demuxer.errors()
     }
+    pub fn transcoder_errors(&self) -> u64 {
+        self.video.errors()
+    }
 
     /// Start a session whose timeline is measured from a PES timestamp of the
     /// caller's choosing, rather than from wherever this input happens to open.
