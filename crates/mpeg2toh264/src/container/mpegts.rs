@@ -9,6 +9,7 @@ const TS_PACKET_SIZE: usize = 188;
 const SYNC_BYTE: u8 = 0x47;
 const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
+const MIN_SYNC_COUNT: usize = 6;
 
 /// The body of the first descriptor carrying this tag, without its own two
 /// bytes of tag and length.
@@ -105,7 +106,7 @@ impl AudioStream {
     }
 }
 
-fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
+fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<PrivateStream> {
     let caption = streams
         .iter()
         .find(|(_, tag)| matches!(tag, Some(0x30 | 0x87)))
@@ -114,7 +115,10 @@ fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
                 .iter()
                 .find(|(_, tag)| matches!(tag, Some(0x30..=0x37 | 0x87)))
         })
-        .map(|(pid, _)| *pid);
+        .map(|(pid, _)| PrivateStream {
+            is_async: false,
+            pid: *pid,
+        });
     let superimpose = streams
         .iter()
         .find(|(_, tag)| matches!(tag, Some(0x38 | 0x88)))
@@ -123,7 +127,10 @@ fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
                 .iter()
                 .find(|(_, tag)| matches!(tag, Some(0x38..=0x3f | 0x88)))
         })
-        .map(|(pid, _)| *pid);
+        .map(|(pid, _)| PrivateStream {
+            is_async: true,
+            pid: *pid,
+        });
 
     let mut selected = Vec::new();
     selected.extend(caption);
@@ -134,6 +141,7 @@ fn select_private_streams(streams: Vec<(u16, Option<u8>)>) -> Vec<u16> {
 #[cfg(test)]
 mod private_stream_tests {
     use super::select_private_streams;
+    use super::PrivateStream;
 
     #[test]
     fn prefers_default_caption_and_superimpose_component_tags() {
@@ -143,7 +151,19 @@ mod private_stream_tests {
             (0x130, Some(0x30)),
             (0x138, Some(0x38)),
         ];
-        assert_eq!(select_private_streams(streams), [0x130, 0x138]);
+        assert_eq!(
+            select_private_streams(streams),
+            [
+                PrivateStream {
+                    is_async: false,
+                    pid: 0x130
+                },
+                PrivateStream {
+                    is_async: true,
+                    pid: 0x138
+                }
+            ]
+        );
     }
 
     #[test]
@@ -154,7 +174,19 @@ mod private_stream_tests {
             (0x13a, Some(0x3a)),
             (0x139, Some(0x39)),
         ];
-        assert_eq!(select_private_streams(streams), [0x132, 0x13a]);
+        assert_eq!(
+            select_private_streams(streams),
+            [
+                PrivateStream {
+                    is_async: false,
+                    pid: 0x132
+                },
+                PrivateStream {
+                    is_async: true,
+                    pid: 0x13a
+                }
+            ]
+        );
     }
 
     #[test]
@@ -183,15 +215,6 @@ impl ElementaryKind {
             Self::PrivateStream2 => stream_id == 0xbf,
         }
     }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Video => "video",
-            Self::Audio => "audio",
-            Self::PrivateStream1 => "private_stream_1",
-            Self::PrivateStream2 => "private_stream_2",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +230,7 @@ pub struct ElementaryPacket {
 
 struct TsPayload<'a> {
     pid: u16,
+    transport_error_indicator: bool,
     payload_unit_start: bool,
     continuity_counter: u8,
     discontinuity: bool,
@@ -215,21 +239,18 @@ struct TsPayload<'a> {
 }
 
 /// Find the first packet boundary, by requiring several sync bytes 188 apart.
-fn sync_offset(data: &[u8]) -> Option<usize> {
+fn sync_offset(data: &[u8], min_sync_count: usize) -> Option<usize> {
     for offset in 0..TS_PACKET_SIZE.min(data.len()) {
-        if data[offset] != SYNC_BYTE {
-            continue;
-        }
         let mut matches = 0;
         let mut at = offset;
-        while at < data.len() && matches < 4 {
+        while at < data.len() && matches < min_sync_count {
             if data[at] != SYNC_BYTE {
                 break;
             }
             matches += 1;
             at += TS_PACKET_SIZE;
         }
-        if matches >= 4.min((data.len() - offset) / TS_PACKET_SIZE) {
+        if matches >= min_sync_count {
             return Some(offset);
         }
     }
@@ -237,26 +258,21 @@ fn sync_offset(data: &[u8]) -> Option<usize> {
 }
 
 pub fn is_mpeg_transport_stream(data: &[u8]) -> bool {
-    data.len() >= TS_PACKET_SIZE && sync_offset(data).is_some()
+    data.len() >= TS_PACKET_SIZE * MIN_SYNC_COUNT && sync_offset(data, MIN_SYNC_COUNT).is_some()
 }
 
-fn payload_at(data: &[u8], at: usize) -> Result<Option<TsPayload<'_>>> {
+fn payload_at(data: &[u8], at: usize) -> Option<TsPayload<'_>> {
     if data[at] != SYNC_BYTE {
-        bail!("MPEG-TS sync lost at byte {at}");
+        return None;
     }
-    if data[at + 1] & 0x80 != 0 {
-        bail!("MPEG-TS transport error at byte {at}");
-    }
+    let transport_error_indicator = data[at + 1] & 0x80 != 0;
     let payload_unit_start = data[at + 1] & 0x40 != 0;
     let scrambled = data[at + 3] >> 6 != 0;
     let continuity_counter = data[at + 3] & 0x0f;
     let pid = (((data[at + 1] & 0x1f) as u16) << 8) | data[at + 2] as u16;
     let adaptation_control = (data[at + 3] >> 4) & 3;
-    if adaptation_control == 0 {
-        bail!("invalid adaptation_field_control at byte {at}");
-    }
     if adaptation_control & 1 == 0 {
-        return Ok(None);
+        return None;
     }
     let mut payload = at + 4;
     let mut discontinuity = false;
@@ -268,16 +284,17 @@ fn payload_at(data: &[u8], at: usize) -> Result<Option<TsPayload<'_>>> {
     }
     let end = at + TS_PACKET_SIZE;
     if payload > end {
-        bail!("invalid MPEG-TS adaptation field at byte {at}");
+        return None;
     }
-    Ok(Some(TsPayload {
+    Some(TsPayload {
         pid,
+        transport_error_indicator,
         payload_unit_start,
         continuity_counter,
         discontinuity,
         scrambled,
         data: &data[payload..end],
-    }))
+    })
 }
 
 /// Reassembles PSI sections, which are length-prefixed and may straddle packets.
@@ -332,7 +349,13 @@ struct DeferredProgram {
     video: Option<u16>,
     audio: Option<u16>,
     audio_streams: Vec<AudioStream>,
-    private: Vec<u16>,
+    private_streams: Vec<PrivateStream>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct PrivateStream {
+    is_async: bool,
+    pid: u16,
 }
 
 /// The elementary stream PIDs a program advertises.
@@ -367,20 +390,10 @@ struct ProgramMap {
     /// Every sound stream the chosen service's map advertises, in the order it
     /// lists them.
     audio_streams: Vec<AudioStream>,
-    private_pids: Vec<u16>,
+    private_streams: Vec<PrivateStream>,
     /// Every service seen in the program association table, in the order they
     /// were announced.
     services: Vec<u16>,
-    /// Whether the streams may still be changed, which they may until the
-    /// first of their packets has been handed on.
-    may_switch_streams: bool,
-    /// Set when a scan moved to a service with different streams, so that what
-    /// was gathered from the old ones can be thrown away.
-    changed_streams: bool,
-    /// Set when the service being read moved its own streams to other PIDs.
-    /// What was gathered from the old ones is the end of the same programme,
-    /// so it goes out rather than being thrown away.
-    moved_streams: bool,
     all_service_pids: HashMap<u16, Vec<u16>>,
     changed_pids: HashSet<u16>,
     assemblers: HashMap<u16, SectionAssembler>,
@@ -400,11 +413,8 @@ impl Default for ProgramMap {
             audio_pid: None,
             wanted_audio: None,
             audio_streams: Vec::new(),
-            private_pids: Vec::new(),
+            private_streams: Vec::new(),
             services: Vec::new(),
-            may_switch_streams: true,
-            changed_streams: false,
-            moved_streams: false,
             all_service_pids: HashMap::new(),
             changed_pids: HashSet::new(),
             assemblers: HashMap::new(),
@@ -420,7 +430,7 @@ impl ProgramMap {
             self.video_pid = deferred.video;
             self.audio_pid = deferred.audio;
             self.audio_streams = deferred.audio_streams;
-            self.private_pids = deferred.private;
+            self.private_streams = deferred.private_streams;
         }
     }
 
@@ -537,7 +547,7 @@ impl ProgramMap {
                 .wanted_audio
                 .filter(|wanted| audio_streams.iter().any(|stream| stream.pid == *wanted))
                 .or_else(|| audio_streams.first().map(|stream| stream.pid));
-            let private = select_private_streams(private);
+            let private_streams = select_private_streams(private);
             all_pids.sort_unstable();
             all_pids.dedup();
             let old = self
@@ -591,58 +601,27 @@ impl ProgramMap {
                         video,
                         audio,
                         audio_streams,
-                        private,
+                        private_streams,
                     });
                 }
                 return;
-            }
-            // Moving to a better-placed service is free while it names the
-            // streams already being read -- which is what an accompanying data
-            // service does -- and is only a matter of calling them by the right
-            // name. Where it names different ones, the packets gathered so far
-            // belong to the wrong programme and have to go, so it is only worth
-            // doing before any of them have been handed on.
-            let same_streams =
-                self.video_pid == video && self.audio_pid == audio && self.private_pids == private;
-            // Unless the service saying so is the one being read. A station
-            // that leaves a multi-channel block sends a new version of its own
-            // program map naming different elementary PIDs -- in Japan the
-            // standard-definition sub-channel's video gives way to the
-            // high-definition one -- and that is the same programme carrying
-            // on, not another one being spliced onto it. Refusing it stops the
-            // video where the map changed. The lock is against being pulled
-            // onto a *different* service once its packets have gone out, and
-            // that is left alone.
-            let continues_this_service = self.service == Some(service);
-            if self.service.is_some()
-                && !same_streams
-                && !self.may_switch_streams
-                && !continues_this_service
-            {
-                return;
-            }
-            if !same_streams && self.service.is_some() {
-                if continues_this_service {
-                    self.moved_streams = true;
-                } else {
-                    self.changed_streams = true;
-                }
             }
             self.service = Some(service);
             self.rank = rank;
             self.video_pid = video;
             self.audio_pid = audio;
             self.audio_streams = audio_streams;
-            self.private_pids = private;
+            self.private_streams = private_streams;
         }
     }
 }
 
-/// The 33-bit presentation timestamp, in 90 kHz units, or `None` when the PES
-/// packet carries none. It is spread over five bytes with a marker bit after
-/// every group (clause 2.4.3.7).
 fn pes_pts(packet: &[u8]) -> Option<u64> {
-    if packet.len() < 14 || packet[6] & 0xc0 != 0x80 || packet[7] & 0x80 == 0 {
+    if packet.len() < 14 {
+        return None;
+    } else if packet[3] == 0xbf {
+        return None;
+    } else if packet[6] & 0xc0 != 0x80 || packet[7] & 0x80 == 0 {
         return None;
     }
     Some(
@@ -654,13 +633,13 @@ fn pes_pts(packet: &[u8]) -> Option<u64> {
     )
 }
 
-fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
+fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Option<&[u8]> {
     if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 || packet[2] != 1 {
-        bail!("invalid MPEG-TS {} PES start code", kind.name());
+        return None;
     }
     let stream_id = packet[3];
     if !kind.accepts_stream_id(stream_id) {
-        bail!("unexpected {} stream_id 0x{stream_id:02x}", kind.name());
+        return None;
     }
     let pes_length = ((packet[4] as usize) << 8) | packet[5] as usize;
     let start = if kind == ElementaryKind::PrivateStream2 {
@@ -676,19 +655,19 @@ fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
             start += 1;
         }
         let Some(&first) = packet.get(start) else {
-            bail!("truncated MPEG-1 PES header");
+            return None;
         };
         if first & 0xc0 == 0x40 {
             start += 2;
         }
         let Some(&marker) = packet.get(start) else {
-            bail!("truncated MPEG-1 PES header");
+            return None;
         };
         match marker & 0xf0 {
             0x20 => start += 5,
             0x30 => start += 10,
             _ if marker == 0x0f => start += 1,
-            _ => bail!("invalid MPEG-1 PES header"),
+            _ => return None,
         }
         start
     };
@@ -698,9 +677,16 @@ fn pes_payload(packet: &[u8], kind: ElementaryKind) -> Result<&[u8]> {
         packet.len().min(6 + pes_length)
     };
     if start > end {
-        bail!("truncated MPEG-TS {} PES header", kind.name());
+        return None;
     }
-    Ok(&packet[start..end])
+    Some(&packet[start..end])
+}
+
+fn pes_packet_length(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 || packet[2] != 1 {
+        return None;
+    }
+    return Some(((packet[4] as usize) << 8) | packet[5] as usize);
 }
 
 /// Whether a packet payload opens a PES packet of the given kind. A payload
@@ -717,10 +703,8 @@ fn is_pes_start(packet: &[u8], kind: ElementaryKind) -> bool {
 /// One elementary stream's PES packet as it accumulates across TS packets.
 #[derive(Default)]
 struct PesState {
+    continuity_counter: Option<u8>,
     parts: Vec<u8>,
-    collecting: bool,
-    /// Timestamp of the accompanying media when this private PES began.
-    fallback_pts: Option<u64>,
 }
 
 impl PesState {
@@ -729,43 +713,67 @@ impl PesState {
         kind: ElementaryKind,
         pid: u16,
         output: &mut Vec<ElementaryPacket>,
-    ) -> Result<()> {
+        fallback_pts: Option<u64>,
+    ) {
+        self.continuity_counter = None;
         if self.parts.is_empty() {
-            return Ok(());
+            return;
         }
-        let packet = std::mem::take(&mut self.parts);
-        let data = pes_payload(&packet, kind)?.to_vec();
-        let pts = match kind {
-            ElementaryKind::PrivateStream2 => self.fallback_pts,
-            ElementaryKind::PrivateStream1 if data.first() == Some(&0x81) => {
-                pes_pts(&packet).or(self.fallback_pts)
-            }
-            _ => pes_pts(&packet),
+        let Some(data) = pes_payload(&self.parts, kind) else {
+            self.parts.clear();
+            return;
         };
+        let data = data.to_vec();
+        let pts = pes_pts(&self.parts).or(fallback_pts);
+        self.parts.clear();
         output.push(ElementaryPacket {
             kind,
             pid,
             data,
             pts,
         });
-        self.collecting = false;
-        self.fallback_pts = None;
-        Ok(())
     }
-}
 
-/// A stream the programme has moved off but which is still sending.
-///
-/// A multiplexer does not cut the old stream where the program map changes: it
-/// keeps sending for a fraction of a second, and the stream that replaces it
-/// has not started yet. Everything in between is the programme, so it is read
-/// until the new one's first packet -- a third of a second of picture and
-/// sound, on the recording this was measured against. Its own PES state,
-/// because the two can overlap in the multiplex and a shared one would
-/// interleave them.
-struct Superseded {
-    pid: u16,
-    state: PesState,
+    fn push(
+        &mut self,
+        kind: ElementaryKind,
+        pid: u16,
+        payload: &TsPayload,
+        output: &mut Vec<ElementaryPacket>,
+        fallback_pts: Option<u64>,
+    ) {
+        let discon = !payload.discontinuity
+            && self.continuity_counter.map(|ci| (ci + 1) & 15) != Some(payload.continuity_counter);
+        if !payload.discontinuity && self.continuity_counter == Some(payload.continuity_counter) {
+            return;
+        }
+        if payload.payload_unit_start {
+            if !discon {
+                match pes_packet_length(&self.parts) {
+                    Some(0) => self.flush(kind, pid, output, fallback_pts),
+                    _ => (),
+                }
+            }
+            self.parts.clear();
+        } else {
+            if discon {
+                self.parts.clear();
+                self.continuity_counter = None;
+                return;
+            }
+        }
+        self.continuity_counter = Some(payload.continuity_counter);
+        self.parts.extend_from_slice(payload.data);
+        if let Some(length) = pes_packet_length(&self.parts) {
+            if length == 0 {
+            } else if length + 6 == self.parts.len() {
+                self.flush(kind, pid, output, fallback_pts);
+            } else if length + 6 < self.parts.len() {
+                self.continuity_counter = None;
+                self.parts.clear();
+            }
+        }
+    }
 }
 
 /// Stateful MPEG-2-video/AAC demuxer, for streaming a file through in bounded
@@ -773,14 +781,10 @@ struct Superseded {
 #[derive(Default)]
 pub struct MpegTsAvDemuxer {
     pending: Vec<u8>,
-    synced: bool,
+    unsynced: bool,
     program: ProgramMap,
     video: PesState,
     audio: PesState,
-    /// The streams the programme has moved off, still being read; see
-    /// [`Superseded`].
-    superseded_video: Option<Superseded>,
-    superseded_audio: Option<Superseded>,
     /// A sound stream the caller has asked to be read instead, which takes
     /// effect at the next packet boundary; see [`MpegTsAvDemuxer::select_audio`].
     audio_switch: Option<u16>,
@@ -868,25 +872,10 @@ impl MpegTsAvDemuxer {
         }
     }
 
-    /// Move to the sound stream [`Self::select_audio`] asked for, at a packet
-    /// boundary rather than in the middle of one.
-    ///
-    /// What has been gathered from the stream being left goes out under its own
-    /// PID, so that whoever is reading the access units sees where one stream
-    /// ended and the next began. Joined instead, the two would make one access
-    /// unit belonging to neither -- which a browser's audio decoder refuses
-    /// outright rather than concealing, and that ends playback.
-    fn take_audio_switch(&mut self, output: &mut Vec<ElementaryPacket>) -> Result<()> {
+    fn take_audio_switch(&mut self) -> Result<()> {
         let Some(pid) = self.audio_switch.take() else {
             return Ok(());
         };
-        if let Some(mut old) = self.superseded_audio.take() {
-            old.state
-                .flush(ElementaryKind::Audio, old.pid, &mut *output)?;
-        }
-        if let Some(old) = self.program.audio_pid {
-            self.audio.flush(ElementaryKind::Audio, old, &mut *output)?;
-        }
         self.audio = PesState::default();
         self.program.audio_pid = Some(pid);
         self.audio_pts = None;
@@ -895,7 +884,7 @@ impl MpegTsAvDemuxer {
 
     /// ARIB character superimpose is timed by the accompanying audio PES, or
     /// by video when the service has no audio. Its own PES commonly has no PTS.
-    fn superimpose_pts(&self) -> Option<u64> {
+    fn fallback_pts(&self) -> Option<u64> {
         if self.program.audio_pid.is_some() {
             self.audio_pts
         } else {
@@ -908,200 +897,145 @@ impl MpegTsAvDemuxer {
         let input = std::mem::take(&mut self.pending);
 
         let mut at = 0;
-        if !self.synced {
-            match sync_offset(&input) {
-                Some(offset) => {
-                    at = offset;
-                    self.synced = true;
-                }
-                None => {
-                    self.pending = input;
-                    return Ok(Vec::new());
-                }
-            }
-        }
-
         let mut output = Vec::new();
-        self.take_audio_switch(&mut output)?;
+        self.take_audio_switch()?;
         let mut sections = Vec::new();
         while at + TS_PACKET_SIZE <= input.len() {
-            match payload_at(&input, at) {
-                Err(_) => {
-                    self.errors += 1;
+            if input[at] != 0x47 || self.unsynced {
+                if input[at..].len() < TS_PACKET_SIZE * MIN_SYNC_COUNT {
+                    break;
                 }
-                Ok(Some(packet)) if packet.scrambled => {
-                    self.note_continuity(&packet);
-                    self.scrambled += 1;
-                }
-                Ok(Some(packet)) => {
-                    self.note_continuity(&packet);
-                    if self.program.wants(packet.pid) {
-                        // Which streams the programme was being read from, in
-                        // case its map moves it to others: what is half
-                        // gathered from these belongs to them and not to
-                        // whatever the new PIDs carry.
-                        let previous = (self.program.video_pid, self.program.audio_pid);
-                        let changed_pids = self.program.push(&packet, &mut sections);
-                        for pid in changed_pids {
-                            self.continuity.remove(&pid);
-                        }
-                        if std::mem::take(&mut self.program.moved_streams) {
-                            // The same programme, carried by other streams from
-                            // here on. The old ones are still sending, and what
-                            // they send until the new ones start belongs to the
-                            // programme too, so they are read on until then --
-                            // with what has been gathered from them so far.
-                            if previous.0 != self.program.video_pid {
-                                self.superseded_video = previous.0.map(|pid| Superseded {
-                                    pid,
-                                    state: std::mem::take(&mut self.video),
-                                });
-                            }
-                            if previous.1 != self.program.audio_pid {
-                                self.superseded_audio = previous.1.map(|pid| Superseded {
-                                    pid,
-                                    state: std::mem::take(&mut self.audio),
-                                });
-                            }
-                            for (pid, state) in self.private.iter_mut() {
-                                if self.program.private_pids.contains(pid) {
-                                    continue;
-                                }
-                                // Which of the two private streams this is, read
-                                // where the ordinary path reads it: out of the
-                                // PES header already gathered.
-                                let kind = match state.parts.get(3) {
-                                    Some(0xbf) => ElementaryKind::PrivateStream2,
-                                    _ => ElementaryKind::PrivateStream1,
-                                };
-                                state.flush(kind, *pid, &mut output)?;
-                            }
-                            self.private
-                                .retain(|pid, _| self.program.private_pids.contains(pid));
-                            self.video_pts = None;
-                            self.audio_pts = None;
-                        }
-                        if std::mem::take(&mut self.program.changed_streams) {
-                            // The streams belong to a different programme now, and
-                            // what was gathered from the old ones is not the start
-                            // of anything.
-                            self.video = PesState::default();
-                            self.audio = PesState::default();
-                            self.private.clear();
-                            self.video_pts = None;
-                            self.audio_pts = None;
-                        }
+                match sync_offset(&input[at..], MIN_SYNC_COUNT) {
+                    Some(offset) => {
+                        at += offset;
+                        self.unsynced = false;
                     }
-                    // Whether this packet belongs to a stream the programme has
-                    // moved off, which is read into its own state until the one
-                    // that replaced it starts.
-                    let mut superseded = false;
-                    let kind = if Some(packet.pid) == self.program.video_pid {
-                        // The old stream's last access unit goes out in front of
-                        // the new stream's first bytes, which is here.
-                        if let Some(mut old) = self.superseded_video.take() {
-                            old.state
-                                .flush(ElementaryKind::Video, old.pid, &mut output)?;
-                        }
-                        Some(ElementaryKind::Video)
-                    } else if Some(packet.pid) == self.program.audio_pid {
-                        if let Some(mut old) = self.superseded_audio.take() {
-                            old.state
-                                .flush(ElementaryKind::Audio, old.pid, &mut output)?;
-                        }
-                        Some(ElementaryKind::Audio)
-                    } else if self
-                        .superseded_video
-                        .as_ref()
-                        .is_some_and(|old| old.pid == packet.pid)
-                    {
-                        superseded = true;
-                        Some(ElementaryKind::Video)
-                    } else if self
-                        .superseded_audio
-                        .as_ref()
-                        .is_some_and(|old| old.pid == packet.pid)
-                    {
-                        superseded = true;
-                        Some(ElementaryKind::Audio)
-                    } else if self.program.private_pids.contains(&packet.pid) {
-                        let stream_id = if packet.payload_unit_start {
-                            packet.data.get(3)
-                        } else {
-                            self.private
-                                .get(&packet.pid)
-                                .and_then(|state| state.parts.get(3))
-                        };
-                        stream_id.and_then(|stream_id| match stream_id {
-                            0xbd => Some(ElementaryKind::PrivateStream1),
-                            0xbf => Some(ElementaryKind::PrivateStream2),
-                            _ => None,
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(kind) = kind {
-                        if packet.payload_unit_start {
-                            match kind {
-                                ElementaryKind::Video => {
-                                    if let Some(pts) = pes_pts(packet.data) {
-                                        self.video_pts = Some(pts);
-                                    }
-                                }
-                                ElementaryKind::Audio => {
-                                    if let Some(pts) = pes_pts(packet.data) {
-                                        self.audio_pts = Some(pts);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        let superimpose_pts = self.superimpose_pts();
-                        let state = match (kind, superseded) {
-                            (ElementaryKind::Video, false) => &mut self.video,
-                            (ElementaryKind::Audio, false) => &mut self.audio,
-                            (ElementaryKind::Video, true) => {
-                                &mut self.superseded_video.as_mut().expect("just matched").state
-                            }
-                            (ElementaryKind::Audio, true) => {
-                                &mut self.superseded_audio.as_mut().expect("just matched").state
-                            }
-                            (
-                                ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2,
-                                _,
-                            ) => self.private.entry(packet.pid).or_default(),
-                        };
-                        if packet.payload_unit_start {
-                            let previous_kind = match state.parts.get(3) {
-                                Some(0xbd) => ElementaryKind::PrivateStream1,
-                                Some(0xbf) => ElementaryKind::PrivateStream2,
-                                _ => kind,
-                            };
-                            state.flush(previous_kind, packet.pid, &mut output)?;
-                            state.collecting = is_pes_start(packet.data, kind);
-                            if matches!(
-                                kind,
-                                ElementaryKind::PrivateStream1 | ElementaryKind::PrivateStream2
-                            ) {
-                                state.fallback_pts = superimpose_pts;
-                            }
-                        }
-                        if state.collecting {
-                            state.parts.extend_from_slice(packet.data);
-                        }
-                        // Once a packet of these streams is on its way out, the
-                        // choice of service is made: switching would splice one
-                        // programme onto another.
-                        if !output.is_empty() {
-                            self.program.may_switch_streams = false;
-                        }
+                    None => {
+                        at += TS_PACKET_SIZE * MIN_SYNC_COUNT;
+                        self.unsynced = true;
+                        continue;
                     }
                 }
-                Ok(None) => {}
             }
+            let Some(packet) = payload_at(&input, at) else {
+                at += TS_PACKET_SIZE;
+                continue;
+            };
             at += TS_PACKET_SIZE;
+            if packet.transport_error_indicator {
+                self.errors += 1;
+                continue;
+            }
+            if packet.scrambled {
+                self.note_continuity(&packet);
+                self.scrambled += 1;
+                continue;
+            }
+            self.note_continuity(&packet);
+            if self.program.wants(packet.pid) {
+                let prev_video_pid = self.program.video_pid;
+                let prev_audio_pid = self.program.audio_pid;
+                let changed_pids = self.program.push(&packet, &mut sections);
+                for pid in changed_pids {
+                    self.continuity.remove(&pid);
+                }
+                if prev_video_pid != self.program.video_pid {
+                    if let Some(prev_video_pid) = prev_video_pid {
+                        self.video
+                            .flush(ElementaryKind::Video, prev_video_pid, &mut output, None);
+                        self.video = PesState::default();
+                        self.video_pts = None;
+                    }
+                }
+                if prev_audio_pid != self.program.audio_pid {
+                    if let Some(prev_audio_pid) = prev_audio_pid {
+                        self.audio
+                            .flush(ElementaryKind::Audio, prev_audio_pid, &mut output, None);
+                        self.audio = PesState::default();
+                        self.audio_pts = None;
+                    }
+                }
+                let fallback_pts = self.fallback_pts();
+                for (pid, state) in &mut self.private {
+                    if !self.program.private_streams.contains(&PrivateStream {
+                        is_async: false,
+                        pid: *pid,
+                    }) {
+                        state.flush(
+                            ElementaryKind::PrivateStream1,
+                            *pid,
+                            &mut output,
+                            fallback_pts,
+                        );
+                    } else if !self.program.private_streams.contains(&PrivateStream {
+                        is_async: true,
+                        pid: *pid,
+                    }) {
+                        state.flush(
+                            ElementaryKind::PrivateStream2,
+                            *pid,
+                            &mut output,
+                            fallback_pts,
+                        );
+                    }
+                }
+            }
+            let fallback_pts = self.fallback_pts();
+            let (kind, state) = if Some(packet.pid) == self.program.video_pid {
+                (ElementaryKind::Video, &mut self.video)
+            } else if Some(packet.pid) == self.program.audio_pid {
+                (ElementaryKind::Audio, &mut self.audio)
+            } else if self.program.private_streams.contains(&PrivateStream {
+                is_async: false,
+                pid: packet.pid,
+            }) {
+                (
+                    ElementaryKind::PrivateStream1,
+                    self.private.entry(packet.pid).or_default(),
+                )
+            } else if self.program.private_streams.contains(&PrivateStream {
+                is_async: true,
+                pid: packet.pid,
+            }) {
+                (
+                    ElementaryKind::PrivateStream2,
+                    self.private.entry(packet.pid).or_default(),
+                )
+            } else {
+                continue;
+            };
+            if packet.payload_unit_start {
+                match kind {
+                    ElementaryKind::Video => {
+                        if let Some(pts) = pes_pts(packet.data) {
+                            self.video_pts = Some(pts);
+                        }
+                    }
+                    ElementaryKind::Audio => {
+                        if let Some(pts) = pes_pts(packet.data) {
+                            self.audio_pts = Some(pts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            state.push(
+                kind,
+                packet.pid,
+                &packet,
+                &mut output,
+                if kind == ElementaryKind::PrivateStream2 {
+                    fallback_pts
+                } else {
+                    None
+                },
+            );
         }
-        self.pending = input[at..].to_vec();
+        if at >= input.len() {
+            self.pending.clear();
+        } else {
+            self.pending = input[at..].to_vec();
+        }
         Ok(output)
     }
 
@@ -1132,40 +1066,25 @@ impl MpegTsAvDemuxer {
 
     /// Flush whatever PES packets were still accumulating at end of input.
     pub fn finish(&mut self) -> Result<Vec<ElementaryPacket>> {
-        if !self.synced {
-            bail!("input is not a 188-byte MPEG transport stream");
-        }
-        if self.program.video_pid.is_none() {
-            bail!("MPEG-TS contains no MPEG-2 video stream (stream_type 0x02)");
-        }
         let mut output = Vec::new();
-        // A stream the programme moved off, which the input ended before the
-        // one that replaced it started, still holds the end of the programme.
-        if let Some(mut old) = self.superseded_video.take() {
-            old.state
-                .flush(ElementaryKind::Video, old.pid, &mut output)?;
+        let fallback_pts = self.fallback_pts();
+        if let Some(video_pid) = self.program.video_pid {
+            self.video
+                .flush(ElementaryKind::Video, video_pid, &mut output, None);
         }
-        if let Some(mut old) = self.superseded_audio.take() {
-            old.state
-                .flush(ElementaryKind::Audio, old.pid, &mut output)?;
+        if let Some(audio_pid) = self.program.audio_pid {
+            self.audio
+                .flush(ElementaryKind::Audio, audio_pid, &mut output, None);
         }
-        self.video.flush(
-            ElementaryKind::Video,
-            self.program.video_pid.unwrap_or(0),
-            &mut output,
-        )?;
-        self.audio.flush(
-            ElementaryKind::Audio,
-            self.program.audio_pid.unwrap_or(0),
-            &mut output,
-        )?;
-        for (&pid, state) in self.private.iter_mut() {
-            let kind = match state.parts.get(3) {
-                Some(0xbd) => ElementaryKind::PrivateStream1,
-                Some(0xbf) => ElementaryKind::PrivateStream2,
-                _ => continue,
-            };
-            state.flush(kind, pid, &mut output)?;
+        for private in &mut self.program.private_streams {
+            if let Some(state) = self.private.get_mut(&private.pid) {
+                state.flush(
+                    ElementaryKind::PrivateStream1,
+                    private.pid,
+                    &mut output,
+                    fallback_pts,
+                );
+            }
         }
         Ok(output)
     }
@@ -1179,14 +1098,14 @@ impl MpegTsAvDemuxer {
 /// may open mid-packet, and a program map it happens to miss would leave a
 /// PID-driven demuxer with nothing to report.
 fn walk_pts(data: &[u8], mut visit: impl FnMut(u64) -> ControlFlow<()>) {
-    let Some(mut at) = sync_offset(data) else {
+    let Some(mut at) = sync_offset(data, 6) else {
         return;
     };
     while at + TS_PACKET_SIZE <= data.len() {
         // A payload the sync check walked past is worth stepping over rather
         // than giving up on: a slice is a fragment of a file, and one damaged
         // packet says nothing about the ones after it.
-        if let Ok(Some(packet)) = payload_at(data, at) {
+        if let Some(packet) = payload_at(data, at) {
             if packet.payload_unit_start
                 && (is_pes_start(packet.data, ElementaryKind::Video)
                     || is_pes_start(packet.data, ElementaryKind::Audio))
@@ -1239,7 +1158,7 @@ pub fn extract_mpeg2_video_es(data: &[u8]) -> Result<Vec<u8>> {
             saw_video = true;
         }
     }
-    if !demuxer.synced {
+    if demuxer.unsynced {
         bail!("input is not a 188-byte MPEG transport stream");
     }
     if demuxer.program.pmt_pids.is_empty() {

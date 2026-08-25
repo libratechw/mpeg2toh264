@@ -7,6 +7,8 @@
 
 mod support;
 
+use std::collections::HashMap;
+
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
 use mpeg2toh264::{
     mpeg2_passthrough_unit, mpeg2_to_fmp4, Fragment, Session, TranscodeOptions, VideoMode,
@@ -161,13 +163,20 @@ fn describes_the_video_as_mpeg_2_with_its_sequence_header() {
 // ---------------------------------------------------------------- a session
 
 /// The fixture, repeated, as a transport stream: one group of pictures each.
-fn video_only_stream(copies: usize) -> Vec<u8> {
-    wrap_mpeg2_es_in_ts(&read_fixture("ibbp.m2v").repeat(copies), Some(90_000))
+fn video_only_stream(copies: usize, continuity: &mut HashMap<u16, u8>) -> Vec<u8> {
+    wrap_mpeg2_es_in_ts(
+        &read_fixture("ibbp.m2v").repeat(copies),
+        Some(90_000),
+        continuity,
+    )
 }
 
 #[test]
 fn a_passthrough_session_says_it_carries_mpeg_2() {
-    let fragments = run_session(&video_only_stream(3), passthrough_options());
+    let fragments = run_session(
+        &video_only_stream(3, &mut HashMap::new()),
+        passthrough_options(),
+    );
     let Some(Fragment::Init {
         data, mime_codec, ..
     }) = fragments.first()
@@ -188,7 +197,7 @@ fn a_passthrough_session_says_it_carries_mpeg_2() {
 
 #[test]
 fn a_session_carries_the_source_pictures_end_to_end() {
-    let stream = video_only_stream(3);
+    let stream = video_only_stream(3, &mut HashMap::new());
     let fragments = run_session(&stream, passthrough_options());
     let carried = media_bytes(&fragments);
 
@@ -216,7 +225,7 @@ fn both_paths_place_the_same_pictures_on_the_same_timeline() {
     // The invariant the two paths share: they accept and drop exactly the same
     // source pictures, and put what they keep at the same times. A fragment
     // that disagreed would drift against the audio track beside it.
-    let stream = video_only_stream(26);
+    let stream = video_only_stream(26, &mut HashMap::new());
     let transcoded = run_session(&stream, TranscodeOptions::default());
     let carried = run_session(&stream, passthrough_options());
     let transcoded = media_only(&transcoded);
@@ -291,7 +300,10 @@ fn both_paths_place_the_same_pictures_on_the_same_timeline() {
 fn a_restart_point_opens_with_a_sequence_header() {
     // A player evicting what it has shown cuts back to a restart point, so the
     // sample there has to be one a decoder can be handed cold.
-    let fragments = run_session(&video_only_stream(26), passthrough_options());
+    let fragments = run_session(
+        &video_only_stream(26, &mut HashMap::new()),
+        passthrough_options(),
+    );
     let mut restarts = 0;
     for fragment in &fragments {
         let Fragment::Media {
@@ -338,6 +350,7 @@ fn a_passthrough_session_muxes_the_aac_track_beside_it() {
                 payload: &support::adts_stream(64, 4, 2),
             },
         ],
+        &mut HashMap::new(),
     );
     let fragments = run_session(&stream, passthrough_options());
     let Some(Fragment::Init { mime_codec, .. }) = fragments.first() else {

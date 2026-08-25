@@ -436,7 +436,7 @@ impl Session {
         self.demuxer.scrambled()
     }
     pub fn errors(&self) -> u64 {
-        self.demuxer.errors() + self.video.errors()
+        self.demuxer.errors()
     }
 
     /// Start a session whose timeline is measured from a PES timestamp of the
