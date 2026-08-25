@@ -65,6 +65,10 @@ const fps = document.querySelector<HTMLElement>("#fps")!;
 const deinterlaceStats =
   document.querySelector<HTMLElement>("#deinterlace-stats")!;
 const probe = document.querySelector<HTMLElement>("#probe")!;
+const perfChartDetails = document.querySelector<HTMLDetailsElement>(
+  "#perf-chart-details",
+)!;
+const perfChart = document.querySelector<HTMLCanvasElement>("#perf-chart")!;
 
 /** How many steps the seek bar divides the video into. */
 const SEEK_STEPS = 1000;
@@ -73,6 +77,129 @@ const SEEK_STEPS = 1000;
 const ARROW_SECONDS = 5;
 const SKIP_SECONDS = 10;
 const DOUBLE_CLICK_DELAY_MS = 300;
+
+const PERF_CHART_WINDOW_MS = 60_000;
+
+interface PerfSample {
+  at: number;
+  fps: number;
+  rollingFps: number;
+}
+
+const perfSamples: PerfSample[] = [];
+
+function recordPerf(perf: PerfSample): void {
+  perfSamples.push(perf);
+  const oldest = perf.at - PERF_CHART_WINDOW_MS;
+  while (perfSamples[0] != null && perfSamples[0].at < oldest)
+    perfSamples.shift();
+  drawPerfChart(performance.now());
+}
+
+function drawPerfChart(now: number): void {
+  if (!perfChartDetails.open) return;
+  const context = perfChart.getContext("2d");
+  const width = perfChart.clientWidth;
+  const height = perfChart.clientHeight;
+  if (!context || width <= 0 || height <= 0) return;
+  const scale = window.devicePixelRatio;
+  const pixelWidth = Math.round(width * scale);
+  const pixelHeight = Math.round(height * scale);
+  if (perfChart.width !== pixelWidth || perfChart.height !== pixelHeight) {
+    perfChart.width = pixelWidth;
+    perfChart.height = pixelHeight;
+  }
+  context.setTransform(scale, 0, 0, scale, 0, 0);
+  context.clearRect(0, 0, width, height);
+
+  const foreground = getComputedStyle(perfChart).color;
+  const left = 58;
+  const right = 10;
+  const top = 28;
+  const bottom = 24;
+  const plotWidth = Math.max(1, width - left - right);
+  const plotHeight = Math.max(1, height - top - bottom);
+  const start = now - PERF_CHART_WINDOW_MS;
+  const x = ({ at }: { at: number }): number =>
+    left + ((at - start) / PERF_CHART_WINDOW_MS) * plotWidth;
+  const timeMin = 0;
+  const timeMax = Math.ceil(
+    Math.max(0, ...perfSamples.map((sample) => 1000 / sample.fps)),
+  );
+  const timeY = (value: number): number =>
+    top + ((timeMax - value) / (timeMax - timeMin)) * plotHeight;
+  context.font = "12px";
+  context.lineWidth = 1;
+  context.strokeStyle = "GrayText";
+  context.fillStyle = foreground;
+  context.textBaseline = "middle";
+  context.textAlign = "right";
+  const target = 1001 / 30;
+  for (const value of [timeMax, 0, target, target / 2]) {
+    const y = timeY(value);
+    context.globalAlpha = value === 0 ? 0.65 : 0.25;
+    context.beginPath();
+    context.moveTo(left, y);
+    context.lineTo(width - right, y);
+    context.stroke();
+    context.globalAlpha = 1;
+    context.fillText(value.toFixed(2), left - 6, y);
+  }
+  context.textAlign = "left";
+  context.fillText("時間 [ms]", 0, top - 12);
+  context.fillStyle = "#48f";
+  context.fillText("フレーム処理時間 [ms]", left, top - 12);
+  context.fillStyle = "#484";
+  context.fillText(
+    "フレーム処理時間 (15回移動平均) [ms]",
+    left + 140,
+    top - 12,
+  );
+  context.fillStyle = foreground;
+  context.textBaseline = "top";
+  context.textAlign = "center";
+  for (const seconds of [-60, -30, 0]) {
+    const tickX = left + ((seconds + 60) / 60) * plotWidth;
+    context.fillText(`${seconds} s`, tickX, height - 18);
+  }
+
+  drawSeries(
+    context,
+    perfSamples,
+    x,
+    (sample) => timeY(1000 / sample.fps),
+    "#48f",
+  );
+  drawSeries(
+    context,
+    perfSamples,
+    x,
+    (sample) => timeY(1000 / sample.rollingFps),
+    "#484",
+  );
+}
+
+function drawSeries<T>(
+  context: CanvasRenderingContext2D,
+  samples: T[],
+  x: (sample: T) => number,
+  y: (sample: T) => number,
+  color: string,
+): void {
+  if (samples.length === 0) return;
+  context.strokeStyle = color;
+  context.lineWidth = 2;
+  context.beginPath();
+  samples.forEach((sample, index) => {
+    if (index === 0) context.moveTo(x(sample), y(sample));
+    else context.lineTo(x(sample), y(sample));
+  });
+  context.stroke();
+}
+
+new ResizeObserver(() => {
+  drawPerfChart(performance.now());
+}).observe(perfChart);
 
 const IDLE_FPS = "瞬間: - トータル: -";
 const IDLE_DEINTERLACE = "-";
@@ -287,6 +414,7 @@ function createPlayer(): Mpeg2TsPlayer {
   captions = null;
   player?.destroy();
   yadif = null;
+  perfSamples.length = 0;
   const chosen = PLACEMENTS[placement.value] ?? PLACEMENTS["auto"]!;
   const created = new Mpeg2TsPlayer(video, {
     mediaSource: chosen.mediaSource,
@@ -386,6 +514,14 @@ function createPlayer(): Mpeg2TsPlayer {
       scrambled,
       errors,
     } = event.detail;
+    const last15 = perfSamples.slice(-15);
+    recordPerf({
+      at: performance.now(),
+      fps: event.detail.instantFps,
+      rollingFps:
+        last15.reduce((p, c) => p + c.fps, event.detail.instantFps) /
+        (last15.length + 1),
+    });
     const { convertingMs, readingMs, waitingMs } = event.detail;
     fps.textContent =
       `瞬間: ${instantFps.toFixed(1)} トータル: ${totalFps.toFixed(1)}` +
