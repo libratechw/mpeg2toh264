@@ -192,6 +192,156 @@ fn detects_loss_immediately_after_a_payload_discontinuity_marker() {
 }
 
 #[test]
+fn preserves_an_open_video_pes_across_a_payload_discontinuity_marker() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // A payload-bearing discontinuity marker supplies the first bytes and the
+    // counter baseline of its new run, so the open PES remains intact.
+    let first = vec![0xaa; 400];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(90_000),
+                payload: &first,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(93_000),
+                payload: &second,
+            },
+        ],
+    );
+    // The last packet of the first PES already has an adaptation field, so its
+    // marker resets continuity without removing any elementary-stream bytes.
+    stream[4 * 188 + 5] = 0x80;
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes the marked PES");
+    packets.extend(demuxer.finish().expect("flushes both PES packets"));
+    let video: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
+
+    assert_eq!(video.len(), 2);
+    assert_eq!(video[0].data, first);
+    assert_eq!(video[1].data, second);
+    assert!(!video[1].damaged_previous_pes);
+    assert_eq!(demuxer.dropped(), 0);
+}
+
+#[test]
+fn preserves_an_open_video_pes_across_an_adaptation_only_discontinuity() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // An adaptation-only marker carries no elementary-stream bytes, but its
+    // counter anchors the first payload of the new continuity run.
+    let first = vec![0xaa; 400];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(90_000),
+                payload: &first,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(93_000),
+                payload: &second,
+            },
+        ],
+    );
+    let marker = [
+        0x47,
+        (VIDEO_PID >> 8) as u8,
+        VIDEO_PID as u8,
+        0x21,
+        183,
+        0x80,
+    ];
+    let mut packet = vec![0xff; 188];
+    packet[..marker.len()].copy_from_slice(&marker);
+    stream.splice(4 * 188..4 * 188, packet);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes the marked PES");
+    packets.extend(demuxer.finish().expect("flushes both PES packets"));
+    let video: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
+
+    assert_eq!(video.len(), 2);
+    assert_eq!(video[0].data, first);
+    assert_eq!(video[1].data, second);
+    assert!(!video[1].damaged_previous_pes);
+    assert_eq!(demuxer.dropped(), 0);
+}
+
+#[test]
+fn discards_an_open_video_pes_after_loss_following_an_adaptation_only_discontinuity() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    // An adaptation-only marker anchors the next expected counter, so losing
+    // the first payload after it proves that the open PES was cut.
+    let first = vec![0xaa; 700];
+    let second = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(90_000),
+                payload: &first,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                pts: Some(93_000),
+                payload: &second,
+            },
+        ],
+    );
+    let mut marker = vec![0xff; 188];
+    marker[..6].copy_from_slice(&[
+        0x47,
+        (VIDEO_PID >> 8) as u8,
+        VIDEO_PID as u8,
+        0x20,
+        183,
+        0x80,
+    ]);
+    // Replacing the first continuation packet models loss immediately after
+    // the marker while leaving no received counter from which to prove it.
+    stream.splice(3 * 188..4 * 188, marker);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes around the hole");
+    packets.extend(demuxer.finish().expect("flushes the replacement"));
+    let video: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
+
+    assert_eq!(video.len(), 1);
+    assert_eq!(video[0].data, second);
+    assert!(video[0].damaged_previous_pes);
+}
+
+#[test]
 fn ignores_a_retransmitted_payload_discontinuity_marker() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};

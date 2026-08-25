@@ -1482,12 +1482,14 @@ fn presentation_end(fragments: &[Fragment]) -> (f64, usize) {
     let mut audio = 0;
     for fragment in fragments {
         if let Fragment::Media {
+            data,
             start,
             audio_samples,
             ..
         } = fragment
         {
-            end = end.max(*start);
+            let (decode_start, decode_end) = video_decode_span(data);
+            end = end.max(*start + (decode_end - decode_start) as f64 / 90_000.0);
             audio += audio_samples;
         }
     }
@@ -1517,6 +1519,73 @@ fn a_hole_in_the_recording_does_not_move_what_follows_it() {
     assert!(
         intact_audio.abs_diff(lossy_audio) <= 1,
         "the sound is {lossy_audio} access units against {intact_audio}, so the hole was not filled"
+    );
+}
+
+#[test]
+fn hidden_packet_loss_at_payload_discontinuities_recovers_both_tracks() {
+    // A payload-bearing discontinuity marker resets the counter baseline, so
+    // loss immediately before it cannot be proved by transport continuity.
+    // The elementary-stream parsers must still recover at the next complete
+    // GOP and ADTS frame instead of stopping the session or moving its tail.
+    let video = read_fixture("ibbp.m2v");
+    let audio = adts_stream(32, 3, 2);
+    let mut units = Vec::new();
+    for copy in 0..4u64 {
+        units.push(PesUnit {
+            pid: VIDEO_PID,
+            stream_id: 0xe0,
+            payload: &video,
+            pts: Some(900_000 + copy * 36_000),
+        });
+        units.push(PesUnit {
+            pid: AUDIO_PID,
+            stream_id: 0xc0,
+            payload: &audio,
+            pts: Some(900_000 + copy * 57_600),
+        });
+    }
+    let intact = mux_transport_stream(
+        &[
+            (VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO),
+            (AUDIO_PID, STREAM_TYPE_AAC_ADTS),
+        ],
+        &units,
+    );
+    let mut lossy = intact.clone();
+
+    for pid in [VIDEO_PID, AUDIO_PID] {
+        // The last packet of a bounded PES already has an adaptation field.
+        // Marking it discontinuous after dropping its predecessor hides that
+        // loss from the next continuity-counter comparison.
+        let starts: Vec<usize> = lossy
+            .chunks(188)
+            .enumerate()
+            .filter(|(_, packet)| {
+                let packet_pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+                packet_pid == pid && packet[1] & 0x40 != 0
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let marker = starts[1] - 1;
+        assert!(marker > starts[0] + 1, "the first PES spans enough packets");
+        assert_ne!(lossy[marker * 188 + 3] & 0x20, 0);
+        assert_ne!(lossy[marker * 188 + 4], 0);
+        lossy[marker * 188 + 5] |= 0x80;
+        lossy.drain((marker - 1) * 188..marker * 188);
+    }
+
+    let (intact_end, intact_audio) = presentation_end(&run_session(&intact, 64 * 1024));
+    let (lossy_end, lossy_audio) = presentation_end(&run_session(&lossy, 64 * 1024));
+
+    assert!(
+        (intact_end - lossy_end).abs() < 0.05,
+        "the recovered tail ends at {lossy_end}s instead of {intact_end}s"
+    );
+    let missing_audio = intact_audio.abs_diff(lossy_audio);
+    assert!(
+        (1..=4).contains(&missing_audio),
+        "the recovered sound lost {missing_audio} samples instead of only the damaged access units"
     );
 }
 

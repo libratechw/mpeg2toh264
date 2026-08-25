@@ -233,6 +233,7 @@ enum ContinuityChange {
     Loss,
 }
 
+#[derive(Default)]
 struct ContinuityState {
     counter: u8,
     payload_unit_start: bool,
@@ -1017,10 +1018,11 @@ impl MpegTsAvDemuxer {
                     self.errors += 1;
                 }
                 Ok(packet) if !packet.has_payload => {
-                    // An adaptation-only marker separates the payloads on its
-                    // two sides while leaving the continuity counter unchanged.
+                    // An adaptation-only marker anchors the counter of the new
+                    // run even though it contributes no elementary-stream bytes.
                     if packet.discontinuity {
-                        self.continuity.remove(&packet.pid);
+                        self.continuity.entry(packet.pid).or_default().counter =
+                            packet.continuity_counter;
                         self.pending_discontinuities.insert(packet.pid);
                     }
                 }
@@ -1040,7 +1042,7 @@ impl MpegTsAvDemuxer {
                     if continuity_change == ContinuityChange::Duplicate {
                         continue;
                     }
-                    if continuity_change != ContinuityChange::None && !packet.payload_unit_start {
+                    if continuity_change == ContinuityChange::Loss && !packet.payload_unit_start {
                         // Bytes after a continuity hole are the tail of a PES whose
                         // middle is gone. Keeping its head would manufacture a valid-
                         // looking AAC frame or video slice that a decoder later rejects.
@@ -1263,15 +1265,29 @@ impl MpegTsAvDemuxer {
             return ContinuityChange::Duplicate;
         }
         let has_pending_discontinuity = self.pending_discontinuities.remove(&packet.pid);
-        let continuity_change = if packet.discontinuity || has_pending_discontinuity {
+        let continuity_change = if packet.discontinuity {
             // A stream commonly marks its very first packet discontinuous to
             // open a new time base. There is no earlier access unit to cut in
             // that case; only a marker inside a stream asks downstream state
             // to be discarded.
             let had_previous = previous.is_some();
             self.implicit_restart_tables = 0;
-            if had_previous || has_pending_discontinuity {
+            if had_previous {
                 ContinuityChange::Reset
+            } else {
+                ContinuityChange::None
+            }
+        } else if has_pending_discontinuity {
+            self.implicit_restart_tables = 0;
+            if let Some(previous) = previous.as_ref() {
+                let expected = (previous.counter + 1) & 0x0f;
+                if packet.continuity_counter == expected {
+                    ContinuityChange::Reset
+                } else {
+                    self.dropped +=
+                        ((packet.continuity_counter as u16 + 16 - expected as u16) & 0x0f) as u64;
+                    ContinuityChange::Loss
+                }
             } else {
                 ContinuityChange::None
             }
