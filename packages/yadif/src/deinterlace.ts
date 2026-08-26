@@ -52,13 +52,13 @@ const HISTORY = 3;
 
 /**
  * Filtered pictures held ready to go up.
- *
- * Two frames' worth of fields, because the pair of a frame is filtered while
- * the second field of the frame before it is still waiting for its moment.
- * Anything less and the picture would have to be filtered again at the point
- * of showing it, which is back to having the two tied together.
+ * Four pictures remain available to the schedule because the pair of a frame
+ * is filtered while the second field of the frame before it is still waiting
+ * for its moment. The fifth is the picture represented by the canvas; keeping
+ * it out of the schedule until another picture is shown leaves snapshots an
+ * immutable source without filtering during presentation.
  */
-const OUTPUTS = 4;
+const OUTPUTS = 5;
 
 /** FFmpeg fieldmatch's default combed-pixel limit in a 16 by 16 block. */
 const FILM_SCORE_THRESHOLD = 80;
@@ -123,6 +123,12 @@ interface Ready {
   /** When it belongs on the screen, on `performance.now()`'s clock. */
   at: number;
 }
+
+/** The draw path that produced the picture still represented by the canvas. */
+type PresentedPicture =
+  | { kind: "texture"; texture: WebGLTexture; flip: boolean }
+  | { kind: "yadif"; flush: boolean; second: boolean }
+  | { kind: "film" };
 
 /**
  * How the filter is getting on, and where it is being let down.
@@ -361,6 +367,8 @@ export class Deinterlacer extends EventTarget {
   #outputs: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
   /** Which output slot was written last; the next one follows round the ring. */
   #outputHead = OUTPUTS - 1;
+  /** The draw path currently shown on the canvas, retained for snapshots. */
+  #presentedPicture: PresentedPicture | null = null;
   /** Filtered fields waiting for their moment, oldest first. */
   #queue: Ready[] = [];
   /** The rAF loop that puts them up, which is all that draws on the canvas. */
@@ -501,6 +509,8 @@ export class Deinterlacer extends EventTarget {
       // Refill the history under the new field structure before filtering it.
       this.#frames = 0;
       this.#resetFilm();
+      this.#presentedPicture = null;
+      this.canvas.style.visibility = "hidden";
     }
     this.#apply();
   }
@@ -541,6 +551,8 @@ export class Deinterlacer extends EventTarget {
     // queued pictures measured with the former order before using the new one.
     this.#frames = 0;
     this.#resetFilm();
+    this.#presentedPicture = null;
+    this.canvas.style.visibility = "hidden";
   }
 
   /** Whether a picture goes up for every field rather than every frame. */
@@ -642,7 +654,41 @@ export class Deinterlacer extends EventTarget {
     this.#stopLoop();
     this.#frames = 0;
     this.#clocked = false;
+    this.#presentedPicture = null;
     this.canvas.style.visibility = "hidden";
+  }
+
+  /**
+   * Copy the picture currently represented by the deinterlacer.
+   * The WebGL drawing buffer is deliberately not preserved between browser
+   * composites. Repeating the exact draw path of the presented picture before
+   * `createImageBitmap` makes a snapshot reliable without imposing the
+   * permanent cost of `preserveDrawingBuffer` on ordinary playback.
+   * The video's natural dimensions apply its sample aspect ratio to the coded
+   * canvas, giving the bitmap the same display aspect ratio as the element.
+   */
+  capture(): Promise<ImageBitmap> {
+    const picture = this.#presentedPicture;
+    if (!this.#running || this.#lost || !picture)
+      return createImageBitmap(this.#video);
+    if (picture.kind === "texture")
+      this.#showTexture(picture.texture, picture.flip, false);
+    else if (picture.kind === "yadif")
+      this.#render(picture.flush, picture.second, null, false);
+    else this.#renderFilm(null, false);
+    const width = this.#video.videoWidth;
+    const height = this.#video.videoHeight;
+    if (
+      width > 0 &&
+      height > 0 &&
+      (width !== this.canvas.width || height !== this.canvas.height)
+    )
+      return createImageBitmap(this.canvas, {
+        resizeWidth: width,
+        resizeHeight: height,
+        resizeQuality: "high",
+      });
+    return createImageBitmap(this.canvas);
   }
 
   destroy(): void {
@@ -775,10 +821,13 @@ export class Deinterlacer extends EventTarget {
       this.#lastFrameAt = at;
       this.#push();
       const shouldDropFilmFrame =
-        this.#autoFilm && this.#frames === HISTORY && this.#analyseFilm();
+        this.#autoFilm &&
+        this.#frames === HISTORY &&
+        this.#analyseFilm() &&
+        this.#outputs.length === OUTPUTS;
       if (shouldDropFilmFrame) {
         // decimate removes this duplicate before yadif, so it contributes no
-        // output picture and the next film deadline remains unchanged
+        // output picture and the retained texture remains an immutable snapshot
       } else if (
         this.#autoFilm &&
         !this.#isCombed &&
@@ -786,9 +835,19 @@ export class Deinterlacer extends EventTarget {
         this.#mode === "film"
       ) {
         if (!this.#scheduling()) {
-          // A framebuffer allocation failure still presents the reconstructed
-          // picture directly instead of hiding the underlying video
-          this.#renderFilm(null);
+          const slot = this.#nextOutputSlot();
+          const output = slot === null ? undefined : this.#outputs[slot];
+          if (slot !== null && output) {
+            // Startup has no measured period yet, so retain the film picture
+            // without sending it through a schedule whose clock is not ready
+            this.#outputHead = slot;
+            this.#renderFilm(output.framebuffer);
+            this.#show(slot);
+          } else {
+            // A framebuffer allocation failure still presents every analysed
+            // picture, keeping the direct draw recipe current for snapshots
+            this.#renderFilm(null);
+          }
         } else {
           // Four reconstructed film pictures are presented at equal intervals
           // over the five input-frame cycle selected by decimate
@@ -817,7 +876,17 @@ export class Deinterlacer extends EventTarget {
         this.#filter(false, first);
         this.#filter(true, first + half);
       } else {
-        this.#render(false, false, null);
+        const slot = this.#autoFilm ? this.#nextOutputSlot() : null;
+        const output = slot === null ? undefined : this.#outputs[slot];
+        if (slot !== null && output) {
+          // A texture keeps the last picture immutable when the next analysed
+          // frame is a duplicate that intentionally produces no presentation
+          this.#outputHead = slot;
+          this.#render(false, false, output.framebuffer);
+          this.#show(slot);
+        } else {
+          this.#render(false, false, null);
+        }
       }
       this.#msSinceReport += performance.now() - at;
       this.#framesSinceReport++;
@@ -1087,7 +1156,8 @@ export class Deinterlacer extends EventTarget {
 
   /** Weave the selected film fields into an output texture and queue it. */
   #filterFilm(at: number): void {
-    const slot = (this.#outputHead + 1) % OUTPUTS;
+    const slot = this.#nextOutputSlot();
+    if (slot === null) return;
     const output = this.#outputs[slot];
     if (!output) return;
     this.#outputHead = slot;
@@ -1096,7 +1166,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   /** Draw the selected p/c/n field weave into a full-size output texture. */
-  #renderFilm(target: WebGLFramebuffer | null): void {
+  #renderFilm(target: WebGLFramebuffer | null, countOutput = true): void {
     const program = this.#filmWeave;
     const location = this.#filmWeaveLocation;
     if (!program || !location) return;
@@ -1122,8 +1192,9 @@ export class Deinterlacer extends EventTarget {
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     if (target === null) {
+      this.#presentedPicture = { kind: "film" };
       this.canvas.style.visibility = "visible";
-      this.#outputSinceReport++;
+      if (countOutput) this.#outputSinceReport++;
     }
   }
 
@@ -1136,12 +1207,27 @@ export class Deinterlacer extends EventTarget {
    * moment, which no later frame can take away.
    */
   #filter(second: boolean, at: number): void {
-    const slot = (this.#outputHead + 1) % OUTPUTS;
+    const slot = this.#nextOutputSlot();
+    if (slot === null) return;
     const output = this.#outputs[slot];
     if (!output) return;
     this.#outputHead = slot;
     this.#render(false, second, output.framebuffer);
     this.#enqueue(slot, at);
+  }
+
+  /** Select an output whose pixels are not still represented by the canvas. */
+  #nextOutputSlot(): number | null {
+    const shownTexture =
+      this.#presentedPicture?.kind === "texture"
+        ? this.#presentedPicture.texture
+        : null;
+    for (let offset = 1; offset <= OUTPUTS; offset++) {
+      const slot = (this.#outputHead + offset) % OUTPUTS;
+      const output = this.#outputs[slot];
+      if (output && output.texture !== shownTexture) return slot;
+    }
+    return null;
   }
 
   /** Add a completed picture to the shared film and field-rate schedule. */
@@ -1241,7 +1327,7 @@ export class Deinterlacer extends EventTarget {
     this.#frames = 0;
   }
 
-  #showTexture(texture: WebGLTexture, flip = false): void {
+  #showTexture(texture: WebGLTexture, flip = false, countOutput = true): void {
     const gl = this.#gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.useProgram(this.#blit);
@@ -1251,8 +1337,9 @@ export class Deinterlacer extends EventTarget {
     gl.uniform1i(this.#blitFlip, flip ? 1 : 0);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.#presentedPicture = { kind: "texture", texture, flip };
     this.canvas.style.visibility = "visible";
-    this.#outputSinceReport++;
+    if (countOutput) this.#outputSinceReport++;
   }
 
   /**
@@ -1337,10 +1424,13 @@ export class Deinterlacer extends EventTarget {
     flush: boolean,
     second: boolean,
     target: WebGLFramebuffer | null,
+    countOutput = true,
   ): void {
     if (this.#frames === 0 || this.#lost) return;
-    if (this.#frames === HISTORY && !flush) this.#stats.filtered++;
-    else this.#stats.degraded++;
+    if (countOutput) {
+      if (this.#frames === HISTORY && !flush) this.#stats.filtered++;
+      else this.#stats.degraded++;
+    }
     const gl = this.#gl;
     const newest = this.#head;
     const older = (this.#head + HISTORY - 1) % HISTORY;
@@ -1391,8 +1481,9 @@ export class Deinterlacer extends EventTarget {
     // A picture filtered into a texture is not on the screen yet, and showing
     // the canvas for it would put up whatever was drawn on it last.
     if (target === null) {
+      this.#presentedPicture = { kind: "yadif", flush, second };
       this.canvas.style.visibility = "visible";
-      this.#outputSinceReport++;
+      if (countOutput) this.#outputSinceReport++;
     }
   }
 
@@ -1432,6 +1523,7 @@ export class Deinterlacer extends EventTarget {
     this.canvas.height = height;
     this.#width = width;
     this.#height = height;
+    this.#presentedPicture = null;
     this.#frames = 0;
     // A coded-size change replaces every history texture. Restart cadence
     // detection so no field match or duplicate phase spans two geometries.
@@ -1577,6 +1669,13 @@ export class Deinterlacer extends EventTarget {
 
   #freeOutputs(): void {
     const gl = this.#gl;
+    const shownTexture =
+      this.#presentedPicture?.kind === "texture"
+        ? this.#presentedPicture.texture
+        : null;
+    // Direct draws and history textures remain reproducible when this pool is released
+    if (this.#outputs.some((output) => output.texture === shownTexture))
+      this.#presentedPicture = null;
     for (const { texture, framebuffer } of this.#outputs) {
       gl.deleteFramebuffer(framebuffer);
       gl.deleteTexture(texture);
@@ -1628,6 +1727,7 @@ export class Deinterlacer extends EventTarget {
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
     this.#resetStats();
+    this.#presentedPicture = null;
     this.canvas.style.visibility = "hidden";
   };
 
@@ -1672,7 +1772,17 @@ export class Deinterlacer extends EventTarget {
     // rather than through a schedule that has nothing left to keep to.
     this.#queue.length = 0;
     this.#clocked = false;
-    if (this.#running) this.#render(true, false, null);
+    if (!this.#running || this.#frames === 0) return;
+    const slot = this.#nextOutputSlot();
+    const output = slot === null ? undefined : this.#outputs[slot];
+    if (slot !== null && output) {
+      // A retained texture survives the first history upload after playback resumes
+      this.#outputHead = slot;
+      this.#render(true, false, output.framebuffer);
+      this.#show(slot);
+    } else {
+      this.#render(true, false, null);
+    }
   };
 
   /**
