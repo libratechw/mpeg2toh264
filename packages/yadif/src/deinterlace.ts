@@ -266,6 +266,9 @@ export interface DeinterlacerOptions {
    * Called about once a second while frames are arriving, and not at all while
    * nothing is playing -- there is nothing to say about a filter that is not
    * being asked for anything.
+   *
+   * The same report is a `stats` event on the instance. A player that did not
+   * construct this object listens there, the way it listens to conversion.
    */
   onStats?(stats: DeinterlaceStats): void;
 }
@@ -280,6 +283,10 @@ export interface VideoState {
   start: number;
   codedSize?: { width: number; height: number };
   scan?: Scan;
+}
+
+export interface DeinterlacerEventMap {
+  stats: CustomEvent<DeinterlaceStats>;
 }
 
 /** Whether this browser has the two things the deinterlacer is built on. */
@@ -304,8 +311,15 @@ export function supportsDeinterlace(): boolean {
  * element still works, but it does cover the element's own controls; a page
  * that wants controls with this on has to draw them itself. `stop()` hides the
  * canvas again, which is all it takes to compare the two.
+ *
+ * How the filter is keeping up is a `stats` event, once a second while frames
+ * arrive:
+ *
+ * ```ts
+ * deinterlacer.addEventListener('stats', (event) => show(event.detail.missed));
+ * ```
  */
-export class Deinterlacer {
+export class Deinterlacer extends EventTarget {
   readonly canvas: HTMLCanvasElement;
 
   readonly #video: HTMLVideoElement;
@@ -404,6 +418,7 @@ export class Deinterlacer {
   #msSinceReport = 0;
 
   constructor(video: HTMLVideoElement, options: DeinterlacerOptions = {}) {
+    super();
     this.#video = video;
     this.#topFieldFirst = options.topFieldFirst ?? true;
     this.#doubleRate = options.doubleRate ?? false;
@@ -649,6 +664,42 @@ export class Deinterlacer {
     if (this.#filmWeave) this.#gl.deleteProgram(this.#filmWeave);
     if (this.#filmSample) this.#gl.deleteProgram(this.#filmSample);
     this.#gl.getExtension("WEBGL_lose_context")?.loseContext();
+  }
+
+  override addEventListener<K extends keyof DeinterlacerEventMap>(
+    type: K,
+    listener: (event: DeinterlacerEventMap[K]) => void,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  override addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  override addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | AddEventListenerOptions,
+  ): void {
+    super.addEventListener(type, listener, options);
+  }
+
+  override removeEventListener<K extends keyof DeinterlacerEventMap>(
+    type: K,
+    listener: (event: DeinterlacerEventMap[K]) => void,
+    options?: boolean | EventListenerOptions,
+  ): void;
+  override removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | EventListenerOptions,
+  ): void;
+  override removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | EventListenerOptions,
+  ): void {
+    super.removeEventListener(type, listener, options);
   }
 
   #request(): void {
@@ -1221,11 +1272,10 @@ export class Deinterlacer {
   }
 
   #report(at: number): void {
-    if (!this.#onStats) return;
     const elapsed = at - this.#reportedAt;
     if (elapsed < STATS_INTERVAL_MS) return;
     const frames = this.#framesSinceReport;
-    this.#onStats({
+    const stats: DeinterlaceStats = {
       ...this.#stats,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
@@ -1238,7 +1288,9 @@ export class Deinterlacer {
       outputFps: (this.#outputSinceReport * 1000) / elapsed,
       duplicateScore: this.#duplicateScore,
       duplicateRunnerUp: this.#duplicateRunnerUp,
-    });
+    };
+    this.dispatchEvent(new CustomEvent("stats", { detail: stats }));
+    this.#onStats?.(stats);
     this.#reportedAt = at;
     this.#framesSinceReport = 0;
     this.#msSinceReport = 0;

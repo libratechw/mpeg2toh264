@@ -1,6 +1,7 @@
 export { Deinterlacer, supportsDeinterlace } from "./deinterlace.js";
 export type {
   DeinterlaceStats,
+  DeinterlacerEventMap,
   DeinterlacerOptions,
   Scan,
 } from "./deinterlace.js";
