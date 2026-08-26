@@ -222,6 +222,16 @@ export declare class Deinterlacer extends EventTarget {
     start(): void;
     /** Take the deinterlaced picture away, leaving the element's own showing. */
     stop(): void;
+    /**
+     * Copy the picture currently represented by the deinterlacer.
+     * The WebGL drawing buffer is deliberately not preserved between browser
+     * composites. Repeating the exact draw path of the presented picture before
+     * `createImageBitmap` makes a snapshot reliable without imposing the
+     * permanent cost of `preserveDrawingBuffer` on ordinary playback.
+     * The video's natural dimensions apply its sample aspect ratio to the coded
+     * canvas, giving the bitmap the same display aspect ratio as the element.
+     */
+    capture(): Promise<ImageBitmap>;
     destroy(): void;
     addEventListener<K extends keyof DeinterlacerEventMap>(type: K, listener: (event: DeinterlacerEventMap[K]) => void, options?: boolean | AddEventListenerOptions): void;
     addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void;
