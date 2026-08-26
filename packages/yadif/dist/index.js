@@ -545,7 +545,7 @@ void main() {
 function Me() {
   return typeof HTMLVideoElement < "u" && "requestVideoFrameCallback" in HTMLVideoElement.prototype && typeof WebGL2RenderingContext < "u";
 }
-class Fe {
+class Fe extends EventTarget {
   canvas;
   #t;
   #e;
@@ -585,7 +585,7 @@ class Fe {
   #s;
   #Q;
   #H;
-  #pe;
+  #me;
   #X = "video";
   #O = "c";
   #Ae = 0;
@@ -615,21 +615,21 @@ class Fe {
   #r = null;
   #z = [];
   #P = !1;
-  #ce;
+  #pe;
   /** Everything the next report is counted from. See DeinterlaceStats. */
   #D = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0, late: 0 };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
   #I = 0;
   #V = 0;
   /** When the last frame the filter took arrived, to see the gaps between. */
-  #le = 0;
+  #ce = 0;
   #W = 0;
   #_ = 0;
   constructor(e, A = {}) {
-    this.#t = e, this.#f = A.topFieldFirst ?? !0, this.#u = A.doubleRate ?? !1, this.#s = A.autoFilm ?? !1, this.#Q = Math.max(
+    super(), this.#t = e, this.#f = A.topFieldFirst ?? !0, this.#u = A.doubleRate ?? !1, this.#s = A.autoFilm ?? !1, this.#Q = Math.max(
       0,
       A.filmCombThreshold ?? ce
-    ), this.#H = Math.max(0, A.bufferFields ?? 1), this.#pe = A.spatialCheck ?? !0, this.#ce = A.onStats, this.canvas = document.createElement("canvas"), this.canvas.style.cssText = "position:absolute;pointer-events:none;visibility:hidden";
+    ), this.#H = Math.max(0, A.bufferFields ?? 1), this.#me = A.spatialCheck ?? !0, this.#pe = A.onStats, this.canvas = document.createElement("canvas"), this.canvas.style.cssText = "position:absolute;pointer-events:none;visibility:hidden";
     const t = this.canvas.getContext("webgl2", {
       alpha: !1,
       antialias: !1,
@@ -656,18 +656,18 @@ class Fe {
     return this.#he;
   }
   set enabled(e) {
-    this.#he = e, this.#fe();
+    this.#he = e, this.#le();
   }
   /** Update whether the source needs filtering and which field comes first. */
   set scan(e) {
     const A = this.#r?.interlaced !== e?.interlaced || this.#r?.topFieldFirst !== e?.topFieldFirst;
-    this.#r = e, e && (this.#f = e.topFieldFirst), A && (this.#i = 0, this.#v()), this.#fe();
+    this.#r = e, e && (this.#f = e.topFieldFirst), A && (this.#i = 0, this.#v()), this.#le();
   }
   get scan() {
     return this.#r;
   }
   set videoTimeline(e) {
-    this.#z = e, e.length === 0 && (this.#r = null), this.#fe();
+    this.#z = e, e.length === 0 && (this.#r = null), this.#le();
   }
   get videoTimeline() {
     return this.#z;
@@ -693,14 +693,14 @@ class Fe {
     return this.#u;
   }
   set doubleRate(e) {
-    e !== this.#u && (this.#u = e, this.#A.length = 0, this.#E = !1, e ? (this.#h > 0 && this.#me(), (this.#r?.interlaced ?? !0) && this.#$()) : this.#s || (this.#q(), this.#k()));
+    e !== this.#u && (this.#u = e, this.#A.length = 0, this.#E = !1, e ? (this.#h > 0 && this.#de(), (this.#r?.interlaced ?? !0) && this.#$()) : this.#s || (this.#q(), this.#k()));
   }
   /** Whether hard-telecined material is reconstructed at film cadence. */
   get autoFilm() {
     return this.#s;
   }
   set autoFilm(e) {
-    e !== this.#s && (this.#s = e, this.#v(), e ? (this.#De(), this.#h > 0 && (this.#Fe(), this.#me()), (this.#r?.interlaced ?? !0) && this.#$()) : (this.#de(), this.#u || (this.#q(), this.#k())));
+    e !== this.#s && (this.#s = e, this.#v(), e ? (this.#De(), this.#h > 0 && (this.#Fe(), this.#de()), (this.#r?.interlaced ?? !0) && this.#$()) : (this.#ue(), this.#u || (this.#q(), this.#k())));
   }
   /** The combed-pixel boundary between clean field matches and field motion. */
   get filmCombThreshold() {
@@ -716,7 +716,7 @@ class Fe {
   set bufferFields(e) {
     this.#H = Math.max(0, e);
   }
-  #fe() {
+  #le() {
     this.#he && (this.#z.length > 0 || (this.#r?.interlaced ?? !0)) ? this.start() : this.stop();
   }
   start() {
@@ -729,7 +729,13 @@ class Fe {
   destroy() {
     this.stop(), this.canvas.removeEventListener("webglcontextlost", this.#Be), this.#t.removeEventListener("emptied", this.#Se), this.#t.removeEventListener("resize", this.#Re), this.#t.removeEventListener("pause", this.#U), this.#t.removeEventListener("ended", this.#U), this.#t.removeEventListener("seeked", this.#U), this.#ze();
     for (const e of this.#m) this.#e.deleteTexture(e);
-    this.#m = [], this.#k(), this.#de(), this.#e.deleteProgram(this.#x), this.#e.deleteProgram(this.#l), this.#w && this.#e.deleteProgram(this.#w), this.#y && this.#e.deleteProgram(this.#y), this.#M && this.#e.deleteProgram(this.#M), this.#e.getExtension("WEBGL_lose_context")?.loseContext();
+    this.#m = [], this.#k(), this.#ue(), this.#e.deleteProgram(this.#x), this.#e.deleteProgram(this.#l), this.#w && this.#e.deleteProgram(this.#w), this.#y && this.#e.deleteProgram(this.#y), this.#M && this.#e.deleteProgram(this.#M), this.#e.getExtension("WEBGL_lose_context")?.loseContext();
+  }
+  addEventListener(e, A, t) {
+    super.addEventListener(e, A, t);
+  }
+  removeEventListener(e, A, t) {
+    super.removeEventListener(e, A, t);
   }
   #K() {
     !this.#p || this.#L !== null || (this.#L = this.#t.requestVideoFrameCallback(this.#Le));
@@ -750,7 +756,7 @@ class Fe {
         }
         !i && t > 0 && this.#Ie(t), this.#J = A.mediaTime;
         const r = performance.now();
-        if (r - this.#le > $ && (this.#V = r, this.#W = 0, this.#_ = 0), this.#le = r, this.#ye(), !(this.#s && this.#i === v && this.#_e())) if (this.#s && !this.#ie && this.#i === v && this.#X === "film")
+        if (r - this.#ce > $ && (this.#V = r, this.#W = 0, this.#_ = 0), this.#ce = r, this.#ye(), !(this.#s && this.#i === v && this.#_e())) if (this.#s && !this.#ie && this.#i === v && this.#X === "film")
           if (!this.#we())
             this.#ve(null);
           else {
@@ -761,7 +767,7 @@ class Fe {
           const n = this.#a / 2, h = this.#Ee(A.mediaTime, A.expectedDisplayTime) + (1 + this.#H) * n;
           this.#xe(!1, h), this.#xe(!0, h + n);
         } else
-          this.#ue(!1, !1, null);
+          this.#fe(!1, !1, null);
         this.#_ += performance.now() - r, this.#W++, this.#Xe(r);
       }
       this.#K();
@@ -931,7 +937,7 @@ class Fe {
    */
   #xe(e, A) {
     const t = (this.#G + 1) % B, i = this.#g[t];
-    i && (this.#G = t, this.#ue(!1, e, i.framebuffer), this.#ge(t, A));
+    i && (this.#G = t, this.#fe(!1, e, i.framebuffer), this.#ge(t, A));
   }
   /** Add a completed picture to the shared film and field-rate schedule. */
   #ge(e, A) {
@@ -1004,11 +1010,9 @@ class Fe {
     this.#I !== 0 && !A && (this.#D.missed += Math.max(0, e - this.#I - 1)), this.#I = e;
   }
   #Xe(e) {
-    if (!this.#ce) return;
     const A = e - this.#V;
     if (A < $) return;
-    const t = this.#W;
-    this.#ce({
+    const t = this.#W, i = {
       ...this.#D,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
@@ -1021,7 +1025,8 @@ class Fe {
       outputFps: this.#B * 1e3 / A,
       duplicateScore: this.#re,
       duplicateRunnerUp: this.#ne
-    }), this.#V = e, this.#W = 0, this.#_ = 0, this.#B = 0;
+    };
+    this.dispatchEvent(new CustomEvent("stats", { detail: i })), this.#pe?.(i), this.#V = e, this.#W = 0, this.#_ = 0, this.#B = 0;
   }
   /** Take the newest frame into the ring. */
   #ye() {
@@ -1055,7 +1060,7 @@ class Fe {
    * the first. The shader takes the pair of frames the missing line sits
    * between from the parity, so this is the whole of it.
    */
-  #ue(e, A, t) {
+  #fe(e, A, t) {
     if (this.#i === 0 || this.#P) return;
     this.#i === v && !e ? this.#D.filtered++ : this.#D.degraded++;
     const i = this.#e, s = this.#c, r = (this.#c + v - 1) % v, a = (this.#c + 1) % v;
@@ -1065,7 +1070,7 @@ class Fe {
       i.activeTexture(i.TEXTURE0 + f), i.bindTexture(i.TEXTURE_2D, this.#m[l] ?? null);
     i.uniform1i(this.#n.prev, 0), i.uniform1i(this.#n.cur, 1), i.uniform1i(this.#n.next, 2), i.uniform2i(this.#n.size, this.#h, this.#d);
     const d = this.#f ? 0 : 1;
-    i.uniform1i(this.#n.parity, A ? 1 - d : d), i.uniform1i(this.#n.tff, this.#f ? 1 : 0), i.uniform1i(this.#n.spatialCheck, this.#pe ? 1 : 0), i.viewport(0, 0, this.#h, this.#d), i.drawArrays(i.TRIANGLES, 0, 3), t === null && (this.canvas.style.visibility = "visible", this.#B++);
+    i.uniform1i(this.#n.parity, A ? 1 - d : d), i.uniform1i(this.#n.tff, this.#f ? 1 : 0), i.uniform1i(this.#n.spatialCheck, this.#me ? 1 : 0), i.viewport(0, 0, this.#h, this.#d), i.drawArrays(i.TRIANGLES, 0, 3), t === null && (this.canvas.style.visibility = "visible", this.#B++);
   }
   /**
    * Put the canvas exactly where the element's picture is.
@@ -1107,7 +1112,7 @@ class Fe {
         null
       ), this.#m.push(s);
     }
-    this.#k(), this.#de(), this.#s && this.#Fe(), (this.#u || this.#s) && this.#me();
+    this.#k(), this.#ue(), this.#s && this.#Fe(), (this.#u || this.#s) && this.#de();
   }
   /** Allocate the fixed-size framebuffer used by both cadence passes. */
   #Fe() {
@@ -1143,7 +1148,7 @@ class Fe {
       pixels: new Uint8Array(y * M * 4)
     };
   }
-  #de() {
+  #ue() {
     this.#F && (this.#e.deleteFramebuffer(this.#F.framebuffer), this.#e.deleteTexture(this.#F.texture), this.#F = null);
   }
   /**
@@ -1155,7 +1160,7 @@ class Fe {
    * -- the whole lot goes and the fields are drawn as their frames arrive,
    * which is the timing this replaces but is still a picture.
    */
-  #me() {
+  #de() {
     const e = this.#e;
     if (!(this.#g.length === B || this.#h === 0)) {
       this.#k();
@@ -1224,7 +1229,7 @@ class Fe {
       degraded: 0,
       discontinuities: 0,
       late: 0
-    }, this.#I = 0, this.#V = 0, this.#le = 0, this.#W = 0, this.#_ = 0, this.#B = 0;
+    }, this.#I = 0, this.#V = 0, this.#ce = 0, this.#W = 0, this.#_ = 0, this.#B = 0;
   }
   /** Return FFmpeg's fieldmatch and decimate windows to their initial state. */
   #v() {
@@ -1236,7 +1241,7 @@ class Fe {
    * the one the first field was taken at.
    */
   #U = () => {
-    this.#A.length = 0, this.#E = !1, this.#p && this.#ue(!0, !1, null);
+    this.#A.length = 0, this.#E = !1, this.#p && this.#fe(!0, !1, null);
   };
   /**
    * A lost context takes the textures and the program with it. Rebuilding

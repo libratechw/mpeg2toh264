@@ -139,6 +139,9 @@ export interface DeinterlacerOptions {
      * Called about once a second while frames are arriving, and not at all while
      * nothing is playing -- there is nothing to say about a filter that is not
      * being asked for anything.
+     *
+     * The same report is a `stats` event on the instance. A player that did not
+     * construct this object listens there, the way it listens to conversion.
      */
     onStats?(stats: DeinterlaceStats): void;
 }
@@ -155,6 +158,9 @@ export interface VideoState {
     };
     scan?: Scan;
 }
+export interface DeinterlacerEventMap {
+    stats: CustomEvent<DeinterlaceStats>;
+}
 /** Whether this browser has the two things the deinterlacer is built on. */
 export declare function supportsDeinterlace(): boolean;
 /**
@@ -170,8 +176,15 @@ export declare function supportsDeinterlace(): boolean;
  * element still works, but it does cover the element's own controls; a page
  * that wants controls with this on has to draw them itself. `stop()` hides the
  * canvas again, which is all it takes to compare the two.
+ *
+ * How the filter is keeping up is a `stats` event, once a second while frames
+ * arrive:
+ *
+ * ```ts
+ * deinterlacer.addEventListener('stats', (event) => show(event.detail.missed));
+ * ```
  */
-export declare class Deinterlacer {
+export declare class Deinterlacer extends EventTarget {
     #private;
     readonly canvas: HTMLCanvasElement;
     constructor(video: HTMLVideoElement, options?: DeinterlacerOptions);
@@ -210,5 +223,9 @@ export declare class Deinterlacer {
     /** Take the deinterlaced picture away, leaving the element's own showing. */
     stop(): void;
     destroy(): void;
+    addEventListener<K extends keyof DeinterlacerEventMap>(type: K, listener: (event: DeinterlacerEventMap[K]) => void, options?: boolean | AddEventListenerOptions): void;
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void;
+    removeEventListener<K extends keyof DeinterlacerEventMap>(type: K, listener: (event: DeinterlacerEventMap[K]) => void, options?: boolean | EventListenerOptions): void;
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions): void;
 }
 //# sourceMappingURL=deinterlace.d.ts.map
