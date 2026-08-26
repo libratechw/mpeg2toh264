@@ -18,19 +18,6 @@
  * to wait for it, so the canvas is one frame -- around 33 ms -- behind the
  * audio. That is well inside what a viewer can tell, and the alternative is a
  * filter with half its motion measurements missing.
- *
- * A picture for every field wants two of them shown in the time one frame
- * arrives, and the callback saying a frame arrived is not a clock: it runs
- * when the page gets its turn, a refresh or so either side of the moment the
- * frame reaches the screen. Hanging the second field off that callback spaces
- * the two of them by however late it was, and loses the second one outright
- * whenever the next frame beats it -- which is motion that stops and starts
- * for no reason a viewer can see. So filtering and showing are separated
- * here: both fields of a frame are filtered into textures of their own as
- * soon as it arrives, given the moment they belong to by a clock run off the
- * media timeline, and put up by an animation frame loop that is the only
- * thing drawing on the canvas. The queue between the two is what a late
- * callback is absorbed by, and `bufferFields` is how much of it there is.
  */
 import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 
@@ -40,15 +27,7 @@ const CONTINUOUS_SECONDS = 0.5;
 /** prev, cur and next: everything the filter reads. */
 const HISTORY = 3;
 
-/**
- * Filtered pictures held ready to go up.
- *
- * Two frames' worth of fields, because the pair of a frame is filtered while
- * the second field of the frame before it is still waiting for its moment.
- * Anything less and the picture would have to be filtered again at the point
- * of showing it, which is back to having the two tied together.
- */
-const OUTPUTS = 4;
+const FIELD_QUEUE_LENGTH = 5;
 
 /** How often the filter says how it is getting on, in milliseconds. */
 const STATS_INTERVAL_MS = 1000;
@@ -59,21 +38,6 @@ const MAX_PERIOD_MS = 200;
 
 /** How much of each measurement the smoothed frame period takes. */
 const PERIOD_SMOOTHING = 0.25;
-
-/**
- * How much of the error in the predicted display time is taken each frame.
- *
- * Low enough that a refresh of noise in one frame's estimate moves the fields
- * by a fraction of it, high enough to follow a clock that really is drifting
- * within a second or so.
- */
-const CLOCK_SMOOTHING = 0.2;
-
-/** The screen's refresh interval until animation frames have said otherwise. */
-const DEFAULT_REFRESH_MS = 1000 / 60;
-
-/** How fast the refresh estimate is allowed to climb back towards a long gap. */
-const REFRESH_DECAY = 0.02;
 
 const VERTEX_SHADER = `#version 300 es
 void main() {
@@ -109,6 +73,7 @@ interface Ready {
   slot: number;
   /** When it belongs on the screen, on `performance.now()`'s clock. */
   at: number;
+  duration: number;
 }
 
 /**
@@ -170,15 +135,13 @@ export interface DeinterlaceStats {
    * deinterlacer takes away from everything else.
    */
   frameMs: number;
+  /** The number of times the field queue was reset when doubleRate is true. */
+  queueResetted: number;
+  /** The number of fields queued when doubleRate is true. */
+  maxQueuedFields: number;
 }
 
 export interface DeinterlacerOptions {
-  /**
-   * Whether the top field of a frame is the one captured first. True for every
-   * MPEG-2 broadcast format worth the name, which is why it is the default;
-   * getting it wrong makes motion jerk back and forth by a field.
-   */
-  topFieldFirst?: boolean;
   /**
    * Whether to show a picture for every field rather than for every frame.
    *
@@ -198,25 +161,6 @@ export interface DeinterlacerOptions {
    * are the `nospatial` pair.
    */
   doubleRate?: boolean;
-  /**
-   * How many field intervals of slack to hold a picture for every field back
-   * by, on top of the half a frame the second field is late by anyway.
-   *
-   * Every filtered field waits in a queue for the animation frame nearest the
-   * moment it stands for. This is how much of the wait is spare: how late the
-   * callback announcing a frame may be before the fields built from it have
-   * already missed their turn. One field interval -- around 17 ms of a 1080i
-   * broadcast -- covers a callback that slipped a refresh, which is what a
-   * page under any load at all does now and again, and it is the default.
-   *
-   * Zero shows each field at the earliest moment it could be shown at, which
-   * is the least delay and the least tolerance. Raising it past one or two
-   * buys nothing a viewer will see and costs delay a viewer might.
-   *
-   * It has no effect at all without `doubleRate`, where a frame's one picture
-   * goes up as the frame after it arrives and there is nothing to schedule.
-   */
-  bufferFields?: number;
   /**
    * Whether to let the local vertical range widen what the temporal check
    * allows. This is yadif's default and its `nospatial` mode turns it off.
@@ -283,27 +227,18 @@ export class Deinterlacer {
   /** Somewhere to filter a field into, and to read it back out of. */
   #outputs: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
   /** Which output slot was written last; the next one follows round the ring. */
-  #outputHead = OUTPUTS - 1;
+  #outputHead = FIELD_QUEUE_LENGTH - 1;
   /** Filtered fields waiting for their moment, oldest first. */
   #queue: Ready[] = [];
   /** The rAF loop that puts them up, which is all that draws on the canvas. */
   #loopHandle: number | null = null;
-  #lastLoopAt = 0;
-  /** The gap between animation frames: as near as the page gets to the screen. */
-  #refreshMs = DEFAULT_REFRESH_MS;
   /** The `<div>` this put around the element, so it can be taken away again. */
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver;
-  #topFieldFirst: boolean;
   #doubleRate: boolean;
-  #bufferFields: number;
   #spatialCheck: boolean;
   /** How long a frame lasts in wall time, from what the frames themselves say. */
   #periodMs = 0;
-  /** Where the media timeline was last pinned to the wall clock, and when. */
-  #clockMedia = 0;
-  #clockWall = 0;
-  #clocked = false;
   /** The size of a frame as it is coded, which is what a texture holds. */
   #width = 0;
   #height = 0;
@@ -320,20 +255,28 @@ export class Deinterlacer {
   #lost = false;
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
   /** Everything the next report is counted from. See DeinterlaceStats. */
-  #stats = { filtered: 0, missed: 0, degraded: 0, discontinuities: 0, late: 0 };
+  #stats = {
+    filtered: 0,
+    missed: 0,
+    degraded: 0,
+    discontinuities: 0,
+    late: 0,
+    queueResetted: 0,
+  };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
   #lastPresented = 0;
-  #reportedAt = 0;
   /** When the last frame the filter took arrived, to see the gaps between. */
   #lastFrameAt = 0;
-  #framesSinceReport = 0;
-  #msSinceReport = 0;
+  #reportedAt = 0;
+  #renderFramesSinceReport = 0;
+  #renderMsSinceReport = 0;
+  #showFramesSinceReport = 0;
+  #showMsSinceReport = 0;
+  #reportMaxQueuedFields = 0;
 
   constructor(video: HTMLVideoElement, options: DeinterlacerOptions = {}) {
     this.#video = video;
-    this.#topFieldFirst = options.topFieldFirst ?? true;
     this.#doubleRate = options.doubleRate ?? false;
-    this.#bufferFields = Math.max(0, options.bufferFields ?? 1);
     this.#spatialCheck = options.spatialCheck ?? true;
     this.#onStats = options.onStats;
     this.canvas = document.createElement("canvas");
@@ -378,6 +321,7 @@ export class Deinterlacer {
     video.addEventListener("pause", this.#onFlush);
     video.addEventListener("ended", this.#onFlush);
     video.addEventListener("seeked", this.#onFlush);
+    video.addEventListener("ratechange", this.#onFlush);
   }
 
   get running(): boolean {
@@ -397,7 +341,6 @@ export class Deinterlacer {
   /** Update whether the source needs filtering and which field comes first. */
   set scan(scan: Scan | null) {
     this.#scan = scan;
-    if (scan) this.#topFieldFirst = scan.topFieldFirst;
     this.#apply();
   }
 
@@ -425,15 +368,6 @@ export class Deinterlacer {
     return this.#wrapper ?? this.#video;
   }
 
-  /** Whether the top field of a frame is the one captured first. */
-  get topFieldFirst(): boolean {
-    return this.#topFieldFirst;
-  }
-
-  set topFieldFirst(topFieldFirst: boolean) {
-    this.#topFieldFirst = topFieldFirst;
-  }
-
   /** Whether a picture goes up for every field rather than every frame. */
   get doubleRate(): boolean {
     return this.#doubleRate;
@@ -451,15 +385,6 @@ export class Deinterlacer {
       this.#stopLoop();
       this.#freeOutputs();
     }
-  }
-
-  /** How many field intervals of slack the field schedule is held back by. */
-  get bufferFields(): number {
-    return this.#bufferFields;
-  }
-
-  set bufferFields(fields: number) {
-    this.#bufferFields = Math.max(0, fields);
   }
 
   #apply(): void {
@@ -489,7 +414,6 @@ export class Deinterlacer {
     this.#handle = null;
     this.#stopLoop();
     this.#frames = 0;
-    this.#clocked = false;
     this.canvas.style.visibility = "hidden";
   }
 
@@ -501,6 +425,7 @@ export class Deinterlacer {
     this.#video.removeEventListener("pause", this.#onFlush);
     this.#video.removeEventListener("ended", this.#onFlush);
     this.#video.removeEventListener("seeked", this.#onFlush);
+    this.#video.removeEventListener("ratechange", this.#onFlush);
     this.#unmount();
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
@@ -516,7 +441,7 @@ export class Deinterlacer {
   }
 
   #onFrame = (
-    _now: DOMHighResTimeStamp,
+    now: DOMHighResTimeStamp,
     metadata: VideoFrameCallbackMetadata,
   ): void => {
     this.#handle = null;
@@ -546,7 +471,6 @@ export class Deinterlacer {
         // behind, and the clock they were timed by is pinned to the same
         // place. Both start again from where playback actually is.
         this.#queue.length = 0;
-        this.#clocked = false;
       }
       this.#count(metadata.presentedFrames, stale);
       // The same picture presented again, which the compositor does whenever
@@ -567,27 +491,34 @@ export class Deinterlacer {
       // filter says nothing about it. Begin the interval at this frame.
       if (at - this.#lastFrameAt > STATS_INTERVAL_MS) {
         this.#reportedAt = at;
-        this.#framesSinceReport = 0;
-        this.#msSinceReport = 0;
+        this.#renderFramesSinceReport = 0;
+        this.#renderMsSinceReport = 0;
+        this.#showFramesSinceReport = 0;
+        this.#showMsSinceReport = 0;
+        this.#reportMaxQueuedFields = 0;
       }
       this.#lastFrameAt = at;
+      const begin = performance.now();
       this.#push();
+      this.#reportMaxQueuedFields = Math.max(
+        this.#reportMaxQueuedFields,
+        this.#queue.length,
+      );
       if (this.#scheduling()) {
-        // The moment this frame reaches the screen is the moment the frame
-        // before it stops standing for, so both of that one's fields hang off
-        // it: the first half a frame later, and the second half a frame after
-        // that, plus whatever slack the queue is being given.
-        const half = this.#periodMs / 2;
-        const first =
-          this.#clock(metadata.mediaTime, metadata.expectedDisplayTime) +
-          (1 + this.#bufferFields) * half;
-        this.#filter(false, first);
-        this.#filter(true, first + half);
+        const duration = this.#periodMs / 2;
+        if (this.#queue.length >= FIELD_QUEUE_LENGTH) {
+          this.#queue.length = 0;
+          this.#stats.queueResetted += 1;
+        }
+        const last = this.#queue.at(-1);
+        const at = last != null ? last.at + last.duration : now;
+        this.#filter(false, at, duration);
+        this.#filter(true, at + duration, duration);
       } else {
         this.#render(false, false, null);
       }
-      this.#msSinceReport += performance.now() - at;
-      this.#framesSinceReport++;
+      this.#renderMsSinceReport += performance.now() - begin;
+      this.#renderFramesSinceReport++;
       this.#report(at);
     }
     this.#request();
@@ -618,10 +549,8 @@ export class Deinterlacer {
     )
       return;
     this.#scan = scan;
-    this.#topFieldFirst = scan.topFieldFirst;
     this.#frames = 0;
     this.#queue.length = 0;
-    this.#clocked = false;
     if (scan.interlaced) {
       if (this.#doubleRate) this.#startLoop();
     } else {
@@ -639,7 +568,9 @@ export class Deinterlacer {
    */
   #scheduling(): boolean {
     return (
-      this.#doubleRate && this.#periodMs > 0 && this.#outputs.length === OUTPUTS
+      this.#doubleRate &&
+      this.#periodMs > 0 &&
+      this.#outputs.length === FIELD_QUEUE_LENGTH
     );
   }
 
@@ -667,45 +598,6 @@ export class Deinterlacer {
   }
 
   /**
-   * When this frame reaches the screen, from a clock that is pulled towards
-   * what each frame says rather than set by it.
-   *
-   * `expectedDisplayTime` is an estimate, and it moves about by a refresh or
-   * so either way even while playback is perfectly steady. Hanging two fields
-   * off it directly passes that movement to the screen, which is exactly the
-   * unevenness a picture for every field is meant to remove; running a clock
-   * of the media timeline and correcting a fifth of the error each frame
-   * keeps the fields evenly spaced while still following the element. An
-   * error of more than a whole frame is not drift -- the element is
-   * presenting from somewhere else, or at a rate it was not at before -- and
-   * the clock goes straight there, taking the fields timed by the old one
-   * with it.
-   */
-  #clock(mediaTime: number, displayAt: number): number {
-    if (!this.#clocked) {
-      this.#clocked = true;
-      this.#clockMedia = mediaTime;
-      this.#clockWall = displayAt;
-      return displayAt;
-    }
-    const rate = this.#video.playbackRate || 1;
-    const predicted =
-      this.#clockWall + ((mediaTime - this.#clockMedia) * 1000) / rate;
-    const error = displayAt - predicted;
-    let at: number;
-    if (Math.abs(error) > this.#periodMs) {
-      at = displayAt;
-      this.#stats.late += this.#queue.length;
-      this.#queue.length = 0;
-    } else {
-      at = predicted + error * CLOCK_SMOOTHING;
-    }
-    this.#clockMedia = mediaTime;
-    this.#clockWall = at;
-    return at;
-  }
-
-  /**
    * Filter one field into an output texture and put it in the queue.
    *
    * The three frames the filter reads are only the right three between one
@@ -713,8 +605,8 @@ export class Deinterlacer {
    * held as pictures. What is queued after that is a copy waiting for a
    * moment, which no later frame can take away.
    */
-  #filter(second: boolean, at: number): void {
-    const slot = (this.#outputHead + 1) % OUTPUTS;
+  #filter(second: boolean, at: number, duration: number): void {
+    const slot = (this.#outputHead + 1) % FIELD_QUEUE_LENGTH;
     const output = this.#outputs[slot];
     if (!output) return;
     this.#outputHead = slot;
@@ -726,14 +618,13 @@ export class Deinterlacer {
       this.#stats.late++;
     }
     this.#render(false, second, output.framebuffer);
-    this.#queue.push({ slot, at });
+    this.#queue.push({ slot, at, duration });
   }
 
   /** The loop that puts filtered fields up, and the only thing that draws. */
   #startLoop(): void {
     if (this.#loopHandle !== null) return;
     if (!this.#running || this.#lost || !this.#doubleRate) return;
-    this.#lastLoopAt = 0;
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   }
 
@@ -746,21 +637,6 @@ export class Deinterlacer {
   #onLoop = (now: DOMHighResTimeStamp): void => {
     this.#loopHandle = null;
     if (!this.#running || this.#lost || !this.#doubleRate) return;
-    // Animation frames are as near as a page gets to seeing the screen, and
-    // the gap between two of them is a refresh whenever neither was late.
-    // Taking the shortest gap seen and letting it climb back slowly finds the
-    // refresh interval from either side: a hitch pulls the estimate up by a
-    // fiftieth, and the very next ordinary frame pulls it back down.
-    if (this.#lastLoopAt > 0) {
-      const gap = now - this.#lastLoopAt;
-      if (gap >= 1 && gap <= MAX_PERIOD_MS) {
-        this.#refreshMs =
-          gap < this.#refreshMs
-            ? gap
-            : this.#refreshMs + (gap - this.#refreshMs) * REFRESH_DECAY;
-      }
-    }
-    this.#lastLoopAt = now;
     this.#present(now);
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   };
@@ -776,19 +652,23 @@ export class Deinterlacer {
    * the older of the two is a moment the viewer should already be past.
    */
   #present(now: number): void {
-    const deadline = now + this.#refreshMs * 1.5;
-    if ((this.#queue[0]?.at ?? Infinity) > deadline) return;
-    let ready = this.#queue.shift();
-    while ((this.#queue[0]?.at ?? Infinity) <= deadline) {
+    const tolerance = 3;
+    while (this.#queue[1] && this.#queue[1].at - now <= tolerance) {
       this.#stats.late++;
-      ready = this.#queue.shift();
+      this.#queue.shift();
     }
-    if (!ready) return;
-    const at = performance.now();
+    let ready = this.#queue[0];
+    if (!ready) {
+      return;
+    }
+    if (ready.at - now > tolerance) {
+      return;
+    }
+    this.#queue.shift();
+    const begin = performance.now();
     this.#show(ready.slot);
-    // Counted in the cost of the frame the field came from rather than as a
-    // frame of its own, so `frameMs` stays the price of one frame of video.
-    this.#msSinceReport += performance.now() - at;
+    this.#showMsSinceReport += performance.now() - begin;
+    this.#showFramesSinceReport++;
   }
 
   /** Copy one of the filtered pictures onto the canvas. */
@@ -840,18 +720,28 @@ export class Deinterlacer {
     if (!this.#onStats) return;
     const elapsed = at - this.#reportedAt;
     if (elapsed < STATS_INTERVAL_MS) return;
-    const frames = this.#framesSinceReport;
+    const frames = this.#scheduling()
+      ? this.#showFramesSinceReport
+      : this.#renderFramesSinceReport;
     this.#onStats({
       ...this.#stats,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
       dropped: this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
       fps: (frames * 1000) / elapsed,
-      frameMs: frames === 0 ? 0 : this.#msSinceReport / frames,
+      frameMs:
+        this.#renderFramesSinceReport === 0
+          ? 0
+          : (this.#renderMsSinceReport + this.#showMsSinceReport) /
+            this.#renderFramesSinceReport,
+      maxQueuedFields: this.#reportMaxQueuedFields,
     });
     this.#reportedAt = at;
-    this.#framesSinceReport = 0;
-    this.#msSinceReport = 0;
+    this.#renderFramesSinceReport = 0;
+    this.#renderMsSinceReport = 0;
+    this.#showFramesSinceReport = 0;
+    this.#showMsSinceReport = 0;
+    this.#reportMaxQueuedFields = 0;
   }
 
   /** Take the newest frame into the ring. */
@@ -939,9 +829,12 @@ export class Deinterlacer {
     // The lines that survive are the ones of the field being shown: the first
     // field is the top one when the top field leads, and the second is the
     // other. A frame at a time is always the first.
-    const first = this.#topFieldFirst ? 0 : 1;
+    const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
     gl.uniform1i(this.#location.parity, second ? 1 - first : first);
-    gl.uniform1i(this.#location.tff, this.#topFieldFirst ? 1 : 0);
+    gl.uniform1i(
+      this.#location.tff,
+      this.#scan?.topFieldFirst !== false ? 1 : 0,
+    );
     gl.uniform1i(this.#location.spatialCheck, this.#spatialCheck ? 1 : 0);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -1029,9 +922,10 @@ export class Deinterlacer {
    */
   #allocateOutputs(): void {
     const gl = this.#gl;
-    if (this.#outputs.length === OUTPUTS || this.#width === 0) return;
+    if (this.#outputs.length === FIELD_QUEUE_LENGTH || this.#width === 0)
+      return;
     this.#freeOutputs();
-    for (let index = 0; index < OUTPUTS; index++) {
+    for (let index = 0; index < FIELD_QUEUE_LENGTH; index++) {
       const texture = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -1069,7 +963,7 @@ export class Deinterlacer {
       }
       this.#outputs.push({ texture, framebuffer });
     }
-    this.#outputHead = OUTPUTS - 1;
+    this.#outputHead = FIELD_QUEUE_LENGTH - 1;
   }
 
   #freeOutputs(): void {
@@ -1119,7 +1013,6 @@ export class Deinterlacer {
     this.#frames = 0;
     this.#lastMediaTime = 0;
     this.#queue.length = 0;
-    this.#clocked = false;
     this.#periodMs = 0;
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
@@ -1134,12 +1027,16 @@ export class Deinterlacer {
       degraded: 0,
       discontinuities: 0,
       late: 0,
+      queueResetted: 0,
     };
     this.#lastPresented = 0;
     this.#reportedAt = 0;
     this.#lastFrameAt = 0;
-    this.#framesSinceReport = 0;
-    this.#msSinceReport = 0;
+    this.#renderFramesSinceReport = 0;
+    this.#renderMsSinceReport = 0;
+    this.#showFramesSinceReport = 0;
+    this.#showMsSinceReport = 0;
+    this.#reportMaxQueuedFields = 0;
   }
 
   /**
@@ -1152,7 +1049,6 @@ export class Deinterlacer {
     // coming to make sense of them, so the picture goes straight to the canvas
     // rather than through a schedule that has nothing left to keep to.
     this.#queue.length = 0;
-    this.#clocked = false;
     if (this.#running) this.#render(true, false, null);
   };
 
