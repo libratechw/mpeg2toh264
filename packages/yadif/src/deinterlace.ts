@@ -859,11 +859,11 @@ export class Deinterlacer {
     const gl = this.#gl;
     this.#head = (this.#head + 1) % HISTORY;
     gl.bindTexture(gl.TEXTURE_2D, this.#textures[this.#head] ?? null);
-    gl.texSubImage2D(
+    // texSubImage2D is very slow in WebKit (~7 ms), so use texImage2D instead (~1 ms).
+    gl.texImage2D(
       gl.TEXTURE_2D,
       0,
-      0,
-      0,
+      gl.RGBA,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
       this.#video,
