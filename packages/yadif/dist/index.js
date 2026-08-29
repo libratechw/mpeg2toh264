@@ -781,7 +781,7 @@ class ye extends EventTarget {
         if (this.#xe(), this.#k = Math.max(
           this.#k,
           this.#e.length
-        ), !(this.#i && this.#s === x && this.#Le() && this.#te()) && this.#i && !this.#V && this.#L === "film")
+        ), !(this.#i && this.#s === x && this.#Le() && this.#te())) if (this.#i && !this.#V && this.#L === "film")
           if (this.#te()) {
             const n = this.#E * 5 / 4;
             this.#e.length >= J && (this.#e.length = 0, this.#p.queueResetted += 1);

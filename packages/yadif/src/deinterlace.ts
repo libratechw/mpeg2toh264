@@ -758,12 +758,10 @@ export class Deinterlacer extends EventTarget {
       // frame on the direct path rather than silently dropping it.
       const shouldDropFilmFrame =
         filmFrameShouldBeDropped && this.#scheduling();
-      if (
-        !shouldDropFilmFrame &&
-        this.#autoFilm &&
-        !this.#isCombed &&
-        this.#mode === "film"
-      ) {
+      if (shouldDropFilmFrame) {
+        // decimate removes this duplicate before YADIF, so it contributes no
+        // output picture to the reconstructed film cadence.
+      } else if (this.#autoFilm && !this.#isCombed && this.#mode === "film") {
         if (this.#scheduling()) {
           // Five input frames become four film pictures. The interval between
           // them is therefore five quarters of the measured input period.
