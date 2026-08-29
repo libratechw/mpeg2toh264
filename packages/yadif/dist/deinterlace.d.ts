@@ -57,6 +57,10 @@ export interface DeinterlaceStats {
      * deinterlacer takes away from everything else.
      */
     frameMs: number;
+    /** The number of times the field queue was reset when doubleRate is true. */
+    queueResetted: number;
+    /** The number of fields queued when doubleRate is true. */
+    maxQueuedFields: number;
     /** The render path currently selected by automatic cadence detection. */
     mode: "film" | "video";
     /** The field match selected for the most recently analysed frame. */
@@ -71,12 +75,6 @@ export interface DeinterlaceStats {
     duplicateRunnerUp: number;
 }
 export interface DeinterlacerOptions {
-    /**
-     * Whether the top field of a frame is the one captured first. True for every
-     * MPEG-2 broadcast format worth the name, which is why it is the default;
-     * getting it wrong makes motion jerk back and forth by a field.
-     */
-    topFieldFirst?: boolean;
     /**
      * Whether to show a picture for every field rather than for every frame.
      *
@@ -98,38 +96,17 @@ export interface DeinterlacerOptions {
     doubleRate?: boolean;
     /**
      * Whether hard-telecined film is reconstructed and shown at its native
-     * 24000/1001 cadence. Matching follows FFmpeg's `fieldmatch=mode=pc_n:
-     * combmatch=full:mchroma=0`, and duplicate decisions follow `decimate=cycle=5:
-     * mixed=1`. Only a clean match inside a decimated cycle uses the film path;
-     * every other frame continues through yadif.
+     * 24000/1001 cadence. Matching and duplicate decisions follow the same
+     * fieldmatch/decimate rules as the fork's previous implementation. Frames
+     * that do not form a clean film cadence continue through YADIF.
      */
     autoFilm?: boolean;
     /**
-     * Largest combed-pixel block count accepted as a clean film field match.
-     * The default 80 matches FFmpeg fieldmatch's `combpel` default. Duplicate
-     * cadence must still be established independently before film mode starts.
+     * The combed-pixel threshold for a 16 by 16 block. A fieldmatch result with
+     * a score at or above this value is considered combed. This is the browser
+     * equivalent of FFmpeg fieldmatch's `combpel` threshold.
      */
     filmCombThreshold?: number;
-    /**
-     * How many field intervals of slack to hold a picture for every field back
-     * by, on top of the half a frame the second field is late by anyway.
-     *
-     * Every filtered field waits in a queue for the animation frame nearest the
-     * moment it stands for. This is how much of the wait is spare: how late the
-     * callback announcing a frame may be before the fields built from it have
-     * already missed their turn. One field interval -- around 17 ms of a 1080i
-     * broadcast -- covers a callback that slipped a refresh, which is what a
-     * page under any load at all does now and again, and it is the default.
-     *
-     * Zero shows each field at the earliest moment it could be shown at, which
-     * is the least delay and the least tolerance. Raising it past one or two
-     * buys nothing a viewer will see and costs delay a viewer might.
-     *
-     * It affects the queued field-rate output from `doubleRate` and the queued
-     * native-cadence output from `autoFilm`. With both features off, a frame's
-     * one picture goes up as the frame after it arrives and nothing is queued.
-     */
-    bufferFields?: number;
     /**
      * Whether to let the local vertical range widen what the temporal check
      * allows. This is yadif's default and its `nospatial` mode turns it off.
@@ -139,9 +116,6 @@ export interface DeinterlacerOptions {
      * Called about once a second while frames are arriving, and not at all while
      * nothing is playing -- there is nothing to say about a filter that is not
      * being asked for anything.
-     *
-     * The same report is a `stats` event on the instance. A player that did not
-     * construct this object listens there, the way it listens to conversion.
      */
     onStats?(stats: DeinterlaceStats): void;
 }
@@ -177,12 +151,9 @@ export declare function supportsDeinterlace(): boolean;
  * that wants controls with this on has to draw them itself. `stop()` hides the
  * canvas again, which is all it takes to compare the two.
  *
- * How the filter is keeping up is a `stats` event, once a second while frames
- * arrive:
- *
- * ```ts
- * deinterlacer.addEventListener('stats', (event) => show(event.detail.missed));
- * ```
+ * While frames are arriving, the current counters are also dispatched as a
+ * `stats` event about once a second. The optional `onStats` callback receives
+ * the same snapshot for callers that prefer a constructor option.
  */
 export declare class Deinterlacer extends EventTarget {
     #private;
@@ -204,35 +175,28 @@ export declare class Deinterlacer extends EventTarget {
      * the page, and with it the only deinterlaced picture there is.
      */
     get container(): HTMLElement;
-    /** Whether the top field of a frame is the one captured first. */
-    get topFieldFirst(): boolean;
-    set topFieldFirst(topFieldFirst: boolean);
     /** Whether a picture goes up for every field rather than every frame. */
     get doubleRate(): boolean;
     set doubleRate(doubleRate: boolean);
     /** Whether hard-telecined material is reconstructed at film cadence. */
     get autoFilm(): boolean;
     set autoFilm(autoFilm: boolean);
-    /** The combed-pixel boundary between clean field matches and field motion. */
+    /** The combed-pixel limit used by automatic film detection. */
     get filmCombThreshold(): number;
-    set filmCombThreshold(filmCombThreshold: number);
-    /** How many field intervals of slack the field schedule is held back by. */
-    get bufferFields(): number;
-    set bufferFields(fields: number);
+    set filmCombThreshold(value: number);
     start(): void;
     /** Take the deinterlaced picture away, leaving the element's own showing. */
     stop(): void;
+    destroy(): void;
     /**
      * Copy the picture currently represented by the deinterlacer.
+     *
      * The WebGL drawing buffer is deliberately not preserved between browser
      * composites. Repeating the exact draw path of the presented picture before
      * `createImageBitmap` makes a snapshot reliable without imposing the
      * permanent cost of `preserveDrawingBuffer` on ordinary playback.
-     * The video's natural dimensions apply its sample aspect ratio to the coded
-     * canvas, giving the bitmap the same display aspect ratio as the element.
      */
     capture(): Promise<ImageBitmap>;
-    destroy(): void;
     addEventListener<K extends keyof DeinterlacerEventMap>(type: K, listener: (event: DeinterlacerEventMap[K]) => void, options?: boolean | AddEventListenerOptions): void;
     addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void;
     removeEventListener<K extends keyof DeinterlacerEventMap>(type: K, listener: (event: DeinterlacerEventMap[K]) => void, options?: boolean | EventListenerOptions): void;

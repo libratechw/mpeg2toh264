@@ -3,15 +3,16 @@
 `@mpeg2toh264/player`へ注入できるWebGL版yadifデインターレーサーです。
 
 ```ts
-import { Mpeg2TsPlayer } from '@mpeg2toh264/player';
-import { Deinterlacer } from '@mpeg2toh264/yadif';
+import { Mpeg2TsPlayer } from "@mpeg2toh264/player";
+import { Deinterlacer } from "@mpeg2toh264/yadif";
 
 const player = new Mpeg2TsPlayer(video, {
   deinterlace: true,
-  deinterlacer: (element) => new Deinterlacer(element, {
-    autoFilm: true,
-    doubleRate: true,
-  }),
+  deinterlacer: (element) =>
+    new Deinterlacer(element, {
+      autoFilm: true,
+      doubleRate: true,
+    }),
 });
 ```
 
@@ -22,7 +23,7 @@ const player = new Mpeg2TsPlayer(video, {
 ### 独自追加機能: `autoFilm`
 
 `autoFilm` を有効にすると、FFmpeg の `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` と `decimate=cycle=5:mixed=1` に相当する判定で、3:2 プルダウン区間を 24000/1001fps で表示します。  
-ブラウザーでは映像だけを5フレーム保持すると音声より約 167ms 遅れるため、完了した5フレーム周期で得た重複位相を次の周期へ適用し、現在の差分も FFmpeg の `dupthresh=1.1` を満たす場合だけ間引きます。
+判定用には 160×90 に縮小したフレームだけを読み出し、フル解像度の映像は GPU テクスチャのまま保持します。選択されたフィルム画像は、通常のフィールド出力と同じ presentation queue へ投入します。
 
 重複を含む周期でフィールドマッチが成立した場合だけ、24fps のフィルム区間として扱います。  
 フィルム周期として採用されていない区間のフレームと、フィールドマッチ後もインターレースと判定されたフレームは間引かず、通常の YADIF 処理へ渡します。  
@@ -30,3 +31,28 @@ const player = new Mpeg2TsPlayer(video, {
 
 `autoFilm` の既定値は `false` です。  
 無効時には判定用シェーダーとフレームバッファーを生成せず、通常の YADIF 経路だけを使用します。
+
+`filmCombThreshold` で fieldmatch の comb 判定閾値を変更できます。既定値は FFmpeg の `combpel=80` 相当で、`combScore` がこの値以上のフィールドはインターレースとして扱われます。
+
+field order は `scan` から受け取ります。通常の player 経由では MPEG-2 bitstream から自動的に設定されます。standalone で BFF を指定する場合は、次のように設定します。
+
+```ts
+const deinterlacer = new Deinterlacer(video);
+deinterlacer.scan = {
+  interlaced: true,
+  topFieldFirst: false,
+};
+```
+
+### `capture()` と統計イベント
+
+`capture()` は、その時点で Deinterlacer が表示しているフィールドまたはフィルムフレームを描き直し、`ImageBitmap` として返します。WebGL の描画バッファーを常時保持する設定には依存しません。
+
+再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。`late`、`queueResetted`、`maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
+
+```ts
+deinterlacer.addEventListener("stats", (event) => {
+  console.log(event.detail.fps, event.detail.late);
+});
+const image = await deinterlacer.capture();
+```
