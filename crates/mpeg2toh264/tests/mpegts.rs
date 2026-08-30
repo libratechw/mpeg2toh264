@@ -968,6 +968,219 @@ fn a_superseded_stream_recovers_after_packet_loss() {
 }
 
 #[test]
+fn packet_loss_is_not_a_table_restart_just_because_every_counter_is_zero() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};
+
+    const PACKET_SIZE: usize = 188;
+    let packet_pid = |packet: &[u8]| (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+    let first = vec![0xaa; 17 * 184 - 9];
+    let replacement = vec![0xbb; 32];
+    let mut stream = mux_transport_stream(
+        &[(VIDEO_PID, STREAM_TYPE_MPEG2_VIDEO)],
+        &[
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                payload: &first,
+                pts: None,
+            },
+            PesUnit {
+                pid: VIDEO_PID,
+                stream_id: 0xe0,
+                payload: &replacement,
+                pts: None,
+            },
+        ],
+        &mut HashMap::new(),
+    );
+    let video_packets: Vec<_> = stream
+        .chunks(PACKET_SIZE)
+        .enumerate()
+        .filter_map(|(index, packet)| (packet_pid(packet) == VIDEO_PID).then_some(index))
+        .collect();
+    assert_eq!(video_packets.len(), 18);
+    assert_eq!(stream[video_packets[16] * PACKET_SIZE + 3] & 0x0f, 0);
+
+    // Detect loss on the video PID independently of coincidental PAT and PMT counter resets
+    let mut pat = stream[..PACKET_SIZE].to_vec();
+    let mut pmt = stream[PACKET_SIZE..2 * PACKET_SIZE].to_vec();
+    pat[PACKET_SIZE - 1] = 0xfe;
+    pmt[PACKET_SIZE - 1] = 0xfe;
+    let insert_at = (video_packets[14] + 1) * PACKET_SIZE;
+    stream.splice(insert_at..insert_at, pat);
+    stream.splice(insert_at + PACKET_SIZE..insert_at + PACKET_SIZE, pmt);
+    let missing = (video_packets[15] + 2) * PACKET_SIZE;
+    stream.drain(missing..missing + PACKET_SIZE);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes");
+    packets.extend(demuxer.finish().expect("flushes"));
+    let video: Vec<_> = packets
+        .into_iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .map(|packet| packet.data)
+        .collect();
+
+    assert_eq!(video, vec![replacement]);
+    assert_eq!(demuxer.dropped(), 31);
+}
+
+#[test]
+fn two_pmt_pid_changes_do_not_drop_the_first_superseded_pes() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{PesUnit, STREAM_TYPE_MPEG2_VIDEO};
+
+    const PACKET_SIZE: usize = 188;
+    let packet_pid = |packet: &[u8]| (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+    let old_pid = 0x200;
+    let middle_pid = 0x201;
+    let new_pid = 0x202;
+    let old = vec![0xaa; 400];
+    let new = vec![0xcc; 32];
+    let mut continuity = HashMap::new();
+    let mut stream = mux_programs(
+        &[(101, 0x1f0, &[(old_pid, STREAM_TYPE_MPEG2_VIDEO)])],
+        &[PesUnit {
+            pid: old_pid,
+            stream_id: 0xe0,
+            payload: &old,
+            pts: None,
+        }],
+        &mut continuity,
+    );
+    let old_start = stream
+        .chunks(PACKET_SIZE)
+        .position(|packet| packet_pid(packet) == old_pid && packet[1] & 0x40 != 0)
+        .expect("old PES starts");
+    stream[old_start * PACKET_SIZE + 8] = 0;
+    stream[old_start * PACKET_SIZE + 9] = 0;
+
+    // Finalize the earlier PID's PES even when the next PMT precedes the intermediate PID's PES
+    stream.extend_from_slice(&mux_programs(
+        &[(101, 0x1f0, &[(middle_pid, STREAM_TYPE_MPEG2_VIDEO)])],
+        &[],
+        &mut continuity,
+    ));
+    stream.extend_from_slice(&mux_programs(
+        &[(101, 0x1f0, &[(new_pid, STREAM_TYPE_MPEG2_VIDEO)])],
+        &[PesUnit {
+            pid: new_pid,
+            stream_id: 0xe0,
+            payload: &new,
+            pts: None,
+        }],
+        &mut continuity,
+    ));
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes");
+    packets.extend(demuxer.finish().expect("flushes"));
+    let video: Vec<_> = packets
+        .into_iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .map(|packet| (packet.pid, packet.data))
+        .collect();
+
+    assert_eq!(video, vec![(old_pid, old), (new_pid, new)]);
+}
+
+#[test]
+fn flushes_a_superseded_pes_when_the_service_changes_before_new_video_arrives() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{mux_programs, PesUnit, STREAM_TYPE_MPEG2_VIDEO};
+
+    let old_pid = 0x200;
+    let middle_pid = 0x201;
+    let replacement_pid = 0x300;
+    let first_service: &[(u16, u8)] = &[(replacement_pid, STREAM_TYPE_MPEG2_VIDEO)];
+    let old_service: &[(u16, u8)] = &[(old_pid, STREAM_TYPE_MPEG2_VIDEO)];
+    let moved_service: &[(u16, u8)] = &[(middle_pid, STREAM_TYPE_MPEG2_VIDEO)];
+    let mut continuity = HashMap::new();
+    let initial = mux_programs(
+        &[(101, 0x1f0, first_service), (102, 0x1f1, old_service)],
+        &[],
+        &mut continuity,
+    );
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    // Select the lower-priority service once while the earlier service's PMT remains pending
+    assert!(demuxer
+        .push(&initial[..2 * 188])
+        .expect("defers service 102")
+        .is_empty());
+    let mut repeated_pat = initial[..188].to_vec();
+    repeated_pat[3] = (repeated_pat[3] & 0xf0) | 1;
+    assert!(demuxer
+        .push(&repeated_pat)
+        .expect("selects service 102")
+        .is_empty());
+
+    let old_pes = mux_programs(
+        &[(101, 0x1f0, first_service), (102, 0x1f1, old_service)],
+        &[PesUnit {
+            pid: old_pid,
+            stream_id: 0xe0,
+            payload: &[0xaa; 400],
+            pts: None,
+        }],
+        &mut continuity,
+    );
+    // Send only the opening packet, leaving the old PID's PES pending
+    assert!(demuxer
+        .push(&old_pes[3 * 188..4 * 188])
+        .expect("starts the old service PES")
+        .is_empty());
+
+    let moved = mux_programs(
+        &[(101, 0x1f0, first_service), (102, 0x1f1, moved_service)],
+        &[],
+        &mut continuity,
+    );
+    // Allow the old PID to continue after a PID update within the same service
+    assert!(demuxer
+        .push(&moved[188..2 * 188])
+        .expect("moves service 102 to its new PID")
+        .is_empty());
+
+    // Return the old service's pending PES when switching to the preferred service
+    let selected = mux_programs(
+        &[(101, 0x1f0, first_service), (102, 0x1f1, moved_service)],
+        &[],
+        &mut continuity,
+    );
+    let switched: Vec<_> = demuxer
+        .push(&selected[2 * 188..3 * 188])
+        .expect("selects service 101")
+        .into_iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .map(|packet| (packet.pid, packet.data))
+        .collect();
+    assert_eq!(switched, vec![(old_pid, vec![0xaa; 175])]);
+
+    let replacement = mux_programs(
+        &[(101, 0x1f0, first_service), (102, 0x1f1, moved_service)],
+        &[PesUnit {
+            pid: replacement_pid,
+            stream_id: 0xe0,
+            payload: &[0xbb],
+            pts: None,
+        }],
+        &mut continuity,
+    );
+    // Do not emit the old service's already returned PES again with the new service's video
+    let video: Vec<_> = demuxer
+        .push(&replacement[3 * 188..])
+        .expect("reads the replacement service")
+        .into_iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .map(|packet| (packet.pid, packet.data))
+        .collect();
+    assert_eq!(video, vec![(replacement_pid, vec![0xbb])]);
+    assert!(demuxer.finish().expect("flushes").is_empty());
+}
+
+#[test]
 fn marks_packet_loss_ending_at_counter_zero_as_damaged() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{mux_transport_stream, PesUnit, STREAM_TYPE_MPEG2_VIDEO, VIDEO_PID};

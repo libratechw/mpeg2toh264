@@ -883,8 +883,6 @@ pub struct MpegTsAvDemuxer {
     continuity: HashMap<u16, ContinuityState>,
     /// PIDs whose adaptation-only marker applies to their next payload.
     pending_discontinuities: HashSet<u16>,
-    /// Evidence that PAT and PMT counters restarted before the media counters.
-    implicit_restart_tables: u8,
 }
 
 impl MpegTsAvDemuxer {
@@ -1059,6 +1057,15 @@ impl MpegTsAvDemuxer {
                 }
                 if prev_video_pid != self.program.video_pid {
                     if let Some(prev_video_pid) = prev_video_pid {
+                        // Flush the older superseded PID before replacing the current PID
+                        if let Some(mut superseded) = self.superseded_video.take() {
+                            superseded.state.flush(
+                                ElementaryKind::Video,
+                                superseded.pid,
+                                &mut output,
+                                None,
+                            );
+                        }
                         if prev_service == self.program.service {
                             self.superseded_video = Some(Superseded {
                                 pid: prev_video_pid,
@@ -1078,6 +1085,15 @@ impl MpegTsAvDemuxer {
                 }
                 if prev_audio_pid != self.program.audio_pid {
                     if let Some(prev_audio_pid) = prev_audio_pid {
+                        // Flush the older superseded PID before replacing the current PID
+                        if let Some(mut superseded) = self.superseded_audio.take() {
+                            superseded.state.flush(
+                                ElementaryKind::Audio,
+                                superseded.pid,
+                                &mut output,
+                                None,
+                            );
+                        }
                         if prev_service == self.program.service {
                             self.superseded_audio = Some(Superseded {
                                 pid: prev_audio_pid,
@@ -1249,14 +1265,12 @@ impl MpegTsAvDemuxer {
         let has_pending_discontinuity = self.pending_discontinuities.remove(&packet.pid);
         let continuity_change = if packet.discontinuity {
             let had_previous = previous.is_some();
-            self.implicit_restart_tables = 0;
             if had_previous {
                 ContinuityChange::Reset
             } else {
                 ContinuityChange::None
             }
         } else if has_pending_discontinuity {
-            self.implicit_restart_tables = 0;
             if let Some(previous) = previous.as_ref() {
                 let expected = (previous.counter + 1) & 0x0f;
                 if packet.continuity_counter == expected {
@@ -1274,27 +1288,7 @@ impl MpegTsAvDemuxer {
             if packet.continuity_counter == expected {
                 ContinuityChange::None
             } else {
-                // Independently muxed recording stretches restart table
-                // counters before their media counters restart.
-                if packet.continuity_counter == 0 && packet.pid == 0 {
-                    self.implicit_restart_tables = 1;
-                } else if packet.continuity_counter == 0
-                    && self.program.pmt_pids.contains(&packet.pid)
-                    && self.implicit_restart_tables & 1 != 0
-                {
-                    self.implicit_restart_tables |= 2;
-                }
-                let is_implicit_restart = if is_elementary_pid {
-                    let is_restart =
-                        packet.continuity_counter == 0 && self.implicit_restart_tables == 3;
-                    self.implicit_restart_tables = 0;
-                    is_restart
-                } else {
-                    false
-                };
-                if is_implicit_restart {
-                    ContinuityChange::Reset
-                } else if previous.accepted && previous.is_duplicate(packet) {
+                if previous.accepted && previous.is_duplicate(packet) {
                     ContinuityChange::Duplicate
                 } else if !previous.accepted && previous.counter == packet.continuity_counter {
                     ContinuityChange::None
@@ -1308,9 +1302,6 @@ impl MpegTsAvDemuxer {
             ContinuityChange::None
         };
 
-        if is_elementary_pid {
-            self.implicit_restart_tables = 0;
-        }
         if continuity_change == ContinuityChange::Duplicate {
             self.continuity
                 .insert(packet.pid, previous.expect("duplicate has a predecessor"));
