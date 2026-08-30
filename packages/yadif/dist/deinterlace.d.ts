@@ -47,6 +47,11 @@ export interface DeinterlaceStats {
      * show fields at all, and turning `doubleRate` off is the answer.
      */
     late: number;
+    /**
+     * Retained for compatibility with existing statistics consumers.
+     * Late pictures are discarded individually, so this counter remains zero.
+     */
+    queueResetted: number;
     /** Frames presented per second over the last report. */
     fps: number;
     /**

@@ -24,7 +24,7 @@ export interface DecimateResult {
     lowestCycleDifference: number;
     runnerUpCycleDifference: number;
 }
-/** FFmpeg-compatible fieldmatch and mixed-content decimate decisions. */
+/** FFmpeg-derived field matching and low-latency mixed-content detection. */
 export declare class FFmpegIVTC {
     #private;
     static readonly CYCLE = 5;
@@ -36,11 +36,11 @@ export declare class FFmpegIVTC {
     /**
      * Apply `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` to reduced luma.
      * FFmpeg can retain full decoded frames while it looks ahead. The browser
-     * keeps the clean full-resolution textures on the GPU and runs the exact
-     * matching arithmetic on this fixed-size luma proxy instead.
+     * keeps the clean full-resolution textures on the GPU and runs the matching
+     * arithmetic on this fixed-size luma proxy instead.
      */
     fieldMatch(previous: Uint8Array, current: Uint8Array, next: Uint8Array, isTopFieldFirst: boolean, combedPixelLimit?: number): FieldMatchResult;
-    /** Apply `decimate=cycle=5:mixed=1` metrics without delaying live audio. */
+    /** Apply FFmpeg's mixed decimate threshold to a live five-frame window. */
     decimate(sample: Uint8Array): DecimateResult;
     /** Weave p, c or n samples exactly as fieldmatch does for any channel count. */
     weave(previous: Uint8Array, current: Uint8Array, next: Uint8Array, match: FilmMatch, isTopFieldFirst: boolean): Uint8Array;
