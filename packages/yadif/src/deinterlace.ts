@@ -809,10 +809,12 @@ export class Deinterlacer extends EventTarget {
         }
       } else if (this.#doubleRate && this.#scheduling()) {
         const duration = this.#periodMs / 2;
-        // The first field waits for the next field-rate presentation slot, so
-        // both fields remain available across normal callback phase variation.
+        // One field interval of slack lets the first output survive when the
+        // video callback runs just after the animation callback for the same
+        // composite. Without it, both fields are due at the next animation
+        // callback and the scheduler retires the first one before drawing it.
         const last = this.#queue.at(-1);
-        const at = last == null ? now + duration : last.at + last.duration;
+        const at = last == null ? now + duration * 2 : last.at + last.duration;
         this.#filter(false, at, duration);
         this.#filter(true, at + duration, duration);
       } else {
