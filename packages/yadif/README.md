@@ -30,9 +30,12 @@ const player = new Mpeg2TsPlayer(video, {
 `autoFilm` の既定値は `false` です。  
 無効時には判定用シェーダーとフレームバッファーを生成せず、通常の YADIF 経路だけを使用します。
 
-`filmCombThreshold` で fieldmatch の comb 判定閾値を変更できます。既定値は FFmpeg の `combpel=80` 相当で、`combScore` がこの値以上のフィールドはインターレースとして扱われます。
+`filmCombThreshold` で fieldmatch の comb 判定閾値を変更できます。
+既定値は FFmpeg の `combpel=80` 相当で、`combScore` がこの値以上のフィールドはインターレースとして扱われます。
 
-field order は `scan` から受け取ります。通常の player 経由では MPEG-2 bitstream から自動的に設定されます。standalone で BFF を指定する場合は、次のように設定します。
+field order は `scan` から受け取ります。
+通常の player 経由では MPEG-2 bitstream から自動的に設定されます。
+standalone で BFF を指定する場合は、次のように設定します。
 
 ```ts
 const deinterlacer = new Deinterlacer(video);
@@ -44,9 +47,11 @@ deinterlacer.scan = {
 
 ### `capture()` と統計イベント
 
-`capture()` は、その時点で Deinterlacer が表示しているフィールドまたはフィルムフレームを描き直し、`ImageBitmap` として返します。WebGL の描画バッファーを常時保持する設定には依存しません。
+`capture()` は、その時点で Deinterlacer が表示しているフィールドまたはフィルムフレームを描き直し、`ImageBitmap` として返します。
+WebGL の描画バッファーを常時保持する設定には依存しません。
 
-再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。`late`、`queueResetted`、`maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
+再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。
+`late`、`queueResetted`、`maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
 
 ```ts
 deinterlacer.addEventListener("stats", (event) => {
