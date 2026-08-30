@@ -43,6 +43,7 @@ deinterlacer.scan = {
   interlaced: true,
   topFieldFirst: false,
 };
+deinterlacer.enabled = true;
 ```
 
 ### `capture()` と統計イベント
@@ -51,7 +52,7 @@ deinterlacer.scan = {
 WebGL の描画バッファーを常時保持する設定には依存しません。
 
 再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。
-`late`、`queueResetted`、`maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
+`late` と `maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
 
 ```ts
 deinterlacer.addEventListener("stats", (event) => {
