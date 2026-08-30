@@ -790,7 +790,7 @@ class Fe extends EventTarget {
           } else
             this.#ue(null);
         else if (this.#d && this.#Ae()) {
-          const c = this.#h / 2, f = this.#e.at(-1), m = f == null ? e + c : f.at + f.duration;
+          const c = this.#h / 2, f = this.#e.at(-1), m = f == null ? e + c * 2 : f.at + f.duration;
           this.#ge(!1, m, c), this.#ge(!0, m + c, c);
         } else
           this.#v.late += this.#e.length, this.#e.length = 0, this.#J(!1, !1, null);
