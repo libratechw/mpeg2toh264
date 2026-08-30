@@ -4,6 +4,10 @@
   "description": "Browser packages for the mpeg2toh264 transcoder",
   "type": "module",
   "private": true,
+  "files": [
+    "packages/player/dist",
+    "packages/yadif/dist"
+  ],
   "exports": {
     "./player": {
       "types": "./packages/player/dist/index.d.ts",
