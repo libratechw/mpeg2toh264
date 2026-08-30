@@ -603,10 +603,10 @@ function showDeinterlaceStats(stats: DeinterlaceStats): void {
   const { filtered, missed, dropped, degraded, discontinuities, late } = stats;
   const { fps: presentedFps, frameMs } = stats;
   deinterlaceStats.textContent =
-    `${presentedFps.toFixed(1)} FPS ${frameMs.toFixed(1)} ms/フレーム` +
+    `${presentedFps.toFixed(2)} FPS ${frameMs.toFixed(3)} ms/フレーム` +
     ` 適用: ${filtered} 取りこぼし: ${missed} 端: ${degraded}` +
     ` 未表示: ${late}` +
-    ` 不連続: ${discontinuities} ドロップ: ${dropped}`;
+    ` 不連続: ${discontinuities} ドロップ: ${dropped} キューリセット数: ${stats.queueResetted} キュー長: ${stats.maxQueuedFields}`;
 }
 
 /** The service a viewer picked, which only a fresh load can act on. */

@@ -219,6 +219,28 @@ async function main() {
     assert.equal(combedResult.match, "c");
     assert.equal(combedResult.isCombed, true);
     assert.deepEqual(combedResult.luma, combed);
+
+    // The public comb threshold is inclusive: crossing it changes the
+    // externally visible fieldmatch decision without changing the input.
+    assert.equal(FFmpegIVTC.COMBED_PIXEL_LIMIT, 80);
+    assert.equal(combedResult.combScore, 256);
+    const thresholdBoundary = new FFmpegIVTC(WIDTH, HEIGHT);
+    const atLimit = thresholdBoundary.fieldMatch(
+      combed,
+      combed,
+      combed,
+      true,
+      combedResult.combScore,
+    );
+    const aboveLimit = thresholdBoundary.fieldMatch(
+      combed,
+      combed,
+      combed,
+      true,
+      combedResult.combScore + 1,
+    );
+    assert.equal(atLimit.isCombed, true);
+    assert.equal(aboveLimit.isCombed, false);
   } finally {
     await server.close();
   }
