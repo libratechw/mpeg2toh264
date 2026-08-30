@@ -321,6 +321,9 @@ export class Deinterlacer extends EventTarget {
     texture: WebGLTexture;
     framebuffer: WebGLFramebuffer;
     pixels: Uint8Array;
+    previousLuma: Uint8Array;
+    currentLuma: Uint8Array;
+    nextLuma: Uint8Array;
   } | null = null;
   #textures: WebGLTexture[] = [];
   /** Somewhere to filter a field into, and to read it back out of. */
@@ -989,13 +992,7 @@ export class Deinterlacer extends EventTarget {
       gl.UNSIGNED_BYTE,
       target.pixels,
     );
-    const previousLuma = new Uint8Array(
-      FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT,
-    );
-    const currentLuma = new Uint8Array(
-      FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT,
-    );
-    const nextLuma = new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT);
+    const { previousLuma, currentLuma, nextLuma } = target;
     for (let pixel = 0; pixel < previousLuma.length; pixel++) {
       const offset = pixel * 4;
       previousLuma[pixel] = target.pixels[offset] ?? 0;
@@ -1521,6 +1518,9 @@ export class Deinterlacer extends EventTarget {
       texture,
       framebuffer,
       pixels: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT * 4),
+      previousLuma: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT),
+      currentLuma: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT),
+      nextLuma: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT),
     };
   }
 

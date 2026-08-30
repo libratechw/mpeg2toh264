@@ -246,10 +246,10 @@ export const FILM_UNIFORMS = {
 } as const;
 
 /** Width of the reduced fieldmatch and decimate inputs. */
-export const FILM_ANALYSIS_WIDTH = 160;
+export const FILM_ANALYSIS_WIDTH = 288;
 
 /** Height of the reduced fieldmatch and decimate inputs. */
-export const FILM_ANALYSIS_HEIGHT = 90;
+export const FILM_ANALYSIS_HEIGHT = 162;
 
 /**
  * Reads reduced luma from the three frames available to fieldmatch.

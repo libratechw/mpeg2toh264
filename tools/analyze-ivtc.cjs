@@ -3,25 +3,35 @@
 const { spawn, spawnSync } = require("node:child_process");
 const { performance } = require("node:perf_hooks");
 
-const [inputPath, start = "0", duration = "20", requestedFieldOrder] =
-  process.argv.slice(2);
+const [
+  inputPath,
+  start = "0",
+  duration = "20",
+  requestedFieldOrder,
+  requestedWidth = "288",
+  requestedHeight = "162",
+] = process.argv.slice(2);
 if (!inputPath) {
   console.error(
-    "usage: node tools/analyze-ivtc.cjs INPUT [START] [DURATION] [tff|bff]",
+    "usage: node tools/analyze-ivtc.cjs INPUT [START] [DURATION] [tff|bff] [WIDTH] [HEIGHT]",
   );
   process.exit(2);
 }
 
-const WIDTH = 160;
-const HEIGHT = 90;
+const WIDTH = Number(requestedWidth);
+const HEIGHT = Number(requestedHeight);
+if (!Number.isInteger(WIDTH) || WIDTH < 32)
+  throw new Error("width must be an integer of at least 32");
+if (!Number.isInteger(HEIGHT) || HEIGHT < 8)
+  throw new Error("height must be an integer of at least 8");
 const FRAME_BYTES = WIDTH * HEIGHT * 4;
 
-/** 明示値または入力ストリームのヘッダーからフィールド順を決定する。 */
+/** Determine field order from an explicit value or the input stream headers. */
 function topFieldFirst() {
   if (requestedFieldOrder === "tff") return true;
   if (requestedFieldOrder === "bff") return false;
-  if (requestedFieldOrder !== undefined)
-    throw new Error("field order must be tff or bff");
+  if (requestedFieldOrder !== undefined && requestedFieldOrder !== "auto")
+    throw new Error("field order must be auto, tff, or bff");
   const probe = spawnSync(
     "ffprobe",
     [
@@ -54,6 +64,69 @@ function topFieldFirst() {
   );
 }
 
+/**
+ * Return the input frame numbers FFmpeg drops over the same interval.
+ * @param {boolean} isTopFieldFirst Whether the input video is TFF
+ * @returns {number[]} Input frame numbers dropped by FFmpeg
+ */
+function ffmpegDropIndices(isTopFieldFirst) {
+  const reference = spawnSync(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "info",
+      "-ss",
+      start,
+      "-i",
+      inputPath,
+      "-map",
+      "0:v:0",
+      "-an",
+      "-vf",
+      `trim=duration=${duration},fieldmatch=mode=pc_n:combmatch=full:mchroma=0:order=${isTopFieldFirst ? "tff" : "bff"},showinfo,decimate=cycle=5:mixed=1,showinfo`,
+      "-fps_mode",
+      "passthrough",
+      "-f",
+      "null",
+      "-",
+    ],
+    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+  );
+  if (reference.error) throw reference.error;
+  if (reference.status !== 0) throw new Error(reference.stderr.trim());
+
+  // Collect checksum sequences from before and after decimation separately
+  const passes = new Map();
+  for (const line of reference.stderr.split("\n")) {
+    const parsed = line.match(
+      /Parsed_showinfo_(\d+).*? n:\s*(\d+).*? checksum:([0-9A-F]+)/,
+    );
+    if (!parsed) continue;
+    const pass = Number(parsed[1]);
+    const frames = passes.get(pass) ?? [];
+    frames.push({ index: Number(parsed[2]), checksum: parsed[3] });
+    passes.set(pass, frames);
+  }
+  const passIDs = [...passes.keys()].sort((first, second) => first - second);
+  if (passIDs.length !== 2)
+    throw new Error(
+      `expected two FFmpeg showinfo passes, got ${passIDs.length}`,
+    );
+  const before = passes.get(passIDs[0]) ?? [];
+  const after = passes.get(passIDs[1]) ?? [];
+  // Match retained checksums in input order and treat missing positions as drops
+  const drops = [];
+  let retainedIndex = 0;
+  for (const frame of before) {
+    if (frame.checksum === after[retainedIndex]?.checksum) retainedIndex++;
+    else drops.push(frame.index);
+  }
+  if (retainedIndex !== after.length)
+    throw new Error("FFmpeg showinfo passes could not be aligned by checksum");
+  return drops;
+}
+
 async function main() {
   const isTopFieldFirst = topFieldFirst();
   // Load the package's implementation through Vite so this diagnostic cannot
@@ -76,17 +149,15 @@ async function main() {
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        inputPath,
         "-ss",
         start,
-        "-t",
-        duration,
+        "-i",
+        inputPath,
         "-map",
         "0:v:0",
         "-an",
         "-vf",
-        `scale=${WIDTH}:${HEIGHT}:flags=neighbor:interl=1,format=rgba`,
+        `trim=duration=${duration},scale=${WIDTH}:${HEIGHT}:flags=neighbor:interl=1,format=rgba`,
         "-fps_mode",
         "passthrough",
         "-f",
@@ -99,6 +170,7 @@ async function main() {
     const frames = [];
     const lumaFrames = [];
     const results = [];
+    let decodedFrames = 0;
     let analysisMs = 0;
     const code = await new Promise((resolve, reject) => {
       ffmpeg.once("error", reject);
@@ -107,6 +179,7 @@ async function main() {
           pending = Buffer.concat([pending, chunk]);
           while (pending.length >= FRAME_BYTES) {
             frames.push(pending.subarray(0, FRAME_BYTES));
+            decodedFrames++;
             // The shader stores this Rec. 709 luma in its three analysis channels
             const rgba = frames.at(-1);
             const luma = new Uint8Array(WIDTH * HEIGHT);
@@ -137,7 +210,11 @@ async function main() {
                 isTopFieldFirst,
               ),
             );
-            results.push({ fieldMatch, decimate });
+            results.push({
+              sourceIndex: decodedFrames - 2,
+              fieldMatch,
+              decimate,
+            });
             analysisMs += performance.now() - analysisStarted;
             frames.shift();
             lumaFrames.shift();
@@ -178,6 +255,38 @@ async function main() {
           Math.floor(duplicateScores.length * part),
         )
       ] ?? 0;
+    const predictedDrops = results
+      .filter(
+        ({ fieldMatch, decimate }) =>
+          decimate.shouldDrop && !fieldMatch.isCombed,
+      )
+      .map(({ sourceIndex }) => sourceIndex);
+    const predictedDropScores = results
+      .filter(
+        ({ fieldMatch, decimate }) =>
+          decimate.shouldDrop && !fieldMatch.isCombed,
+      )
+      .map(({ decimate }) => ({
+        max: decimate.maxBlockDifference,
+        total: decimate.totalDifference,
+      }))
+      .sort((first, second) => first.max - second.max);
+    // Compare the causal prediction with the minimum-difference frame available
+    // to a path that can wait for all five frames
+    const cycleMinimumDrops = [];
+    let proxyCycle = [];
+    for (const result of results) {
+      proxyCycle.push(result);
+      if (result.decimate.cycleIndex !== FFmpegIVTC.CYCLE - 1) continue;
+      const dropIndex = result.decimate.nextDropIndex;
+      const dropped = dropIndex === null ? undefined : proxyCycle[dropIndex];
+      if (dropped && !dropped.fieldMatch.isCombed)
+        cycleMinimumDrops.push(dropped.sourceIndex);
+      proxyCycle = [];
+    }
+    const ffmpegDrops = ffmpegDropIndices(isTopFieldFirst);
+    const predictedSet = new Set(predictedDrops);
+    const cycleMinimumSet = new Set(cycleMinimumDrops);
     console.log(
       JSON.stringify(
         {
@@ -185,6 +294,7 @@ async function main() {
           start: Number(start),
           duration: Number(duration),
           fieldOrder: isTopFieldFirst ? "tff" : "bff",
+          analysisSize: { width: WIDTH, height: HEIGHT },
           analyzedFrames: results.length,
           analysisFrameMs: analysisMs / results.length,
           matches: Object.fromEntries(
@@ -209,10 +319,7 @@ async function main() {
             p90: duplicatePercentile(0.9),
             p99: duplicatePercentile(0.99),
           },
-          decimatedFrames: results.filter(
-            ({ fieldMatch, decimate }) =>
-              decimate.shouldDrop && !fieldMatch.isCombed,
-          ).length,
+          decimatedFrames: predictedDrops.length,
           decimatedCycles: results.filter(
             ({ decimate }) =>
               decimate.cycleIndex === FFmpegIVTC.CYCLE - 1 &&
@@ -223,6 +330,21 @@ async function main() {
               decimate.cycleIndex === FFmpegIVTC.CYCLE - 1 &&
               decimate.nextDropIndex === null,
           ).length,
+          comparison: {
+            ffmpegDrops: ffmpegDrops.length,
+            cycleMinimumDrops: cycleMinimumDrops.length,
+            matchingCycleMinimumDrops: predictedDrops.filter((index) =>
+              cycleMinimumSet.has(index),
+            ).length,
+            predictedAtDifferentPhase: predictedDrops.filter(
+              (index) => !cycleMinimumSet.has(index),
+            ),
+            retainedByPrediction: cycleMinimumDrops.filter(
+              (index) => !predictedSet.has(index),
+            ),
+            predictedDropScores,
+            predictedDrops,
+          },
           firstMatches: results
             .slice(0, 60)
             .map(({ fieldMatch }) => fieldMatch.match)

@@ -103,6 +103,10 @@ async function main() {
   });
   try {
     const { FFmpegIVTC } = await server.ssrLoadModule("/src/ivtc.ts");
+    const { FILM_ANALYSIS_WIDTH, FILM_ANALYSIS_HEIGHT } =
+      await server.ssrLoadModule("/src/shader.ts");
+    assert.equal(FILM_ANALYSIS_WIDTH, 288);
+    assert.equal(FILM_ANALYSIS_HEIGHT, 162);
     for (const isTopFieldFirst of [true, false]) {
       const telecine = makeTelecineFrames(isTopFieldFirst);
       const ffmpegMatches = fieldmatchWithFFmpeg(telecine, isTopFieldFirst);
@@ -177,6 +181,39 @@ async function main() {
     );
     assert.equal(transitioned[4].shouldDrop, false);
     assert.equal(transitioned[4].nextDropIndex, null);
+
+    // Preserve a shifted cadence and relock when that phase repeats next cycle
+    decimator.reset();
+    for (const level of [20, 60, 100, 140, 140])
+      decimator.decimate(new Uint8Array(LUMA_BYTES).fill(level));
+    const shifted = [20, 60, 100, 100, 140].map((level) =>
+      decimator.decimate(new Uint8Array(LUMA_BYTES).fill(level)),
+    );
+    assert.equal(
+      shifted.some(({ shouldDrop }) => shouldDrop),
+      false,
+    );
+    assert.equal(shifted[4].nextDropIndex, 3);
+    const relocked = [20, 60, 100, 100, 140].map((level) =>
+      decimator.decimate(new Uint8Array(LUMA_BYTES).fill(level)),
+    );
+    assert.deepEqual(
+      relocked.flatMap(({ shouldDrop }, index) => (shouldDrop ? [index] : [])),
+      [3],
+    );
+
+    // Continuously distinct 60i-like frames establish no phase and all survive
+    const videoDecimator = new FFmpegIVTC(WIDTH, HEIGHT);
+    const videoDecisions = Array.from({ length: 20 }, (_, index) =>
+      videoDecimator.decimate(
+        new Uint8Array(LUMA_BYTES).fill((index * 47) & 255),
+      ),
+    );
+    assert.equal(
+      videoDecisions.some(({ shouldDrop }) => shouldDrop),
+      false,
+    );
+    assert.equal(videoDecisions.at(-1).nextDropIndex, null);
 
     // Browser decimation receives the selected RGB weave, retaining FFmpeg's
     // chroma-sensitive intent for colour-only animation changes
