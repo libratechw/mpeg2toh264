@@ -509,6 +509,8 @@ export class Deinterlacer extends EventTarget {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
       this.#stopLoop();
+      this.#presentedPicture = null;
+      this.canvas.style.visibility = "hidden";
       this.#freeOutputs();
     }
   }
@@ -533,6 +535,8 @@ export class Deinterlacer extends EventTarget {
       this.#freeAnalysisTarget();
       if (!this.#doubleRate) {
         this.#stopLoop();
+        this.#presentedPicture = null;
+        this.canvas.style.visibility = "hidden";
         this.#freeOutputs();
       }
     }
@@ -748,10 +752,6 @@ export class Deinterlacer extends EventTarget {
       this.#lastFrameAt = at;
       const begin = performance.now();
       this.#push();
-      this.#reportMaxQueuedFields = Math.max(
-        this.#reportMaxQueuedFields,
-        this.#queue.length,
-      );
       const filmFrameShouldBeDropped =
         this.#autoFilm && this.#frames === HISTORY && this.#analyseFilm();
       // Decimation is only safe when the output schedule can retain the
@@ -792,6 +792,10 @@ export class Deinterlacer extends EventTarget {
       } else {
         this.#render(false, false, null);
       }
+      this.#reportMaxQueuedFields = Math.max(
+        this.#reportMaxQueuedFields,
+        this.#queue.length,
+      );
       this.#renderMsSinceReport += performance.now() - begin;
       this.#renderFramesSinceReport++;
       this.#report(at);
@@ -1635,16 +1639,22 @@ export class Deinterlacer extends EventTarget {
    * whatever the rate: a still frame stands for a moment, and the moment is
    * the one the first field was taken at.
    */
-  #onFlush = (): void => {
+  #onFlush = (event: Event): void => {
+    if (event.type === "seeked") {
+      // A seek completes with the video on its destination frame. History still
+      // belongs to the former position, so expose the video until the callback
+      // refills every texture from the new timeline.
+      this.#frames = 0;
+      this.#resetFilm();
+      this.#presentedPicture = null;
+      this.canvas.style.visibility = "hidden";
+      return;
+    }
     // The fields still queued stand for moments after this one and nothing is
     // coming to make sense of them, so the picture goes straight to the canvas
     // rather than through a schedule that has nothing left to keep to.
     this.#queue.length = 0;
     if (!this.#running || this.#frames === 0) return;
-    if (this.#autoFilm && !this.#isCombed && this.#mode === "film") {
-      this.#renderFilm(null);
-      return;
-    }
     const slot = this.#nextOutputSlot();
     const output = slot === null ? undefined : this.#outputs[slot];
     if (slot !== null && output) {
