@@ -606,7 +606,7 @@ function showDeinterlaceStats(stats: DeinterlaceStats): void {
     `${presentedFps.toFixed(2)} FPS ${frameMs.toFixed(3)} ms/フレーム` +
     ` 適用: ${filtered} 取りこぼし: ${missed} 端: ${degraded}` +
     ` 未表示: ${late}` +
-    ` 不連続: ${discontinuities} ドロップ: ${dropped} キューリセット数: ${stats.queueResetted} キュー長: ${stats.maxQueuedFields}`;
+    ` 不連続: ${discontinuities} ドロップ: ${dropped} キュー長: ${stats.maxQueuedFields}`;
 }
 
 /** The service a viewer picked, which only a fresh load can act on. */

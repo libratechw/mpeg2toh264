@@ -55,6 +55,12 @@ const MAX_PERIOD_MS = 200;
 /** How much of each measurement the smoothed frame period takes. */
 const PERIOD_SMOOTHING = 0.25;
 
+/** The screen's refresh interval until animation frames have said otherwise. */
+const DEFAULT_REFRESH_MS = 1000 / 60;
+
+/** How fast the refresh estimate is allowed to climb back towards a long gap. */
+const REFRESH_DECAY = 0.02;
+
 function validateFilmCombThreshold(value: number): number {
   if (!Number.isFinite(value) || value < 0)
     throw new RangeError(
@@ -165,9 +171,10 @@ export interface DeinterlaceStats {
    * deinterlacer takes away from everything else.
    */
   frameMs: number;
-  /** The number of times the field queue was reset when doubleRate is true. */
-  queueResetted: number;
-  /** The number of fields queued when doubleRate is true. */
+  /**
+   * The largest number of pictures queued during the last reporting interval,
+   * across both the field-rate and film scheduling paths.
+   */
   maxQueuedFields: number;
   /** The render path currently selected by automatic cadence detection. */
   mode: "film" | "video";
@@ -321,6 +328,9 @@ export class Deinterlacer extends EventTarget {
   #queue: Ready[] = [];
   /** The rAF loop that puts them up, which is all that draws on the canvas. */
   #loopHandle: number | null = null;
+  #lastLoopAt = 0;
+  /** The gap between animation frames: as near as the page gets to the screen. */
+  #refreshMs = DEFAULT_REFRESH_MS;
   /** The `<div>` this put around the element, so it can be taken away again. */
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver;
@@ -360,7 +370,6 @@ export class Deinterlacer extends EventTarget {
     degraded: 0,
     discontinuities: 0,
     late: 0,
-    queueResetted: 0,
   };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
   #lastPresented = 0;
@@ -502,9 +511,12 @@ export class Deinterlacer extends EventTarget {
   set doubleRate(doubleRate: boolean) {
     if (doubleRate === this.#doubleRate) return;
     this.#doubleRate = doubleRate;
+    // A rate change gives every queued field a different presentation cadence,
+    // so the next decoded frame starts a new schedule on the current timeline.
+    this.#queue.length = 0;
     if (doubleRate) {
       if (this.#width > 0) this.#allocateOutputs();
-      this.#startLoop();
+      if (this.#scan?.interlaced ?? true) this.#startLoop();
     } else if (!this.#autoFilm) {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
@@ -767,12 +779,10 @@ export class Deinterlacer extends EventTarget {
           // Five input frames become four film pictures. The interval between
           // them is therefore five quarters of the measured input period.
           const duration = (this.#periodMs * 5) / 4;
-          if (this.#queue.length >= FIELD_QUEUE_LENGTH) {
-            this.#queue.length = 0;
-            this.#stats.queueResetted += 1;
-          }
           const last = this.#queue.at(-1);
-          const at = last != null ? last.at + last.duration : now;
+          // The first picture needs one output interval of presentation slack;
+          // otherwise an ordinary callback-to-rAF gap can consume its turn.
+          const at = last != null ? last.at + last.duration : now + duration;
           this.#filterFilm(at, duration);
         } else {
           // Until a period and output pool exist, keep the direct film draw
@@ -781,15 +791,17 @@ export class Deinterlacer extends EventTarget {
         }
       } else if (this.#doubleRate && this.#scheduling()) {
         const duration = this.#periodMs / 2;
-        if (this.#queue.length >= FIELD_QUEUE_LENGTH) {
-          this.#queue.length = 0;
-          this.#stats.queueResetted += 1;
-        }
         const last = this.#queue.at(-1);
-        const at = last != null ? last.at + last.duration : now;
+        // The first field waits for the next field-rate presentation slot, so
+        // both fields remain available across normal callback phase variation.
+        const at = last != null ? last.at + last.duration : now + duration;
         this.#filter(false, at, duration);
         this.#filter(true, at + duration, duration);
       } else {
+        // Direct video output supersedes any older film pictures that still
+        // have future deadlines in the shared presentation queue.
+        this.#stats.late += this.#queue.length;
+        this.#queue.length = 0;
         this.#render(false, false, null);
       }
       this.#reportMaxQueuedFields = Math.max(
@@ -1122,6 +1134,7 @@ export class Deinterlacer extends EventTarget {
     if (this.#loopHandle !== null) return;
     if (!this.#running || this.#lost || (!this.#doubleRate && !this.#autoFilm))
       return;
+    this.#lastLoopAt = 0;
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   }
 
@@ -1135,6 +1148,18 @@ export class Deinterlacer extends EventTarget {
     this.#loopHandle = null;
     if (!this.#running || this.#lost || (!this.#doubleRate && !this.#autoFilm))
       return;
+    // Short ordinary gaps identify the refresh interval, while a long task
+    // only moves the estimate gradually until regular animation resumes.
+    if (this.#lastLoopAt > 0) {
+      const gap = now - this.#lastLoopAt;
+      if (gap >= 1 && gap <= MAX_PERIOD_MS) {
+        this.#refreshMs =
+          gap < this.#refreshMs
+            ? gap
+            : this.#refreshMs + (gap - this.#refreshMs) * REFRESH_DECAY;
+      }
+    }
+    this.#lastLoopAt = now;
     this.#present(now);
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   };
@@ -1150,8 +1175,10 @@ export class Deinterlacer extends EventTarget {
    * the older of the two is a moment the viewer should already be past.
    */
   #present(now: number): void {
-    const tolerance = 3;
-    while (this.#queue[1] && this.#queue[1].at - now <= tolerance) {
+    // A draw requested now reaches the upcoming composite, so select the
+    // newest picture whose deadline belongs to that presentation opportunity.
+    const deadline = now + this.#refreshMs * 1.5;
+    while (this.#queue[1] && this.#queue[1].at <= deadline) {
       this.#stats.late++;
       this.#queue.shift();
     }
@@ -1159,7 +1186,7 @@ export class Deinterlacer extends EventTarget {
     if (!ready) {
       return;
     }
-    if (ready.at - now > tolerance) {
+    if (ready.at > deadline) {
       return;
     }
     this.#queue.shift();
@@ -1219,9 +1246,10 @@ export class Deinterlacer extends EventTarget {
   #report(at: number): void {
     const elapsed = at - this.#reportedAt;
     if (elapsed < STATS_INTERVAL_MS) return;
-    const frames = this.#scheduling()
-      ? this.#showFramesSinceReport
-      : this.#renderFramesSinceReport;
+    const frames =
+      this.#scheduling() && (this.#doubleRate || this.#mode === "film")
+        ? this.#showFramesSinceReport
+        : this.#renderFramesSinceReport;
     const stats: DeinterlaceStats = {
       ...this.#stats,
       // The element's own count of what its decoder could not keep up with,
@@ -1608,7 +1636,6 @@ export class Deinterlacer extends EventTarget {
       degraded: 0,
       discontinuities: 0,
       late: 0,
-      queueResetted: 0,
     };
     this.#lastPresented = 0;
     this.#reportedAt = 0;
@@ -1649,6 +1676,12 @@ export class Deinterlacer extends EventTarget {
       this.#presentedPicture = null;
       this.canvas.style.visibility = "hidden";
       return;
+    }
+    if (event.type === "ratechange") {
+      // The measured wall-time period includes playback rate, so the next
+      // callback establishes a fresh cadence from the new rate.
+      this.#periodMs = 0;
+      this.#lastMediaTime = this.#video.currentTime;
     }
     // The fields still queued stand for moments after this one and nothing is
     // coming to make sense of them, so the picture goes straight to the canvas
