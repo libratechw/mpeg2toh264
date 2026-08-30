@@ -57,9 +57,10 @@ export interface DeinterlaceStats {
      * deinterlacer takes away from everything else.
      */
     frameMs: number;
-    /** The number of times the field queue was reset when doubleRate is true. */
-    queueResetted: number;
-    /** The number of fields queued when doubleRate is true. */
+    /**
+     * The largest number of pictures queued during the last reporting interval,
+     * across both the field-rate and film scheduling paths.
+     */
     maxQueuedFields: number;
     /** The render path currently selected by automatic cadence detection. */
     mode: "film" | "video";
