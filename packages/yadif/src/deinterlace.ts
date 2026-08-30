@@ -161,6 +161,11 @@ export interface DeinterlaceStats {
    * show fields at all, and turning `doubleRate` off is the answer.
    */
   late: number;
+  /**
+   * Retained for compatibility with existing statistics consumers.
+   * Late pictures are discarded individually, so this counter remains zero.
+   */
+  queueResetted: number;
   /** Frames presented per second over the last report. */
   fps: number;
   /**
@@ -370,6 +375,7 @@ export class Deinterlacer extends EventTarget {
     degraded: 0,
     discontinuities: 0,
     late: 0,
+    queueResetted: 0,
   };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
   #lastPresented = 0;
@@ -459,9 +465,9 @@ export class Deinterlacer extends EventTarget {
 
   /** Update whether the source needs filtering and which field comes first. */
   set scan(scan: Scan | null) {
+    const interlacingChanged = this.#scan?.interlaced !== scan?.interlaced;
     const changed =
-      this.#scan?.interlaced !== scan?.interlaced ||
-      this.#scan?.topFieldFirst !== scan?.topFieldFirst;
+      interlacingChanged || this.#scan?.topFieldFirst !== scan?.topFieldFirst;
     this.#scan = scan;
     if (changed) {
       // A standalone caller may update scan metadata without a timeline entry.
@@ -469,6 +475,9 @@ export class Deinterlacer extends EventTarget {
       // the new source state.
       this.#frames = 0;
       this.#resetFilm();
+      // Progressive video carries no cadence measurement, so schedule fields
+      // only after measuring the first complete interlaced interval
+      if (interlacingChanged) this.#periodMs = 0;
       this.#presentedPicture = null;
       this.canvas.style.visibility = "hidden";
     }
@@ -719,6 +728,7 @@ export class Deinterlacer extends EventTarget {
       const stale = elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
       if (stale) {
         this.#frames = 0;
+        this.#periodMs = 0;
         this.#stats.discontinuities++;
         // The fields still waiting stand for moments the element has left
         // behind, and the clock they were timed by is pinned to the same
@@ -764,8 +774,13 @@ export class Deinterlacer extends EventTarget {
       this.#lastFrameAt = at;
       const begin = performance.now();
       this.#push();
+      const previousMode = this.#mode;
       const filmFrameShouldBeDropped =
         this.#autoFilm && this.#frames === HISTORY && this.#analyseFilm();
+      const cadenceChanged = previousMode !== this.#mode;
+      // A duplicate that confirms film cadence adds no output, but stale field
+      // deadlines from the old mode still need discarding at the transition
+      if (cadenceChanged) this.#queue.length = 0;
       // Decimation is only safe when the output schedule can retain the
       // selected film picture. If allocation or timing is not ready, keep the
       // frame on the direct path rather than silently dropping it.
@@ -779,10 +794,10 @@ export class Deinterlacer extends EventTarget {
           // Five input frames become four film pictures. The interval between
           // them is therefore five quarters of the measured input period.
           const duration = (this.#periodMs * 5) / 4;
-          const last = this.#queue.at(-1);
           // The first picture needs one output interval of presentation slack;
           // otherwise an ordinary callback-to-rAF gap can consume its turn.
-          const at = last != null ? last.at + last.duration : now + duration;
+          const last = this.#queue.at(-1);
+          const at = last == null ? now + duration : last.at + last.duration;
           this.#filterFilm(at, duration);
         } else {
           // Until a period and output pool exist, keep the direct film draw
@@ -791,10 +806,10 @@ export class Deinterlacer extends EventTarget {
         }
       } else if (this.#doubleRate && this.#scheduling()) {
         const duration = this.#periodMs / 2;
-        const last = this.#queue.at(-1);
         // The first field waits for the next field-rate presentation slot, so
         // both fields remain available across normal callback phase variation.
-        const at = last != null ? last.at + last.duration : now + duration;
+        const last = this.#queue.at(-1);
+        const at = last == null ? now + duration : last.at + last.duration;
         this.#filter(false, at, duration);
         this.#filter(true, at + duration, duration);
       } else {
@@ -839,10 +854,14 @@ export class Deinterlacer extends EventTarget {
         this.#scan.topFieldFirst === scan.topFieldFirst)
     )
       return;
+    const previousInterlaced = this.#scan?.interlaced;
     this.#scan = scan;
     this.#frames = 0;
     this.#queue.length = 0;
     this.#resetFilm();
+    // Progressive sections provide no cadence measurement, and a discontinuity
+    // may change the input rate, so remeasure the next interlaced section
+    if (previousInterlaced !== scan.interlaced) this.#periodMs = 0;
     if (scan.interlaced) {
       if (this.#doubleRate || this.#autoFilm) this.#startLoop();
     } else {
@@ -922,7 +941,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   /**
-   * Run FFmpeg's fieldmatch and mixed decimate decisions on reduced luma.
+   * Run FFmpeg's fieldmatch and live decimate decisions on reduced luma.
    * Full decoded frames remain in GPU textures, while the first readback packs
    * the previous, current and next luma proxies into RGB. A second readback
    * supplies the selected RGB weave to its chroma-sensitive decimate metric.
@@ -1024,6 +1043,8 @@ export class Deinterlacer extends EventTarget {
     // non-decimated cycle retains the original YADIF path.
     const isFilmCycle = decimate.dropIndex !== null && !fieldMatch.isCombed;
     if ((isFilmCycle ? "film" : "video") !== this.#mode) {
+      // Queued deadlines belong to their originating cadence, so anchor the
+      // first picture of the new cadence to this frame callback
       this.#mode = isFilmCycle ? "film" : "video";
     }
     return decimate.shouldDrop && !fieldMatch.isCombed;
@@ -1636,6 +1657,7 @@ export class Deinterlacer extends EventTarget {
       degraded: 0,
       discontinuities: 0,
       late: 0,
+      queueResetted: 0,
     };
     this.#lastPresented = 0;
     this.#reportedAt = 0;

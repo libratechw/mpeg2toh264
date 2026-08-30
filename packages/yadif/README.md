@@ -22,9 +22,12 @@ const player = new Mpeg2TsPlayer(video, {
 
 ### `autoFilm`
 
-`autoFilm` を有効にすると、FFmpeg の `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` と `decimate=cycle=5:mixed=1` に相当する判定で、3:2 プルダウン区間を 24000/1001fps で表示します。  
+`autoFilm` を有効にすると、FFmpeg の `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` を移植したフィールド選択と、縮小画像上で `decimate=cycle=5:mixed=1` と同じ重複閾値を使うライブ向け周期判定により、3:2 プルダウン区間を 24000/1001fps で表示します。  
+FFmpeg の `decimate` は5フレームを保持してから同じ周期内の最小差分を選びますが、この実装は音声に対する映像遅延を増やさないよう、完了した周期の位相を次の周期へ適用します。  
+
 重複を含む周期でフィールドマッチが成立した場合だけ、24fps のフィルム区間として扱います。  
-フィルム周期として採用されていない区間のフレームと、フィールドマッチ後もインターレースと判定されたフレームは間引かず、通常の YADIF 処理へ渡します。  
+フィルム周期として採用されていない区間は通常の YADIF 処理へ渡します。  
+フィールドマッチ後もインターレースと判定されたフレームは間引かず、YADIF で処理します。  
 `doubleRate` が有効なら 60000/1001fps 相当、無効なら入力フレームレートで表示するため、実写の 60i 区間はフィールドレートの動きを維持します。
 
 `autoFilm` の既定値は `false` です。  

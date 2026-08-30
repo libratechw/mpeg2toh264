@@ -33,7 +33,7 @@ interface DifferenceMetric {
   totalDifference: number;
 }
 
-/** FFmpeg-compatible fieldmatch and mixed-content decimate decisions. */
+/** FFmpeg-derived field matching and low-latency mixed-content detection. */
 export class FFmpegIVTC {
   static readonly CYCLE = 5;
   static readonly COMB_THRESHOLD = 9;
@@ -64,8 +64,8 @@ export class FFmpegIVTC {
   /**
    * Apply `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` to reduced luma.
    * FFmpeg can retain full decoded frames while it looks ahead. The browser
-   * keeps the clean full-resolution textures on the GPU and runs the exact
-   * matching arithmetic on this fixed-size luma proxy instead.
+   * keeps the clean full-resolution textures on the GPU and runs the matching
+   * arithmetic on this fixed-size luma proxy instead.
    */
   fieldMatch(
     previous: Uint8Array,
@@ -117,7 +117,7 @@ export class FFmpegIVTC {
     };
   }
 
-  /** Apply `decimate=cycle=5:mixed=1` metrics without delaying live audio. */
+  /** Apply FFmpeg's mixed decimate threshold to a live five-frame window. */
   decimate(sample: Uint8Array): DecimateResult {
     const cycleIndex = this.#cycleIndex;
     const metric = this.#previousSample

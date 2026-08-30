@@ -5,6 +5,7 @@
 - `crates/mpeg2toh264` is the codec/container core. Keep it dependency-free unless a dependency is clearly justified; `unsafe_code` is forbidden.
 - `crates/mpeg2toh264-cli` and `crates/mpeg2toh264-wasm` are thin frontends. Codec or timeline decisions belong in the core.
 - `packages/player` is MIT and must not import `packages/yadif`, which is LGPL-2.1-or-later. The demo injects yadif through `PlayerDeinterlacer`.
+- Keep straightforward scheduling decisions at their call sites. Do not extract trivial helpers solely to unit-test them or add tests that only restate assignments and array clearing; a regression test must exercise an observable player or deinterlacer path that could actually fail.
 
 ## Codec invariants
 
