@@ -16,6 +16,7 @@
 
 ## Generated and reference files
 
+- Changes under `packages/*/dist/` must be committed separately from source, documentation, tests, and every other file. The dedicated generated-output commit must contain only `dist` files and use the exact commit message `dist: update dist file to install npm package from git`.
 - `h264/*_tables.rs` and `mpeg2/vlc_tables.rs` are generated/spec-derived data. Read their headers before editing.
 - `tools/gen-*.py` still emit TypeScript in places. Do not claim that Rust tables can be regenerated unchanged until the emitters have been ported.
 - The checked-in ITU/ISO PDFs and `analysis/` files are implementation references, not build inputs.
