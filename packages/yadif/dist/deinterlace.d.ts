@@ -96,9 +96,10 @@ export interface DeinterlacerOptions {
     doubleRate?: boolean;
     /**
      * Whether hard-telecined film is reconstructed and shown at its native
-     * 24000/1001 cadence. Matching and duplicate decisions follow the same
-     * fieldmatch/decimate rules as the fork's previous implementation. Frames
-     * that do not form a clean film cadence continue through YADIF.
+     * 24000/1001 cadence. Matching follows FFmpeg's
+     * `fieldmatch=mode=pc_n:combmatch=full:mchroma=0`, and duplicate decisions
+     * follow `decimate=cycle=5:mixed=1`. Frames that do not form a clean film
+     * cadence continue through YADIF.
      */
     autoFilm?: boolean;
     /**
