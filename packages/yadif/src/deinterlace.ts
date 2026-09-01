@@ -798,10 +798,15 @@ export class Deinterlacer extends EventTarget {
           // Five input frames become four film pictures. The interval between
           // them is therefore five quarters of the measured input period.
           const duration = (this.#periodMs * 5) / 4;
+          const queueResetted = this.#prepareQueue(1, now, duration);
           // The first picture needs one output interval of presentation slack;
           // otherwise an ordinary callback-to-rAF gap can consume its turn.
           const last = this.#queue.at(-1);
-          const at = last == null ? now + duration : last.at + last.duration;
+          const at = queueResetted
+            ? now
+            : last == null
+              ? now + duration
+              : last.at + last.duration;
           this.#filterFilm(at, duration);
         } else {
           // Until a period and output pool exist, keep the direct film draw
@@ -810,12 +815,17 @@ export class Deinterlacer extends EventTarget {
         }
       } else if (this.#doubleRate && this.#scheduling()) {
         const duration = this.#periodMs / 2;
+        const queueResetted = this.#prepareQueue(2, now, duration);
         // One field interval of slack lets the first output survive when the
         // video callback runs just after the animation callback for the same
         // composite. Without it, both fields are due at the next animation
         // callback and the scheduler retires the first one before drawing it.
         const last = this.#queue.at(-1);
-        const at = last == null ? now + duration * 2 : last.at + last.duration;
+        const at = queueResetted
+          ? now
+          : last == null
+            ? now + duration * 2
+            : last.at + last.duration;
         this.#filter(false, at, duration);
         this.#filter(true, at + duration, duration);
       } else {
@@ -1123,6 +1133,32 @@ export class Deinterlacer extends EventTarget {
     }
     this.#render(false, second, output.framebuffer);
     this.#queue.push({ slot, at, duration });
+  }
+
+  /** Make room without treating ordinary capacity pressure as clock divergence. */
+  #prepareQueue(
+    requiredOutputs: number,
+    now: number,
+    outputDuration: number,
+  ): boolean {
+    const last = this.#queue.at(-1);
+    const maximumUsefulLead =
+      (FIELD_QUEUE_LENGTH + 1) * Math.max(this.#refreshMs, outputDuration);
+    if (last && last.at - now > maximumUsefulLead) {
+      this.#queue.length = 0;
+      this.#stats.queueResetted++;
+      return true;
+    }
+
+    const overflow = Math.max(
+      0,
+      this.#queue.length + requiredOutputs - FIELD_QUEUE_LENGTH,
+    );
+    for (let index = 0; index < overflow; index++) {
+      if (!this.#queue.shift()) break;
+      this.#stats.late++;
+    }
+    return false;
   }
 
   /** Select an output whose pixels are not still represented by the canvas or queue. */
