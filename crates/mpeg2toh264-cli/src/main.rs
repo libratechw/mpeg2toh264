@@ -499,6 +499,7 @@ fn write_fragment(
             video_samples,
             audio_samples,
             scans,
+            ..
         } => {
             totals.fragments += 1;
             totals.video_samples += video_samples;

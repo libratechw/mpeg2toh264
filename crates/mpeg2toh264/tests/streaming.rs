@@ -154,6 +154,33 @@ fn gives_each_unit_the_timestamp_of_the_packet_that_opens_it() {
 }
 
 #[test]
+fn gives_each_unit_its_transport_restart_position() {
+    let one = read_fixture("ibbp.m2v");
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = Vec::new();
+    for (index, chunk) in [one.as_slice(), one.as_slice(), one.as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let restart = 9_500 + index as u64 * 1_000;
+        units.extend(splitter.push_with_restart(
+            chunk,
+            Some(900_000 + index as u64 * 15_000),
+            Some(restart),
+        ));
+    }
+    units.extend(splitter.finish());
+
+    assert_eq!(
+        units
+            .iter()
+            .map(|unit| unit.restart_offset)
+            .collect::<Vec<_>>(),
+        vec![Some(9_500), Some(10_500), Some(11_500)],
+    );
+}
+
+#[test]
 fn holds_an_unfinished_group_back() {
     let one = read_fixture("ibbp.m2v");
     let mut splitter = Mpeg2GopStream::new();
@@ -929,6 +956,21 @@ fn emits_one_initialization_segment_then_media() {
         assert_eq!(&data[4..8], b"moof");
         assert!(data.windows(4).any(|w| w == b"mdat"));
     }
+}
+
+#[test]
+fn carries_each_gops_transport_restart_position_to_its_fragment() {
+    let stream = video_only_stream(3);
+    let fragments = run_session(&stream, 197);
+    let restarts: Vec<_> = fragments
+        .iter()
+        .filter_map(|fragment| match fragment {
+            Fragment::Media { restart_offset, .. } => Some(*restart_offset),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(restarts, vec![Some(0); 3]);
 }
 
 #[test]
@@ -2197,5 +2239,45 @@ fn an_anchored_session_carries_both_tracks_over_a_cut() {
         audio > 0,
         "the audio track resumes too -- the count it measures from is the \
          audio's own start, not the file's"
+    );
+}
+
+#[test]
+fn a_reported_restart_position_reopens_at_the_same_fragment() {
+    let stream = seekable_stream(6, 40);
+    let (whole, origin) = run_anchored(&stream, None);
+    let origin = origin.expect("the whole stream fixes the timeline origin");
+    let (restart, expected_start) = whole
+        .iter()
+        .find_map(|fragment| match fragment {
+            Fragment::Media {
+                start,
+                restart_offset: Some(restart),
+                ..
+            } if *restart > 0 => Some((*restart as usize, *start)),
+            _ => None,
+        })
+        .expect("a later repeated PAT/PMT opens a restartable fragment");
+
+    let (resumed, _) = run_anchored(&stream[restart..], Some(origin));
+    let (actual_start, audio_samples) = resumed
+        .iter()
+        .find_map(|fragment| match fragment {
+            Fragment::Media {
+                start,
+                audio_samples,
+                ..
+            } => Some((*start, *audio_samples)),
+            _ => None,
+        })
+        .expect("the reported position opens a media fragment");
+
+    assert!(
+        (actual_start - expected_start).abs() < 0.04,
+        "restart opens at {actual_start}, not the reported fragment at {expected_start}"
+    );
+    assert!(
+        audio_samples > 0,
+        "the safe restart carries the audio track"
     );
 }

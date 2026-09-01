@@ -85,6 +85,9 @@ pub enum Fragment {
         /// Whether a decoder can begin here. A player needs this, with `start`,
         /// to evict buffered media without cutting into what is about to play.
         random_access: bool,
+        /// Recent PAT/PMT start from which a new session for the same service
+        /// can demux this GOP, relative to this session's first input byte.
+        restart_offset: Option<u64>,
         video_samples: usize,
         audio_samples: usize,
         /// Picture-accurate field changes in presentation order.
@@ -667,7 +670,11 @@ impl Session {
                     if packet.damaged_previous_pes {
                         self.gops.discard_pending();
                     }
-                    let units = self.gops.push(&packet.data, packet.pts);
+                    let units = self.gops.push_with_restart(
+                        &packet.data,
+                        packet.pts,
+                        packet.restart_offset,
+                    );
                     self.pending_gops.extend(units);
                 }
                 ElementaryKind::Audio => {
@@ -1284,6 +1291,7 @@ impl Session {
             data: fragment.media_segment,
             start,
             random_access,
+            restart_offset: gop.restart_offset,
             video_samples: fragment.sample_count,
             audio_samples: audio_frames.len(),
             scans,

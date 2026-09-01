@@ -232,9 +232,13 @@ pub struct ElementaryPacket {
     /// The preceding PES itself lost bytes, so video parsing also discards the
     /// unfinished GOP before reading this packet.
     pub damaged_previous_pes: bool,
+    /// Earliest recent program-table packet a new demuxer for the same service
+    /// can start at and still discover this PES packet's PID.
+    pub restart_offset: Option<u64>,
 }
 
 struct TsPayload<'a> {
+    source_offset: u64,
     pid: u16,
     transport_error_indicator: bool,
     has_payload: bool,
@@ -313,7 +317,7 @@ pub fn is_mpeg_transport_stream(data: &[u8]) -> bool {
     data.len() >= TS_PACKET_SIZE * MIN_SYNC_COUNT && sync_offset(data, MIN_SYNC_COUNT).is_some()
 }
 
-fn payload_at(data: &[u8], at: usize) -> Option<TsPayload<'_>> {
+fn payload_at(data: &[u8], at: usize, source_offset: u64) -> Option<TsPayload<'_>> {
     if data[at] != SYNC_BYTE {
         return None;
     }
@@ -340,6 +344,7 @@ fn payload_at(data: &[u8], at: usize) -> Option<TsPayload<'_>> {
         return None;
     }
     Some(TsPayload {
+        source_offset,
         pid,
         transport_error_indicator,
         has_payload,
@@ -352,15 +357,22 @@ fn payload_at(data: &[u8], at: usize) -> Option<TsPayload<'_>> {
 }
 
 /// Reassembles PSI sections, which are length-prefixed and may straddle packets.
+struct PsiSection {
+    data: Vec<u8>,
+    source_offset: Option<u64>,
+}
+
 #[derive(Default)]
 struct SectionAssembler {
     bytes: Vec<u8>,
+    source_offset: Option<u64>,
 }
 
 impl SectionAssembler {
-    fn push(&mut self, payload: &[u8], payload_unit_start: bool, sections: &mut Vec<Vec<u8>>) {
+    fn push(&mut self, packet: &TsPayload<'_>, sections: &mut Vec<PsiSection>) {
+        let payload = packet.data;
         let mut at = 0;
-        if payload_unit_start {
+        if packet.payload_unit_start {
             if payload.is_empty() {
                 return;
             }
@@ -368,21 +380,26 @@ impl SectionAssembler {
             at = 1;
             if !self.bytes.is_empty() && pointer > 0 {
                 let end = (at + pointer).min(payload.len());
-                self.append(&payload[at..end], sections);
+                self.append(&payload[at..end], packet.source_offset, sections);
             }
             self.bytes.clear();
+            self.source_offset = None;
             at += pointer;
         }
         if at <= payload.len() {
-            self.append(&payload[at..], sections);
+            self.append(&payload[at..], packet.source_offset, sections);
         }
     }
 
-    fn append(&mut self, data: &[u8], sections: &mut Vec<Vec<u8>>) {
+    fn append(&mut self, data: &[u8], source_offset: u64, sections: &mut Vec<PsiSection>) {
+        if self.bytes.is_empty() && !data.is_empty() {
+            self.source_offset = Some(source_offset);
+        }
         self.bytes.extend_from_slice(data);
         loop {
             if self.bytes.first() == Some(&0xff) {
                 self.bytes.clear();
+                self.source_offset = None;
                 return;
             }
             if self.bytes.len() < 3 {
@@ -392,8 +409,50 @@ impl SectionAssembler {
             if self.bytes.len() < length {
                 return;
             }
-            sections.push(self.bytes.drain(..length).collect());
+            sections.push(PsiSection {
+                data: self.bytes.drain(..length).collect(),
+                source_offset: self.source_offset.take(),
+            });
+            if !self.bytes.is_empty() {
+                self.source_offset = Some(source_offset);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod section_source_tests {
+    use super::{PsiSection, SectionAssembler, TsPayload};
+
+    fn payload<'a>(data: &'a [u8], source_offset: u64, start: bool) -> TsPayload<'a> {
+        TsPayload {
+            source_offset,
+            pid: 0,
+            transport_error_indicator: false,
+            payload_unit_start: start,
+            continuity_counter: 0,
+            discontinuity: false,
+            scrambled: false,
+            data,
+        }
+    }
+
+    #[test]
+    fn retains_the_first_packet_of_a_section_that_spans_packets() {
+        let mut section = vec![0; 200];
+        section[..3].copy_from_slice(&[0x00, 0xb0, 197]);
+        let mut first = vec![0];
+        first.extend_from_slice(&section[..183]);
+
+        let mut assembler = SectionAssembler::default();
+        let mut output: Vec<PsiSection> = Vec::new();
+        assembler.push(&payload(&first, 1_000, true), &mut output);
+        assert!(output.is_empty());
+        assembler.push(&payload(&section[183..], 1_188, false), &mut output);
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].source_offset, Some(1_000));
+        assert_eq!(output[0].data, section);
     }
 }
 
@@ -451,6 +510,8 @@ struct ProgramMap {
     all_service_pids: HashMap<u16, Vec<u16>>,
     changed_pids: HashSet<u16>,
     assemblers: HashMap<u16, SectionAssembler>,
+    pat_offsets: HashMap<u16, u64>,
+    restart_offsets: HashMap<u16, u64>,
 }
 
 impl Default for ProgramMap {
@@ -472,6 +533,8 @@ impl Default for ProgramMap {
             all_service_pids: HashMap::new(),
             changed_pids: HashSet::new(),
             assemblers: HashMap::new(),
+            pat_offsets: HashMap::new(),
+            restart_offsets: HashMap::new(),
         }
     }
 }
@@ -492,22 +555,26 @@ impl ProgramMap {
         pid == 0 || self.pmt_pids.contains(&pid)
     }
 
-    fn push(&mut self, packet: &TsPayload<'_>, sections: &mut Vec<Vec<u8>>) -> Vec<u16> {
+    fn push(&mut self, packet: &TsPayload<'_>, sections: &mut Vec<PsiSection>) -> Vec<u16> {
         sections.clear();
-        self.assemblers.entry(packet.pid).or_default().push(
-            packet.data,
-            packet.payload_unit_start,
-            sections,
-        );
+        self.assemblers
+            .entry(packet.pid)
+            .or_default()
+            .push(packet, sections);
         for section in sections.iter() {
-            self.scan(section, packet.pid);
+            self.scan(&section.data, packet.pid, section.source_offset);
         }
         self.changed_pids.drain().collect()
     }
 
+    fn restart_offset(&self) -> Option<u64> {
+        let service = self.service?;
+        self.restart_offsets.get(&service).copied()
+    }
+
     /// Scan a PAT or PMT section, recording the PMT PIDs and the first MPEG-2
     /// video and AAC elementary streams they advertise.
-    fn scan(&mut self, section: &[u8], pid: u16) {
+    fn scan(&mut self, section: &[u8], pid: u16, source_offset: Option<u64>) {
         if section.len() < 12 {
             return;
         }
@@ -526,6 +593,9 @@ impl ProgramMap {
             while i + 3 < end {
                 let program = ((section[i] as u16) << 8) | section[i + 1] as u16;
                 if program != 0 {
+                    if let Some(source_offset) = source_offset {
+                        self.pat_offsets.insert(program, source_offset);
+                    }
                     if !self.services.contains(&program) {
                         self.services.push(program);
                     }
@@ -543,6 +613,14 @@ impl ProgramMap {
             // another would put a programme's picture against a different
             // programme's sound, so both come from here or neither does.
             let service = ((section[3] as u16) << 8) | section[4] as u16;
+            if source_offset.is_some() {
+                if let Some(&pat_offset) = self.pat_offsets.get(&service) {
+                    // A new demuxer has to read the PAT before this PMT: if a
+                    // newer PAT arrived after the last PMT, starting there
+                    // would make it discard that PMT and miss the next GOP.
+                    self.restart_offsets.insert(service, pat_offset);
+                }
+            }
             if self.wanted_service.is_some_and(|wanted| wanted != service) {
                 return;
             }
@@ -762,6 +840,8 @@ struct PesState {
     discontinuity_before: bool,
     /// Whether packet loss cut the preceding PES rather than falling between PES packets.
     damaged_before: bool,
+    started: bool,
+    restart_offset: Option<u64>,
 }
 
 impl PesState {
@@ -782,12 +862,22 @@ impl PesState {
         fallback_pts: Option<u64>,
     ) {
         if self.parts.is_empty() {
+            self.started = false;
+            self.restart_offset = None;
             return;
         }
         let Some(data) = pes_payload(&self.parts, kind) else {
             self.parts.clear();
+            self.started = false;
+            self.restart_offset = None;
             return;
         };
+        if !self.started {
+            self.parts.clear();
+            self.restart_offset = None;
+            return;
+        }
+        self.started = false;
         let data = data.to_vec();
         let pts = pes_pts(&self.parts).or(fallback_pts);
         self.parts.clear();
@@ -798,6 +888,7 @@ impl PesState {
             pts,
             discontinuity: std::mem::take(&mut self.discontinuity_before),
             damaged_previous_pes: std::mem::take(&mut self.damaged_before),
+            restart_offset: self.restart_offset.take(),
         });
     }
 
@@ -816,6 +907,7 @@ impl PesState {
         continuity_change: ContinuityChange,
         output: &mut Vec<ElementaryPacket>,
         fallback_pts: Option<u64>,
+        restart_offset: Option<u64>,
     ) {
         if payload.payload_unit_start {
             let was_previous_pes_incomplete = self.is_declared_pes_incomplete();
@@ -829,6 +921,9 @@ impl PesState {
             if !self.parts.is_empty() {
                 self.flush(kind, pid, output, fallback_pts);
             }
+            self.parts.clear();
+            self.started = is_pes_start(payload.data, kind);
+            self.restart_offset = self.started.then_some(restart_offset).flatten();
             if continuity_change != ContinuityChange::None {
                 self.discontinuity_before = true;
                 self.damaged_before |= was_previous_pes_damaged;
@@ -848,6 +943,8 @@ impl PesState {
                 self.flush(kind, pid, output, fallback_pts);
             } else if length + 6 < self.parts.len() {
                 self.parts.clear();
+                self.started = false;
+                self.restart_offset = None;
             }
         }
     }
@@ -865,6 +962,8 @@ struct Superseded {
 #[derive(Default)]
 pub struct MpegTsAvDemuxer {
     pending: Vec<u8>,
+    /// Offset of `pending[0]` in the byte stream handed to this demuxer.
+    stream_offset: u64,
     unsynced: bool,
     program: ProgramMap,
     video: PesState,
@@ -983,6 +1082,7 @@ impl MpegTsAvDemuxer {
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ElementaryPacket>> {
         self.pending.extend_from_slice(chunk);
         let input = std::mem::take(&mut self.pending);
+        let input_offset = self.stream_offset;
 
         let mut at = 0;
         let mut output = Vec::new();
@@ -1005,7 +1105,8 @@ impl MpegTsAvDemuxer {
                     }
                 }
             }
-            let Some(packet) = payload_at(&input, at) else {
+            let packet_offset = input_offset + at as u64;
+            let Some(packet) = payload_at(&input, at, packet_offset) else {
                 at += TS_PACKET_SIZE;
                 continue;
             };
@@ -1214,8 +1315,10 @@ impl MpegTsAvDemuxer {
                 } else {
                     None
                 },
+                self.program.restart_offset(),
             );
         }
+        self.stream_offset += at as u64;
         if at >= input.len() {
             self.pending.clear();
         } else {
@@ -1410,7 +1513,7 @@ fn walk_pts(data: &[u8], mut visit: impl FnMut(u64) -> ControlFlow<()>) {
         // A payload the sync check walked past is worth stepping over rather
         // than giving up on: a slice is a fragment of a file, and one damaged
         // packet says nothing about the ones after it.
-        if let Some(packet) = payload_at(data, at) {
+        if let Some(packet) = payload_at(data, at, at as u64) {
             if packet.payload_unit_start
                 && (is_pes_start(packet.data, ElementaryKind::Video)
                     || is_pes_start(packet.data, ElementaryKind::Audio))

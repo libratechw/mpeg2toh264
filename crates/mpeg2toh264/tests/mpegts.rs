@@ -32,6 +32,85 @@ fn recovers_the_elementary_stream_byte_for_byte() {
 }
 
 #[test]
+fn reports_the_program_tables_that_can_reopen_each_pes() {
+    use mpeg2toh264::container::mpegts::MpegTsAvDemuxer;
+
+    let es = read_fixture("ibbp.m2v");
+    let ts = wrap_mpeg2_es_in_ts(&es, Some(900_000), &mut HashMap::new());
+    let prefix = [0xaa; 17];
+    let mut input = prefix.to_vec();
+    input.extend_from_slice(&ts);
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = Vec::new();
+    for chunk in input.chunks(197) {
+        packets.extend(demuxer.push(chunk).expect("demux succeeds"));
+    }
+    packets.extend(demuxer.finish().expect("flush succeeds"));
+
+    let video = packets
+        .iter()
+        .find(|packet| packet.kind == mpeg2toh264::container::mpegts::ElementaryKind::Video)
+        .expect("video PES");
+    assert_eq!(video.restart_offset, Some(17));
+}
+
+#[test]
+fn advances_the_safe_restart_position_with_repeated_program_tables() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+
+    let es = read_fixture("ibbp.m2v");
+    let mut continuity = HashMap::new();
+    let first = wrap_mpeg2_es_in_ts(&es, Some(900_000), &mut continuity);
+    let second = wrap_mpeg2_es_in_ts(&es, Some(915_000), &mut continuity);
+    let second_tables = first.len() as u64;
+    let mut input = first;
+    input.extend_from_slice(&second);
+
+    let mut demuxer = MpegTsAvDemuxer::for_service(Some(1));
+    let mut packets = Vec::new();
+    for chunk in input.chunks(211) {
+        packets.extend(demuxer.push(chunk).expect("demux succeeds"));
+    }
+    packets.extend(demuxer.finish().expect("flush succeeds"));
+    let video: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
+
+    assert_eq!(video.len(), 2);
+    assert_eq!(video[0].restart_offset, Some(0));
+    assert_eq!(video[1].restart_offset, Some(second_tables));
+}
+
+#[test]
+fn keeps_the_pat_that_precedes_the_pmt_in_the_restart_position() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+
+    let es = read_fixture("ibbp.m2v");
+    let unit = wrap_mpeg2_es_in_ts(&es, Some(900_000), &mut HashMap::new());
+    // PAT, a PES that is still unknown, PMT, the next PAT, then the PES to
+    // restart at. Choosing the numerically nearer PMT would make a new demuxer
+    // discard it before that next PAT and miss the target PES.
+    let mut input = unit[..188].to_vec();
+    input.extend_from_slice(&unit[2 * 188..]);
+    input.extend_from_slice(&unit[188..2 * 188]);
+    input.extend_from_slice(&unit[..188]);
+    input.extend_from_slice(&unit[2 * 188..]);
+
+    let mut demuxer = MpegTsAvDemuxer::for_service(Some(1));
+    let mut packets = demuxer.push(&input).expect("demux succeeds");
+    packets.extend(demuxer.finish().expect("flush succeeds"));
+    let video: Vec<_> = packets
+        .iter()
+        .filter(|packet| packet.kind == ElementaryKind::Video)
+        .collect();
+
+    assert_eq!(video.len(), 1);
+    assert_eq!(video[0].restart_offset, Some(0));
+}
+
+#[test]
 fn skips_a_packet_with_reserved_adaptation_field_control() {
     let es = read_fixture("ibbp.m2v");
     let mut ts = wrap_mpeg2_es_in_ts(&es, None, &mut HashMap::new());

@@ -37,6 +37,8 @@ export type Fragment =
       start: number;
       /** Whether a decoder can begin here, which is where eviction may stop. */
       randomAccess: boolean;
+      /** PAT/PMT start from which this GOP can be demuxed in a new Session. */
+      restartOffset: number | null;
       videoSamples: number;
       audioSamples: number;
       /** Picture-accurate field changes, in presentation order. */
@@ -478,6 +480,7 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
             data,
             start,
             random_access,
+            restart_offset,
             video_samples,
             audio_samples,
             scans,
@@ -486,6 +489,11 @@ fn to_js_fragment(fragment: Fragment) -> Result<JsValue, JsError> {
             set(&object, "data", &copy_out(&data))?;
             set(&object, "start", &start.into())?;
             set(&object, "randomAccess", &random_access.into())?;
+            set(
+                &object,
+                "restartOffset",
+                &restart_offset.map_or(JsValue::NULL, |offset| (offset as f64).into()),
+            )?;
             set(&object, "videoSamples", &(video_samples as f64).into())?;
             set(&object, "audioSamples", &(audio_samples as f64).into())?;
             let js_scans = Array::new_with_length(scans.len() as u32);

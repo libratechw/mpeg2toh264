@@ -59,13 +59,16 @@ pub struct Mpeg2Gop {
     /// -- and it discards everything before the first sequence header, which
     /// can be several pictures -- is already excluded.
     pub pts: Option<u64>,
+    /// Recent PAT/PMT start from which that PES can be demuxed again.
+    pub restart_offset: Option<u64>,
 }
 
 /// Where a PES packet's payload landed in the stream, and what time it claimed.
 #[derive(Clone, Copy)]
 struct Mark {
     offset: usize,
-    pts: u64,
+    pts: Option<u64>,
+    restart_offset: Option<u64>,
 }
 
 /// Split an MPEG-2 ES into bounded GOP units while carrying sequence headers
@@ -95,10 +98,29 @@ impl Mpeg2GopStream {
     }
 
     pub fn push(&mut self, chunk: &[u8], pts: Option<u64>) -> Vec<Mpeg2Gop> {
-        if let Some(pts) = pts {
+        self.push_marked(chunk, pts, None)
+    }
+
+    pub fn push_with_restart(
+        &mut self,
+        chunk: &[u8],
+        pts: Option<u64>,
+        restart_offset: Option<u64>,
+    ) -> Vec<Mpeg2Gop> {
+        self.push_marked(chunk, pts, restart_offset)
+    }
+
+    fn push_marked(
+        &mut self,
+        chunk: &[u8],
+        pts: Option<u64>,
+        restart_offset: Option<u64>,
+    ) -> Vec<Mpeg2Gop> {
+        if pts.is_some() || restart_offset.is_some() {
             self.marks.push(Mark {
                 offset: self.base + self.buffer.len() - self.prefix_length,
                 pts,
+                restart_offset,
             });
         }
         self.buffer.extend_from_slice(chunk);
@@ -168,20 +190,20 @@ impl Mpeg2GopStream {
     }
 
     /// The timestamp of the PES packet covering an absolute stream offset.
-    fn pts_at(&mut self, offset: usize) -> Option<u64> {
-        let mut pts = None;
+    fn mark_at(&mut self, offset: usize) -> Option<Mark> {
+        let mut found = None;
         let mut covering: isize = -1;
         for (i, mark) in self.marks.iter().enumerate() {
             if mark.offset > offset {
                 break;
             }
-            pts = Some(mark.pts);
+            found = Some(*mark);
             covering = i as isize;
         }
         if covering > 0 {
             self.marks.drain(..covering as usize);
         }
-        pts
+        found
     }
 
     /// Where a unit running from the start of the buffer to `boundary` has to
@@ -257,10 +279,11 @@ impl Mpeg2GopStream {
                 .copied();
             let boundary = next_sequence.unwrap_or(second_gop);
             let boundary = self.description_boundary(first_gop, boundary);
-            let pts = self.pts_at(self.base);
+            let mark = self.mark_at(self.base);
             output.push(Mpeg2Gop {
                 data: self.buffer[..boundary].to_vec(),
-                pts,
+                pts: mark.and_then(|mark| mark.pts),
+                restart_offset: mark.and_then(|mark| mark.restart_offset),
             });
             self.consume(boundary);
             if next_sequence.is_none() && !self.sequence_prefix.is_empty() {
@@ -285,10 +308,11 @@ impl Mpeg2GopStream {
             }
         }
         if final_flush && !self.pictures.is_empty() {
-            let pts = self.pts_at(self.base);
+            let mark = self.mark_at(self.base);
             output.push(Mpeg2Gop {
                 data: std::mem::take(&mut self.buffer),
-                pts,
+                pts: mark.and_then(|mark| mark.pts),
+                restart_offset: mark.and_then(|mark| mark.restart_offset),
             });
             self.prefix_length = 0;
         }
