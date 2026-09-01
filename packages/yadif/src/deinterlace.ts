@@ -364,6 +364,8 @@ export class Deinterlacer extends EventTarget {
   /** How many of the held frames are consecutive, up to HISTORY. */
   #frames = 0;
   #lastMediaTime = 0;
+  /** A destination frame that arrived before the browser finished seeking. */
+  #seekFrameReady = false;
   #handle: number | null = null;
   #running = false;
   #enabled = false;
@@ -443,6 +445,7 @@ export class Deinterlacer extends EventTarget {
     // or the last thing a viewer sees is the one before it.
     video.addEventListener("pause", this.#onFlush);
     video.addEventListener("ended", this.#onFlush);
+    video.addEventListener("seeking", this.#onSeeking);
     video.addEventListener("seeked", this.#onFlush);
     video.addEventListener("ratechange", this.#onFlush);
   }
@@ -617,6 +620,7 @@ export class Deinterlacer extends EventTarget {
     this.#video.removeEventListener("resize", this.#onResize);
     this.#video.removeEventListener("pause", this.#onFlush);
     this.#video.removeEventListener("ended", this.#onFlush);
+    this.#video.removeEventListener("seeking", this.#onSeeking);
     this.#video.removeEventListener("seeked", this.#onFlush);
     this.#video.removeEventListener("ratechange", this.#onFlush);
     this.#unmount();
@@ -713,6 +717,31 @@ export class Deinterlacer extends EventTarget {
     if (!this.#running || this.#lost) return;
     this.#selectVideoState(metadata.mediaTime);
     if (metadata.width > 0 && metadata.height > 0) {
+      // Chromium can submit the destination frame while `seeking` is still
+      // true, immediately before `seeked`. Remember that this frame already
+      // belongs to the new playhead so the event does not hide it again.
+      let seekFrame = false;
+      if (!this.#seekFrameReady && this.#video.seeking) {
+        const buffered = this.#video.buffered;
+        // mediaTime is the start of the frame containing the playhead, so it
+        // may precede currentTime by one measured frame period.
+        const frameSeconds =
+          this.#periodMs >= MIN_PERIOD_MS
+            ? this.#periodMs / 1000
+            : MAX_PERIOD_MS / 1000;
+        for (let index = 0; index < buffered.length; index++) {
+          if (
+            metadata.mediaTime >= buffered.start(index) &&
+            metadata.mediaTime < buffered.end(index) &&
+            Math.abs(metadata.mediaTime - this.#video.currentTime) <=
+              frameSeconds
+          ) {
+            seekFrame = true;
+            break;
+          }
+        }
+      }
+      if (seekFrame) this.#seekFrameReady = true;
       // Standalone users do not have a container feeding coded sizes. Their
       // callback dimensions remain the best available fallback.
       if (this.#width === 0 || this.#height === 0)
@@ -728,7 +757,7 @@ export class Deinterlacer extends EventTarget {
       // the neighbours are then further apart than they should be, which is
       // worth less than filtering nothing at all.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
-      const stale = elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
+      const stale = seekFrame || elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
       if (stale) {
         this.#frames = 0;
         this.#periodMs = 0;
@@ -1723,12 +1752,26 @@ export class Deinterlacer extends EventTarget {
   }
 
   /**
+   * A new seek invalidates any destination frame remembered for the last one.
+   */
+  #onSeeking = (): void => {
+    this.#seekFrameReady = false;
+  };
+
+  /**
    * Playback stopped, so the frame being held back goes up now. One picture,
    * whatever the rate: a still frame stands for a moment, and the moment is
    * the one the first field was taken at.
    */
   #onFlush = (event: Event): void => {
     if (event.type === "seeked") {
+      // A destination frame may have reached requestVideoFrameCallback while
+      // the element still reported `seeking`. #onFrame has already discarded
+      // the old history and drawn that frame, so clearing it here would turn a
+      // completed seek back into a blank canvas until another frame arrives.
+      const seekFrameReady = this.#seekFrameReady;
+      this.#seekFrameReady = false;
+      if (seekFrameReady) return;
       // A seek completes with the video on its destination frame. History still
       // belongs to the former position, so expose the video until the callback
       // refills every texture from the new timeline.
