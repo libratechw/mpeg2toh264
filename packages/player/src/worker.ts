@@ -268,6 +268,8 @@ class Playback {
   #duration: number | null = null;
   /** What is known of where the timeline sits in the file; see `Sample`. */
   #index: Sample[] = [];
+  /** Observed GOPs and the program-table-safe byte that can reach them. */
+  #restarts: Sample[] = [];
 
   constructor(command: LoadCommand) {
     this.#command = command;
@@ -314,11 +316,15 @@ class Playback {
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
     this.#sink.reset();
-    const offset = await this.#search(
-      Math.max(0, time - SEEK_LEAD_SECONDS),
-      leg,
-      signal,
-    );
+    const restart = this.#restartBefore(time);
+    const offset =
+      restart && time - restart.seconds <= SEEK_LEAD_SECONDS
+        ? restart.byte
+        : await this.#search(
+            Math.max(0, time - SEEK_LEAD_SECONDS),
+            leg,
+            signal,
+          );
     // A newer seek, or a stop, took over while this one was reading.
     if (!this.#running(leg)) return;
     await this.#run(offset);
@@ -391,6 +397,45 @@ class Playback {
     if (at >= 0 && this.#index[at]!.byte === sample.byte)
       this.#index[at] = sample;
     else this.#index.splice(at < 0 ? this.#index.length : at, 0, sample);
+  }
+
+  /** Keep the first GOP reached from each observed restart byte. */
+  #recordRestart(sample: Sample): void {
+    const at = this.#restarts.findIndex((known) => known.byte >= sample.byte);
+    if (at >= 0 && this.#restarts[at]!.byte === sample.byte) {
+      // More than one GOP can share the same preceding PAT/PMT. Reopening at
+      // that byte reaches the first one, so a later GOP must not make the
+      // restart look closer to the requested time than it really is.
+      if (sample.seconds < this.#restarts[at]!.seconds)
+        this.#restarts[at] = sample;
+      return;
+    }
+    this.#restarts.splice(at < 0 ? this.#restarts.length : at, 0, sample);
+  }
+
+  /** The latest observed GOP no later than `seconds`. */
+  #restartBefore(seconds: number): Sample | null {
+    let found: Sample | null = null;
+    for (const sample of this.#restarts) {
+      if (
+        sample.seconds <= seconds &&
+        (found === null || sample.seconds > found.seconds)
+      )
+        found = sample;
+    }
+    return found;
+  }
+
+  /** Associate each observed GOP with input that can demux it independently. */
+  #learnRestarts(sourceOffset: number, fragments: Fragment[]): void {
+    for (const fragment of fragments) {
+      if (fragment.kind !== "media" || fragment.restartOffset === null)
+        continue;
+      this.#recordRestart({
+        byte: sourceOffset + fragment.restartOffset,
+        seconds: fragment.start,
+      });
+    }
   }
 
   setCurrentTime(currentTime: number): void {
@@ -677,6 +722,7 @@ class Playback {
       if (queuedBytes <= INPUT_QUEUE_LOW_WATER_BYTES) refill.set(true);
       const fragments = await converter.push(chunk);
       if (!this.#running(leg)) return;
+      this.#learnRestarts(source.offset, fragments);
       this.#announceServices(id, converter);
       this.#announceAudio(id, converter);
       if (
@@ -694,6 +740,7 @@ class Playback {
     if (readError) throw readError;
     const final = await converter.finish();
     if (!this.#running(leg)) return;
+    this.#learnRestarts(source.offset, final);
     this.#place(converter);
     if (!(await this.#deliver(leg, final))) return;
     this.#report(converter);
