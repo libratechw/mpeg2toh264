@@ -200,6 +200,12 @@ interface Pending {
   init: boolean;
 }
 
+type Operation =
+  // An updateend belongs to the entry and timeline that started it. A reset
+  // may replace the queue before the browser finishes the old append.
+  | { type: "append"; pending: Pending; epoch: number }
+  | { type: "remove" | "clear" };
+
 export class MseSink implements FragmentSink {
   /**
    * Made in the constructor rather than in `open`, because a caller needs
@@ -227,7 +233,7 @@ export class MseSink implements FragmentSink {
   #retype: string | null = null;
   #queue: Pending[] = [];
   #queuedBytes = 0;
-  #operation: "append" | "remove" | "clear" | null = null;
+  #operation: Operation | null = null;
   #quotaBlocked = false;
   /**
    * Whether a managed source wants data at the moment.
@@ -424,7 +430,7 @@ export class MseSink implements FragmentSink {
     // Emptying the buffer comes before anything queued behind it, and settles
     // the quota on its own.
     if (this.#clearing) {
-      this.#operation = "clear";
+      this.#operation = { type: "clear" };
       try {
         sourceBuffer.remove(0, Number.POSITIVE_INFINITY);
       } catch (error) {
@@ -451,7 +457,7 @@ export class MseSink implements FragmentSink {
         return;
       }
     }
-    this.#operation = "append";
+    this.#operation = { type: "append", pending: next, epoch: this.#epoch };
     try {
       sourceBuffer.appendBuffer(next.data);
     } catch (error) {
@@ -471,16 +477,20 @@ export class MseSink implements FragmentSink {
   }
 
   #onUpdateEnd = (): void => {
-    if (this.#operation === "append") {
-      const appended = this.#queue.shift();
-      if (appended) {
+    const operation = this.#operation;
+    if (operation?.type === "append") {
+      if (
+        operation.epoch === this.#epoch &&
+        this.#queue[0] === operation.pending
+      ) {
+        const appended = this.#queue.shift()!;
         this.#queuedBytes -= appended.data.byteLength;
         if (!appended.init) this.#startAtMedia();
       }
-    } else if (this.#operation === "remove") {
+    } else if (operation?.type === "remove") {
       this.#quotaBlocked = false;
       this.#updateBlocked();
-    } else if (this.#operation === "clear") {
+    } else if (operation?.type === "clear") {
       this.#clearing = false;
     }
     this.#operation = null;
@@ -603,7 +613,7 @@ export class MseSink implements FragmentSink {
     ) {
       this.#randomAccessPoints.shift();
     }
-    this.#operation = "remove";
+    this.#operation = { type: "remove" };
     sourceBuffer.remove(0, removeEnd);
   }
 
