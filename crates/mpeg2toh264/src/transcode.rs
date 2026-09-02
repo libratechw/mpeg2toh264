@@ -2860,45 +2860,15 @@ fn write_picture(
             [0, 0]
         };
 
-        let split_frame_mb = ctx.mbaff && !field_pair;
-        let mode = PredictionMode::from_mb_type(pred.mb_type);
-
         let mut partitions: Option<[MotionPartition; 2]> = None;
         let mut field_modes: Option<[PredictionMode; 2]> = None;
 
-        if split_frame_mb {
-            let mut built = [MotionPartition::default(); 2];
-            for (part, slot) in built.iter_mut().enumerate() {
-                let p_l0 = if uses_l0 {
-                    motion.predict_16x8(mb_x, mb_y, part, 0, pred.ref_idx_l0)
-                } else {
-                    [0, 0]
-                };
-                let p_l1 = if uses_l1 {
-                    motion.predict_16x8(mb_x, mb_y, part, 1, pred.ref_idx_l1)
-                } else {
-                    [0, 0]
-                };
-                let state = MbMotion {
-                    ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
-                    ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
-                    mv_l0x: if uses_l0 { pred.mv_l0[0] } else { 0 },
-                    mv_l0y: if uses_l0 { pred.mv_l0[1] } else { 0 },
-                    mv_l1x: if uses_l1 { pred.mv_l1[0] } else { 0 },
-                    mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
-                };
-                motion.set_16x8(mb_x, mb_y, part, &state);
-                *slot = MotionPartition {
-                    ref_idx_l0: state.ref_idx_l0,
-                    ref_idx_l1: state.ref_idx_l1,
-                    mvd_l0x: if uses_l0 { pred.mv_l0[0] - p_l0[0] } else { 0 },
-                    mvd_l0y: if uses_l0 { pred.mv_l0[1] - p_l0[1] } else { 0 },
-                    mvd_l1x: if uses_l1 { pred.mv_l1[0] - p_l1[0] } else { 0 },
-                    mvd_l1y: if uses_l1 { pred.mv_l1[1] - p_l1[1] } else { 0 },
-                };
-            }
-            partitions = Some(built);
-        } else if direct_field_pair
+        // A frame macroblock covers the same sixteen lines as the source
+        // macroblock it came from and carries that one vector, half of an MBAFF
+        // pair or not, so it goes out as a single 16x16 partition and `pred_l0`
+        // and `pred_l1` above are its predictors. Only the two halves of a field
+        // pair have anything to say separately.
+        if direct_field_pair
             && source
                 .is_some_and(|mb| mb.motion_type == motion_type::FRAME_OR_16X8 && mb.mv_count >= 2)
         {
@@ -3065,9 +3035,7 @@ fn write_picture(
             ]);
         }
 
-        let mb_type = if split_frame_mb {
-            b16x8_mb_type(mode, mode)
-        } else if let Some(modes) = field_modes {
+        let mb_type = if let Some(modes) = field_modes {
             b16x8_mb_type(modes[0], modes[1])
         } else {
             pred.mb_type
@@ -3131,7 +3099,7 @@ fn write_picture(
                     mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
                 },
             );
-        } else if !split_frame_mb && !field_pair {
+        } else if !field_pair {
             motion.set(
                 mb_x,
                 mb_y,
