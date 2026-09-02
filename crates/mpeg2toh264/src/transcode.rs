@@ -2193,8 +2193,25 @@ fn write_picture(
         l1_short_term_delta: None,
         anchor_second_field: true,
     };
-    let picture_field_pairs =
-        direct_field_pair || (ctx.mbaff && pic.header.picture_coding_type != PictureType::I);
+    // Field macroblock pairs are what a picture needs to say that a macroblock
+    // predicted its two fields separately, and nothing else needs them. They
+    // are not free: H.264 derives chroma motion from the luma vector, and for a
+    // field macroblock whose reference field is the other parity it shifts that
+    // vector by a quarter of a chroma sample (clause 8.4.1.4). MPEG-2's frame
+    // prediction has no such step, so the chroma the residual was coded against
+    // is not the chroma the decoder predicts, and in interlaced 4:2:0 -- where
+    // one chroma line belongs to each field -- the miss is a quarter of the
+    // difference between the fields. On saturated colour in motion that reaches
+    // tens of levels and alternates line by line, which is invisible woven and
+    // becomes a solid macroblock once a deinterlacer keeps one field.
+    //
+    // So a picture takes them only where one of its macroblocks actually
+    // predicts field by field. The mode stays uniform within the picture, which
+    // is what keeps every neighbour in one coordinate system and the slices few.
+    let picture_field_pairs = direct_field_pair
+        || (ctx.mbaff
+            && pic.header.picture_coding_type != PictureType::I
+            && by_address.any_field_prediction());
     let mut cached_pair_address: isize = -1;
     let mut cached_pair_targets = [FieldTargetSet::default(); 2];
     let mut cached_pair_qp = PPS_INIT_QP;

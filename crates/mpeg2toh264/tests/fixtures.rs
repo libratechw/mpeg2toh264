@@ -16,8 +16,12 @@ use mpeg2toh264::{
 use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
 
 /// fixture, converted pictures, output bytes, FNV-1a of the Annex B stream.
+/// `altscan.m2v` and `hd1080i.m2v` are the interlaced ones, and of those only
+/// `altscan.m2v` has pictures whose macroblocks all predict frame by frame, so
+/// it is the only one carrying frame-coded macroblock pairs. See the note on
+/// `picture_field_pairs` in `transcode.rs` for what that spares its chroma.
 const GOLDEN: [(&str, usize, usize, u64); 6] = [
-    ("altscan.m2v", 8, 223217, 0xdcb6_509e_e22e_e21a),
+    ("altscan.m2v", 8, 202057, 0x18ef_cbc6_c960_3696),
     ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
     ("hd1080i.m2v", 15, 2106380, 0xa903_55d8_0a1c_4d05),
     ("i_only.m2v", 3, 79513, 0x31f6_0c7f_fb6b_b97a),
