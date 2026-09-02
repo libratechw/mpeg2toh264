@@ -63,12 +63,12 @@ pub struct Mpeg2Gop {
     pub restart_offset: Option<u64>,
 }
 
-/// Where a PES packet's payload landed in the stream, and what time it claimed.
+/// Where a PES packet's payload landed in the stream, and one value it
+/// supplied there.
 #[derive(Clone, Copy)]
 struct Mark {
     offset: usize,
-    pts: Option<u64>,
-    restart_offset: Option<u64>,
+    value: u64,
 }
 
 /// Split an MPEG-2 ES into bounded GOP units while carrying sequence headers
@@ -82,7 +82,8 @@ pub struct Mpeg2GopStream {
     /// is not part of the stream and has no offset of its own.
     base: usize,
     prefix_length: usize,
-    marks: Vec<Mark>,
+    pts_marks: Vec<Mark>,
+    restart_marks: Vec<Mark>,
     /// Start-code offsets in `buffer`, discovered once as bytes arrive.
     sequences: VecDeque<usize>,
     gops: VecDeque<usize>,
@@ -116,12 +117,12 @@ impl Mpeg2GopStream {
         pts: Option<u64>,
         restart_offset: Option<u64>,
     ) -> Vec<Mpeg2Gop> {
-        if pts.is_some() || restart_offset.is_some() {
-            self.marks.push(Mark {
-                offset: self.base + self.buffer.len() - self.prefix_length,
-                pts,
-                restart_offset,
-            });
+        let offset = self.base + self.buffer.len() - self.prefix_length;
+        if let Some(value) = pts {
+            self.pts_marks.push(Mark { offset, value });
+        }
+        if let Some(value) = restart_offset {
+            self.restart_marks.push(Mark { offset, value });
         }
         self.buffer.extend_from_slice(chunk);
         self.scan_new_bytes();
@@ -189,21 +190,21 @@ impl Mpeg2GopStream {
         self.scan_pos = self.buffer.len().saturating_sub(3);
     }
 
-    /// The timestamp of the PES packet covering an absolute stream offset.
-    fn mark_at(&mut self, offset: usize) -> Option<Mark> {
-        let mut found = None;
+    /// The last supplied value covering an absolute stream offset.
+    fn mark_at(marks: &mut Vec<Mark>, offset: usize) -> Option<u64> {
+        let mut value = None;
         let mut covering: isize = -1;
-        for (i, mark) in self.marks.iter().enumerate() {
+        for (i, mark) in marks.iter().enumerate() {
             if mark.offset > offset {
                 break;
             }
-            found = Some(*mark);
+            value = Some(mark.value);
             covering = i as isize;
         }
         if covering > 0 {
-            self.marks.drain(..covering as usize);
+            marks.drain(..covering as usize);
         }
-        found
+        value
     }
 
     /// Where a unit running from the start of the buffer to `boundary` has to
@@ -279,11 +280,12 @@ impl Mpeg2GopStream {
                 .copied();
             let boundary = next_sequence.unwrap_or(second_gop);
             let boundary = self.description_boundary(first_gop, boundary);
-            let mark = self.mark_at(self.base);
+            let pts = Self::mark_at(&mut self.pts_marks, self.base);
+            let restart_offset = Self::mark_at(&mut self.restart_marks, self.base);
             output.push(Mpeg2Gop {
                 data: self.buffer[..boundary].to_vec(),
-                pts: mark.and_then(|mark| mark.pts),
-                restart_offset: mark.and_then(|mark| mark.restart_offset),
+                pts,
+                restart_offset,
             });
             self.consume(boundary);
             if next_sequence.is_none() && !self.sequence_prefix.is_empty() {
@@ -308,11 +310,12 @@ impl Mpeg2GopStream {
             }
         }
         if final_flush && !self.pictures.is_empty() {
-            let mark = self.mark_at(self.base);
+            let pts = Self::mark_at(&mut self.pts_marks, self.base);
+            let restart_offset = Self::mark_at(&mut self.restart_marks, self.base);
             output.push(Mpeg2Gop {
                 data: std::mem::take(&mut self.buffer),
-                pts: mark.and_then(|mark| mark.pts),
-                restart_offset: mark.and_then(|mark| mark.restart_offset),
+                pts,
+                restart_offset,
             });
             self.prefix_length = 0;
         }

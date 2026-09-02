@@ -181,6 +181,21 @@ fn gives_each_unit_its_transport_restart_position() {
 }
 
 #[test]
+fn restart_only_mark_does_not_hide_the_previous_timestamp() {
+    let one = read_fixture("ibbp.m2v");
+    let mut splitter = Mpeg2GopStream::new();
+    let mut units = Vec::new();
+    units.extend(splitter.push_with_restart(&one, Some(900_000), Some(9_500)));
+    units.extend(splitter.push_with_restart(&one, None, Some(10_500)));
+    units.extend(splitter.push_with_restart(&one, Some(930_000), Some(11_500)));
+    units.extend(splitter.finish());
+
+    assert_eq!(units.len(), 3);
+    assert_eq!(units[1].pts, Some(900_000));
+    assert_eq!(units[1].restart_offset, Some(10_500));
+}
+
+#[test]
 fn holds_an_unfinished_group_back() {
     let one = read_fixture("ibbp.m2v");
     let mut splitter = Mpeg2GopStream::new();
