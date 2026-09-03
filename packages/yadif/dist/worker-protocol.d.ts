@@ -79,10 +79,6 @@ export type WorkerNotification = {
     type: "visibility";
     visible: boolean;
 } | {
-    type: "size";
-    width: number;
-    height: number;
-} | {
     type: "stats";
     stats: Omit<DeinterlaceStats, "dropped">;
 } | {
