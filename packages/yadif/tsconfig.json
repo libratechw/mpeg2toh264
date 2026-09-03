@@ -1,4 +1,9 @@
 {
   "extends": "../../tsconfig.base.json",
-  "include": ["src/index.ts", "src/deinterlace.ts", "src/probe.ts"]
+  "include": [
+    "src/index.ts",
+    "src/deinterlace.ts",
+    "src/probe.ts",
+    "src/worker-modules.d.ts"
+  ]
 }

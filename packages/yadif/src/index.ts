@@ -1,3 +1,8 @@
+import bundledWorkerURL from "./worker.ts?worker&url";
+import { setBundledWorkerURL } from "./deinterlace.js";
+
+setBundledWorkerURL(bundledWorkerURL);
+
 export { Deinterlacer, supportsDeinterlace } from "./deinterlace.js";
 export type {
   DeinterlaceStats,

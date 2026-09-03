@@ -16,6 +16,6 @@
   "scripts": {
     "build": "vite build && tsc -p tsconfig.build.json",
     "prepack": "npm run build",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json"
   }
 }

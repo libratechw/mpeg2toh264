@@ -18,6 +18,18 @@ const player = new Mpeg2TsPlayer(video, {
 
 `Deinterlacer` は MPEG-2 由来のインターレース情報を受け取り、プログレッシブ映像では停止し、インターレース映像ではフィールド順に従って処理します。詳細なオプションは `DeinterlacerOptions` を参照してください。
 
+### 描画先
+
+既定の `rendering: "auto"` では、対応ブラウザーで YADIF、`autoFilm` の判定、WebGL 描画、表示キュー、統計集計を OffscreenCanvas と専用 Worker へ移します。
+
+`HTMLVideoElement` からのフレーム取得、`requestVideoFrameCallback()` が停止した場合の `requestAnimationFrame()` による復旧、DOM レイアウトはメインスレッド側に残ります。
+
+Worker 内で OffscreenCanvas、WebGL2、Worker rAF、転送可能な `VideoFrame` を初期化できない場合、`auto` は従来のメインスレッド描画へ戻ります。
+
+比較や互換性確認では `rendering: "main"`、Worker 経路の強制確認では `rendering: "worker"` を指定できます。
+
+パッケージへ同梱した Worker の代わりに別のファイルを読み込む場合は、`workerUrl` へ URL を指定してください。
+
 `probeDecoder()`と`decoderDeinterlaces()`は、ブラウザーのデコーダーがすでにデインターレースしているかを確認します。二重処理を避けるため、フィルターの有効化前に利用できます。
 
 ### `autoFilm`

@@ -30,6 +30,19 @@ import {
   YADIF_UNIFORMS,
 } from "./shader.js";
 import { FFmpegIVTC } from "./ivtc.js";
+import type {
+  WorkerCommand,
+  WorkerNotification,
+  WorkerRenderingOptions,
+  WorkerVideoState,
+} from "./worker-protocol.js";
+
+let bundledWorkerURL: string | URL | null = null;
+
+/** @internal Worker として出力したファイルの URL を公開エントリから受け取る。 */
+export function setBundledWorkerURL(url: string | URL): void {
+  bundledWorkerURL = url;
+}
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
@@ -162,18 +175,7 @@ export interface DeinterlaceStats {
   degraded: number;
   /** Times the held frames were dropped as stale: seeks, and stream changes. */
   discontinuities: number;
-  /**
-   * Filtered pictures that were never shown, because an animation frame did
-   * not come round while their moment was still ahead, or because the clock
-   * they were timed by turned out to be somewhere else.
-   *
-   * Only a picture for every field can have these -- a picture for every frame
-   * goes up as its frame arrives -- and they are the page being too busy to
-   * keep a field rate rather than anything the filter did. A few are a hiccup,
-   * and one every few seconds is a display whose refresh rate the field rate
-   * does not divide into. A steady stream of them is a machine that cannot
-   * show fields at all, and turning `doubleRate` off is the answer.
-   */
+  /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
   late: number;
   /**
    * Retained for compatibility with existing statistics consumers.
@@ -182,13 +184,7 @@ export interface DeinterlaceStats {
   queueResetted: number;
   /** Frames presented per second over the last report. */
   fps: number;
-  /**
-   * What one frame costs, in milliseconds, averaged over the last report:
-   * uploading it, filtering the picture or pair of pictures built from it, and
-   * putting them up. This is the time on the page's own thread -- the GPU's
-   * part of the draw is not in it -- so it is the measure of what the
-   * deinterlacer takes away from everything else.
-   */
+  /** 直近区間で入力1枚のアップロード、フィルター、表示に費やした描画スレッド上の平均時間。GPU の実行時間と Worker 描画時のメインスレッド占有時間は含まない。 */
   frameMs: number;
   /**
    * The largest number of pictures queued during the last reporting interval,
@@ -210,6 +206,10 @@ export interface DeinterlaceStats {
 }
 
 export interface DeinterlacerOptions {
+  /** 描画先。`auto` は同梱 Worker を優先し、初期化できない場合はメインスレッドへ戻る。 */
+  rendering?: "auto" | "worker" | "main";
+  /** module Worker の URL。省略時はパッケージへ同梱したファイルを使う。 */
+  workerUrl?: string | URL;
   /**
    * Whether to show a picture for every field rather than for every frame.
    *
@@ -281,6 +281,25 @@ export function supportsDeinterlace(): boolean {
   );
 }
 
+/** Worker の入口だけが、同じクラスから描画エンジンを構築するために渡す内部接続。 */
+interface ExternalRenderingHost {
+  canvas: OffscreenCanvas;
+  onFailure(message: string): void;
+  onVisibility(visible: boolean): void;
+  onSize(width: number, height: number): void;
+  requestAnimationFrame(callback: FrameRequestCallback): number;
+  cancelAnimationFrame(handle: number): void;
+}
+
+/** ACK を待つ間にページ側が所有する最新フレームと、その観測状態。 */
+interface PendingWorkerFrame {
+  id: number;
+  frame: VideoFrame;
+  now: number;
+  metadata: FrameObservation;
+  video: WorkerVideoState;
+}
+
 /**
  * Puts a deinterlaced copy of a `<video>` over the top of it.
  *
@@ -300,7 +319,8 @@ export function supportsDeinterlace(): boolean {
  * the same snapshot for callers that prefer a constructor option.
  */
 export class Deinterlacer extends EventTarget {
-  readonly canvas: HTMLCanvasElement;
+  readonly #renderCanvas: HTMLCanvasElement | OffscreenCanvas;
+  #displayCanvas: HTMLCanvasElement;
 
   readonly #video: HTMLVideoElement;
   readonly #gl: WebGL2RenderingContext;
@@ -355,7 +375,7 @@ export class Deinterlacer extends EventTarget {
   #refreshMs = DEFAULT_REFRESH_MS;
   /** The `<div>` this put around the element, so it can be taken away again. */
   #wrapper: HTMLElement | null = null;
-  readonly #resizes: ResizeObserver;
+  readonly #resizes: ResizeObserver | null;
   #doubleRate: boolean;
   #autoFilm: boolean;
   #filmCombThreshold: number;
@@ -393,6 +413,24 @@ export class Deinterlacer extends EventTarget {
   #videoTimeline: readonly VideoState[] = [];
   #lost = false;
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
+  readonly #externalHost: ExternalRenderingHost | null;
+  #frameSource: TexImageSource;
+  readonly #rendering: "auto" | "worker" | "main";
+  readonly #workerURL: string | URL | null;
+  #worker: Worker | null = null;
+  #workerState: "idle" | "starting" | "active" | "main" | "failed";
+  #workerRestarted = false;
+  #workerGeneration = 0;
+  #displayCanvasTransferred = false;
+  #workerFrameID = 0;
+  #workerFrameInFlight = false;
+  #workerAcceptedFrame = false;
+  #pendingWorkerFrame: PendingWorkerFrame | null = null;
+  #captureID = 0;
+  readonly #captureRequests = new Map<
+    number,
+    { resolve(image: ImageBitmap): void; reject(error: Error): void }
+  >();
   /** Everything the next report is counted from. See DeinterlaceStats. */
   #stats = {
     filtered: 0,
@@ -413,7 +451,18 @@ export class Deinterlacer extends EventTarget {
   #showMsSinceReport = 0;
   #reportMaxQueuedFields = 0;
 
-  constructor(video: HTMLVideoElement, options: DeinterlacerOptions = {}) {
+  constructor(video: HTMLVideoElement, options?: DeinterlacerOptions);
+  /** @internal Worker の描画エンジンを構築する場合だけ使う。 */
+  constructor(
+    video: HTMLVideoElement,
+    options: DeinterlacerOptions,
+    externalHost: ExternalRenderingHost,
+  );
+  constructor(
+    video: HTMLVideoElement,
+    options: DeinterlacerOptions = {},
+    externalHost: ExternalRenderingHost | null = null,
+  ) {
     super();
     this.#video = video;
     this.#doubleRate = options.doubleRate ?? false;
@@ -423,12 +472,25 @@ export class Deinterlacer extends EventTarget {
     );
     this.#spatialCheck = options.spatialCheck ?? true;
     this.#onStats = options.onStats;
-    this.canvas = document.createElement("canvas");
+    this.#externalHost = externalHost;
+    this.#rendering = externalHost ? "main" : (options.rendering ?? "auto");
+    this.#workerURL = options.workerUrl ?? bundledWorkerURL;
+    this.#workerState = this.#rendering === "main" ? "main" : "idle";
+    this.#displayCanvas = externalHost
+      ? (externalHost.canvas as unknown as HTMLCanvasElement)
+      : document.createElement("canvas");
+    this.#renderCanvas =
+      externalHost?.canvas ??
+      (this.#rendering === "main"
+        ? this.#displayCanvas
+        : document.createElement("canvas"));
+    this.#frameSource = video;
     // Where it goes is worked out in #layout; the element underneath keeps
     // every click, since all this does is cover it.
-    this.canvas.style.cssText =
-      "position:absolute;pointer-events:none;visibility:hidden";
-    const gl = this.canvas.getContext("webgl2", {
+    if (!externalHost)
+      this.#displayCanvas.style.cssText =
+        "position:absolute;pointer-events:none;visibility:hidden";
+    const gl = this.#renderCanvas.getContext("webgl2", {
       alpha: false,
       antialias: false,
       depth: false,
@@ -450,11 +512,16 @@ export class Deinterlacer extends EventTarget {
     this.#blitField = gl.getUniformLocation(this.#blit, "uField");
     this.#blitFlip = gl.getUniformLocation(this.#blit, "uFlip");
     if (this.#autoFilm) this.#ensureFilmPrograms();
-    this.canvas.addEventListener("webglcontextlost", this.#onContextLost);
+    this.#renderCanvas.addEventListener(
+      "webglcontextlost",
+      this.#onContextLost,
+    );
     // The canvas is placed in pixels rather than in percentages, because where
     // the picture sits inside the element is arithmetic the browser does not
     // hand out. Anything that moves the element has to move it too.
-    this.#resizes = new ResizeObserver(() => this.#layout());
+    this.#resizes = externalHost
+      ? null
+      : new ResizeObserver(() => this.#layout());
     // A frame the filter has not seen the neighbours of is not worth holding:
     // whatever is next will have been somewhere else entirely.
     video.addEventListener("emptied", this.#onEmptied);
@@ -474,9 +541,24 @@ export class Deinterlacer extends EventTarget {
     return this.#running && (this.#scan?.interlaced ?? true);
   }
 
+  /** 現在 media element の上に配置している HTML canvas。 */
+  get canvas(): HTMLCanvasElement {
+    return this.#displayCanvas;
+  }
+
   /** Field order for the current scan state, defaulting to top-field-first. */
   get #topFieldFirst(): boolean {
     return this.#scan?.topFieldFirst !== false;
+  }
+
+  /** どの描画先にも同じ公開オプションを渡す。 */
+  #workerRenderingOptions(): WorkerRenderingOptions {
+    return {
+      doubleRate: this.#doubleRate,
+      autoFilm: this.#autoFilm,
+      filmCombThreshold: this.#filmCombThreshold,
+      spatialCheck: this.#spatialCheck,
+    };
   }
 
   /** Whether the caller wants filtering, independently of the current source. */
@@ -487,6 +569,10 @@ export class Deinterlacer extends EventTarget {
   set enabled(enabled: boolean) {
     this.#enabled = enabled;
     this.#apply();
+    this.#worker?.postMessage({
+      type: "enabled",
+      enabled,
+    } satisfies WorkerCommand);
   }
 
   /** Update whether the source needs filtering and which field comes first. */
@@ -495,6 +581,7 @@ export class Deinterlacer extends EventTarget {
     const changed =
       interlacingChanged || this.#scan?.topFieldFirst !== scan?.topFieldFirst;
     this.#scan = scan;
+    this.#worker?.postMessage({ type: "scan", scan } satisfies WorkerCommand);
     if (changed) {
       // A standalone caller may update scan metadata without a timeline entry.
       // Do not let history or queued fields measured under the old parity cross
@@ -505,7 +592,7 @@ export class Deinterlacer extends EventTarget {
       // only after measuring the first complete interlaced interval
       if (interlacingChanged) this.#periodMs = 0;
       this.#presentedPicture = null;
-      this.canvas.style.visibility = "hidden";
+      this.#setVisible(false);
     }
     this.#apply();
     if (changed) {
@@ -520,6 +607,10 @@ export class Deinterlacer extends EventTarget {
 
   set videoTimeline(timeline: readonly VideoState[]) {
     this.#videoTimeline = timeline;
+    this.#worker?.postMessage({
+      type: "timeline",
+      videoTimeline: timeline,
+    } satisfies WorkerCommand);
     if (timeline.length === 0) this.#scan = null;
     this.#apply();
   }
@@ -546,6 +637,7 @@ export class Deinterlacer extends EventTarget {
   set doubleRate(doubleRate: boolean) {
     if (doubleRate === this.#doubleRate) return;
     this.#doubleRate = doubleRate;
+    this.#postWorkerSettings();
     // A rate change gives every queued field a different presentation cadence,
     // so the next decoded frame starts a new schedule on the current timeline.
     this.#queue.length = 0;
@@ -556,7 +648,7 @@ export class Deinterlacer extends EventTarget {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
       this.#presentedPicture = null;
-      this.canvas.style.visibility = "hidden";
+      this.#setVisible(false);
       this.#freeOutputs();
     }
   }
@@ -569,6 +661,7 @@ export class Deinterlacer extends EventTarget {
   set autoFilm(autoFilm: boolean) {
     if (autoFilm === this.#autoFilm) return;
     this.#autoFilm = autoFilm;
+    this.#postWorkerSettings();
     this.#resetFilm();
     if (autoFilm) {
       this.#ensureFilmPrograms();
@@ -581,7 +674,7 @@ export class Deinterlacer extends EventTarget {
       this.#freeAnalysisTarget();
       if (!this.#doubleRate) {
         this.#presentedPicture = null;
-        this.canvas.style.visibility = "hidden";
+        this.#setVisible(false);
         this.#freeOutputs();
       }
     }
@@ -596,7 +689,16 @@ export class Deinterlacer extends EventTarget {
     const validated = validateFilmCombThreshold(value);
     if (validated === this.#filmCombThreshold) return;
     this.#filmCombThreshold = validated;
+    this.#postWorkerSettings();
     if (this.#autoFilm) this.#resetFilm();
+  }
+
+  /** Worker と canvas を再構築せずに変更可能なフィルター設定を反映する。 */
+  #postWorkerSettings(): void {
+    this.#worker?.postMessage({
+      type: "settings",
+      options: this.#workerRenderingOptions(),
+    } satisfies WorkerCommand);
   }
 
   #apply(): void {
@@ -606,6 +708,207 @@ export class Deinterlacer extends EventTarget {
     )
       this.start();
     else this.stop();
+  }
+
+  /** 転送に必要な API がそろっている場合だけ同梱 Worker を起動する。 */
+  #ensureWorker(): boolean {
+    if (this.#externalHost || this.#rendering === "main") return false;
+    if (this.#workerState === "starting" || this.#workerState === "active")
+      return true;
+    const canTransfer =
+      typeof Worker !== "undefined" &&
+      typeof VideoFrame !== "undefined" &&
+      typeof OffscreenCanvas !== "undefined" &&
+      this.#workerURL !== null &&
+      "transferControlToOffscreen" in HTMLCanvasElement.prototype;
+    if (!canTransfer) {
+      if (this.#rendering === "auto") {
+        this.#fallBackToMain();
+        return false;
+      }
+      this.#workerState = "failed";
+      this.#running = false;
+      return true;
+    }
+    this.#startWorker();
+    return true;
+  }
+
+  /** 表示中の canvas を置き換えてから、新しい canvas の制御を Worker へ移す。 */
+  #startWorker(): void {
+    this.#closePendingWorkerFrame();
+    this.#worker?.terminate();
+    this.#worker = null;
+    this.#workerFrameInFlight = false;
+    this.#workerAcceptedFrame = false;
+    let canvas = this.#displayCanvas;
+    // 初回は公開済みの要素をそのまま使い、片方向転送済みの canvas を復旧する場合だけ新しい要素へ差し替える。
+    if (this.#displayCanvasTransferred) {
+      canvas = document.createElement("canvas");
+      canvas.className = this.#displayCanvas.className;
+      const style = this.#displayCanvas.getAttribute("style");
+      if (style === null) canvas.removeAttribute("style");
+      else canvas.setAttribute("style", style);
+      canvas.style.visibility = "hidden";
+      if (this.#displayCanvas.parentElement)
+        this.#displayCanvas.replaceWith(canvas);
+      this.#displayCanvas = canvas;
+    }
+
+    const generation = ++this.#workerGeneration;
+    this.#workerState = "starting";
+    let worker: Worker;
+    let offscreen: OffscreenCanvas;
+    try {
+      // canvas の制御移動後はメインスレッドへ戻せないため、以降の失敗は未転送の描画用 canvas へ切り替える。
+      offscreen = canvas.transferControlToOffscreen();
+      this.#displayCanvasTransferred = true;
+      worker = new Worker(this.#workerURL!, { type: "module" });
+    } catch (error) {
+      this.#workerFailed(
+        error instanceof Error ? error.message : String(error),
+      );
+      return;
+    }
+    this.#worker = worker;
+    worker.onmessage = (event: MessageEvent<WorkerNotification>) => {
+      if (generation === this.#workerGeneration)
+        this.#onWorkerMessage(event.data);
+    };
+    worker.onerror = (event) => {
+      if (generation !== this.#workerGeneration) return;
+      event.preventDefault();
+      this.#workerFailed(event.message || "the deinterlacer worker failed");
+    };
+    worker.postMessage(
+      {
+        type: "initialize",
+        canvas: offscreen,
+        options: this.#workerRenderingOptions(),
+        scan: this.#scan,
+        videoTimeline: this.#videoTimeline,
+        enabled: this.#enabled,
+        video: this.#workerVideoState(),
+      } satisfies WorkerCommand,
+      [offscreen],
+    );
+  }
+
+  /** Worker の通知を反映し、入力を1枚ずつ送るための待機を解除する。 */
+  #onWorkerMessage(notification: WorkerNotification): void {
+    switch (notification.type) {
+      case "ready":
+        this.#workerState = "active";
+        if (this.#running) {
+          this.#request();
+          if (this.#scan?.interlaced ?? true) this.#startLoop();
+        }
+        break;
+      case "failed":
+        this.#workerFailed(notification.message);
+        break;
+      case "consumed": {
+        this.#workerFrameInFlight = false;
+        this.#workerAcceptedFrame = true;
+        const pending = this.#pendingWorkerFrame;
+        this.#pendingWorkerFrame = null;
+        if (pending) this.#sendWorkerFrame(pending);
+        break;
+      }
+      case "visibility":
+        this.#displayCanvas.style.visibility = notification.visible
+          ? "visible"
+          : "hidden";
+        break;
+      case "size":
+        this.#displayCanvas.width = notification.width;
+        this.#displayCanvas.height = notification.height;
+        break;
+      case "stats": {
+        const stats: DeinterlaceStats = {
+          ...notification.stats,
+          dropped:
+            this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
+        };
+        this.dispatchEvent(new CustomEvent("stats", { detail: stats }));
+        this.#onStats?.(stats);
+        break;
+      }
+      case "capture": {
+        const request = this.#captureRequests.get(notification.id);
+        this.#captureRequests.delete(notification.id);
+        if (!request) {
+          notification.image?.close();
+          break;
+        }
+        if (notification.image) request.resolve(notification.image);
+        else
+          void createImageBitmap(this.#video).then(
+            request.resolve,
+            request.reject,
+          );
+        break;
+      }
+    }
+  }
+
+  /** 一時的な Worker 障害を1回だけ復旧し、再失敗時は media element 自体を表示する。 */
+  #workerFailed(message: string): void {
+    if (
+      this.#workerState === "starting" &&
+      this.#rendering === "auto" &&
+      !this.#workerRestarted
+    ) {
+      this.#fallBackToMain();
+      return;
+    }
+    this.#rejectCaptureRequests(message);
+    if (!this.#workerRestarted) {
+      this.#workerRestarted = true;
+      this.#startWorker();
+      return;
+    }
+    console.error(`Deinterlacer Worker stopped: ${message}`);
+    this.#workerState = "failed";
+    this.#worker?.terminate();
+    this.#worker = null;
+    this.#closePendingWorkerFrame();
+    this.stop();
+  }
+
+  /** Worker を自動選択できなかった場合は元のメインスレッド用 canvas へ戻す。 */
+  #fallBackToMain(): void {
+    const mainCanvas = this.#renderCanvas as HTMLCanvasElement;
+    mainCanvas.className = this.#displayCanvas.className;
+    const style = this.#displayCanvas.getAttribute("style");
+    if (style === null) mainCanvas.removeAttribute("style");
+    else mainCanvas.setAttribute("style", style);
+    mainCanvas.style.visibility = "hidden";
+    if (this.#displayCanvas.parentElement)
+      this.#displayCanvas.replaceWith(mainCanvas);
+    this.#displayCanvas = mainCanvas;
+    this.#displayCanvasTransferred = false;
+    this.#worker?.terminate();
+    this.#worker = null;
+    this.#workerState = "main";
+    this.#closePendingWorkerFrame();
+    if (this.#running) {
+      this.#request();
+      if (this.#scan?.interlaced ?? true) this.#startLoop();
+    }
+  }
+
+  /** 描画先を切り替えるとき、ページ側がまだ所有する待機フレームを閉じる。 */
+  #closePendingWorkerFrame(): void {
+    this.#pendingWorkerFrame?.frame.close();
+    this.#pendingWorkerFrame = null;
+  }
+
+  /** Worker の再構築後には応答できない capture を失敗として完了する。 */
+  #rejectCaptureRequests(message: string): void {
+    for (const request of this.#captureRequests.values())
+      request.reject(new Error(message));
+    this.#captureRequests.clear();
   }
 
   start(): void {
@@ -618,6 +921,7 @@ export class Deinterlacer extends EventTarget {
     this.#lastObservedVideoFrames =
       this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
     this.#mount();
+    if (this.#ensureWorker()) return;
     this.#request();
     if (this.#scan?.interlaced ?? true) this.#startLoop();
   }
@@ -632,12 +936,25 @@ export class Deinterlacer extends EventTarget {
     this.#stopLoop();
     this.#frames = 0;
     this.#presentedPicture = null;
-    this.canvas.style.visibility = "hidden";
+    this.#setVisible(false);
+    this.#closePendingWorkerFrame();
+    this.#worker?.postMessage({
+      type: "enabled",
+      enabled: false,
+    } satisfies WorkerCommand);
   }
 
   destroy(): void {
     this.stop();
-    this.canvas.removeEventListener("webglcontextlost", this.#onContextLost);
+    this.#worker?.postMessage({ type: "destroy" } satisfies WorkerCommand);
+    this.#worker?.terminate();
+    this.#worker = null;
+    this.#closePendingWorkerFrame();
+    this.#rejectCaptureRequests("the deinterlacer was destroyed");
+    this.#renderCanvas.removeEventListener(
+      "webglcontextlost",
+      this.#onContextLost,
+    );
     this.#video.removeEventListener("emptied", this.#onEmptied);
     this.#video.removeEventListener("resize", this.#onResize);
     this.#video.removeEventListener("pause", this.#onFlush);
@@ -667,7 +984,28 @@ export class Deinterlacer extends EventTarget {
    * permanent cost of `preserveDrawingBuffer` on ordinary playback.
    */
   capture(): Promise<ImageBitmap> {
+    if (
+      this.#workerState === "active" &&
+      this.#displayCanvas.style.visibility === "visible" &&
+      this.#worker
+    ) {
+      const id = ++this.#captureID;
+      const image = new Promise<ImageBitmap>((resolve, reject) => {
+        this.#captureRequests.set(id, { resolve, reject });
+      });
+      this.#worker.postMessage({
+        type: "capture",
+        id,
+        width: this.#video.videoWidth,
+        height: this.#video.videoHeight,
+      } satisfies WorkerCommand);
+      return image;
+    }
+    if (this.#workerState === "starting" || this.#workerState === "failed")
+      return createImageBitmap(this.#video);
     const picture = this.#presentedPicture;
+    if (this.#externalHost && (!this.#running || this.#lost || !picture))
+      return Promise.reject(new Error("no rendered picture is available"));
     if (!this.#running || this.#lost || !picture)
       return createImageBitmap(this.#video);
     if (picture.kind === "texture")
@@ -680,14 +1018,15 @@ export class Deinterlacer extends EventTarget {
     if (
       width > 0 &&
       height > 0 &&
-      (width !== this.canvas.width || height !== this.canvas.height)
+      (width !== this.#renderCanvas.width ||
+        height !== this.#renderCanvas.height)
     )
-      return createImageBitmap(this.canvas, {
+      return createImageBitmap(this.#renderCanvas, {
         resizeWidth: width,
         resizeHeight: height,
         resizeQuality: "high",
       });
-    return createImageBitmap(this.canvas);
+    return createImageBitmap(this.#renderCanvas);
   }
 
   override addEventListener<K extends keyof DeinterlacerEventMap>(
@@ -727,8 +1066,89 @@ export class Deinterlacer extends EventTarget {
   }
 
   #request(): void {
-    if (!this.#running || this.#handle !== null) return;
+    if (this.#externalHost || !this.#running || this.#handle !== null) return;
     this.#handle = this.#video.requestVideoFrameCallback(this.#onFrame);
+  }
+
+  /** seek と表示周期の判断に必要な DOM 側の再生状態を複製する。 */
+  #workerVideoState(): WorkerVideoState {
+    const buffered: Array<{ start: number; end: number }> = [];
+    for (let index = 0; index < this.#video.buffered.length; index++)
+      buffered.push({
+        start: this.#video.buffered.start(index),
+        end: this.#video.buffered.end(index),
+      });
+    return {
+      currentTime: this.#video.currentTime,
+      playbackRate: this.#video.playbackRate,
+      seeking: this.#video.seeking,
+      paused: this.#video.paused,
+      ended: this.#video.ended,
+      readyState: this.#video.readyState,
+      videoWidth: this.#video.videoWidth,
+      videoHeight: this.#video.videoHeight,
+      buffered,
+    };
+  }
+
+  /** 転送中1枚と最新の待機1枚だけを保持し、音声時計からの遅延蓄積を防ぐ。 */
+  #queueWorkerFrame(
+    now: DOMHighResTimeStamp,
+    metadata: FrameObservation,
+  ): void {
+    let frame: VideoFrame;
+    try {
+      frame = new VideoFrame(this.#video, {
+        timestamp: Math.max(0, Math.round(metadata.mediaTime * 1_000_000)),
+      });
+    } catch (error) {
+      this.#workerFailed(
+        error instanceof Error ? error.message : String(error),
+      );
+      return;
+    }
+    const pending: PendingWorkerFrame = {
+      id: ++this.#workerFrameID,
+      frame,
+      now,
+      metadata,
+      video: this.#workerVideoState(),
+    };
+    if (this.#workerFrameInFlight) {
+      this.#pendingWorkerFrame?.frame.close();
+      this.#pendingWorkerFrame = pending;
+      return;
+    }
+    this.#sendWorkerFrame(pending);
+  }
+
+  /** 直前の入力を Worker が解放した後に、選択済みフレームを転送する。 */
+  #sendWorkerFrame(pending: PendingWorkerFrame): void {
+    const worker = this.#worker;
+    if (!worker || this.#workerState !== "active") {
+      pending.frame.close();
+      return;
+    }
+    this.#workerFrameInFlight = true;
+    const command: WorkerCommand = { type: "frame", ...pending };
+    try {
+      worker.postMessage(command, [pending.frame]);
+    } catch (error) {
+      this.#workerFrameInFlight = false;
+      pending.frame.close();
+      const message = error instanceof Error ? error.message : String(error);
+      // 最初のフレーム転送失敗は機能不足として扱い、実動後の障害だけを再構築の対象にする。
+      if (
+        this.#rendering === "auto" &&
+        !this.#workerAcceptedFrame &&
+        !this.#workerRestarted
+      ) {
+        this.#fallBackToMain();
+        this.#processFrame(pending.now, pending.metadata);
+      } else {
+        this.#workerFailed(message);
+      }
+    }
   }
 
   #onFrame = (
@@ -746,8 +1166,31 @@ export class Deinterlacer extends EventTarget {
     this.#request();
   };
 
-  /** どちらの通知経路で見つけたフレームも同じ履歴へ取り込んでフィルターする。 */
+  /** どちらの通知経路で見つけたフレームも選択中の描画先へ取り込む。 */
   #ingestFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
+    if (this.#workerState === "active") {
+      this.#queueWorkerFrame(now, metadata);
+      return;
+    }
+    if (this.#workerState !== "starting") this.#processFrame(now, metadata);
+  }
+
+  /** @internal Worker でもメインスレッドと同じ履歴と描画判断を使うための入口。 */
+  ingestExternalFrame(
+    now: DOMHighResTimeStamp,
+    metadata: FrameObservation,
+    frame: VideoFrame,
+  ): void {
+    this.#frameSource = frame;
+    try {
+      this.#processFrame(now, metadata);
+    } finally {
+      this.#frameSource = this.#video;
+    }
+  }
+
+  /** 1枚の入力を共通の履歴へ取り込み、YADIF と IVTC の表示判断を完了する。 */
+  #processFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
     this.#selectVideoState(metadata.mediaTime);
     if (metadata.width > 0 && metadata.height > 0) {
       // Chromium can submit the destination frame while `seeking` is still
@@ -1164,7 +1607,7 @@ export class Deinterlacer extends EventTarget {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     if (target === null) {
       this.#presentedPicture = { kind: "film" };
-      this.canvas.style.visibility = "visible";
+      this.#setVisible(true);
       if (countOutput) this.#outputSinceReport++;
     }
   }
@@ -1259,11 +1702,11 @@ export class Deinterlacer extends EventTarget {
     if (this.#loopHandle !== null) return;
     if (!this.#running || this.#lost) return;
     this.#lastLoopAt = 0;
-    this.#loopHandle = requestAnimationFrame(this.#onLoop);
+    this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
   }
 
   #stopLoop(): void {
-    if (this.#loopHandle !== null) cancelAnimationFrame(this.#loopHandle);
+    if (this.#loopHandle !== null) this.#cancelAnimationFrame(this.#loopHandle);
     this.#loopHandle = null;
     this.#queue.length = 0;
   }
@@ -1284,12 +1727,26 @@ export class Deinterlacer extends EventTarget {
     }
     this.#lastLoopAt = now;
     this.#recoverFrameCallback(now);
-    this.#present(now);
-    this.#loopHandle = requestAnimationFrame(this.#onLoop);
+    if (this.#workerState === "main") this.#present(now);
+    this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
   };
+
+  /** ページと Worker のそれぞれが所有する rAF へ表示ループを委ねる。 */
+  #requestAnimationFrame(callback: FrameRequestCallback): number {
+    return this.#externalHost
+      ? this.#externalHost.requestAnimationFrame(callback)
+      : requestAnimationFrame(callback);
+  }
+
+  /** 選択中の描画先で予約した表示機会を取り消す。 */
+  #cancelAnimationFrame(handle: number): void {
+    if (this.#externalHost) this.#externalHost.cancelAnimationFrame(handle);
+    else cancelAnimationFrame(handle);
+  }
 
   /** ブラウザから callback が来ない間も animation loop から復号フレームを取り込む。 */
   #recoverFrameCallback(now: DOMHighResTimeStamp): void {
+    if (this.#externalHost) return;
     if (
       now - this.#lastVideoFrameCallbackAt < FRAME_CALLBACK_TIMEOUT_MS ||
       this.#video.paused ||
@@ -1375,6 +1832,15 @@ export class Deinterlacer extends EventTarget {
     this.#frames = 0;
   }
 
+  /** DOM の visibility 変更はページ側に残し、Worker からは状態だけを通知する。 */
+  #setVisible(visible: boolean): void {
+    if (this.#externalHost) {
+      this.#externalHost.onVisibility(visible);
+      return;
+    }
+    this.#displayCanvas.style.visibility = visible ? "visible" : "hidden";
+  }
+
   #showTexture(texture: WebGLTexture, flip = false, countOutput = true): void {
     const gl = this.#gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1386,7 +1852,7 @@ export class Deinterlacer extends EventTarget {
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.#presentedPicture = { kind: "texture", texture, flip };
-    this.canvas.style.visibility = "visible";
+    this.#setVisible(true);
     if (countOutput) this.#outputSinceReport++;
   }
 
@@ -1458,7 +1924,7 @@ export class Deinterlacer extends EventTarget {
       gl.RGBA,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
-      this.#video,
+      this.#frameSource,
     );
     this.#frames = Math.min(this.#frames + 1, HISTORY);
   }
@@ -1544,7 +2010,7 @@ export class Deinterlacer extends EventTarget {
     // the canvas for it would put up whatever was drawn on it last.
     if (target === null) {
       this.#presentedPicture = { kind: "yadif", flush, second };
-      this.canvas.style.visibility = "visible";
+      this.#setVisible(true);
       if (countOutput) this.#outputSinceReport++;
     }
   }
@@ -1573,16 +2039,17 @@ export class Deinterlacer extends EventTarget {
     );
     const width = displayWidth * scale;
     const height = displayHeight * scale;
-    this.canvas.style.left = `${video.offsetLeft + (video.offsetWidth - width) / 2}px`;
-    this.canvas.style.top = `${video.offsetTop + (video.offsetHeight - height) / 2}px`;
-    this.canvas.style.width = `${width}px`;
-    this.canvas.style.height = `${height}px`;
+    this.#displayCanvas.style.left = `${video.offsetLeft + (video.offsetWidth - width) / 2}px`;
+    this.#displayCanvas.style.top = `${video.offsetTop + (video.offsetHeight - height) / 2}px`;
+    this.#displayCanvas.style.width = `${width}px`;
+    this.#displayCanvas.style.height = `${height}px`;
   }
 
   #resize(width: number, height: number): void {
     const gl = this.#gl;
-    this.canvas.width = width;
-    this.canvas.height = height;
+    this.#renderCanvas.width = width;
+    this.#renderCanvas.height = height;
+    this.#externalHost?.onSize(width, height);
     this.#width = width;
     this.#height = height;
     this.#frames = 0;
@@ -1764,17 +2231,18 @@ export class Deinterlacer extends EventTarget {
       "position:relative;display:inline-block;line-height:0;max-width:100%";
     parent.insertBefore(wrapper, this.#video);
     wrapper.appendChild(this.#video);
-    wrapper.appendChild(this.canvas);
+    wrapper.appendChild(this.#displayCanvas);
     this.#wrapper = wrapper;
-    this.#resizes.observe(this.#video);
+    this.#resizes?.observe(this.#video);
     this.#layout();
   }
 
   #unmount(): void {
+    if (this.#externalHost) return;
     const wrapper = this.#wrapper;
     this.#wrapper = null;
-    this.#resizes.disconnect();
-    this.canvas.remove();
+    this.#resizes?.disconnect();
+    this.#displayCanvas.remove();
     if (!wrapper?.parentElement) return;
     wrapper.parentElement.insertBefore(this.#video, wrapper);
     wrapper.remove();
@@ -1782,7 +2250,25 @@ export class Deinterlacer extends EventTarget {
 
   #onResize = (): void => this.#layout();
 
+  /** media event と、その意味を決めたページ側の再生状態を Worker へ転送する。 */
+  #postWorkerEvent(
+    name: "emptied" | "pause" | "ended" | "seeking" | "seeked" | "ratechange",
+  ): boolean {
+    if (!this.#worker || this.#workerState === "main") return false;
+    this.#worker.postMessage({
+      type: "event",
+      name,
+      video: this.#workerVideoState(),
+    } satisfies WorkerCommand);
+    return true;
+  }
+
   #onEmptied = (): void => {
+    if (this.#postWorkerEvent("emptied")) {
+      this.#closePendingWorkerFrame();
+      this.#setVisible(false);
+      return;
+    }
     this.#frames = 0;
     this.#lastMediaTime = 0;
     this.#queue.length = 0;
@@ -1792,7 +2278,7 @@ export class Deinterlacer extends EventTarget {
     this.#resetStats();
     this.#resetFilm();
     this.#presentedPicture = null;
-    this.canvas.style.visibility = "hidden";
+    this.#setVisible(false);
   };
 
   #resetStats(): void {
@@ -1832,6 +2318,10 @@ export class Deinterlacer extends EventTarget {
    * A new seek invalidates any destination frame remembered for the last one.
    */
   #onSeeking = (): void => {
+    if (this.#postWorkerEvent("seeking")) {
+      this.#closePendingWorkerFrame();
+      return;
+    }
     this.#seekFrameReady = false;
   };
 
@@ -1841,6 +2331,16 @@ export class Deinterlacer extends EventTarget {
    * the one the first field was taken at.
    */
   #onFlush = (event: Event): void => {
+    if (
+      (event.type === "pause" ||
+        event.type === "ended" ||
+        event.type === "seeked" ||
+        event.type === "ratechange") &&
+      this.#postWorkerEvent(event.type)
+    ) {
+      this.#closePendingWorkerFrame();
+      return;
+    }
     if (event.type === "seeked") {
       // A destination frame may have reached requestVideoFrameCallback while
       // the element still reported `seeking`. #onFrame has already discarded
@@ -1855,7 +2355,7 @@ export class Deinterlacer extends EventTarget {
       this.#frames = 0;
       this.#resetFilm();
       this.#presentedPicture = null;
-      this.canvas.style.visibility = "hidden";
+      this.#setVisible(false);
       return;
     }
     const rateChanged = event.type === "ratechange";
@@ -1896,9 +2396,35 @@ export class Deinterlacer extends EventTarget {
    */
   #onContextLost = (event: Event): void => {
     event.preventDefault();
+    if (this.#externalHost) {
+      this.#externalHost.onFailure("the deinterlacer WebGL context was lost");
+      return;
+    }
+    if (this.#workerState === "active") return;
     this.#lost = true;
     this.stop();
   };
+}
+
+/** @internal Worker 内の OffscreenCanvas へ共通描画エンジンを接続する。 */
+export function createWorkerDeinterlacer(
+  video: HTMLVideoElement,
+  canvas: OffscreenCanvas,
+  options: DeinterlacerOptions,
+  onFailure: (message: string) => void,
+  onVisibility: (visible: boolean) => void,
+  onSize: (width: number, height: number) => void,
+  requestAnimationFrame: (callback: FrameRequestCallback) => number,
+  cancelAnimationFrame: (handle: number) => void,
+): Deinterlacer {
+  return new Deinterlacer(video, options, {
+    canvas,
+    onFailure,
+    onVisibility,
+    onSize,
+    requestAnimationFrame,
+    cancelAnimationFrame,
+  });
 }
 
 function createProgram(
