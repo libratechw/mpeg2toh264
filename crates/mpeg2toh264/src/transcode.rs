@@ -34,6 +34,7 @@ use crate::h264::mb::{
     write_inter_macroblock, write_intra_macroblock, ChromaCounts, CoeffCountMap, InterMacroblock,
     MotionPartition, PredictionMode, FIELD_SCAN_8X8,
 };
+use crate::h264::mbaff::Frame as MbaffFrame;
 use crate::h264::mvmap::{map_vector, native_position, VectorKind};
 use crate::h264::mvpred::{MbMotion, MotionField};
 use crate::h264::params::{
@@ -224,6 +225,10 @@ struct PictureScratch {
     field_counts: [CoeffCountMap; 2],
     field_chroma_counts: [ChromaCounts; 2],
     field_motion: [MotionField; 2],
+    /// Where each macroblock's neighbours are, for the frame picture and for
+    /// each field of a picture coded as two field pictures.
+    frame: MbaffFrame,
+    field_frames: [MbaffFrame; 2],
 }
 
 impl PictureScratch {
@@ -246,6 +251,11 @@ impl PictureScratch {
             field_motion: [
                 MotionField::new(mb_width, field_height),
                 MotionField::new(mb_width, field_height),
+            ],
+            frame: MbaffFrame::new(mb_width, mb_height, false),
+            field_frames: [
+                MbaffFrame::new(mb_width, field_height, false),
+                MbaffFrame::new(mb_width, field_height, false),
             ],
         }
     }
@@ -2149,8 +2159,13 @@ fn write_picture(
         field_counts,
         field_chroma_counts,
         field_motion,
+        frame,
+        field_frames,
         ..
     } = scratch;
+    // A picture coded as two field pictures is not macroblock-adaptive whatever
+    // the sequence says; `field_pic_flag` has already settled it.
+    frame.set_mbaff(ctx.mbaff && paired_field.is_none());
     let mut targets = [[0.0f32; 64]; 4];
     let mut field_targets = [[0.0f32; 64]; 4];
     let mut luma_scratch = [[0i32; 64]; 4];
@@ -2485,10 +2500,14 @@ fn write_picture(
         } else {
             by_address.get(((mb_y & !1) + 1) * g.mb_width + mb_x)
         };
-        // Use a uniform coding mode across an MBAFF picture. This makes every
-        // horizontal and vertical neighbour live in the same field coordinate
-        // system, so thousands of pair-isolating slices are unnecessary.
+        let address = frame.address(mb_x, mb_y);
+        let field_address = field_frames[mb_y & 1].address(mb_x, mb_y >> 1);
         let field_pair = picture_field_pairs;
+        // Both macroblocks of a pair are coded the same way, and the neighbour
+        // derivation has to know which way before either of them looks around.
+        if !direct_field_pair && mb_y % 2 == 0 {
+            frame.set_field_pair(address, field_pair);
+        }
         let intra = match source {
             Some(mb) if !mb.skipped => mb.is_intra(),
             _ => false,
@@ -2700,8 +2719,16 @@ fn write_picture(
                 } else {
                     &mut *chroma_counts
                 },
-                mb_x,
-                coded_mb_y,
+                if direct_field_pair {
+                    &field_frames[field]
+                } else {
+                    &*frame
+                },
+                if direct_field_pair {
+                    field_address
+                } else {
+                    address
+                },
                 qp,
                 prev_qp,
                 &luma,
@@ -2863,16 +2890,26 @@ fn write_picture(
         let uses_l0 = pred.mb_type != b_mb_type::L1_16X16;
         let uses_l1 = pred.mb_type != b_mb_type::L0_16X16;
         let pred_l0 = if direct_field_pair && uses_l0 {
-            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 0, pred.ref_idx_l0)
+            field_motion[mb_y & 1].predict(
+                &field_frames[mb_y & 1],
+                field_address,
+                0,
+                pred.ref_idx_l0,
+            )
         } else if !field_pair && uses_l0 {
-            motion.predict(mb_x, mb_y, 0, pred.ref_idx_l0)
+            motion.predict(frame, address, 0, pred.ref_idx_l0)
         } else {
             [0, 0]
         };
         let pred_l1 = if direct_field_pair && uses_l1 {
-            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 1, pred.ref_idx_l1)
+            field_motion[mb_y & 1].predict(
+                &field_frames[mb_y & 1],
+                field_address,
+                1,
+                pred.ref_idx_l1,
+            )
         } else if !field_pair && uses_l1 {
-            motion.predict(mb_x, mb_y, 1, pred.ref_idx_l1)
+            motion.predict(frame, address, 1, pred.ref_idx_l1)
         } else {
             [0, 0]
         };
@@ -2907,12 +2944,24 @@ fn write_picture(
                 let uses_part_l0 = part_pred.ref_idx_l0 >= 0;
                 let uses_part_l1 = part_pred.ref_idx_l1 >= 0;
                 let p_l0 = if uses_part_l0 {
-                    field_motion[field].predict_16x8(mb_x, mb_y >> 1, part, 0, part_pred.ref_idx_l0)
+                    field_motion[field].predict_16x8(
+                        &field_frames[field],
+                        field_address,
+                        part,
+                        0,
+                        part_pred.ref_idx_l0,
+                    )
                 } else {
                     [0, 0]
                 };
                 let p_l1 = if uses_part_l1 {
-                    field_motion[field].predict_16x8(mb_x, mb_y >> 1, part, 1, part_pred.ref_idx_l1)
+                    field_motion[field].predict_16x8(
+                        &field_frames[field],
+                        field_address,
+                        part,
+                        1,
+                        part_pred.ref_idx_l1,
+                    )
                 } else {
                     [0, 0]
                 };
@@ -2924,7 +2973,7 @@ fn write_picture(
                     mv_l1x: if uses_part_l1 { part_pred.mv_l1[0] } else { 0 },
                     mv_l1y: if uses_part_l1 { part_pred.mv_l1[1] } else { 0 },
                 };
-                field_motion[field].set_16x8(mb_x, mb_y >> 1, part, &state);
+                field_motion[field].set_16x8(field_address, part, &state);
                 *slot = MotionPartition {
                     ref_idx_l0: state.ref_idx_l0,
                     ref_idx_l1: state.ref_idx_l1,
@@ -2970,30 +3019,17 @@ fn write_picture(
                 let uses_field_l0 = field_pred.ref_idx_l0 >= 0;
                 let uses_field_l1 = field_pred.ref_idx_l1 >= 0;
                 let p_l0 = if uses_field_l0 {
-                    field_motion[field].predict_16x8(
-                        mb_x,
-                        mb_y >> 1,
-                        part,
-                        0,
-                        field_pred.ref_idx_l0,
-                    )
+                    motion.predict_16x8(frame, address, part, 0, field_pred.ref_idx_l0)
                 } else {
                     [0, 0]
                 };
                 let p_l1 = if uses_field_l1 {
-                    field_motion[field].predict_16x8(
-                        mb_x,
-                        mb_y >> 1,
-                        part,
-                        1,
-                        field_pred.ref_idx_l1,
-                    )
+                    motion.predict_16x8(frame, address, part, 1, field_pred.ref_idx_l1)
                 } else {
                     [0, 0]
                 };
-                field_motion[field].set_16x8(
-                    mb_x,
-                    mb_y >> 1,
+                motion.set_16x8(
+                    address,
                     part,
                     &MbMotion {
                         ref_idx_l0: field_pred.ref_idx_l0,
@@ -3059,8 +3095,11 @@ fn write_picture(
         };
         let ref_count = layout.count as i32;
         let mb = InterMacroblock {
-            mb_x,
-            mb_y: if field_pair { mb_y >> 1 } else { mb_y },
+            address: if direct_field_pair {
+                field_address
+            } else {
+                address
+            },
             p_slice: output_slice_type == SliceType::P,
             mb_type,
             ref_idx_l0: pred.ref_idx_l0,
@@ -3105,8 +3144,7 @@ fn write_picture(
 
         if direct_field_pair && partitions.is_none() {
             field_motion[mb_y & 1].set(
-                mb_x,
-                mb_y >> 1,
+                field_address,
                 &MbMotion {
                     ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
                     ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
@@ -3116,10 +3154,9 @@ fn write_picture(
                     mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
                 },
             );
-        } else if !field_pair {
+        } else if partitions.is_none() {
             motion.set(
-                mb_x,
-                mb_y,
+                address,
                 &MbMotion {
                     ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
                     ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
@@ -3140,12 +3177,16 @@ fn write_picture(
             writer.flag(field_pair);
         }
         let field = mb_y & 1;
-        let active_counts: &mut CoeffCountMap = if field_pair {
+        // A picture coded as two field pictures keeps a map for each of them.
+        // Field macroblock pairs inside one picture do not: the neighbour
+        // derivation knows which macroblock of a pair holds a line, so one map
+        // per picture serves both kinds.
+        let active_counts: &mut CoeffCountMap = if direct_field_pair {
             &mut field_counts[field]
         } else {
             &mut *counts
         };
-        let active_chroma_counts: &mut ChromaCounts = if field_pair {
+        let active_chroma_counts: &mut ChromaCounts = if direct_field_pair {
             &mut field_chroma_counts[field]
         } else {
             &mut *chroma_counts
@@ -3163,15 +3204,20 @@ fn write_picture(
             writer,
             active_counts,
             active_chroma_counts,
+            if direct_field_pair {
+                &field_frames[mb_y & 1]
+            } else {
+                &*frame
+            },
             &mb,
             &luma,
             chroma,
         )?;
         if !luma_active.iter().any(|&active| active) {
-            mark_no_coefficients(active_counts, mb.mb_x, mb.mb_y);
+            mark_no_coefficients(active_counts, mb.address);
         }
         if chroma.is_none() {
-            mark_no_chroma_coefficients(active_chroma_counts, mb.mb_x, mb.mb_y);
+            mark_no_chroma_coefficients(active_chroma_counts, mb.address);
         }
         let end_of_field =
             direct_field_pair && mb_x == g.mb_width - 1 && field_position == field_size - 1;
