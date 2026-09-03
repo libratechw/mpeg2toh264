@@ -152,10 +152,6 @@ pub struct MacroblockGrid {
     /// Where a macroblock whose address falls outside the picture is decoded.
     /// Its contents are never read.
     outside: Macroblock,
-    /// Whether any cell published so far predicts field by field, accumulated
-    /// as each macroblock is published: six thousand cells 848 bytes apart are
-    /// a long walk to answer one question.
-    field_prediction: bool,
 }
 
 impl MacroblockGrid {
@@ -164,7 +160,6 @@ impl MacroblockGrid {
             cells: Vec::new(),
             present: Vec::new(),
             outside: Macroblock::empty(),
-            field_prediction: false,
         }
     }
 
@@ -175,7 +170,6 @@ impl MacroblockGrid {
             self.present.resize(cells, false);
         }
         self.present.fill(false);
-        self.field_prediction = false;
     }
 
     /// The macroblock at `address`, or `None` where this picture did not code one.
@@ -188,17 +182,6 @@ impl MacroblockGrid {
         }
     }
 
-    /// Whether any macroblock this picture coded predicts field by field.
-    ///
-    /// Field and dual prime motion give each field of a frame macroblock its
-    /// own prediction, which one frame-coded H.264 macroblock cannot express.
-    /// Field DCT is not counted: that is a change of transform basis and
-    /// [`crate::h264::quant::field_dct_to_frame_targets`] carries it over
-    /// exactly.
-    pub fn any_field_prediction(&self) -> bool {
-        self.field_prediction
-    }
-
     /// The cell to decode `address` into.
     #[inline]
     fn slot(&mut self, address: usize) -> &mut Macroblock {
@@ -208,15 +191,8 @@ impl MacroblockGrid {
     /// Publish a cell `slot` has just been decoded into.
     #[inline]
     fn mark(&mut self, address: usize) {
-        let Some(present) = self.present.get_mut(address) else {
-            return;
-        };
-        *present = true;
-        if matches!(
-            self.cells[address].motion_type,
-            motion_type::FIELD | motion_type::DUAL_PRIME
-        ) {
-            self.field_prediction = true;
+        if let Some(present) = self.present.get_mut(address) {
+            *present = true;
         }
     }
 }

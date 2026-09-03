@@ -2018,6 +2018,19 @@ fn write_recovery_point_sei() -> Vec<u8> {
     to_nal_unit(&[6, 1, 0xe4, 0x80], 0, nal_type::SEI)
 }
 
+/// Whether a macroblock pair has to be coded as field macroblocks.
+///
+/// Field and dual prime motion give each field of a source macroblock its own
+/// prediction, which one frame macroblock cannot carry. Nothing else asks for
+/// field macroblocks, and they are not free: see the chroma note where
+/// `picture_field_pairs` is worked out.
+fn pair_needs_field(top: Option<&Macroblock>, bottom: Option<&Macroblock>) -> bool {
+    [top, bottom]
+        .into_iter()
+        .flatten()
+        .any(|mb| matches!(mb.motion_type, motion_type::FIELD | motion_type::DUAL_PRIME))
+}
+
 /// Which of the two per-slot buffers a field macroblock's targets landed in, and
 /// which of its four blocks carry anything.
 #[derive(Clone, Copy, Default)]
@@ -2220,13 +2233,12 @@ fn write_picture(
     // tens of levels and alternates line by line, which is invisible woven and
     // becomes a solid macroblock once a deinterlacer keeps one field.
     //
-    // So a picture takes them only where one of its macroblocks actually
-    // predicts field by field. The mode stays uniform within the picture, which
-    // is what keeps every neighbour in one coordinate system and the slices few.
-    let picture_field_pairs = direct_field_pair
-        || (ctx.mbaff
-            && pic.header.picture_coding_type != PictureType::I
-            && by_address.any_field_prediction());
+    // So a pair takes them only where one of its two macroblocks actually
+    // predicts field by field; see [`pair_needs_field`]. Which pairs those are
+    // is scattered, so the two kinds sit side by side and where a neighbour is
+    // becomes [`crate::h264::mbaff`]'s answer rather than arithmetic.
+    let picture_field_pairs =
+        direct_field_pair || (ctx.mbaff && pic.header.picture_coding_type != PictureType::I);
     let mut cached_pair_address: isize = -1;
     let mut cached_pair_targets = [FieldTargetSet::default(); 2];
     let mut cached_pair_qp = PPS_INIT_QP;
@@ -2502,7 +2514,8 @@ fn write_picture(
         };
         let address = frame.address(mb_x, mb_y);
         let field_address = field_frames[mb_y & 1].address(mb_x, mb_y >> 1);
-        let field_pair = picture_field_pairs;
+        let field_pair =
+            picture_field_pairs && (direct_field_pair || pair_needs_field(pair_top, pair_bottom));
         // Both macroblocks of a pair are coded the same way, and the neighbour
         // derivation has to know which way before either of them looks around.
         if !direct_field_pair && mb_y % 2 == 0 {
