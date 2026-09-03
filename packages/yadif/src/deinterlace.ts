@@ -11,7 +11,7 @@
  * The filter is supplied by the separate @mpeg2toh264/yadif package because it
  * is derived from FFmpeg and licensed differently. Everything here
  * is the machinery around it: three frames' worth of textures, a program, and
- * `requestVideoFrameCallback` to say when a frame is worth uploading.
+ * `requestVideoFrameCallback()` to say when a frame is worth uploading.
  *
  * Frames are filtered one behind the element. yadif wants the frame either
  * side of the one it is working on, and the only way to hold the next one is
@@ -74,10 +74,10 @@ const DEFAULT_REFRESH_MS = 1000 / 60;
 /** How fast the refresh estimate is allowed to climb back towards a long gap. */
 const REFRESH_DECAY = 0.02;
 
-/** 復号済み映像の進行を video-frame callback なしで待つ時間。 */
+/** 復号済み映像の進行を requestVideoFrameCallback() なしで待つ時間。 */
 const FRAME_CALLBACK_TIMEOUT_MS = 250;
 
-/** callback から周期を実測できるまで使う控えめな入力周期。 */
+/** requestVideoFrameCallback() から周期を実測できるまで使う控えめな入力周期。 */
 const DEFAULT_FALLBACK_PERIOD_MS = 1000 / 30;
 
 function validateFilmCombThreshold(value: number): number {
@@ -286,7 +286,6 @@ interface ExternalRenderingHost {
   canvas: OffscreenCanvas;
   onFailure(message: string): void;
   onVisibility(visible: boolean): void;
-  onSize(width: number, height: number): void;
   requestAnimationFrame(callback: FrameRequestCallback): number;
   cancelAnimationFrame(handle: number): void;
 }
@@ -368,9 +367,11 @@ export class Deinterlacer extends EventTarget {
   #presentedPicture: PresentedPicture | null = null;
   /** Filtered fields waiting for their moment, oldest first. */
   #queue: Ready[] = [];
-  /** The rAF loop that puts them up, which is all that draws on the canvas. */
+  /** The requestAnimationFrame() loop that puts them up, which is all that draws on the canvas. */
   #loopHandle: number | null = null;
   #lastLoopAt = 0;
+  /** ページ側で requestVideoFrameCallback() の停止を監視する requestAnimationFrame()。 */
+  #frameWatchdogHandle: number | null = null;
   /** The gap between animation frames: as near as the page gets to the screen. */
   #refreshMs = DEFAULT_REFRESH_MS;
   /** The `<div>` this put around the element, so it can be taken away again. */
@@ -401,7 +402,7 @@ export class Deinterlacer extends EventTarget {
   /** A destination frame that arrived before the browser finished seeking. */
   #seekFrameReady = false;
   #handle: number | null = null;
-  /** callback の停止を animation loop で検出するために保持する最終通知時刻。 */
+  /** requestVideoFrameCallback() の停止を検出するために保持する最終通知時刻。 */
   #lastVideoFrameCallbackAt = 0;
   /** どちらの取得経路からも参照するブラウザの復号フレーム数。 */
   #lastObservedVideoFrames = 0;
@@ -596,7 +597,11 @@ export class Deinterlacer extends EventTarget {
     }
     this.#apply();
     if (changed) {
-      if (scan?.interlaced ?? true) this.#startLoop();
+      if (
+        (scan?.interlaced ?? true) &&
+        (this.#externalHost || this.#workerState === "main")
+      )
+        this.#startLoop();
       else this.#stopLoop();
     }
   }
@@ -787,7 +792,7 @@ export class Deinterlacer extends EventTarget {
         options: this.#workerRenderingOptions(),
         scan: this.#scan,
         videoTimeline: this.#videoTimeline,
-        enabled: this.#enabled,
+        enabled: this.#running,
         video: this.#workerVideoState(),
       } satisfies WorkerCommand,
       [offscreen],
@@ -801,7 +806,7 @@ export class Deinterlacer extends EventTarget {
         this.#workerState = "active";
         if (this.#running) {
           this.#request();
-          if (this.#scan?.interlaced ?? true) this.#startLoop();
+          this.#startFrameWatchdog();
         }
         break;
       case "failed":
@@ -819,10 +824,6 @@ export class Deinterlacer extends EventTarget {
         this.#displayCanvas.style.visibility = notification.visible
           ? "visible"
           : "hidden";
-        break;
-      case "size":
-        this.#displayCanvas.width = notification.width;
-        this.#displayCanvas.height = notification.height;
         break;
       case "stats": {
         const stats: DeinterlaceStats = {
@@ -894,6 +895,7 @@ export class Deinterlacer extends EventTarget {
     this.#closePendingWorkerFrame();
     if (this.#running) {
       this.#request();
+      this.#startFrameWatchdog();
       if (this.#scan?.interlaced ?? true) this.#startLoop();
     }
   }
@@ -921,7 +923,15 @@ export class Deinterlacer extends EventTarget {
     this.#lastObservedVideoFrames =
       this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
     this.#mount();
-    if (this.#ensureWorker()) return;
+    this.#startFrameWatchdog();
+    if (this.#ensureWorker()) {
+      // `start()` は `enabled` のセッターを経由しない公開経路なので、既存 Worker にも稼働状態を明示する
+      this.#worker?.postMessage({
+        type: "enabled",
+        enabled: true,
+      } satisfies WorkerCommand);
+      return;
+    }
     this.#request();
     if (this.#scan?.interlaced ?? true) this.#startLoop();
   }
@@ -933,6 +943,7 @@ export class Deinterlacer extends EventTarget {
     if (this.#handle !== null)
       this.#video.cancelVideoFrameCallback(this.#handle);
     this.#handle = null;
+    this.#stopFrameWatchdog();
     this.#stopLoop();
     this.#frames = 0;
     this.#presentedPicture = null;
@@ -1303,7 +1314,7 @@ export class Deinterlacer extends EventTarget {
           const duration = (this.#periodMs * 5) / 4;
           const queueResetted = this.#prepareQueue(1, now, duration);
           // The first picture needs one output interval of presentation slack;
-          // otherwise an ordinary callback-to-rAF gap can consume its turn.
+          // otherwise the next animation frame can consume its turn before presentation.
           const last = this.#queue.at(-1);
           const at = queueResetted
             ? now
@@ -1380,7 +1391,10 @@ export class Deinterlacer extends EventTarget {
     // Progressive sections provide no cadence measurement, and a discontinuity
     // may change the input rate, so remeasure the next interlaced section
     if (previousInterlaced !== scan.interlaced) this.#periodMs = 0;
-    if (scan.interlaced) {
+    if (
+      scan.interlaced &&
+      (this.#externalHost || this.#workerState === "main")
+    ) {
       this.#startLoop();
     } else {
       this.#stopLoop();
@@ -1726,12 +1740,11 @@ export class Deinterlacer extends EventTarget {
       }
     }
     this.#lastLoopAt = now;
-    this.#recoverFrameCallback(now);
     if (this.#workerState === "main") this.#present(now);
     this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
   };
 
-  /** ページと Worker のそれぞれが所有する rAF へ表示ループを委ねる。 */
+  /** ページと Worker のそれぞれが所有する requestAnimationFrame() へ表示ループを委ねる。 */
   #requestAnimationFrame(callback: FrameRequestCallback): number {
     return this.#externalHost
       ? this.#externalHost.requestAnimationFrame(callback)
@@ -1744,7 +1757,34 @@ export class Deinterlacer extends EventTarget {
     else cancelAnimationFrame(handle);
   }
 
-  /** ブラウザから callback が来ない間も animation loop から復号フレームを取り込む。 */
+  /** ページ側の監視を開始し、描画ループの停止中も復号フレームの到着を検査する。 */
+  #startFrameWatchdog(): void {
+    if (
+      this.#externalHost ||
+      this.#frameWatchdogHandle !== null ||
+      !this.#running ||
+      this.#lost
+    )
+      return;
+    this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
+  }
+
+  /** ページ側で予約済みのフレーム監視を取り消す。 */
+  #stopFrameWatchdog(): void {
+    if (this.#frameWatchdogHandle !== null)
+      cancelAnimationFrame(this.#frameWatchdogHandle);
+    this.#frameWatchdogHandle = null;
+  }
+
+  /** requestAnimationFrame() ごとにフレーム通知の停止を検査し、次の監視を予約する。 */
+  #onFrameWatchdog = (now: DOMHighResTimeStamp): void => {
+    this.#frameWatchdogHandle = null;
+    if (!this.#running || this.#lost) return;
+    this.#recoverFrameCallback(now);
+    this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
+  };
+
+  /** requestVideoFrameCallback() が来ない間も requestAnimationFrame() から復号フレームを取り込む。 */
   #recoverFrameCallback(now: DOMHighResTimeStamp): void {
     if (this.#externalHost) return;
     if (
@@ -1770,7 +1810,7 @@ export class Deinterlacer extends EventTarget {
     if (!frameCounterAdvanced && !mediaTimeAdvanced) return;
 
     // 復号フレーム数を提供するブラウザではその増加から新しい画像を正確に識別する。
-    // カウンターがゼロのブラウザでは時刻差で間隔を空け、rAF の周期で同じ画像を履歴へ重複登録せずに代替経路を維持する。
+    // カウンターがゼロのブラウザでは時刻差で間隔を空け、requestAnimationFrame() の周期で同じ画像を履歴へ重複登録せずに代替経路を維持する
     this.#lastObservedVideoFrames = Math.max(
       this.#lastObservedVideoFrames,
       totalVideoFrames,
@@ -2049,7 +2089,6 @@ export class Deinterlacer extends EventTarget {
     const gl = this.#gl;
     this.#renderCanvas.width = width;
     this.#renderCanvas.height = height;
-    this.#externalHost?.onSize(width, height);
     this.#width = width;
     this.#height = height;
     this.#frames = 0;
@@ -2342,7 +2381,7 @@ export class Deinterlacer extends EventTarget {
       return;
     }
     if (event.type === "seeked") {
-      // A destination frame may have reached requestVideoFrameCallback while
+      // A destination frame may have reached requestVideoFrameCallback() while
       // the element still reported `seeking`. #onFrame has already discarded
       // the old history and drawn that frame, so clearing it here would turn a
       // completed seek back into a blank canvas until another frame arrives.
@@ -2413,7 +2452,6 @@ export function createWorkerDeinterlacer(
   options: DeinterlacerOptions,
   onFailure: (message: string) => void,
   onVisibility: (visible: boolean) => void,
-  onSize: (width: number, height: number) => void,
   requestAnimationFrame: (callback: FrameRequestCallback) => number,
   cancelAnimationFrame: (handle: number) => void,
 ): Deinterlacer {
@@ -2421,7 +2459,6 @@ export function createWorkerDeinterlacer(
     canvas,
     onFailure,
     onVisibility,
-    onSize,
     requestAnimationFrame,
     cancelAnimationFrame,
   });

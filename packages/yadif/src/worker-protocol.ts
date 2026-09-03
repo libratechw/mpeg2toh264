@@ -64,6 +64,5 @@ export type WorkerNotification =
   | { type: "failed"; message: string }
   | { type: "consumed"; id: number }
   | { type: "visibility"; visible: boolean }
-  | { type: "size"; width: number; height: number }
   | { type: "stats"; stats: Omit<DeinterlaceStats, "dropped"> }
   | { type: "capture"; id: number; image: ImageBitmap | null };

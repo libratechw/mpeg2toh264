@@ -24,7 +24,7 @@ const player = new Mpeg2TsPlayer(video, {
 
 `HTMLVideoElement` からのフレーム取得、`requestVideoFrameCallback()` が停止した場合の `requestAnimationFrame()` による復旧、DOM レイアウトはメインスレッド側に残ります。
 
-Worker 内で OffscreenCanvas、WebGL2、Worker rAF、転送可能な `VideoFrame` を初期化できない場合、`auto` は従来のメインスレッド描画へ戻ります。
+Worker 内で OffscreenCanvas、WebGL2、Worker の `requestAnimationFrame()`、転送可能な `VideoFrame` を初期化できない場合、`auto` は従来のメインスレッド描画へ戻ります。
 
 比較や互換性確認では `rendering: "main"`、Worker 経路の強制確認では `rendering: "worker"` を指定できます。
 

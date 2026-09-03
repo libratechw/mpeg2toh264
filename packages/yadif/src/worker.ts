@@ -82,7 +82,7 @@ let video: WorkerVideo | null = null;
 let deinterlacer: Deinterlacer | null = null;
 let destroying = false;
 
-/** Worker が所有する rAF へ共通描画エンジンの表示ループを接続する。 */
+/** Worker が所有する requestAnimationFrame() へ共通描画エンジンの表示ループを接続する。 */
 function requestWorkerAnimationFrame(callback: FrameRequestCallback): number {
   return workerScope.requestAnimationFrame(callback);
 }
@@ -126,7 +126,6 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
           if (!destroying) post({ type: "failed", message });
         },
         (visible) => post({ type: "visibility", visible }),
-        (width, height) => post({ type: "size", width, height }),
         requestWorkerAnimationFrame,
         cancelWorkerAnimationFrame,
       );
