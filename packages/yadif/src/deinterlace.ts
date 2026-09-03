@@ -773,6 +773,7 @@ export class Deinterlacer extends EventTarget {
         this.#showFramesSinceReport = 0;
         this.#showMsSinceReport = 0;
         this.#reportMaxQueuedFields = 0;
+        this.#outputSinceReport = 0;
       }
       this.#lastFrameAt = at;
       const begin = performance.now();
