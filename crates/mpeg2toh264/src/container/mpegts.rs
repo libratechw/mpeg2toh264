@@ -429,6 +429,7 @@ mod section_source_tests {
             source_offset,
             pid: 0,
             transport_error_indicator: false,
+            has_payload: true,
             payload_unit_start: start,
             continuity_counter: 0,
             discontinuity: false,
@@ -895,6 +896,8 @@ impl PesState {
     /// Forget a PES cut by packet loss and mark the first complete replacement.
     fn discard_at_discontinuity(&mut self) {
         self.parts.clear();
+        self.started = false;
+        self.restart_offset = None;
         self.discontinuity_before = true;
         self.damaged_before = true;
     }

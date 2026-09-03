@@ -196,6 +196,23 @@ fn restart_only_mark_does_not_hide_the_previous_timestamp() {
 }
 
 #[test]
+fn transport_discontinuity_discards_both_pending_marks() {
+    let one = read_fixture("ibbp.m2v");
+    let mut splitter = Mpeg2GopStream::new();
+    assert!(splitter
+        .push_with_restart(&one, Some(900_000), Some(9_500))
+        .is_empty());
+    splitter.discard_pending();
+
+    let mut units = splitter.push_with_restart(&one, None, None);
+    units.extend(splitter.finish());
+
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].pts, None);
+    assert_eq!(units[0].restart_offset, None);
+}
+
+#[test]
 fn holds_an_unfinished_group_back() {
     let one = read_fixture("ibbp.m2v");
     let mut splitter = Mpeg2GopStream::new();

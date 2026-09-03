@@ -139,7 +139,8 @@ impl Mpeg2GopStream {
         self.base += self.buffer.len().saturating_sub(self.prefix_length);
         self.buffer.clear();
         self.prefix_length = 0;
-        self.marks.clear();
+        self.pts_marks.clear();
+        self.restart_marks.clear();
         self.sequences.clear();
         self.gops.clear();
         self.pictures.clear();
