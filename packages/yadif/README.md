@@ -56,6 +56,7 @@ WebGL の描画バッファーを常時保持する設定には依存しませ�
 
 再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。
 `late` と `maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
+容量確保で待機中のフィールドを破棄した場合は、残った表示予定を詰め、破棄したフィールドの表示時間を空白として残しません。
 
 ```ts
 deinterlacer.addEventListener("stats", (event) => {

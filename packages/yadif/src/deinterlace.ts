@@ -1183,10 +1183,19 @@ export class Deinterlacer extends EventTarget {
       0,
       this.#queue.length + requiredOutputs - FIELD_QUEUE_LENGTH,
     );
-    for (let index = 0; index < overflow; index++) {
-      if (!this.#queue.shift()) break;
-      this.#stats.late++;
+    let retiredDuration = 0;
+    let retired = 0;
+    while (retired < overflow) {
+      const ready = this.#queue.shift();
+      if (!ready) break;
+      retiredDuration += ready.duration;
+      retired++;
     }
+    // The retired pictures no longer occupy presentation moments. Close those
+    // holes as well as freeing their slots, so the remaining queue stays on the
+    // current presentation opportunity under sustained capacity pressure.
+    for (const ready of this.#queue) ready.at -= retiredDuration;
+    this.#stats.late += retired;
     return false;
   }
 
