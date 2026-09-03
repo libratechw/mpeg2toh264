@@ -61,6 +61,12 @@ const DEFAULT_REFRESH_MS = 1000 / 60;
 /** How fast the refresh estimate is allowed to climb back towards a long gap. */
 const REFRESH_DECAY = 0.02;
 
+/** 復号済み映像の進行を video-frame callback なしで待つ時間。 */
+const FRAME_CALLBACK_TIMEOUT_MS = 250;
+
+/** callback から周期を実測できるまで使う控えめな入力周期。 */
+const DEFAULT_FALLBACK_PERIOD_MS = 1000 / 30;
+
 function validateFilmCombThreshold(value: number): number {
   if (!Number.isFinite(value) || value < 0)
     throw new RangeError(
@@ -104,6 +110,14 @@ interface Ready {
   /** When it belongs on the screen, on `performance.now()`'s clock. */
   at: number;
   duration: number;
+}
+
+/** 表示済み映像を1フレーム取り込むために使う callback metadata。 */
+interface FrameObservation {
+  mediaTime: number;
+  presentedFrames: number;
+  width: number;
+  height: number;
 }
 
 /** The draw path that produced the picture still represented by the canvas. */
@@ -367,6 +381,12 @@ export class Deinterlacer extends EventTarget {
   /** A destination frame that arrived before the browser finished seeking. */
   #seekFrameReady = false;
   #handle: number | null = null;
+  /** callback の停止を animation loop で検出するために保持する最終通知時刻。 */
+  #lastVideoFrameCallbackAt = 0;
+  /** どちらの取得経路からも参照するブラウザの復号フレーム数。 */
+  #lastObservedVideoFrames = 0;
+  /** animation loop の代替経路が最後にフレームを取り込んだ時刻。 */
+  #lastFallbackAt = 0;
   #running = false;
   #enabled = false;
   #scan: Scan | null = null;
@@ -535,7 +555,6 @@ export class Deinterlacer extends EventTarget {
     } else if (!this.#autoFilm) {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
-      this.#stopLoop();
       this.#presentedPicture = null;
       this.canvas.style.visibility = "hidden";
       this.#freeOutputs();
@@ -561,7 +580,6 @@ export class Deinterlacer extends EventTarget {
     } else {
       this.#freeAnalysisTarget();
       if (!this.#doubleRate) {
-        this.#stopLoop();
         this.#presentedPicture = null;
         this.canvas.style.visibility = "hidden";
         this.#freeOutputs();
@@ -595,6 +613,10 @@ export class Deinterlacer extends EventTarget {
     this.#running = true;
     this.#resetStats();
     this.#resetFilm();
+    this.#lastVideoFrameCallbackAt = performance.now();
+    this.#lastFallbackAt = this.#lastVideoFrameCallbackAt;
+    this.#lastObservedVideoFrames =
+      this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
     this.#mount();
     this.#request();
     if (this.#scan?.interlaced ?? true) this.#startLoop();
@@ -715,6 +737,17 @@ export class Deinterlacer extends EventTarget {
   ): void => {
     this.#handle = null;
     if (!this.#running || this.#lost) return;
+    this.#lastVideoFrameCallbackAt = now;
+    this.#lastObservedVideoFrames = Math.max(
+      this.#lastObservedVideoFrames,
+      this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
+    );
+    this.#ingestFrame(now, metadata);
+    this.#request();
+  };
+
+  /** どちらの通知経路で見つけたフレームも同じ履歴へ取り込んでフィルターする。 */
+  #ingestFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
     this.#selectVideoState(metadata.mediaTime);
     if (metadata.width > 0 && metadata.height > 0) {
       // Chromium can submit the destination frame while `seeking` is still
@@ -748,7 +781,6 @@ export class Deinterlacer extends EventTarget {
         this.#resize(metadata.width, metadata.height);
       if (this.#scan && !this.#scan.interlaced) {
         this.#showVideo();
-        this.#request();
         return;
       }
       // A seek, or a stream that starts again somewhere else, leaves the held
@@ -786,7 +818,6 @@ export class Deinterlacer extends EventTarget {
       // already holds the answer, and taking it into the ring would leave the
       // filter holding one moment twice over and calling it motion.
       if (this.#frames > 0 && metadata.mediaTime === this.#lastMediaTime) {
-        this.#request();
         return;
       }
       if (!stale && elapsed > 0) this.#measure(elapsed);
@@ -872,8 +903,7 @@ export class Deinterlacer extends EventTarget {
       this.#renderFramesSinceReport++;
       this.#report(at);
     }
-    this.#request();
-  };
+  }
 
   #selectVideoState(mediaTime: number): void {
     let selected: VideoState | undefined;
@@ -908,7 +938,7 @@ export class Deinterlacer extends EventTarget {
     // may change the input rate, so remeasure the next interlaced section
     if (previousInterlaced !== scan.interlaced) this.#periodMs = 0;
     if (scan.interlaced) {
-      if (this.#doubleRate || this.#autoFilm) this.#startLoop();
+      this.#startLoop();
     } else {
       this.#stopLoop();
     }
@@ -1227,8 +1257,7 @@ export class Deinterlacer extends EventTarget {
   /** The loop that puts filtered fields up, and the only thing that draws. */
   #startLoop(): void {
     if (this.#loopHandle !== null) return;
-    if (!this.#running || this.#lost || (!this.#doubleRate && !this.#autoFilm))
-      return;
+    if (!this.#running || this.#lost) return;
     this.#lastLoopAt = 0;
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   }
@@ -1241,8 +1270,7 @@ export class Deinterlacer extends EventTarget {
 
   #onLoop = (now: DOMHighResTimeStamp): void => {
     this.#loopHandle = null;
-    if (!this.#running || this.#lost || (!this.#doubleRate && !this.#autoFilm))
-      return;
+    if (!this.#running || this.#lost) return;
     // Short ordinary gaps identify the refresh interval, while a long task
     // only moves the estimate gradually until regular animation resumes.
     if (this.#lastLoopAt > 0) {
@@ -1255,9 +1283,49 @@ export class Deinterlacer extends EventTarget {
       }
     }
     this.#lastLoopAt = now;
+    this.#recoverFrameCallback(now);
     this.#present(now);
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   };
+
+  /** ブラウザから callback が来ない間も animation loop から復号フレームを取り込む。 */
+  #recoverFrameCallback(now: DOMHighResTimeStamp): void {
+    if (
+      now - this.#lastVideoFrameCallbackAt < FRAME_CALLBACK_TIMEOUT_MS ||
+      this.#video.paused ||
+      this.#video.ended ||
+      this.#video.readyState < 2
+    )
+      return;
+
+    const mediaTime = this.#video.currentTime;
+    const totalVideoFrames =
+      this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
+    const fallbackPeriod =
+      this.#periodMs >= MIN_PERIOD_MS
+        ? this.#periodMs
+        : DEFAULT_FALLBACK_PERIOD_MS;
+    const frameCounterAdvanced =
+      totalVideoFrames > this.#lastObservedVideoFrames;
+    const mediaTimeAdvanced =
+      mediaTime > this.#lastMediaTime &&
+      now - this.#lastFallbackAt >= fallbackPeriod * 0.75;
+    if (!frameCounterAdvanced && !mediaTimeAdvanced) return;
+
+    // 復号フレーム数を提供するブラウザではその増加から新しい画像を正確に識別する。
+    // カウンターがゼロのブラウザでは時刻差で間隔を空け、rAF の周期で同じ画像を履歴へ重複登録せずに代替経路を維持する。
+    this.#lastObservedVideoFrames = Math.max(
+      this.#lastObservedVideoFrames,
+      totalVideoFrames,
+    );
+    this.#lastFallbackAt = now;
+    this.#ingestFrame(now, {
+      mediaTime,
+      presentedFrames: Math.max(this.#lastPresented + 1, totalVideoFrames),
+      width: this.#video.videoWidth,
+      height: this.#video.videoHeight,
+    });
+  }
 
   /**
    * Put up whichever filtered field belongs on the screen next.
@@ -1790,7 +1858,8 @@ export class Deinterlacer extends EventTarget {
       this.canvas.style.visibility = "hidden";
       return;
     }
-    if (event.type === "ratechange") {
+    const rateChanged = event.type === "ratechange";
+    if (rateChanged) {
       // The measured wall-time period includes playback rate, so the next
       // callback establishes a fresh cadence from the new rate.
       this.#periodMs = 0;
@@ -1800,17 +1869,23 @@ export class Deinterlacer extends EventTarget {
     // coming to make sense of them, so the picture goes straight to the canvas
     // rather than through a schedule that has nothing left to keep to.
     this.#queue.length = 0;
-    if (!this.#running || this.#frames === 0) return;
-    const slot = this.#nextOutputSlot();
-    const output = slot === null ? undefined : this.#outputs[slot];
-    if (slot !== null && output) {
-      // Keep the flushed picture in its own texture so capture can reproduce
-      // it even though the next video frame will upload into history.
-      this.#outputHead = slot;
-      this.#render(true, false, output.framebuffer);
-      this.#show(slot);
-    } else {
-      this.#render(true, false, null);
+    if (this.#running && this.#frames > 0) {
+      const slot = this.#nextOutputSlot();
+      const output = slot === null ? undefined : this.#outputs[slot];
+      if (slot !== null && output) {
+        // Keep the flushed picture in its own texture so capture can reproduce
+        // it even though the next video frame will upload into history.
+        this.#outputHead = slot;
+        this.#render(true, false, output.framebuffer);
+        this.#show(slot);
+      } else {
+        this.#render(true, false, null);
+      }
+    }
+    if (rateChanged) {
+      // 新しい再生速度のフレームが3枚そろうまで、旧周期の field match と decimate 位相を持ち越さずに通常の YADIF で表示する。
+      this.#frames = 0;
+      this.#resetFilm();
     }
   };
 
