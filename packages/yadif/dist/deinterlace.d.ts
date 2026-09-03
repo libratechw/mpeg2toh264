@@ -34,18 +34,7 @@ export interface DeinterlaceStats {
     degraded: number;
     /** Times the held frames were dropped as stale: seeks, and stream changes. */
     discontinuities: number;
-    /**
-     * Filtered pictures that were never shown, because an animation frame did
-     * not come round while their moment was still ahead, or because the clock
-     * they were timed by turned out to be somewhere else.
-     *
-     * Only a picture for every field can have these -- a picture for every frame
-     * goes up as its frame arrives -- and they are the page being too busy to
-     * keep a field rate rather than anything the filter did. A few are a hiccup,
-     * and one every few seconds is a display whose refresh rate the field rate
-     * does not divide into. A steady stream of them is a machine that cannot
-     * show fields at all, and turning `doubleRate` off is the answer.
-     */
+    /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
     late: number;
     /**
      * Retained for compatibility with existing statistics consumers.
@@ -54,13 +43,7 @@ export interface DeinterlaceStats {
     queueResetted: number;
     /** Frames presented per second over the last report. */
     fps: number;
-    /**
-     * What one frame costs, in milliseconds, averaged over the last report:
-     * uploading it, filtering the picture or pair of pictures built from it, and
-     * putting them up. This is the time on the page's own thread -- the GPU's
-     * part of the draw is not in it -- so it is the measure of what the
-     * deinterlacer takes away from everything else.
-     */
+    /** 直近区間で入力1枚のアップロード、フィルター、表示に費やした描画スレッド上の平均時間。GPU の実行時間と Worker 描画時のメインスレッド占有時間は含まない。 */
     frameMs: number;
     /**
      * The largest number of pictures queued during the last reporting interval,
@@ -81,6 +64,10 @@ export interface DeinterlaceStats {
     duplicateRunnerUp: number;
 }
 export interface DeinterlacerOptions {
+    /** 描画先。`auto` は同梱 Worker を優先し、初期化できない場合はメインスレッドへ戻る。 */
+    rendering?: "auto" | "worker" | "main";
+    /** module Worker の URL。省略時はパッケージへ同梱したファイルを使う。 */
+    workerUrl?: string | URL;
     /**
      * Whether to show a picture for every field rather than for every frame.
      *
@@ -164,9 +151,10 @@ export declare function supportsDeinterlace(): boolean;
  */
 export declare class Deinterlacer extends EventTarget {
     #private;
-    readonly canvas: HTMLCanvasElement;
     constructor(video: HTMLVideoElement, options?: DeinterlacerOptions);
     get running(): boolean;
+    /** 現在 media element の上に配置している HTML canvas。 */
+    get canvas(): HTMLCanvasElement;
     /** Whether the caller wants filtering, independently of the current source. */
     get enabled(): boolean;
     set enabled(enabled: boolean);
