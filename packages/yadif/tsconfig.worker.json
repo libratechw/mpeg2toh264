@@ -1,11 +1,12 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2022", "DOM", "WebWorker"]
+    "lib": ["ES2022", "WebWorker"]
   },
   "include": [
     "src/worker.ts",
     "src/worker-protocol.ts",
+    "src/worker-dom.d.ts",
     "src/deinterlace.ts",
     "src/ivtc.ts",
     "src/shader.ts"
