@@ -12,6 +12,16 @@ export type EngineRenderTraceEvent = {
     atMs: number;
     gapMs: number | null;
     queueDepth: number;
+    refreshMs: number;
+    outputPoolLength: number;
+    initializedOutputs: number;
+    outputHead: number;
+    shownSlot: number | null;
+    queue: Array<{
+        slot: number;
+        atMs: number;
+        durationMs: number;
+    }>;
 } | {
     kind: "draw-submit";
     sequence: number;
@@ -20,11 +30,33 @@ export type EngineRenderTraceEvent = {
     scheduledAtMs: number | null;
     queueDepthAfter: number;
     path: "scheduled" | "film-direct" | "yadif-direct" | "progressive" | "flush";
+} | {
+    kind: "frame-ingest";
+    sequence: number;
+    atMs: number;
+    mediaTime: number;
+    presentedFrames: number;
+    path: "callback" | "watchdog" | "worker-transfer";
+} | {
+    kind: "slot-pressure";
+    sequence: number;
+    atMs: number;
+    outcome: "oldest" | "none";
+    resultSlot: number | null;
+    outputPoolLength: number;
+    initializedOutputs: number;
+    outputHead: number;
+    shownSlot: number | null;
+    queuedSlots: number[];
 };
 type EngineRenderTraceInput = Omit<Extract<EngineRenderTraceEvent, {
     kind: "raf";
 }>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
     kind: "draw-submit";
+}>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
+    kind: "frame-ingest";
+}>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
+    kind: "slot-pressure";
 }>, "sequence">;
 export type RenderTraceEvent = (EngineRenderTraceEvent & {
     realm: "worker" | "main";
@@ -47,7 +79,7 @@ export interface RenderTraceBatch {
     droppedEvents: number;
 }
 interface PageRenderTrace {
-    readonly schemaVersion: 1;
+    readonly schemaVersion: 2;
     readonly backend: TraceBackendState;
     readonly droppedEvents: number;
     drain(): {
