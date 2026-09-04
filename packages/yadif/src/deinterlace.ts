@@ -177,10 +177,7 @@ export interface DeinterlaceStats {
   discontinuities: number;
   /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
   late: number;
-  /**
-   * Times the presentation queue was reset because its scheduled lead exceeded
-   * the useful display window.
-   */
+  /** Reserved for stats compatibility; queue resets are not used for recovery. */
   queueResetted: number;
   /** Frames presented per second over the last report. */
   fps: number;
@@ -1338,15 +1335,11 @@ export class Deinterlacer extends EventTarget {
           // Five input frames become four film pictures. The interval between
           // them is therefore five quarters of the measured input period.
           const duration = (this.#periodMs * 5) / 4;
-          const queueResetted = this.#prepareQueue(1, now, duration);
+          this.#prepareQueue(1);
           // The first picture needs one output interval of presentation slack;
           // otherwise the next animation frame can consume its turn before presentation.
           const last = this.#queue.at(-1);
-          const at = queueResetted
-            ? now
-            : last == null
-              ? now + duration
-              : last.at + last.duration;
+          const at = last == null ? now + duration : last.at + last.duration;
           this.#filterFilm(at, duration);
         } else {
           // Until a period and output pool exist, keep the direct film draw
@@ -1355,17 +1348,13 @@ export class Deinterlacer extends EventTarget {
         }
       } else if (this.#doubleRate && this.#scheduling()) {
         const duration = this.#periodMs / 2;
-        const queueResetted = this.#prepareQueue(2, now, duration);
+        this.#prepareQueue(2);
         // One field interval of slack lets the first output survive when the
         // video callback runs just after the animation callback for the same
         // composite. Without it, both fields are due at the next animation
         // callback and the scheduler retires the first one before drawing it.
         const last = this.#queue.at(-1);
-        const at = queueResetted
-          ? now
-          : last == null
-            ? now + duration * 2
-            : last.at + last.duration;
+        const at = last == null ? now + duration * 2 : last.at + last.duration;
         this.#filter(false, at, duration);
         this.#filter(true, at + duration, duration);
       } else {
@@ -1609,11 +1598,6 @@ export class Deinterlacer extends EventTarget {
     const output = this.#outputs[slot];
     if (!output) return;
     this.#outputHead = slot;
-    // Reusing a framebuffer retires the picture whose pixels it replaces.
-    while (this.#queue.length > 0 && this.#queue[0]?.slot === slot) {
-      this.#queue.shift();
-      this.#stats.late++;
-    }
     this.#renderFilm(output.framebuffer);
     this.#queue.push({ slot, at, duration });
   }
@@ -1666,32 +1650,12 @@ export class Deinterlacer extends EventTarget {
     const output = this.#outputs[slot];
     if (!output) return;
     this.#outputHead = slot;
-    // Whatever this slot held has been waiting two frames for a turn it never
-    // got, and its moment is far enough past that showing it now would be a
-    // step backwards. Slots are taken in order, so it can only be the oldest.
-    while (this.#queue.length > 0 && this.#queue[0]?.slot === slot) {
-      this.#queue.shift();
-      this.#stats.late++;
-    }
     this.#render(false, second, output.framebuffer);
     this.#queue.push({ slot, at, duration });
   }
 
   /** Make room without treating ordinary capacity pressure as clock divergence. */
-  #prepareQueue(
-    requiredOutputs: number,
-    now: number,
-    outputDuration: number,
-  ): boolean {
-    const last = this.#queue.at(-1);
-    const maximumUsefulLead =
-      (FIELD_QUEUE_LENGTH + 1) * Math.max(this.#refreshMs, outputDuration);
-    if (last && last.at - now > maximumUsefulLead) {
-      this.#queue.length = 0;
-      this.#stats.queueResetted++;
-      return true;
-    }
-
+  #prepareQueue(requiredOutputs: number): void {
     const overflow = Math.max(
       0,
       this.#queue.length + requiredOutputs - FIELD_QUEUE_LENGTH,
@@ -1709,7 +1673,6 @@ export class Deinterlacer extends EventTarget {
     // current presentation opportunity under sustained capacity pressure.
     for (const ready of this.#queue) ready.at -= retiredDuration;
     this.#stats.late += retired;
-    return false;
   }
 
   /** Select an output whose pixels are not still represented by the canvas or queue. */
@@ -1726,14 +1689,6 @@ export class Deinterlacer extends EventTarget {
         return slot;
     }
 
-    // The pool is saturated: keep the picture represented by the canvas for
-    // capture, but retire the oldest queued picture for this newer field. The
-    // caller's existing overflow handling accounts for that picture as late.
-    const oldest = this.#queue[0];
-    if (oldest) {
-      const output = this.#outputs[oldest.slot];
-      if (output && output.texture !== shownTexture) return oldest.slot;
-    }
     return null;
   }
 
