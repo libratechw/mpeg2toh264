@@ -16,6 +16,25 @@ export interface FieldMatchResult {
   luma: Uint8Array;
 }
 
+interface AutoFilmAnalysisDiagnostic {
+  enabled: boolean;
+  fieldMatchSamples: Array<{
+    atMs: number;
+    compareFieldsMs: number;
+    scoreWeaveMs: number;
+    combScoreMs: number;
+    resultWeaveMs: number;
+    totalMs: number;
+  }>;
+  decimateSamples: Array<{
+    atMs: number;
+    differenceMs: number;
+    sampleCopyMs: number;
+    cycleDecisionMs: number;
+    totalMs: number;
+  }>;
+}
+
 /** The decimate result for the frame currently being analysed. */
 export interface DecimateResult {
   cycleIndex: number;
@@ -74,23 +93,43 @@ export class FFmpegIVTC {
     isTopFieldFirst: boolean,
     combedPixelLimit = FFmpegIVTC.COMBED_PIXEL_LIMIT,
   ): FieldMatchResult {
+    const diagnostic = (
+      globalThis as typeof globalThis & {
+        __YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__?: AutoFilmAnalysisDiagnostic;
+      }
+    ).__YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__;
+    const measure = diagnostic?.enabled === true;
+    const startedAt = measure ? performance.now() : 0;
     const field = isTopFieldFirst ? 1 : 0;
     const frames = { p: previous, c: current, n: next } as const;
 
     // pc_n first chooses p or c with FFmpeg's motion-aware comparison, then
     // lets n replace it only through the full comb-matching check
     let match = this.#compareFields("c", "p", field, frames);
+    const comparedAt = measure ? performance.now() : 0;
     // checkmm calculates only the candidates it visits, so the port keeps the
     // same lazy score cache around its p/c result and n rescue candidate
     const combScores = new Map<FilmMatch, number>();
+    let scoreWeaveMs = 0;
+    let combScoreMs = 0;
     const score = (candidate: FilmMatch): number => {
       const cached = combScores.get(candidate);
       if (cached !== undefined) return cached;
-      const value = FFmpegIVTC.#combedScore(
-        this.weave(previous, current, next, candidate, isTopFieldFirst),
-        this.#width,
-        this.#height,
+      const weaveStartedAt = measure ? performance.now() : 0;
+      const luma = this.weave(
+        previous,
+        current,
+        next,
+        candidate,
+        isTopFieldFirst,
       );
+      const weaveFinishedAt = measure ? performance.now() : 0;
+      const value = FFmpegIVTC.#combedScore(luma, this.#width, this.#height);
+      const scoreFinishedAt = measure ? performance.now() : 0;
+      if (measure) {
+        scoreWeaveMs += weaveFinishedAt - weaveStartedAt;
+        combScoreMs += scoreFinishedAt - weaveFinishedAt;
+      }
       combScores.set(candidate, value);
       return value;
     };
@@ -109,16 +148,35 @@ export class FFmpegIVTC {
     const combScore = score(match);
     const isCombed = combScore >= combedPixelLimit;
     if (isCombed) match = "c";
+    const resultWeaveStartedAt = measure ? performance.now() : 0;
+    const luma = this.weave(previous, current, next, match, isTopFieldFirst);
+    const finishedAt = measure ? performance.now() : 0;
+    if (measure)
+      diagnostic.fieldMatchSamples.push({
+        atMs: startedAt,
+        compareFieldsMs: comparedAt - startedAt,
+        scoreWeaveMs,
+        combScoreMs,
+        resultWeaveMs: finishedAt - resultWeaveStartedAt,
+        totalMs: finishedAt - startedAt,
+      });
     return {
       match,
       combScore,
       isCombed,
-      luma: this.weave(previous, current, next, match, isTopFieldFirst),
+      luma,
     };
   }
 
   /** Apply FFmpeg's mixed decimate threshold to a live five-frame window. */
   decimate(sample: Uint8Array): DecimateResult {
+    const diagnostic = (
+      globalThis as typeof globalThis & {
+        __YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__?: AutoFilmAnalysisDiagnostic;
+      }
+    ).__YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__;
+    const measure = diagnostic?.enabled === true;
+    const startedAt = measure ? performance.now() : 0;
     const cycleIndex = this.#cycleIndex;
     const metric = this.#previousSample
       ? FFmpegIVTC.#difference(
@@ -131,6 +189,7 @@ export class FFmpegIVTC {
           maxBlockDifference: Infinity,
           totalDifference: Infinity,
         };
+    const differenceFinishedAt = measure ? performance.now() : 0;
     this.#metrics.push(metric);
 
     // The completed preceding cycle supplies the candidate phase, but the
@@ -145,7 +204,9 @@ export class FFmpegIVTC {
     // this live cycle at input rate while its metrics establish the new one
     if (isPredictedDuplicate && !shouldDrop) this.#activeDropIndex = null;
     const dropIndex = this.#activeDropIndex;
+    const copyStartedAt = measure ? performance.now() : 0;
     this.#previousSample = sample.slice();
+    const copyFinishedAt = measure ? performance.now() : 0;
     this.#cycleIndex++;
 
     let nextDropIndex = this.#activeDropIndex;
@@ -186,6 +247,17 @@ export class FFmpegIVTC {
       this.#metrics = [];
       this.#cycleIndex = 0;
     }
+
+    const finishedAt = measure ? performance.now() : 0;
+    if (measure)
+      diagnostic.decimateSamples.push({
+        atMs: startedAt,
+        differenceMs: differenceFinishedAt - startedAt,
+        sampleCopyMs: copyFinishedAt - copyStartedAt,
+        cycleDecisionMs:
+          copyStartedAt - differenceFinishedAt + finishedAt - copyFinishedAt,
+        totalMs: finishedAt - startedAt,
+      });
 
     return {
       cycleIndex,
