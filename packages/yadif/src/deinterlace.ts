@@ -178,8 +178,8 @@ export interface DeinterlaceStats {
   /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
   late: number;
   /**
-   * Retained for compatibility with existing statistics consumers.
-   * Late pictures are discarded individually, so this counter remains zero.
+   * Times the presentation queue was reset because its scheduled lead exceeded
+   * the useful display window.
    */
   queueResetted: number;
   /** Frames presented per second over the last report. */
