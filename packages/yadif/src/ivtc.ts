@@ -439,21 +439,38 @@ export class FFmpegIVTC {
   /** Calculate fieldmatch's vertical comb mask and overlapping 16x16 score. */
   static #combedScore(luma: Uint8Array, width: number, height: number): number {
     const mask = new Uint8Array(width * height);
-    const sample = (x: number, y: number): number =>
-      luma[Math.max(0, Math.min(height - 1, y)) * width + x] ?? 0;
     // The five-tap vertical filter marks pixels whose alternating-line energy
     // exceeds FFmpeg's default cthresh on both adjacent lines
     for (let y = 0; y < height; y++) {
+      const currentRow = y * width;
+      const previousRow =
+        Math.max(0, Math.min(height - 1, y === 0 ? 1 : y - 1)) * width;
+      const nextRow =
+        Math.max(
+          0,
+          Math.min(height - 1, y === height - 1 ? height - 2 : y + 1),
+        ) * width;
+      const farPreviousRow =
+        Math.max(0, Math.min(height - 1, y < 2 ? (y === 0 ? 2 : 3) : y - 2)) *
+        width;
+      const farNextRow =
+        Math.max(
+          0,
+          Math.min(
+            height - 1,
+            y + 2 >= height
+              ? y === height - 1
+                ? height - 3
+                : height - 4
+              : y + 2,
+          ),
+        ) * width;
       for (let x = 0; x < width; x++) {
-        const current = sample(x, y);
-        const previous = sample(x, y === 0 ? 1 : y - 1);
-        const next = sample(x, y === height - 1 ? height - 2 : y + 1);
-        const farPrevious =
-          y < 2 ? sample(x, y === 0 ? 2 : 3) : sample(x, y - 2);
-        const farNext =
-          y + 2 >= height
-            ? sample(x, y === height - 1 ? height - 3 : height - 4)
-            : sample(x, y + 2);
+        const current = luma[currentRow + x] ?? 0;
+        const previous = luma[previousRow + x] ?? 0;
+        const next = luma[nextRow + x] ?? 0;
+        const farPrevious = luma[farPreviousRow + x] ?? 0;
+        const farNext = luma[farNextRow + x] ?? 0;
         const hasAdjacentDifference =
           y === 0
             ? Math.abs(current - next) > FFmpegIVTC.COMB_THRESHOLD
