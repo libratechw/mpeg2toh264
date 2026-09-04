@@ -1113,9 +1113,18 @@ export class Deinterlacer extends EventTarget {
         timestamp: Math.max(0, Math.round(metadata.mediaTime * 1_000_000)),
       });
     } catch (error) {
-      this.#workerFailed(
-        error instanceof Error ? error.message : String(error),
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      // 最初のフレームを生成できない環境では Worker 経路を利用できないため、自動選択時はメインスレッドの描画へ移す
+      if (
+        this.#rendering === "auto" &&
+        !this.#workerAcceptedFrame &&
+        !this.#workerRestarted
+      ) {
+        this.#fallBackToMain();
+        this.#processFrame(now, metadata);
+      } else {
+        this.#workerFailed(message);
+      }
       return;
     }
     const pending: PendingWorkerFrame = {
