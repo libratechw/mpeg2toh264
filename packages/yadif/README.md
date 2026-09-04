@@ -69,7 +69,10 @@ WebGL の描画バッファーを常時保持する設定には依存しませ�
 再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。
 `late` と `maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
 容量確保で待機中のフィールドを破棄した場合は、残った表示予定を詰め、破棄したフィールドの表示時間を空白として残しません。
+`queueResetted`は互換性のため残しますが、表示時刻の先行を理由とするqueue全消去は行わないため増加しません。
 `requestVideoFrameCallback()` が 250ms 以上止まっても映像自体が進んでいる場合は、`requestAnimationFrame()` が復号フレーム数と再生時刻を監視して同じデインタレース処理を継続します。
+
+正常60iと固定した欠損区間の短時間確認では、変更前の版でqueue全消去は0件でした。出力slot再利用は専用counterがないため、発火有無を確認できていません。長時間の欠損反復ではこの版と変更前の版の双方に2秒を超える表示停止が1件あり、本変更固有の改善や退行は確定していません。取り込み時は、正常再生、異常TSからの復帰、可聴A/V同期、実画面の表示進行を利用環境で確認してください。
 
 ```ts
 deinterlacer.addEventListener("stats", (event) => {
