@@ -410,6 +410,7 @@ export class Deinterlacer extends EventTarget {
   #lastFallbackAt = 0;
   #running = false;
   #enabled = false;
+  #destroyed = false;
   #scan: Scan | null = null;
   #videoTimeline: readonly VideoState[] = [];
   #lost = false;
@@ -922,7 +923,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   start(): void {
-    if (this.#running || this.#lost) return;
+    if (this.#running || this.#destroyed || this.#lost) return;
     this.#running = true;
     this.#resetStats();
     this.#resetFilm();
@@ -964,6 +965,9 @@ export class Deinterlacer extends EventTarget {
   }
 
   destroy(): void {
+    if (this.#destroyed) return;
+    this.#destroyed = true;
+    this.#enabled = false;
     this.stop();
     this.#worker?.postMessage({ type: "destroy" } satisfies WorkerCommand);
     this.#worker?.terminate();
