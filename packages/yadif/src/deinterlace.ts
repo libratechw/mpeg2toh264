@@ -1244,6 +1244,13 @@ export class Deinterlacer extends EventTarget {
       this.#lastObservedVideoFrames,
       this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
     );
+    recordEngineTrace({
+      kind: "frame-ingest",
+      atMs: now,
+      mediaTime: metadata.mediaTime,
+      presentedFrames: metadata.presentedFrames,
+      path: "callback",
+    });
     this.#ingestFrame(now, metadata);
     this.#request();
   };
@@ -1264,6 +1271,13 @@ export class Deinterlacer extends EventTarget {
     metadata: FrameObservation,
     frame: VideoFrame,
   ): void {
+    recordEngineTrace({
+      kind: "frame-ingest",
+      atMs: now,
+      mediaTime: metadata.mediaTime,
+      presentedFrames: metadata.presentedFrames,
+      path: "worker-transfer",
+    });
     this.#frameSource = frame;
     try {
       this.#processFrame(now, metadata);
@@ -1774,6 +1788,10 @@ export class Deinterlacer extends EventTarget {
       this.#presentedPicture?.kind === "texture"
         ? this.#presentedPicture.texture
         : null;
+    const shownSlotIndex = this.#outputs.findIndex(
+      (candidate) => candidate?.texture === shownTexture,
+    );
+    const shownSlot = shownSlotIndex < 0 ? null : shownSlotIndex;
     const queuedSlots = new Set(this.#queue.map(({ slot }) => slot));
     for (let offset = 1; offset <= OUTPUT_POOL_LENGTH; offset++) {
       const slot = (this.#outputHead + offset) % OUTPUT_POOL_LENGTH;
@@ -1788,8 +1806,32 @@ export class Deinterlacer extends EventTarget {
     const oldest = this.#queue[0];
     if (oldest) {
       const output = this.#outputs[oldest.slot];
-      if (output && output.texture !== shownTexture) return oldest.slot;
+      if (output && output.texture !== shownTexture) {
+        recordEngineTrace({
+          kind: "slot-pressure",
+          atMs: performance.now(),
+          outcome: "oldest",
+          resultSlot: oldest.slot,
+          outputPoolLength: this.#outputs.length,
+          initializedOutputs: this.#outputs.filter(Boolean).length,
+          outputHead: this.#outputHead,
+          shownSlot,
+          queuedSlots: [...queuedSlots],
+        });
+        return oldest.slot;
+      }
     }
+    recordEngineTrace({
+      kind: "slot-pressure",
+      atMs: performance.now(),
+      outcome: "none",
+      resultSlot: null,
+      outputPoolLength: this.#outputs.length,
+      initializedOutputs: this.#outputs.filter(Boolean).length,
+      outputHead: this.#outputHead,
+      shownSlot,
+      queuedSlots: [...queuedSlots],
+    });
     return null;
   }
 
@@ -1823,11 +1865,28 @@ export class Deinterlacer extends EventTarget {
       }
     }
     this.#lastLoopAt = now;
+    const shownTexture =
+      this.#presentedPicture?.kind === "texture"
+        ? this.#presentedPicture.texture
+        : null;
+    const shownSlotIndex = this.#outputs.findIndex(
+      (candidate) => candidate?.texture === shownTexture,
+    );
     recordEngineTrace({
       kind: "raf",
       atMs: now,
       gapMs: loopGap,
       queueDepth: this.#queue.length,
+      refreshMs: this.#refreshMs,
+      outputPoolLength: this.#outputs.length,
+      initializedOutputs: this.#outputs.filter(Boolean).length,
+      outputHead: this.#outputHead,
+      shownSlot: shownSlotIndex < 0 ? null : shownSlotIndex,
+      queue: this.#queue.map(({ slot, at, duration }) => ({
+        slot,
+        atMs: at,
+        durationMs: duration,
+      })),
     });
     if (this.#workerState === "main") this.#present(now);
     this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
@@ -1905,6 +1964,13 @@ export class Deinterlacer extends EventTarget {
       totalVideoFrames,
     );
     this.#lastFallbackAt = now;
+    recordEngineTrace({
+      kind: "frame-ingest",
+      atMs: now,
+      mediaTime,
+      presentedFrames: Math.max(this.#lastPresented + 1, totalVideoFrames),
+      path: "watchdog",
+    });
     this.#ingestFrame(now, {
       mediaTime,
       presentedFrames: Math.max(this.#lastPresented + 1, totalVideoFrames),
