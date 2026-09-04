@@ -457,6 +457,50 @@ mod section_source_tests {
     }
 }
 
+#[cfg(test)]
+mod program_restart_tests {
+    use super::ProgramMap;
+
+    fn pat(service: u16, pmt_pid: u16) -> Vec<u8> {
+        let mut section = vec![0; 16];
+        section[0] = 0x00;
+        section[3] = 0x00;
+        section[4] = 0x01;
+        section[8] = (service >> 8) as u8;
+        section[9] = service as u8;
+        section[10] = 0xe0 | (pmt_pid >> 8) as u8;
+        section[11] = pmt_pid as u8;
+        section
+    }
+
+    fn pmt(service: u16) -> Vec<u8> {
+        let mut section = vec![0; 16];
+        section[0] = 0x02;
+        section[3] = (service >> 8) as u8;
+        section[4] = service as u8;
+        section
+    }
+
+    #[test]
+    fn does_not_advance_restart_offset_from_a_superseded_pmt_pid() {
+        let service = 1;
+        let old_pmt_pid = 0x100;
+        let new_pmt_pid = 0x101;
+        let mut program = ProgramMap::default();
+
+        program.scan(&pat(service, old_pmt_pid), 0, Some(100));
+        program.scan(&pmt(service), old_pmt_pid, Some(150));
+        assert_eq!(program.restart_offsets.get(&service), Some(&100));
+
+        program.scan(&pat(service, new_pmt_pid), 0, Some(200));
+        program.scan(&pmt(service), old_pmt_pid, Some(250));
+        assert_eq!(program.restart_offsets.get(&service), Some(&100));
+
+        program.scan(&pmt(service), new_pmt_pid, Some(300));
+        assert_eq!(program.restart_offsets.get(&service), Some(&200));
+    }
+}
+
 struct DeferredProgram {
     service: u16,
     rank: usize,
@@ -475,6 +519,7 @@ struct PrivateStream {
 /// The elementary stream PIDs a program advertises.
 struct ProgramMap {
     pmt_pids: HashSet<u16>,
+    pmt_pid_by_service: HashMap<u16, u16>,
     /// Which service to take, when the caller has said. A recording can hold
     /// more than one -- a broadcaster's sub-channel rides in the same transport
     /// stream, with its own video and its own audio -- and without being told,
@@ -519,6 +564,7 @@ impl Default for ProgramMap {
     fn default() -> Self {
         Self {
             pmt_pids: HashSet::new(),
+            pmt_pid_by_service: HashMap::new(),
             wanted_service: None,
             service: None,
             rank: usize::MAX,
@@ -600,8 +646,9 @@ impl ProgramMap {
                     if !self.services.contains(&program) {
                         self.services.push(program);
                     }
-                    self.pmt_pids
-                        .insert((((section[i + 2] & 0x1f) as u16) << 8) | section[i + 3] as u16);
+                    let pmt_pid = (((section[i + 2] & 0x1f) as u16) << 8) | section[i + 3] as u16;
+                    self.pmt_pids.insert(pmt_pid);
+                    self.pmt_pid_by_service.insert(program, pmt_pid);
                 }
                 i += 4;
             }
@@ -614,7 +661,7 @@ impl ProgramMap {
             // another would put a programme's picture against a different
             // programme's sound, so both come from here or neither does.
             let service = ((section[3] as u16) << 8) | section[4] as u16;
-            if source_offset.is_some() {
+            if source_offset.is_some() && self.pmt_pid_by_service.get(&service) == Some(&pid) {
                 if let Some(&pat_offset) = self.pat_offsets.get(&service) {
                     // A new demuxer has to read the PAT before this PMT: if a
                     // newer PAT arrived after the last PMT, starting there
