@@ -648,7 +648,11 @@ export class Deinterlacer extends EventTarget {
     this.#queue.length = 0;
     if (doubleRate) {
       if (this.#width > 0) this.#allocateOutputs();
-      if (this.#scan?.interlaced ?? true) this.#startLoop();
+      if (
+        (this.#scan?.interlaced ?? true) &&
+        (this.#externalHost || this.#workerState === "main")
+      )
+        this.#startLoop();
     } else if (!this.#autoFilm) {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
@@ -674,7 +678,11 @@ export class Deinterlacer extends EventTarget {
         this.#allocateAnalysisTarget();
         this.#allocateOutputs();
       }
-      if (this.#scan?.interlaced ?? true) this.#startLoop();
+      if (
+        (this.#scan?.interlaced ?? true) &&
+        (this.#externalHost || this.#workerState === "main")
+      )
+        this.#startLoop();
     } else {
       this.#freeAnalysisTarget();
       if (!this.#doubleRate) {
