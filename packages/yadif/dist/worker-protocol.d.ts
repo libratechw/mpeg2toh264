@@ -1,4 +1,5 @@
 import type { DeinterlaceStats, Scan, VideoState } from "./deinterlace.js";
+import type { RenderTraceBatch } from "./render-trace.js";
 /** ページ側で観測した1枚の復号フレームに付随する情報。 */
 interface WorkerFrameObservation {
     mediaTime: number;
@@ -81,6 +82,9 @@ export type WorkerNotification = {
 } | {
     type: "stats";
     stats: Omit<DeinterlaceStats, "dropped">;
+} | {
+    type: "diagnostic-batch";
+    batch: RenderTraceBatch;
 } | {
     type: "capture";
     id: number;
