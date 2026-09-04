@@ -133,6 +133,23 @@ interface FrameObservation {
   height: number;
 }
 
+interface AutoFilmAnalysisTiming {
+  atMs: number;
+  analysisDrawSubmitMs: number;
+  analysisReadbackMs: number;
+  unpackLumaMs: number;
+  fieldMatchMs: number;
+  sampleDrawSubmitMs: number;
+  sampleReadbackMs: number;
+  decimateMs: number;
+  totalMs: number;
+}
+
+interface AutoFilmAnalysisDiagnostic {
+  enabled: boolean;
+  samples: AutoFilmAnalysisTiming[];
+}
+
 /** The draw path that produced the picture still represented by the canvas. */
 type PresentedPicture =
   | { kind: "texture"; texture: WebGLTexture; flip: boolean }
@@ -1523,6 +1540,15 @@ export class Deinterlacer extends EventTarget {
     const cur = (this.#head + HISTORY - 1) % HISTORY;
     const prev = (this.#head + 1) % HISTORY;
     const isTopFieldFirst = this.#topFieldFirst;
+    // This hook exists only in the diagnostic build and is intentionally not
+    // part of the package API.
+    const diagnostic = (
+      globalThis as typeof globalThis & {
+        __YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__?: AutoFilmAnalysisDiagnostic;
+      }
+    ).__YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__;
+    const measure = diagnostic?.enabled === true;
+    const startedAt = measure ? performance.now() : 0;
 
     // One GPU draw and readback supplies the three luma frames without moving
     // full-resolution RGBA pictures through JavaScript.
@@ -1538,6 +1564,7 @@ export class Deinterlacer extends EventTarget {
     gl.uniform2i(analysisLocation.size, this.#width, this.#height);
     gl.viewport(0, 0, FILM_ANALYSIS_WIDTH, FILM_ANALYSIS_HEIGHT);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const analysisSubmittedAt = measure ? performance.now() : 0;
     gl.readPixels(
       0,
       0,
@@ -1547,6 +1574,7 @@ export class Deinterlacer extends EventTarget {
       gl.UNSIGNED_BYTE,
       target.pixels,
     );
+    const analysisReadAt = measure ? performance.now() : 0;
     const { previousLuma, currentLuma, nextLuma } = target;
     for (let pixel = 0; pixel < previousLuma.length; pixel++) {
       const offset = pixel * 4;
@@ -1554,6 +1582,7 @@ export class Deinterlacer extends EventTarget {
       currentLuma[pixel] = target.pixels[offset + 1] ?? 0;
       nextLuma[pixel] = target.pixels[offset + 2] ?? 0;
     }
+    const unpackedAt = measure ? performance.now() : 0;
     const fieldMatch = this.#ivtc.fieldMatch(
       previousLuma,
       currentLuma,
@@ -1561,6 +1590,7 @@ export class Deinterlacer extends EventTarget {
       isTopFieldFirst,
       this.#filmCombThreshold,
     );
+    const fieldMatchedAt = measure ? performance.now() : 0;
 
     // Decimate returns the selected RGB weave to YUV 4:2:0 sample density, so
     // brightness noise and colour-only changes share FFmpeg's metric scale.
@@ -1575,6 +1605,7 @@ export class Deinterlacer extends EventTarget {
       fieldMatch.match === "p" ? 0 : fieldMatch.match === "c" ? 1 : 2,
     );
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const sampleSubmittedAt = measure ? performance.now() : 0;
     gl.readPixels(
       0,
       0,
@@ -1584,7 +1615,21 @@ export class Deinterlacer extends EventTarget {
       gl.UNSIGNED_BYTE,
       target.pixels,
     );
+    const sampleReadAt = measure ? performance.now() : 0;
     const decimate = this.#ivtc.decimate(target.pixels);
+    const decimatedAt = measure ? performance.now() : 0;
+    if (measure)
+      diagnostic.samples.push({
+        atMs: startedAt,
+        analysisDrawSubmitMs: analysisSubmittedAt - startedAt,
+        analysisReadbackMs: analysisReadAt - analysisSubmittedAt,
+        unpackLumaMs: unpackedAt - analysisReadAt,
+        fieldMatchMs: fieldMatchedAt - unpackedAt,
+        sampleDrawSubmitMs: sampleSubmittedAt - fieldMatchedAt,
+        sampleReadbackMs: sampleReadAt - sampleSubmittedAt,
+        decimateMs: decimatedAt - sampleReadAt,
+        totalMs: decimatedAt - startedAt,
+      });
     this.#match = fieldMatch.match;
     this.#combScore = fieldMatch.combScore;
     this.#isCombed = fieldMatch.isCombed;
