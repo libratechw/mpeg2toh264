@@ -11,6 +11,7 @@ import type {
   WorkerRenderingOptions,
   WorkerVideoState,
 } from "./worker-protocol.js";
+import { drainEngineTrace } from "./render-trace.js";
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -81,6 +82,13 @@ class WorkerVideo extends EventTarget {
 let video: WorkerVideo | null = null;
 let deinterlacer: Deinterlacer | null = null;
 let destroying = false;
+let traceTimer: number | null = null;
+
+function flushRenderTrace(): void {
+  const batch = drainEngineTrace();
+  if (batch.events.length > 0 || batch.droppedEvents > 0)
+    post({ type: "diagnostic-batch", batch });
+}
 
 /** Worker が所有する requestAnimationFrame() へ共通描画エンジンの表示ループを接続する。 */
 function requestWorkerAnimationFrame(callback: FrameRequestCallback): number {
@@ -136,6 +144,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
       deinterlacer.scan = command.scan;
       deinterlacer.videoTimeline = command.videoTimeline;
       deinterlacer.enabled = command.enabled;
+      traceTimer = workerScope.setInterval(flushRenderTrace, 250);
       post({ type: "ready" });
       return;
     }
@@ -184,6 +193,9 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
         break;
       case "destroy":
         destroying = true;
+        if (traceTimer !== null) workerScope.clearInterval(traceTimer);
+        traceTimer = null;
+        flushRenderTrace();
         deinterlacer.destroy();
         deinterlacer = null;
         video = null;

@@ -36,6 +36,11 @@ import type {
   WorkerRenderingOptions,
   WorkerVideoState,
 } from "./worker-protocol.js";
+import {
+  appendWorkerTrace,
+  recordEngineTrace,
+  setTraceBackend,
+} from "./render-trace.js";
 
 let bundledWorkerURL: string | URL | null = null;
 
@@ -479,6 +484,13 @@ export class Deinterlacer extends EventTarget {
     this.#rendering = externalHost ? "main" : (options.rendering ?? "auto");
     this.#workerURL = options.workerUrl ?? bundledWorkerURL;
     this.#workerState = this.#rendering === "main" ? "main" : "idle";
+    if (!externalHost)
+      setTraceBackend(
+        this.#rendering,
+        this.#workerState === "main" ? "main" : "starting",
+        this.#workerGeneration,
+        this.#workerState === "main" ? "configured-main" : "configured-auto",
+      );
     this.#displayCanvas = externalHost
       ? (externalHost.canvas as unknown as HTMLCanvasElement)
       : document.createElement("canvas");
@@ -738,11 +750,17 @@ export class Deinterlacer extends EventTarget {
       "transferControlToOffscreen" in HTMLCanvasElement.prototype;
     if (!canTransfer) {
       if (this.#rendering === "auto") {
-        this.#fallBackToMain();
+        this.#fallBackToMain("capability-fallback");
         return false;
       }
       this.#workerState = "failed";
       this.#running = false;
+      setTraceBackend(
+        this.#rendering,
+        "failed",
+        this.#workerGeneration,
+        "required-worker-unavailable",
+      );
       return true;
     }
     this.#startWorker();
@@ -772,6 +790,12 @@ export class Deinterlacer extends EventTarget {
 
     const generation = ++this.#workerGeneration;
     this.#workerState = "starting";
+    setTraceBackend(
+      this.#rendering,
+      "starting",
+      generation,
+      this.#workerRestarted ? "worker-restarting" : "worker-starting",
+    );
     let worker: Worker;
     let offscreen: OffscreenCanvas;
     try {
@@ -814,6 +838,12 @@ export class Deinterlacer extends EventTarget {
     switch (notification.type) {
       case "ready":
         this.#workerState = "active";
+        setTraceBackend(
+          this.#rendering,
+          "worker",
+          this.#workerGeneration,
+          "worker-ready",
+        );
         if (this.#running) {
           this.#request();
           this.#startFrameWatchdog();
@@ -845,6 +875,9 @@ export class Deinterlacer extends EventTarget {
         this.#onStats?.(stats);
         break;
       }
+      case "diagnostic-batch":
+        appendWorkerTrace(notification.batch, this.#workerGeneration);
+        break;
       case "capture": {
         const request = this.#captureRequests.get(notification.id);
         this.#captureRequests.delete(notification.id);
@@ -870,7 +903,7 @@ export class Deinterlacer extends EventTarget {
       this.#rendering === "auto" &&
       !this.#workerRestarted
     ) {
-      this.#fallBackToMain();
+      this.#fallBackToMain("initialization-fallback");
       return;
     }
     this.#rejectCaptureRequests(message);
@@ -881,6 +914,12 @@ export class Deinterlacer extends EventTarget {
     }
     console.error(`Deinterlacer Worker stopped: ${message}`);
     this.#workerState = "failed";
+    setTraceBackend(
+      this.#rendering,
+      "failed",
+      this.#workerGeneration,
+      "worker-terminal-failure",
+    );
     this.#worker?.terminate();
     this.#worker = null;
     this.#closePendingWorkerFrame();
@@ -888,7 +927,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   /** Worker を自動選択できなかった場合は元のメインスレッド用 canvas へ戻す。 */
-  #fallBackToMain(): void {
+  #fallBackToMain(reason: string): void {
     const mainCanvas = this.#renderCanvas as HTMLCanvasElement;
     mainCanvas.className = this.#displayCanvas.className;
     const style = this.#displayCanvas.getAttribute("style");
@@ -902,6 +941,7 @@ export class Deinterlacer extends EventTarget {
     this.#worker?.terminate();
     this.#worker = null;
     this.#workerState = "main";
+    setTraceBackend(this.#rendering, "main", this.#workerGeneration, reason);
     this.#closePendingWorkerFrame();
     if (this.#running) {
       this.#request();
@@ -976,6 +1016,12 @@ export class Deinterlacer extends EventTarget {
     this.#worker?.postMessage({ type: "destroy" } satisfies WorkerCommand);
     this.#worker?.terminate();
     this.#worker = null;
+    setTraceBackend(
+      this.#rendering,
+      "failed",
+      this.#workerGeneration,
+      "destroyed",
+    );
     this.#closePendingWorkerFrame();
     this.#rejectCaptureRequests("the deinterlacer was destroyed");
     this.#renderCanvas.removeEventListener(
@@ -1136,7 +1182,7 @@ export class Deinterlacer extends EventTarget {
         !this.#workerAcceptedFrame &&
         !this.#workerRestarted
       ) {
-        this.#fallBackToMain();
+        this.#fallBackToMain("video-frame-fallback");
         this.#processFrame(now, metadata);
       } else {
         this.#workerFailed(message);
@@ -1179,7 +1225,7 @@ export class Deinterlacer extends EventTarget {
         !this.#workerAcceptedFrame &&
         !this.#workerRestarted
       ) {
-        this.#fallBackToMain();
+        this.#fallBackToMain("transfer-fallback");
         this.#processFrame(pending.now, pending.metadata);
       } else {
         this.#workerFailed(message);
@@ -1648,7 +1694,17 @@ export class Deinterlacer extends EventTarget {
     if (target === null) {
       this.#presentedPicture = { kind: "film" };
       this.#setVisible(true);
-      if (countOutput) this.#outputSinceReport++;
+      if (countOutput) {
+        this.#outputSinceReport++;
+        recordEngineTrace({
+          kind: "draw-submit",
+          atMs: performance.now(),
+          rafAtMs: null,
+          scheduledAtMs: null,
+          queueDepthAfter: this.#queue.length,
+          path: "film-direct",
+        });
+      }
     }
   }
 
@@ -1754,10 +1810,11 @@ export class Deinterlacer extends EventTarget {
   #onLoop = (now: DOMHighResTimeStamp): void => {
     this.#loopHandle = null;
     if (!this.#running || this.#lost) return;
+    const loopGap = this.#lastLoopAt > 0 ? now - this.#lastLoopAt : null;
     // Short ordinary gaps identify the refresh interval, while a long task
     // only moves the estimate gradually until regular animation resumes.
-    if (this.#lastLoopAt > 0) {
-      const gap = now - this.#lastLoopAt;
+    if (loopGap !== null) {
+      const gap = loopGap;
       if (gap >= 1 && gap <= MAX_PERIOD_MS) {
         this.#refreshMs =
           gap < this.#refreshMs
@@ -1766,6 +1823,12 @@ export class Deinterlacer extends EventTarget {
       }
     }
     this.#lastLoopAt = now;
+    recordEngineTrace({
+      kind: "raf",
+      atMs: now,
+      gapMs: loopGap,
+      queueDepth: this.#queue.length,
+    });
     if (this.#workerState === "main") this.#present(now);
     this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
   };
@@ -1878,8 +1941,17 @@ export class Deinterlacer extends EventTarget {
     this.#queue.shift();
     const begin = performance.now();
     this.#show(ready.slot);
-    this.#showMsSinceReport += performance.now() - begin;
+    const presentedAt = performance.now();
+    this.#showMsSinceReport += presentedAt - begin;
     this.#showFramesSinceReport++;
+    recordEngineTrace({
+      kind: "draw-submit",
+      atMs: presentedAt,
+      rafAtMs: now,
+      scheduledAtMs: ready.at,
+      queueDepthAfter: this.#queue.length,
+      path: "scheduled",
+    });
   }
 
   /** Copy one of the filtered pictures onto the canvas. */
@@ -1893,7 +1965,17 @@ export class Deinterlacer extends EventTarget {
   #showVideo(): void {
     this.#push();
     const texture = this.#textures[this.#head];
-    if (texture) this.#showTexture(texture, true);
+    if (texture) {
+      this.#showTexture(texture, true);
+      recordEngineTrace({
+        kind: "draw-submit",
+        atMs: performance.now(),
+        rafAtMs: null,
+        scheduledAtMs: null,
+        queueDepthAfter: this.#queue.length,
+        path: "progressive",
+      });
+    }
     // Progressive frames are not neighbours of the next interlaced frame.
     this.#frames = 0;
   }
@@ -2077,7 +2159,17 @@ export class Deinterlacer extends EventTarget {
     if (target === null) {
       this.#presentedPicture = { kind: "yadif", flush, second };
       this.#setVisible(true);
-      if (countOutput) this.#outputSinceReport++;
+      if (countOutput) {
+        this.#outputSinceReport++;
+        recordEngineTrace({
+          kind: "draw-submit",
+          atMs: performance.now(),
+          rafAtMs: null,
+          scheduledAtMs: null,
+          queueDepthAfter: this.#queue.length,
+          path: flush ? "flush" : "yadif-direct",
+        });
+      }
     }
   }
 
@@ -2444,6 +2536,14 @@ export class Deinterlacer extends EventTarget {
         this.#outputHead = slot;
         this.#render(true, false, output.framebuffer);
         this.#show(slot);
+        recordEngineTrace({
+          kind: "draw-submit",
+          atMs: performance.now(),
+          rafAtMs: null,
+          scheduledAtMs: null,
+          queueDepthAfter: this.#queue.length,
+          path: "flush",
+        });
       } else {
         this.#render(true, false, null);
       }
