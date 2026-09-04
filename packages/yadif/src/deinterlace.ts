@@ -399,6 +399,7 @@ export class Deinterlacer extends EventTarget {
   /** How many of the held frames are consecutive, up to HISTORY. */
   #frames = 0;
   #lastMediaTime = 0;
+  #lastIngestedMediaTime = Number.NaN;
   /** A destination frame that arrived before the browser finished seeking. */
   #seekFrameReady = false;
   #handle: number | null = null;
@@ -929,6 +930,7 @@ export class Deinterlacer extends EventTarget {
     this.#resetFilm();
     this.#lastVideoFrameCallbackAt = performance.now();
     this.#lastFallbackAt = this.#lastVideoFrameCallbackAt;
+    this.#lastIngestedMediaTime = Number.NaN;
     this.#lastObservedVideoFrames =
       this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
     this.#mount();
@@ -939,6 +941,8 @@ export class Deinterlacer extends EventTarget {
         type: "enabled",
         enabled: true,
       } satisfies WorkerCommand);
+      // 起動済み Worker から `ready` は再送されないため、`stop()` で解除した requestVideoFrameCallback() をここで張り直す
+      if (this.#workerState === "active") this.#request();
       return;
     }
     this.#request();
@@ -1200,6 +1204,7 @@ export class Deinterlacer extends EventTarget {
 
   /** どちらの通知経路で見つけたフレームも選択中の描画先へ取り込む。 */
   #ingestFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
+    this.#lastIngestedMediaTime = metadata.mediaTime;
     if (this.#workerState === "active") {
       this.#queueWorkerFrame(now, metadata);
       return;
@@ -1826,7 +1831,7 @@ export class Deinterlacer extends EventTarget {
     const frameCounterAdvanced =
       totalVideoFrames > this.#lastObservedVideoFrames;
     const mediaTimeAdvanced =
-      mediaTime > this.#lastMediaTime &&
+      mediaTime !== this.#lastIngestedMediaTime &&
       now - this.#lastFallbackAt >= fallbackPeriod * 0.75;
     if (!frameCounterAdvanced && !mediaTimeAdvanced) return;
 
@@ -2324,6 +2329,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   #onEmptied = (): void => {
+    this.#lastIngestedMediaTime = Number.NaN;
     if (this.#postWorkerEvent("emptied")) {
       this.#closePendingWorkerFrame();
       this.#setVisible(false);
