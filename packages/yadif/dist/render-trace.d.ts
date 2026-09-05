@@ -48,6 +48,28 @@ export type EngineRenderTraceEvent = {
     outputHead: number;
     shownSlot: number | null;
     queuedSlots: number[];
+} | {
+    kind: "worker-bridge";
+    sequence: number;
+    atMs: number;
+    stage: "offered" | "pending-set" | "pending-replaced" | "sent" | "acknowledged";
+    id: number;
+    relatedId: number | null;
+    durationMs: number | null;
+} | {
+    kind: "worker-frame";
+    sequence: number;
+    atMs: number;
+    id: number;
+    receiveAtMs: number;
+    ingestMs: number;
+    closeMs: number;
+    totalMs: number;
+} | {
+    kind: "page-raf";
+    sequence: number;
+    atMs: number;
+    gapMs: number | null;
 };
 type EngineRenderTraceInput = Omit<Extract<EngineRenderTraceEvent, {
     kind: "raf";
@@ -55,6 +77,12 @@ type EngineRenderTraceInput = Omit<Extract<EngineRenderTraceEvent, {
     kind: "draw-submit";
 }>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
     kind: "frame-ingest";
+}>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
+    kind: "worker-bridge";
+}>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
+    kind: "worker-frame";
+}>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
+    kind: "page-raf";
 }>, "sequence"> | Omit<Extract<EngineRenderTraceEvent, {
     kind: "slot-pressure";
 }>, "sequence">;
