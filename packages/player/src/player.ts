@@ -756,7 +756,8 @@ export class Mpeg2TsPlayer extends EventTarget {
           .ready()
           .then(() => this.#report(id, { type: "flow", id, ready: true })),
       (error: unknown) => {
-        if (id === this.#generation) this.#fail(toError(error));
+        if (id === this.#generation)
+          this.#fail(this.#withMseAttachmentContext(toError(error)));
       },
     );
   }
@@ -780,7 +781,8 @@ export class Mpeg2TsPlayer extends EventTarget {
           this.#setState(blocked ? "buffer-full" : "converting");
       },
       onError: (error) => {
-        if (id === this.#generation) this.#fail(error);
+        if (id === this.#generation)
+          this.#fail(this.#withMseAttachmentContext(error));
       },
     });
     this.#sink = sink;
@@ -993,6 +995,25 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#setState("error");
     this.#settle(error);
     this.#emit("error", { error });
+  }
+
+  #withMseAttachmentContext(error: Error): Error {
+    const source = this.#source;
+    const objectUrl = this.#objectUrl;
+    const detail = [
+      `videoConnected=${this.video.isConnected}`,
+      `videoReadyState=${this.video.readyState}`,
+      `videoNetworkState=${this.video.networkState}`,
+      `videoPaused=${this.video.paused}`,
+      `sourceElement=${source ? "present" : "absent"}`,
+      `sourceConnected=${source?.isConnected ?? false}`,
+      `sourceMatchesObjectUrl=${source !== null && objectUrl !== null && source.src === objectUrl}`,
+      `currentSrcMatchesObjectUrl=${objectUrl !== null && this.video.currentSrc === objectUrl}`,
+    ].join(", ");
+    const contextual = new Error(`${error.message} (${detail})`);
+    contextual.name = error.name;
+    contextual.stack += `\nCaused by: ${error.stack ?? error.message}`;
+    return contextual;
   }
 
   #settle(error: Error | null): void {

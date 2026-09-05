@@ -260,6 +260,10 @@ export class MseSink implements FragmentSink {
   #currentTime = 0;
   #closed = false;
   #ending = false;
+  #sourceOpenCount = 0;
+  #sourceCloseCount = 0;
+  #lastSourceOpenAt: number | null = null;
+  #lastSourceCloseAt: number | null = null;
   readonly #room = new ReadyGate();
   #drained: (() => void)[] = [];
 
@@ -270,6 +274,8 @@ export class MseSink implements FragmentSink {
     this.#class = source;
     this.mediaSource = new source();
     this.managed = source === managedMediaSource;
+    this.mediaSource.addEventListener("sourceopen", this.#onSourceOpen);
+    this.mediaSource.addEventListener("sourceclose", this.#onSourceClose);
     if (this.managed) {
       this.mediaSource.addEventListener(
         "startstreaming",
@@ -393,6 +399,8 @@ export class MseSink implements FragmentSink {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.mediaSource.removeEventListener("sourceopen", this.#onSourceOpen);
+    this.mediaSource.removeEventListener("sourceclose", this.#onSourceClose);
     if (this.managed) {
       this.mediaSource.removeEventListener(
         "startstreaming",
@@ -541,6 +549,16 @@ export class MseSink implements FragmentSink {
     );
   };
 
+  #onSourceOpen = (): void => {
+    this.#sourceOpenCount++;
+    this.#lastSourceOpenAt = performance.now();
+  };
+
+  #onSourceClose = (): void => {
+    this.#sourceCloseCount++;
+    this.#lastSourceCloseAt = performance.now();
+  };
+
   /**
    * Put the playhead where the media begins, which is not zero.
    *
@@ -676,9 +694,14 @@ export class MseSink implements FragmentSink {
   #error(operation: string, error: unknown): Error {
     const cause = error instanceof Error ? error : new Error(String(error));
     const sourceBuffer = this.#sourceBuffer;
+    const at = performance.now();
     const detail = [
       `mediaSource=${this.mediaSource.readyState}`,
       `closed=${this.#closed}`,
+      `sourceOpens=${this.#sourceOpenCount}`,
+      `sourceCloses=${this.#sourceCloseCount}`,
+      `sinceSourceOpenMs=${this.#lastSourceOpenAt === null ? "none" : Math.round(at - this.#lastSourceOpenAt)}`,
+      `sinceSourceCloseMs=${this.#lastSourceCloseAt === null ? "none" : Math.round(at - this.#lastSourceCloseAt)}`,
       `sourceBuffer=${sourceBuffer ? "present" : "absent"}`,
       `updating=${sourceBuffer?.updating ?? false}`,
       `operation=${this.#operation?.type ?? "none"}`,

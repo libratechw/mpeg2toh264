@@ -110,13 +110,17 @@ try {
   });
   const invalidState = new Error("The object is in an invalid state.");
   invalidState.name = "InvalidStateError";
-  diagnosticSink.mediaSource.sourceBuffer.appendError = invalidState;
   await diagnosticSink.open("video/mp4; codecs=avc1.640028", oldInit);
+  diagnosticSink.mediaSource.sourceBuffer.complete();
+  diagnosticSink.mediaSource.readyState = "closed";
+  diagnosticSink.mediaSource.dispatchEvent(new Event("sourceclose"));
+  diagnosticSink.mediaSource.sourceBuffer.appendError = invalidState;
+  diagnosticSink.push(oldMedia, 0, true);
   assert.equal(diagnosticErrors.length, 1);
   assert.equal(diagnosticErrors[0].name, "InvalidStateError");
   assert.match(
     diagnosticErrors[0].message,
-    /^MSE append SourceBuffer failed \(mediaSource=open, closed=false, sourceBuffer=present, updating=false, operation=none, queue=1, epoch=0\): InvalidStateError: The object is in an invalid state\.$/,
+    /^MSE append SourceBuffer failed \(mediaSource=closed, closed=false, sourceOpens=1, sourceCloses=1, sinceSourceOpenMs=\d+, sinceSourceCloseMs=\d+, sourceBuffer=present, updating=false, operation=none, queue=1, epoch=0\): InvalidStateError: The object is in an invalid state\.$/,
   );
 } finally {
   delete globalThis.MediaSource;

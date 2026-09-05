@@ -1,7 +1,7 @@
 # @mpeg2toh264/player
 
 > [!WARNING]
-> このbranchは、iOSで録画の画質切替を繰り返した際に発生する`InvalidStateError`の診断専用です。MSE操作名と失敗時の内部状態をエラーへ追加しますが、不具合を修正するものではなく、branch全体の取り込みは想定していません。
+> このbranchは、iOSで録画の画質切替を繰り返した際に発生する`InvalidStateError`の診断専用です。MSE操作名、`sourceopen` / `sourceclose`の回数と直近イベントからの時間、失敗直前のvideoと`<source>`の接続状態をエラーへ追加しますが、不具合を修正するものではなく、branch全体の取り込みは想定していません。
 
 MPEG-2 TSをWorker内でH.264へ変換し、`<video>`で再生するMSEプレイヤーです。取得、変換、バッファー管理、Rangeリクエストによるシークをまとめて扱います。
 
