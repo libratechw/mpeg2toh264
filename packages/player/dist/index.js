@@ -102,8 +102,8 @@ class E {
     if (!t) throw new Error("this browser has no Media Source Extensions");
     this.#e = t, this.mediaSource = new t(), this.managed = t === h, this.managed && (this.mediaSource.addEventListener(
       "startstreaming",
-      this.#B
-    ), this.mediaSource.addEventListener("endstreaming", this.#H)), this.#s = new Promise((i) => {
+      this.#H
+    ), this.mediaSource.addEventListener("endstreaming", this.#B)), this.#s = new Promise((i) => {
       this.mediaSource.addEventListener(
         "sourceopen",
         () => {
@@ -128,7 +128,7 @@ class E {
         e !== this.#f && (this.#o = e);
       else {
         const i = this.mediaSource.addSourceBuffer(e);
-        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#N), this.#t = i, this.#f = e;
+        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#O), this.#t = i, this.#f = e;
       }
       this.#U({ data: t, init: !0 }), this.#T();
     }
@@ -167,11 +167,11 @@ class E {
   close() {
     this.#d || (this.#d = !0, this.managed && (this.mediaSource.removeEventListener(
       "startstreaming",
-      this.#B
+      this.#H
     ), this.mediaSource.removeEventListener(
       "endstreaming",
-      this.#H
-    )), this.#t?.removeEventListener("updateend", this.#I), this.#t?.removeEventListener("error", this.#N), this.#t = null, this.#n = [], this.#g = 0, this.#c = [], this.#R.abandon(), this.#v(!0));
+      this.#B
+    )), this.#t?.removeEventListener("updateend", this.#I), this.#t?.removeEventListener("error", this.#O), this.#t = null, this.#n = [], this.#g = 0, this.#c = [], this.#R.abandon(), this.#v(!0));
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(e) {
@@ -230,7 +230,7 @@ class E {
    * The managed source asking for data again, which is the only thing that
    * reopens the door `endstreaming` closed.
    */
-  #B = () => {
+  #H = () => {
     this.#S = !0, this.#m(), this.#w();
   };
   /**
@@ -241,10 +241,10 @@ class E {
    * is taken until it asks. This is the whole point of the managed source: it
    * knows what the radio and the battery are doing and the page does not.
    */
-  #H = () => {
+  #B = () => {
     this.#S = !1, this.#m(), this.#w();
   };
-  #N = () => {
+  #O = () => {
     this.#_(new Error("the SourceBuffer rejected what was appended"));
   };
   /**
@@ -308,12 +308,12 @@ class E {
     }
   }
   /** How far past the playhead the buffer reaches, in seconds. */
-  #O() {
+  #N() {
     const e = this.#t?.buffered;
     return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#y;
   }
   #m() {
-    const e = !this.#u && this.#S && this.#O() < this.#i.maxAheadSeconds && this.#g < this.#i.queueHighWaterMark && this.#n.length < 2;
+    const e = !this.#u && this.#S && this.#N() < this.#i.maxAheadSeconds && this.#g < this.#i.queueHighWaterMark && this.#n.length < 2;
     this.#R.set(e) && this.#i.onReadyChange?.(e);
   }
   /**
@@ -339,7 +339,7 @@ class E {
     );
   }
 }
-const v = "" + new URL("assets/worker-9NJB1U0h.js", import.meta.url).href, S = v, d = 0.1, c = [
+const v = "" + new URL("assets/worker-De-0Qxsc.js", import.meta.url).href, S = v, d = 0.1, c = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
@@ -394,7 +394,7 @@ class T extends EventTarget {
   constructor(e, t = {}) {
     super(), this.video = e, this.#e = t;
     const i = t.mediaSource ?? "auto";
-    this.#i = i === "auto" ? l(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#O);
+    this.#i = i === "auto" ? l(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#N);
     for (const s of c)
       this.video.addEventListener(s, this.#m);
     t.deinterlace && (this.deinterlace = !0);
@@ -572,7 +572,7 @@ class T extends EventTarget {
   /** Stop, and give up the worker. The player cannot be loaded again. */
   destroy() {
     if (!this.#d) {
-      this.stop(), this.#d = !0, this.video.removeEventListener("seeking", this.#O);
+      this.stop(), this.#d = !0, this.video.removeEventListener("seeking", this.#N);
       for (const e of c)
         this.video.removeEventListener(e, this.#m);
       this.#r?.destroy(), this.#r = null, this.#s?.terminate(), this.#s = null;
@@ -592,11 +592,11 @@ class T extends EventTarget {
           type: "module"
         }
       );
-      e.onmessage = this.#B, e.onerror = (t) => this.#L(new Error(t.message || "the worker failed")), this.#s = e;
+      e.onmessage = this.#H, e.onerror = (t) => this.#L(new Error(t.message || "the worker failed")), this.#s = e;
     }
     return this.#s;
   }
-  #B = (e) => {
+  #H = (e) => {
     const t = e.data;
     if (t.id === this.#t)
       switch (t.type) {
@@ -604,7 +604,7 @@ class T extends EventTarget {
           t.managed && this.#T(), this.video.srcObject = t.handle, this.#v("attached", a());
           break;
         case "open":
-          this.#H(t.mimeCodec, t.data);
+          this.#B(t.mimeCodec, t.data);
           break;
         case "video-config":
           this.#R(
@@ -677,11 +677,11 @@ class T extends EventTarget {
       }
   };
   /** Open a MediaSource here, for browsers that cannot have one in a worker. */
-  #H(e, t) {
+  #B(e, t) {
     const i = this.#t;
     let s;
     try {
-      s = this.#o ?? this.#N(i);
+      s = this.#o ?? this.#O(i);
     } catch (r) {
       this.#L(o(r));
       return;
@@ -696,7 +696,7 @@ class T extends EventTarget {
       }
     );
   }
-  #N(e) {
+  #O(e) {
     const t = new E({
       preferManaged: this.#e.preferManagedMediaSource,
       queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
@@ -758,7 +758,7 @@ class T extends EventTarget {
    * What is left is a real seek: the worker throws the buffer away and reads
    * the input again from where the viewer asked to be.
    */
-  #O = () => {
+  #N = () => {
     if (this.#E === null || this.#f === "idle" || this.#f === "error") return;
     const e = this.video.currentTime;
     this.#_(e) || (this.#M("seeking"), this.#p(), this.#G(), this.#s?.postMessage({
