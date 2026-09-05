@@ -745,7 +745,11 @@ fn drops_a_truncated_final_frame() {
 // ------------------------------------------------------------------- Session
 
 fn video_only_stream(copies: usize) -> Vec<u8> {
-    let es = repeat_fixture("ibbp.m2v", copies);
+    video_stream_from_fixture("ibbp.m2v", copies)
+}
+
+fn video_stream_from_fixture(name: &str, copies: usize) -> Vec<u8> {
+    let es = repeat_fixture(name, copies);
     let units: Vec<PesUnit<'_>> = es
         .chunks(20_000)
         .enumerate()
@@ -1612,6 +1616,88 @@ fn a_hole_in_the_recording_does_not_move_what_follows_it() {
         intact_audio.abs_diff(lossy_audio) <= 1,
         "the sound is {lossy_audio} access units against {intact_audio}, so the hole was not filled"
     );
+}
+
+#[test]
+fn a_transport_hole_keeps_pictures_completed_before_the_missing_packet() {
+    // Each 20 kB PES carries several complete picture starts. Losing its last
+    // transport packet leaves an unfinished final picture, but the pictures
+    // ending before that packet remain valid input to the transcoder.
+    let stream = video_only_stream(2);
+    let video_starts: Vec<usize> = stream
+        .chunks(188)
+        .enumerate()
+        .filter(|(_, packet)| {
+            let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+            pid == VIDEO_PID && packet[1] & 0x40 != 0
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(video_starts.len() > 4);
+    let count_video_samples = |stream: &[u8]| {
+        run_session(stream, 64 * 1024)
+            .iter()
+            .map(|fragment| match fragment {
+                Fragment::Media { video_samples, .. } => *video_samples,
+                _ => 0,
+            })
+            .sum::<usize>()
+    };
+    let intact_samples = count_video_samples(&stream);
+    let final_packet_missing =
+        count_video_samples(&with_packets_dropped(&stream, video_starts[3] - 1, 1));
+    let earlier_packet_missing =
+        count_video_samples(&with_packets_dropped(&stream, video_starts[3] - 2, 1));
+
+    assert_eq!(intact_samples, 31, "the intact fixture is the control");
+    assert_eq!(
+        final_packet_missing, 24,
+        "pictures bounded before a loss at the PES tail remain available"
+    );
+    assert_eq!(
+        earlier_packet_missing, 20,
+        "an earlier loss retains only the shorter byte-complete prefix"
+    );
+}
+
+#[test]
+fn a_transport_hole_still_uses_the_field_and_open_gop_rules() {
+    // The prefix retained before a hole still goes through the ordinary
+    // field-pair and open-GOP filters. The 1080i fixture checks the interlaced
+    // timeline; the open-GOP fixture begins groups with complementary B fields.
+    // The sample counts are the externally visible decisions of those filters
+    // at two loss positions; the splitter does not duplicate their policy.
+    for (name, copies, expected_tail, expected_earlier) in [
+        ("hd1080i.m2v", 4, 48, 48),
+        ("open_gop_leading_bb.m2v", 2, 88, 84),
+    ] {
+        let stream = video_stream_from_fixture(name, copies);
+        let video_starts: Vec<usize> = stream
+            .chunks(188)
+            .enumerate()
+            .filter(|(_, packet)| {
+                let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
+                pid == VIDEO_PID && packet[1] & 0x40 != 0
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let count = |stream: &[u8]| {
+            run_session(stream, 64 * 1024)
+                .iter()
+                .map(|fragment| match fragment {
+                    Fragment::Media { video_samples, .. } => *video_samples,
+                    _ => 0,
+                })
+                .sum::<usize>()
+        };
+        let tail = count(&with_packets_dropped(&stream, video_starts[3] - 1, 1));
+        let earlier = count(&with_packets_dropped(&stream, video_starts[3] - 2, 1));
+        assert_eq!(
+            (tail, earlier),
+            (expected_tail, expected_earlier),
+            "{name} retains only the structurally usable prefix at each loss position",
+        );
+    }
 }
 
 #[test]

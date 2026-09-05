@@ -668,7 +668,8 @@ impl Session {
             match packet.kind {
                 ElementaryKind::Video => {
                     if packet.damaged_previous_pes {
-                        self.gops.discard_pending();
+                        self.pending_gops
+                            .extend(self.gops.take_complete_prefix_before_gap());
                     }
                     let units = self.gops.push_with_restart(
                         &packet.data,

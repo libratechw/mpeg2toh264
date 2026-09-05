@@ -229,8 +229,9 @@ pub struct ElementaryPacket {
     /// Bytes belonging to this elementary stream were lost before this PES.
     /// Stateful parsers discard unfinished access units before reading it.
     pub discontinuity: bool,
-    /// The preceding PES itself lost bytes, so video parsing also discards the
-    /// unfinished GOP before reading this packet.
+    /// The preceding PES itself lost bytes, so video parsing must finish or
+    /// discard its pending tail before reading this packet. The demuxer never
+    /// emits bytes received after the gap as part of that tail.
     pub damaged_previous_pes: bool,
     /// Earliest recent program-table packet a new demuxer for the same service
     /// can start at and still discover this PES packet's PID.
