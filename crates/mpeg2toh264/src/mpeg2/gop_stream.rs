@@ -133,6 +133,37 @@ impl Mpeg2GopStream {
         self.extract(true)
     }
 
+    /// Return complete pictures before a known byte gap, then forget the damaged tail.
+    ///
+    /// The caller must invoke this before pushing any bytes received after the
+    /// gap. The last picture start in the buffer then has no following start
+    /// code to prove that picture ended before the gap. Every earlier picture
+    /// does, so the prefix ending at that last start is byte-complete input for
+    /// the transcoder. Reference resolution, leading B pictures, and field-pair
+    /// validity remain the transcoder's responsibility, as for ordinary units.
+    pub(crate) fn take_complete_prefix_before_gap(&mut self) -> Vec<Mpeg2Gop> {
+        let unit = self.gops.front().copied().and_then(|first_gop| {
+            let boundary = self.pictures.back().copied()?;
+            if !self
+                .pictures
+                .iter()
+                .any(|&picture| picture >= first_gop && picture < boundary)
+            {
+                return None;
+            }
+            let boundary = self.description_boundary(first_gop, boundary);
+            let pts = Self::mark_at(&mut self.pts_marks, self.base);
+            let restart_offset = Self::mark_at(&mut self.restart_marks, self.base);
+            Some(Mpeg2Gop {
+                data: self.buffer[..boundary].to_vec(),
+                pts,
+                restart_offset,
+            })
+        });
+        self.discard_pending();
+        unit.into_iter().collect()
+    }
+
     /// Drop the unfinished GOP at a transport discontinuity while retaining
     /// the last sequence header needed to describe the next complete GOP.
     pub fn discard_pending(&mut self) {
