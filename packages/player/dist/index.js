@@ -1,15 +1,15 @@
-const b = 33554432;
-const y = 8, M = 10;
+const y = 33554432;
+const b = 8, M = 10;
 const h = globalThis.ManagedMediaSource;
-function u(n = !1) {
+function c(n = !1) {
   const e = typeof MediaSource > "u" ? null : MediaSource;
   return n && h ? h : e ?? h ?? null;
 }
 function p(n, e = !1) {
-  return u(e)?.isTypeSupported(n) ?? !1;
+  return c(e)?.isTypeSupported(n) ?? !1;
 }
 function m(n = !1) {
-  return u(n)?.canConstructInDedicatedWorker === !0;
+  return c(n)?.canConstructInDedicatedWorker === !0;
 }
 function w() {
   return h !== void 0;
@@ -18,17 +18,17 @@ function _() {
   return typeof MediaSource > "u" && h !== void 0;
 }
 class g {
-  #e = !0;
+  #t = !0;
   #i = [];
   get open() {
-    return this.#e;
+    return this.#t;
   }
   /** Returns whether this changed anything. */
   set(e) {
-    return e === this.#e ? !1 : (this.#e = e, e && this.#s(), !0);
+    return e === this.#t ? !1 : (this.#t = e, e && this.#s(), !0);
   }
   wait() {
-    return this.#e ? Promise.resolve() : new Promise((e) => {
+    return this.#t ? Promise.resolve() : new Promise((e) => {
       this.#i.push(e);
     });
   }
@@ -42,7 +42,7 @@ class g {
     for (const t of e) t();
   }
 }
-class E {
+class S {
   /**
    * Made in the constructor rather than in `open`, because a caller needs
    * something to attach before the codec is known: the worker sends
@@ -57,17 +57,17 @@ class E {
    */
   managed;
   /** The one the source was made from, and the one that answers for codecs. */
-  #e;
+  #t;
   #i;
   #s;
-  #t = null;
+  #e = null;
   /** What the `SourceBuffer` was opened with, or last changed to. */
   #f = "";
   /** A codec to move the `SourceBuffer` to before the next append. */
-  #o = null;
-  #n = [];
+  #d = null;
+  #h = [];
   #g = 0;
-  #h = null;
+  #r = null;
   #u = !1;
   /**
    * Whether a managed source wants data at the moment.
@@ -78,32 +78,32 @@ class E {
    * initialization segment would mean waiting for a player that never starts:
    * this holds the door open until `endstreaming` closes it.
    */
-  #S = !0;
+  #k = !0;
   /** The last thing said about there being no room, so it is said once. */
-  #E = !1;
+  #S = !1;
   /** Whether everything buffered is waiting to be thrown away; see `reset`. */
   #a = !1;
   /** Which stretch of timeline is being filled. Bumped by every `reset`. */
-  #k = 0;
+  #E = 0;
   /** A duration to put on the MediaSource as soon as it will take one. */
-  #b = null;
+  #y = null;
   /** Media times a decoder can start from, in order; see #evict. */
   #c = [];
   /** Whether the playhead has been put where the media starts; see #startAtMedia. */
-  #r = !1;
-  #y = 0;
-  #d = !1;
+  #n = !1;
+  #b = 0;
+  #o = !1;
   #A = !1;
   #R = new g();
   #D = [];
   constructor(e) {
     this.#i = e;
-    const t = u(e.preferManaged);
+    const t = c(e.preferManaged);
     if (!t) throw new Error("this browser has no Media Source Extensions");
-    this.#e = t, this.mediaSource = new t(), this.managed = t === h, this.managed && (this.mediaSource.addEventListener(
+    this.#t = t, this.mediaSource = new t(), this.managed = t === h, this.managed && (this.mediaSource.addEventListener(
       "startstreaming",
-      this.#B
-    ), this.mediaSource.addEventListener("endstreaming", this.#H)), this.#s = new Promise((i) => {
+      this.#H
+    ), this.mediaSource.addEventListener("endstreaming", this.#O)), this.#s = new Promise((i) => {
       this.mediaSource.addEventListener(
         "sourceopen",
         () => {
@@ -121,20 +121,22 @@ class E {
    * it -- re-open the one already running.
    */
   async open(e, t) {
-    if (!this.#e.isTypeSupported(e))
+    if (!this.#t.isTypeSupported(e))
       throw new Error(`unsupported codec: ${e}`);
-    if (await this.#s, !this.#d) {
-      if (this.#t)
-        e !== this.#f && (this.#o = e);
-      else {
+    if (await this.#s, !this.#o) {
+      if (this.#e)
+        e !== this.#f && (this.#d = e);
+      else try {
         const i = this.mediaSource.addSourceBuffer(e);
-        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#N), this.#t = i, this.#f = e;
+        i.mode = "segments", i.addEventListener("updateend", this.#I), i.addEventListener("error", this.#N), this.#e = i, this.#f = e;
+      } catch (i) {
+        throw this.#P("add or configure SourceBuffer", i);
       }
       this.#U({ data: t, init: !0 }), this.#T();
     }
   }
   push(e, t, i) {
-    this.#d || (i && this.#c.push(t), this.#U({ data: e, init: !1 }));
+    this.#o || (i && this.#c.push(t), this.#U({ data: e, init: !1 }));
   }
   /**
    * How long the whole presentation is.
@@ -144,7 +146,7 @@ class E {
    * of what has been converted so far.
    */
   setDuration(e) {
-    this.#b = e, this.#T();
+    this.#y = e, this.#T();
   }
   /**
    * Throw away everything buffered and everything queued.
@@ -155,83 +157,88 @@ class E {
    * bytes that are no longer there.
    */
   reset() {
-    this.#d || (this.#k++, this.#n = [], this.#g = 0, this.#c = [], this.#r = !1, this.#A = !1, this.#u = !1, this.#w(), this.#t && (this.#a = !0), this.#v(!0), this.#m(), this.#p());
+    this.#o || (this.#E++, this.#h = [], this.#g = 0, this.#c = [], this.#n = !1, this.#A = !1, this.#u = !1, this.#_(), this.#e && (this.#a = !0), this.#v(!0), this.#m(), this.#p());
   }
   async finish() {
-    if (this.#A = !0, this.#d || !this.#t) return;
-    const e = this.#k;
-    await new Promise((t) => {
+    if (this.#A = !0, this.#o || !this.#e) return;
+    const e = this.#E;
+    if (await new Promise((t) => {
       this.#D.push(t), this.#p();
-    }), !(this.#d || this.#k !== e) && this.mediaSource.readyState === "open" && this.mediaSource.endOfStream();
+    }), !(this.#o || this.#E !== e) && this.mediaSource.readyState === "open")
+      try {
+        this.mediaSource.endOfStream();
+      } catch (t) {
+        throw this.#P("end MediaSource", t);
+      }
   }
   close() {
-    this.#d || (this.#d = !0, this.managed && (this.mediaSource.removeEventListener(
+    this.#o || (this.#o = !0, this.managed && (this.mediaSource.removeEventListener(
       "startstreaming",
-      this.#B
+      this.#H
     ), this.mediaSource.removeEventListener(
       "endstreaming",
-      this.#H
-    )), this.#t?.removeEventListener("updateend", this.#I), this.#t?.removeEventListener("error", this.#N), this.#t = null, this.#n = [], this.#g = 0, this.#c = [], this.#R.abandon(), this.#v(!0));
+      this.#O
+    )), this.#e?.removeEventListener("updateend", this.#I), this.#e?.removeEventListener("error", this.#N), this.#e = null, this.#h = [], this.#g = 0, this.#c = [], this.#R.abandon(), this.#v(!0));
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(e) {
-    this.#y = e, this.#P(), this.#m(), this.#p();
+    this.#b = e, this.#B(), this.#m(), this.#p();
   }
   #U(e) {
-    this.#n.push(e), this.#g += e.data.byteLength, this.#m(), this.#p();
+    this.#h.push(e), this.#g += e.data.byteLength, this.#m(), this.#p();
   }
   #p() {
-    const e = this.#t;
-    if (this.#d || !e || e.updating || this.#h)
+    const e = this.#e;
+    if (this.#o || !e || e.updating || this.#r)
       return;
     if (this.#a) {
-      this.#h = { type: "clear" };
+      this.#r = { type: "clear" };
       try {
         e.remove(0, Number.POSITIVE_INFINITY);
       } catch (i) {
-        this.#h = null, this.#a = !1, this.#_(i);
+        this.#r = null, this.#a = !1, this.#M("clear SourceBuffer", i);
       }
       return;
     }
     if (this.#u) return;
-    const t = this.#n[0];
+    const t = this.#h[0];
     if (!t) {
       this.#v(!1);
       return;
     }
-    if (this.#o !== null) {
-      const i = this.#o;
-      this.#o = null;
+    if (this.#d !== null) {
+      const i = this.#d;
+      this.#d = null;
       try {
         e.changeType(i), this.#f = i;
       } catch (s) {
-        this.#_(s);
+        this.#M("change SourceBuffer type", s);
         return;
       }
     }
-    this.#h = { type: "append", pending: t, epoch: this.#k };
+    this.#r = { type: "append", pending: t, epoch: this.#E };
     try {
       e.appendBuffer(t.data);
     } catch (i) {
-      this.#h = null, i instanceof DOMException && i.name === "QuotaExceededError" ? (this.#u = !0, this.#m(), this.#w(), this.#P()) : this.#_(i);
+      this.#r = null, i instanceof DOMException && i.name === "QuotaExceededError" ? (this.#u = !0, this.#m(), this.#_(), this.#B()) : this.#M("append SourceBuffer", i);
     }
   }
   #I = () => {
-    const e = this.#h;
+    const e = this.#r;
     if (e?.type === "append") {
-      if (e.epoch === this.#k && this.#n[0] === e.pending) {
-        const t = this.#n.shift();
-        this.#g -= t.data.byteLength, t.init || this.#W();
+      if (e.epoch === this.#E && this.#h[0] === e.pending) {
+        const t = this.#h.shift();
+        this.#g -= t.data.byteLength, t.init || this.#F();
       }
-    } else e?.type === "remove" ? (this.#u = !1, this.#w()) : e?.type === "clear" && (this.#a = !1);
-    this.#h = null, this.#T(), this.#P(), this.#m(), this.#p();
+    } else e?.type === "remove" ? (this.#u = !1, this.#_()) : e?.type === "clear" && (this.#a = !1);
+    this.#r = null, this.#T(), this.#B(), this.#m(), this.#p();
   };
   /**
    * The managed source asking for data again, which is the only thing that
    * reopens the door `endstreaming` closed.
    */
-  #B = () => {
-    this.#S = !0, this.#m(), this.#w();
+  #H = () => {
+    this.#k = !0, this.#m(), this.#_();
   };
   /**
    * The managed source saying it has enough.
@@ -241,11 +248,14 @@ class E {
    * is taken until it asks. This is the whole point of the managed source: it
    * knows what the radio and the battery are doing and the page does not.
    */
-  #H = () => {
-    this.#S = !1, this.#m(), this.#w();
+  #O = () => {
+    this.#k = !1, this.#m(), this.#_();
   };
   #N = () => {
-    this.#_(new Error("the SourceBuffer rejected what was appended"));
+    this.#M(
+      "complete SourceBuffer update",
+      new Error("the SourceBuffer rejected what was appended")
+    );
   };
   /**
    * Put the playhead where the media begins, which is not zero.
@@ -259,9 +269,9 @@ class E {
    * playhead into the first buffered range by itself; Firefox waits at zero for
    * data that is not coming.
    */
-  #W() {
-    const e = this.#t?.buffered;
-    this.#r || !e || e.length === 0 || (this.#r = !0, this.#i.onMark?.("appended"), this.#i.seek(e.start(0)));
+  #F() {
+    const e = this.#e?.buffered;
+    this.#n || !e || e.length === 0 || (this.#n = !0, this.#i.onMark?.("appended"), this.#i.seek(e.start(0)));
   }
   /**
    * Put the length of the file on the MediaSource, once it will take one.
@@ -272,14 +282,14 @@ class E {
    * so what is buffered wins: it is the file speaking for itself.
    */
   #T() {
-    const e = this.#b;
-    if (e === null || this.#d || this.mediaSource.readyState !== "open" || this.#h || this.#t?.updating) return;
-    const t = this.#t?.buffered, i = t && t.length > 0 ? t.end(t.length - 1) : 0;
-    this.#b = null;
+    const e = this.#y;
+    if (e === null || this.#o || this.mediaSource.readyState !== "open" || this.#r || this.#e?.updating) return;
+    const t = this.#e?.buffered, i = t && t.length > 0 ? t.end(t.length - 1) : 0;
+    this.#y = null;
     try {
       this.mediaSource.duration = Math.max(e, i);
     } catch (s) {
-      this.#_(s);
+      this.#M("set MediaSource duration", s);
     }
   }
   /**
@@ -291,10 +301,10 @@ class E {
    * from its own bookkeeping, and does not need help. Removing anyway would
    * only be another chance to remove the wrong thing.
    */
-  #P() {
-    const e = this.#t;
-    if (!this.#u || !e || e.updating || this.#h || this.#a || e.buffered.length === 0) return;
-    const t = this.#y - this.#i.keepBehindSeconds;
+  #B() {
+    const e = this.#e;
+    if (!this.#u || !e || e.updating || this.#r || this.#a || e.buffered.length === 0) return;
+    const t = this.#b - this.#i.keepBehindSeconds;
     let i = 0;
     for (const r of this.#c) {
       if (r > t) break;
@@ -304,16 +314,21 @@ class E {
     if (!(s <= 0)) {
       for (; this.#c.length > 0 && this.#c[0] < i; )
         this.#c.shift();
-      this.#h = { type: "remove" }, e.remove(0, s);
+      this.#r = { type: "remove" };
+      try {
+        e.remove(0, s);
+      } catch (r) {
+        this.#r = null, this.#M("evict SourceBuffer range", r);
+      }
     }
   }
   /** How far past the playhead the buffer reaches, in seconds. */
-  #O() {
-    const e = this.#t?.buffered;
-    return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#y;
+  #W() {
+    const e = this.#e?.buffered;
+    return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#b;
   }
   #m() {
-    const e = !this.#u && this.#S && this.#O() < this.#i.maxAheadSeconds && this.#g < this.#i.queueHighWaterMark && this.#n.length < 2;
+    const e = !this.#u && this.#k && this.#W() < this.#i.maxAheadSeconds && this.#g < this.#i.queueHighWaterMark && this.#h.length < 2;
     this.#R.set(e) && this.#i.onReadyChange?.(e);
   }
   /**
@@ -321,81 +336,94 @@ class E {
    * reasons it is: no room left, or a managed source that wants nothing for
    * now. Both look the same from where the conversion sits.
    */
-  #w() {
-    const e = this.#u || !this.#S;
-    e !== this.#E && (this.#E = e, this.#i.onBlocked?.(e));
+  #_() {
+    const e = this.#u || !this.#k;
+    e !== this.#S && (this.#S = e, this.#i.onBlocked?.(e));
   }
   /** Wake `finish`, either because everything is appended or because we gave up. */
   #v(e) {
-    if (!e && (!this.#A || this.#n.length > 0 || this.#h))
+    if (!e && (!this.#A || this.#h.length > 0 || this.#r))
       return;
     const t = this.#D;
     this.#D = [];
     for (const i of t) i();
   }
-  #_(e) {
-    this.#i.onError?.(
-      e instanceof Error ? e : new Error(String(e))
+  #P(e, t) {
+    const i = t instanceof Error ? t : new Error(String(t)), s = this.#e, r = [
+      `mediaSource=${this.mediaSource.readyState}`,
+      `closed=${this.#o}`,
+      `sourceBuffer=${s ? "present" : "absent"}`,
+      `updating=${s?.updating ?? !1}`,
+      `operation=${this.#r?.type ?? "none"}`,
+      `queue=${this.#h.length}`,
+      `epoch=${this.#E}`
+    ].join(", "), a = new Error(
+      `MSE ${e} failed (${r}): ${i.name}: ${i.message}`
     );
+    return a.name = i.name, a.stack += `
+Caused by: ${i.stack ?? i.message}`, a;
+  }
+  #M(e, t) {
+    this.#i.onError?.(this.#P(e, t));
   }
 }
-const v = "" + new URL("assets/worker-9NJB1U0h.js", import.meta.url).href, S = v, d = 0.1, c = [
+const E = "" + new URL("assets/worker-CpkyDHSk.js", import.meta.url).href, v = E, u = 0.1, l = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
   "playing",
   "waiting"
 ];
-function l(n = !1) {
+function f(n = !1) {
   return m(n);
 }
 const k = 'video/mp4; codecs="mp4v.61"';
 function A(n = !1) {
   return p(k, n);
 }
-function o(n) {
+function d(n) {
   return n instanceof Error ? n : new Error(String(n));
 }
-function a() {
+function o() {
   return performance.timeOrigin + performance.now();
 }
 class T extends EventTarget {
   video;
-  #e;
+  #t;
   #i;
   #s = null;
   /** Which load messages belong to. Bumped by every load and every stop. */
-  #t = 0;
+  #e = 0;
   #f = "idle";
   /** The sink, when the page owns the MediaSource. */
-  #o = null;
-  #n = null;
+  #d = null;
+  #h = null;
   /** The `<source>` child a Managed Media Source needs; see #attachManaged. */
   #g = null;
   /** Whether remote playback was turned off here, and so is ours to turn back. */
-  #h = !1;
+  #r = !1;
   #u = null;
-  #S = null;
+  #k = null;
   /** How long the input is, when it turned out to be one that can be seeked. */
-  #E = null;
+  #S = null;
   /** Source video properties indexed by presentation time. */
   #a = [];
   /** What sound the programme last said it was carrying. See `AudioTracks`. */
-  #k = null;
+  #E = null;
   /** When `load()` was called, as epoch milliseconds; every mark counts from it. */
-  #b = 0;
+  #y = 0;
   /** When the last mark was, so each one can say what it cost on its own. */
   #c = 0;
   /** Built the first time deinterlacing is turned on, and kept after that. */
-  #r = null;
+  #n = null;
   /** Whether deinterlacing was asked for. */
-  #y = !1;
-  #d = !1;
+  #b = !1;
+  #o = !1;
   constructor(e, t = {}) {
-    super(), this.video = e, this.#e = t;
+    super(), this.video = e, this.#t = t;
     const i = t.mediaSource ?? "auto";
-    this.#i = i === "auto" ? l(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#O);
-    for (const s of c)
+    this.#i = i === "auto" ? f(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#W);
+    for (const s of l)
       this.video.addEventListener(s, this.#m);
     t.deinterlace && (this.deinterlace = !0);
   }
@@ -407,14 +435,14 @@ class T extends EventTarget {
    * arrives. The same number reaches the media element as its duration.
    */
   get duration() {
-    return this.#E;
+    return this.#S;
   }
   /**
    * What sound the programme is carrying and which of it is being taken, or
    * null before its program map has been read. See `AudioTracks`.
    */
   get audio() {
-    return this.#k;
+    return this.#E;
   }
   /**
    * Take the sound from another of the service's streams from here on.
@@ -433,7 +461,7 @@ class T extends EventTarget {
   selectAudio(e) {
     this.#s?.postMessage({
       type: "audio",
-      id: this.#t,
+      id: this.#e,
       pid: e,
       dualMonoSub: null
     });
@@ -449,7 +477,7 @@ class T extends EventTarget {
   selectDualMono(e) {
     this.#s?.postMessage({
       type: "audio",
-      id: this.#t,
+      id: this.#e,
       pid: null,
       dualMonoSub: e
     });
@@ -466,11 +494,11 @@ class T extends EventTarget {
    * frame; a browser that cannot run it stays false.
    */
   get deinterlace() {
-    return this.#r?.running ?? !1;
+    return this.#n?.running ?? !1;
   }
   /** Whether deinterlacing was asked for, whatever the source turned out to be. */
   get deinterlaceWanted() {
-    return this.#y;
+    return this.#b;
   }
   /**
    * The deinterlacer itself, once there has been one, for the settings that
@@ -478,10 +506,10 @@ class T extends EventTarget {
    * or per frame. Null until `deinterlace` has been turned on.
    */
   get deinterlacer() {
-    return this.#r;
+    return this.#n;
   }
   set deinterlace(e) {
-    this.#y = e, this.#A();
+    this.#b = e, this.#A();
   }
   /**
    * Run the filter where it is both wanted and called for.
@@ -493,11 +521,11 @@ class T extends EventTarget {
    * the two.
    */
   #A() {
-    if (!this.#d)
+    if (!this.#o)
       try {
-        this.#y && !this.#r && this.#e.deinterlacer && (this.#r = this.#e.deinterlacer(this.video)), this.#r && (this.#r.videoTimeline = this.#a, this.#r.enabled = this.#y);
+        this.#b && !this.#n && this.#t.deinterlacer && (this.#n = this.#t.deinterlacer(this.video)), this.#n && (this.#n.videoTimeline = this.#a, this.#n.enabled = this.#b);
       } catch (e) {
-        this.#l("error", { error: o(e) });
+        this.#l("error", { error: d(e) });
       }
   }
   #R(e, t, i) {
@@ -527,55 +555,55 @@ class T extends EventTarget {
         r++;
       r > 0 && this.#a.splice(0, r);
     }
-    this.#r && (this.#r.videoTimeline = this.#a);
+    this.#n && (this.#n.videoTimeline = this.#a);
   }
   #p() {
-    this.#a = [], this.#r && (this.#r.videoTimeline = []);
+    this.#a = [], this.#n && (this.#n.videoTimeline = []);
   }
   load(e) {
-    if (this.#d)
+    if (this.#o)
       return Promise.reject(new Error("the player has been destroyed"));
-    if (this.#i === "worker" && !l(this.#e.preferManagedMediaSource))
+    if (this.#i === "worker" && !f(this.#t.preferManagedMediaSource))
       return Promise.reject(
         new Error("this browser cannot construct a MediaSource in a worker")
       );
     this.stop();
-    const t = this.#t;
-    this.#E = null, this.#p(), this.#A(), this.#b = a(), this.#c = this.#b;
-    const i = this.#I(), s = new Promise((r, f) => {
-      this.#S = { resolve: r, reject: f };
+    const t = this.#e;
+    this.#S = null, this.#p(), this.#A(), this.#y = o(), this.#c = this.#y;
+    const i = this.#I(), s = new Promise((r, a) => {
+      this.#k = { resolve: r, reject: a };
     });
-    return this.#M("loading"), i.postMessage({
+    return this.#w("loading"), i.postMessage({
       type: "load",
       id: t,
       url: String(e),
-      wasmUrl: this.#e.wasmUrl === void 0 ? null : String(this.#e.wasmUrl),
-      oversample: this.#e.oversample,
-      recoveryInterval: this.#e.recoveryInterval,
-      openGopRecovery: this.#e.openGopRecovery,
-      splitFieldSamples: this.#e.splitFieldSamples,
-      passthrough: this.#e.passthrough ?? !1,
-      pictureWorkers: this.#e.pictureWorkers,
-      serviceId: this.#e.serviceId ?? null,
+      wasmUrl: this.#t.wasmUrl === void 0 ? null : String(this.#t.wasmUrl),
+      oversample: this.#t.oversample,
+      recoveryInterval: this.#t.recoveryInterval,
+      openGopRecovery: this.#t.openGopRecovery,
+      splitFieldSamples: this.#t.splitFieldSamples,
+      passthrough: this.#t.passthrough ?? !1,
+      pictureWorkers: this.#t.pictureWorkers,
+      serviceId: this.#t.serviceId ?? null,
       sink: this.#i,
-      preferManagedMediaSource: this.#e.preferManagedMediaSource ?? !1,
-      queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
-      maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
-      keepBehindSeconds: this.#e.keepBehindSeconds ?? 10
-    }), this.#G(), s;
+      preferManagedMediaSource: this.#t.preferManagedMediaSource ?? !1,
+      queueHighWaterMark: this.#t.queueHighWaterMark ?? 33554432,
+      maxAheadSeconds: this.#t.maxAheadSeconds ?? 8,
+      keepBehindSeconds: this.#t.keepBehindSeconds ?? 10
+    }), this.#$(), s;
   }
   /** Abandon the current load. The player stays usable. */
   stop() {
-    const e = this.#t;
-    this.#t++, this.#s?.postMessage({ type: "stop", id: e }), this.#j(), this.#x(new Error("the load was stopped")), this.#M("idle");
+    const e = this.#e;
+    this.#e++, this.#s?.postMessage({ type: "stop", id: e }), this.#j(), this.#C(new Error("the load was stopped")), this.#w("idle");
   }
   /** Stop, and give up the worker. The player cannot be loaded again. */
   destroy() {
-    if (!this.#d) {
-      this.stop(), this.#d = !0, this.video.removeEventListener("seeking", this.#O);
-      for (const e of c)
+    if (!this.#o) {
+      this.stop(), this.#o = !0, this.video.removeEventListener("seeking", this.#W);
+      for (const e of l)
         this.video.removeEventListener(e, this.#m);
-      this.#r?.destroy(), this.#r = null, this.#s?.terminate(), this.#s = null;
+      this.#n?.destroy(), this.#n = null, this.#s?.terminate(), this.#s = null;
     }
   }
   addEventListener(e, t, i) {
@@ -587,24 +615,24 @@ class T extends EventTarget {
   #I() {
     if (!this.#s) {
       const e = new Worker(
-        this.#e.workerUrl ?? S,
+        this.#t.workerUrl ?? v,
         {
           type: "module"
         }
       );
-      e.onmessage = this.#B, e.onerror = (t) => this.#L(new Error(t.message || "the worker failed")), this.#s = e;
+      e.onmessage = this.#H, e.onerror = (t) => this.#L(new Error(t.message || "the worker failed")), this.#s = e;
     }
     return this.#s;
   }
-  #B = (e) => {
+  #H = (e) => {
     const t = e.data;
-    if (t.id === this.#t)
+    if (t.id === this.#e)
       switch (t.type) {
         case "handle":
-          t.managed && this.#T(), this.video.srcObject = t.handle, this.#v("attached", a());
+          t.managed && this.#T(), this.video.srcObject = t.handle, this.#v("attached", o());
           break;
         case "open":
-          this.#H(t.mimeCodec, t.data);
+          this.#O(t.mimeCodec, t.data);
           break;
         case "video-config":
           this.#R(
@@ -614,20 +642,20 @@ class T extends EventTarget {
           );
           break;
         case "fragment":
-          this.#o?.push(
+          this.#d?.push(
             t.data,
             t.start,
             t.randomAccess
           );
           break;
         case "opened":
-          this.#M("converting"), this.#x(null);
+          this.#w("converting"), this.#C(null);
           break;
         case "seekable":
-          this.#E = t.duration, this.#o?.setDuration(t.duration), this.#l("seekable", { duration: t.duration });
+          this.#S = t.duration, this.#d?.setDuration(t.duration), this.#l("seekable", { duration: t.duration });
           break;
         case "reset":
-          this.#p(), this.#o?.reset();
+          this.#p(), this.#d?.reset();
           break;
         case "scans":
           this.#D(t.scans);
@@ -641,7 +669,7 @@ class T extends EventTarget {
           this.#l("services", t.services);
           break;
         case "audio":
-          this.#k = t.audio, this.#l("audio", t.audio);
+          this.#E = t.audio, this.#l("audio", t.audio);
           break;
         case "private_stream_1":
         case "private_stream_2":
@@ -663,13 +691,13 @@ class T extends EventTarget {
           this.#l("stats", t.stats);
           break;
         case "blocked":
-          this.#M(t.blocked ? "buffer-full" : "converting");
+          this.#w(t.blocked ? "buffer-full" : "converting");
           break;
         case "finish":
-          this.#P();
+          this.#B();
           break;
         case "completed":
-          this.#M("completed"), this.#i === "worker" && this.#F();
+          this.#w("completed"), this.#i === "worker" && this.#x();
           break;
         case "error":
           this.#L(new Error(t.message));
@@ -677,44 +705,44 @@ class T extends EventTarget {
       }
   };
   /** Open a MediaSource here, for browsers that cannot have one in a worker. */
-  #H(e, t) {
-    const i = this.#t;
+  #O(e, t) {
+    const i = this.#e;
     let s;
     try {
-      s = this.#o ?? this.#N(i);
+      s = this.#d ?? this.#N(i);
     } catch (r) {
-      this.#L(o(r));
+      this.#L(d(r));
       return;
     }
     s.open(e, t).then(
       // The worker is waiting on flow to know the open succeeded. Going
       // through ready() rather than saying true covers the case where the
       // append filled the queue on its own.
-      () => s.ready().then(() => this.#C(i, { type: "flow", id: i, ready: !0 })),
+      () => s.ready().then(() => this.#G(i, { type: "flow", id: i, ready: !0 })),
       (r) => {
-        i === this.#t && this.#L(o(r));
+        i === this.#e && this.#L(d(r));
       }
     );
   }
   #N(e) {
-    const t = new E({
-      preferManaged: this.#e.preferManagedMediaSource,
-      queueHighWaterMark: this.#e.queueHighWaterMark ?? 33554432,
-      maxAheadSeconds: this.#e.maxAheadSeconds ?? 8,
-      keepBehindSeconds: this.#e.keepBehindSeconds ?? 10,
+    const t = new S({
+      preferManaged: this.#t.preferManagedMediaSource,
+      queueHighWaterMark: this.#t.queueHighWaterMark ?? 33554432,
+      maxAheadSeconds: this.#t.maxAheadSeconds ?? 8,
+      keepBehindSeconds: this.#t.keepBehindSeconds ?? 10,
       seek: (i) => {
         this.video.currentTime < i && (this.video.currentTime = i);
       },
-      onMark: (i) => this.#v(i, a()),
-      onReadyChange: (i) => this.#C(e, { type: "flow", id: e, ready: i }),
+      onMark: (i) => this.#v(i, o()),
+      onReadyChange: (i) => this.#G(e, { type: "flow", id: e, ready: i }),
       onBlocked: (i) => {
-        e === this.#t && this.#M(i ? "buffer-full" : "converting");
+        e === this.#e && this.#w(i ? "buffer-full" : "converting");
       },
       onError: (i) => {
-        e === this.#t && this.#L(i);
+        e === this.#e && this.#L(i);
       }
     });
-    return this.#o = t, this.#n = URL.createObjectURL(t.mediaSource), t.managed ? this.#W(this.#n) : this.video.src = this.#n, this.#v("attached", a()), this.#E !== null && t.setDuration(this.#E), t;
+    return this.#d = t, this.#h = URL.createObjectURL(t.mediaSource), t.managed ? this.#F(this.#h) : this.video.src = this.#h, this.#v("attached", o()), this.#S !== null && t.setDuration(this.#S), t;
   }
   /**
    * Put a Managed Media Source on the element, which takes more than a `src`.
@@ -725,7 +753,7 @@ class T extends EventTarget {
    * than the attribute. Neither is optional: miss one and `sourceopen` never
    * arrives and the load waits for a stream that has not begun.
    */
-  #W(e) {
+  #F(e) {
     this.video.removeAttribute("src"), this.#T();
     const t = document.createElement("source");
     t.type = "video/mp4", t.src = e, this.video.append(t), this.#g = t, this.video.load();
@@ -737,16 +765,16 @@ class T extends EventTarget {
    * was already off, and theirs to keep.
    */
   #T() {
-    this.video.disableRemotePlayback || (this.video.disableRemotePlayback = !0, this.#h = !0);
+    this.video.disableRemotePlayback || (this.video.disableRemotePlayback = !0, this.#r = !0);
   }
-  #P() {
-    const e = this.#t, t = this.#o;
+  #B() {
+    const e = this.#e, t = this.#d;
     t && t.finish().then(
       () => {
-        e === this.#t && this.#F();
+        e === this.#e && this.#x();
       },
       (i) => {
-        e === this.#t && this.#L(o(i));
+        e === this.#e && this.#L(d(i));
       }
     );
   }
@@ -758,17 +786,17 @@ class T extends EventTarget {
    * What is left is a real seek: the worker throws the buffer away and reads
    * the input again from where the viewer asked to be.
    */
-  #O = () => {
-    if (this.#E === null || this.#f === "idle" || this.#f === "error") return;
+  #W = () => {
+    if (this.#S === null || this.#f === "idle" || this.#f === "error") return;
     const e = this.video.currentTime;
-    this.#_(e) || (this.#M("seeking"), this.#p(), this.#G(), this.#s?.postMessage({
+    this.#P(e) || (this.#w("seeking"), this.#p(), this.#$(), this.#s?.postMessage({
       type: "seek",
-      id: this.#t,
+      id: this.#e,
       time: e
     }));
   };
   #m = (e) => {
-    this.#f !== "idle" && (this.#v(e.type, a()), e.type === "waiting" && this.#w());
+    this.#f !== "idle" && (this.#v(e.type, o()), e.type === "waiting" && this.#_());
   };
   /**
    * Move the playhead over a hole in the media, where playback has stopped at
@@ -789,15 +817,15 @@ class T extends EventTarget {
    * it is the one reading available whether the `MediaSource` is here or in the
    * worker.
    */
-  #w() {
+  #_() {
     if (this.video.seeking) return;
     const e = this.video.currentTime, t = this.video.buffered;
     let i = null;
     for (let s = 0; s < t.length; s++) {
       const r = t.start(s);
-      if (e >= r - d && e < t.end(s) - d)
+      if (e >= r - u && e < t.end(s) - u)
         return;
-      r > e + d && (i === null || r < i) && (i = r);
+      r > e + u && (i === null || r < i) && (i = r);
     }
     i !== null && (this.video.currentTime = i);
   }
@@ -809,11 +837,11 @@ class T extends EventTarget {
    * which is measured from here.
    */
   #v(e, t) {
-    if (this.#b === 0) return;
-    const i = t - this.#b, s = Math.max(0, t - this.#c);
+    if (this.#y === 0) return;
+    const i = t - this.#y, s = Math.max(0, t - this.#c);
     this.#c = Math.max(this.#c, t), this.#l("timing", { name: e, sinceLoad: i, sincePrevious: s });
   }
-  #_(e) {
+  #P(e) {
     const t = this.video.buffered;
     for (let i = 0; i < t.length; i++)
       if (e >= t.start(i) && e < t.end(i))
@@ -825,37 +853,37 @@ class T extends EventTarget {
    * behind. This cannot ride on `timeupdate`: that event stops firing exactly
    * when playback stalls, which is when eviction matters most.
    */
-  #q = () => {
+  #M = () => {
     const e = this.video.currentTime;
-    this.#i === "main" ? this.#o?.setCurrentTime(e) : this.#s?.postMessage({
+    this.#i === "main" ? this.#d?.setCurrentTime(e) : this.#s?.postMessage({
       type: "time",
-      id: this.#t,
+      id: this.#e,
       currentTime: e
     });
   };
-  #C(e, t) {
-    e === this.#t && this.#s?.postMessage(t);
+  #G(e, t) {
+    e === this.#e && this.#s?.postMessage(t);
   }
-  #G() {
+  #$() {
     this.#u === null && (this.#u = setInterval(
-      this.#q,
+      this.#M,
       200
     ));
   }
-  #F() {
+  #x() {
     this.#u !== null && (clearInterval(this.#u), this.#u = null);
   }
   #j() {
-    this.#F(), this.#p(), this.#o?.close(), this.#o = null, this.#n && URL.revokeObjectURL(this.#n), this.#n = null, this.#g?.remove(), this.#g = null, this.#h && (this.video.disableRemotePlayback = !1, this.#h = !1), this.video.removeAttribute("src"), this.video.srcObject = null, this.video.load();
+    this.#x(), this.#p(), this.#d?.close(), this.#d = null, this.#h && URL.revokeObjectURL(this.#h), this.#h = null, this.#g?.remove(), this.#g = null, this.#r && (this.video.disableRemotePlayback = !1, this.#r = !1), this.video.removeAttribute("src"), this.video.srcObject = null, this.video.load();
   }
   #L(e) {
-    this.#j(), this.#M("error"), this.#x(e), this.#l("error", { error: e });
+    this.#j(), this.#w("error"), this.#C(e), this.#l("error", { error: e });
   }
-  #x(e) {
-    const t = this.#S;
-    t && (this.#S = null, e ? t.reject(e) : t.resolve());
+  #C(e) {
+    const t = this.#k;
+    t && (this.#k = null, e ? t.reject(e) : t.resolve());
   }
-  #M(e) {
+  #w(e) {
     this.#f !== e && (this.#f = e, this.#l("statechange", { state: e }));
   }
   #l(e, t) {
@@ -864,12 +892,12 @@ class T extends EventTarget {
 }
 export {
   M as DEFAULT_KEEP_BEHIND_SECONDS,
-  y as DEFAULT_MAX_AHEAD_SECONDS,
-  b as DEFAULT_QUEUE_HIGH_WATER_MARK,
+  b as DEFAULT_MAX_AHEAD_SECONDS,
+  y as DEFAULT_QUEUE_HIGH_WATER_MARK,
   T as Mpeg2TsPlayer,
   _ as requiresManagedMediaSource,
   w as supportsManagedMediaSource,
   A as supportsPassthrough,
-  l as supportsWorkerMediaSource
+  f as supportsWorkerMediaSource
 };
 //# sourceMappingURL=index.js.map
