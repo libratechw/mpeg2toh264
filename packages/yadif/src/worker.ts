@@ -11,7 +11,7 @@ import type {
   WorkerRenderingOptions,
   WorkerVideoState,
 } from "./worker-protocol.js";
-import { drainEngineTrace } from "./render-trace.js";
+import { drainEngineTrace, recordEngineTrace } from "./render-trace.js";
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -150,8 +150,10 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
     }
     if (!video || !deinterlacer) return;
     switch (command.type) {
-      case "frame":
+      case "frame": {
+        const receivedAt = performance.now();
         video.update(command.video);
+        const ingestStartedAt = performance.now();
         try {
           // ページと Worker の performance は時刻原点が一致する保証がないため、表示予定は描画ループと同じ Worker の時計で作る。
           deinterlacer.ingestExternalFrame(
@@ -160,10 +162,23 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
             command.frame,
           );
         } finally {
+          const ingestEndedAt = performance.now();
+          const closeStartedAt = performance.now();
           command.frame.close();
+          const closedAt = performance.now();
+          recordEngineTrace({
+            kind: "worker-frame",
+            atMs: closedAt,
+            id: command.id,
+            receiveAtMs: receivedAt,
+            ingestMs: ingestEndedAt - ingestStartedAt,
+            closeMs: closedAt - closeStartedAt,
+            totalMs: closedAt - receivedAt,
+          });
           post({ type: "consumed", id: command.id });
         }
         break;
+      }
       case "settings":
         applySettings(deinterlacer, command.options);
         break;

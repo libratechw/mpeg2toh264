@@ -377,6 +377,7 @@ export class Deinterlacer extends EventTarget {
   #lastLoopAt = 0;
   /** ページ側で requestVideoFrameCallback() の停止を監視する requestAnimationFrame()。 */
   #frameWatchdogHandle: number | null = null;
+  #lastFrameWatchdogAt = 0;
   /** The gap between animation frames: as near as the page gets to the screen. */
   #refreshMs = DEFAULT_REFRESH_MS;
   /** The `<div>` this put around the element, so it can be taken away again. */
@@ -432,6 +433,7 @@ export class Deinterlacer extends EventTarget {
   #displayCanvasTransferred = false;
   #workerFrameID = 0;
   #workerFrameInFlight = false;
+  #workerFrameSentAt: { id: number; atMs: number } | null = null;
   #workerAcceptedFrame = false;
   #pendingWorkerFrame: PendingWorkerFrame | null = null;
   #captureID = 0;
@@ -773,6 +775,7 @@ export class Deinterlacer extends EventTarget {
     this.#worker?.terminate();
     this.#worker = null;
     this.#workerFrameInFlight = false;
+    this.#workerFrameSentAt = null;
     this.#workerAcceptedFrame = false;
     let canvas = this.#displayCanvas;
     // 初回は公開済みの要素をそのまま使い、片方向転送済みの canvas を復旧する場合だけ新しい要素へ差し替える。
@@ -855,6 +858,18 @@ export class Deinterlacer extends EventTarget {
       case "consumed": {
         this.#workerFrameInFlight = false;
         this.#workerAcceptedFrame = true;
+        const acknowledgedAt = performance.now();
+        const sent = this.#workerFrameSentAt;
+        recordEngineTrace({
+          kind: "worker-bridge",
+          atMs: acknowledgedAt,
+          stage: "acknowledged",
+          id: notification.id,
+          relatedId: null,
+          durationMs:
+            sent?.id === notification.id ? acknowledgedAt - sent.atMs : null,
+        });
+        this.#workerFrameSentAt = null;
         const pending = this.#pendingWorkerFrame;
         this.#pendingWorkerFrame = null;
         if (pending) this.#sendWorkerFrame(pending);
@@ -1169,6 +1184,8 @@ export class Deinterlacer extends EventTarget {
     now: DOMHighResTimeStamp,
     metadata: FrameObservation,
   ): void {
+    const id = ++this.#workerFrameID;
+    const constructionStartedAt = performance.now();
     let frame: VideoFrame;
     try {
       frame = new VideoFrame(this.#video, {
@@ -1189,16 +1206,36 @@ export class Deinterlacer extends EventTarget {
       }
       return;
     }
+    const offeredAt = performance.now();
+    recordEngineTrace({
+      kind: "worker-bridge",
+      atMs: offeredAt,
+      stage: "offered",
+      id,
+      relatedId: null,
+      durationMs: offeredAt - constructionStartedAt,
+    });
     const pending: PendingWorkerFrame = {
-      id: ++this.#workerFrameID,
+      id,
       frame,
       now,
       metadata,
       video: this.#workerVideoState(),
     };
     if (this.#workerFrameInFlight) {
+      const replacedId = this.#pendingWorkerFrame?.id ?? null;
+      const pendingCloseStartedAt = performance.now();
       this.#pendingWorkerFrame?.frame.close();
+      const pendingStoredAt = performance.now();
       this.#pendingWorkerFrame = pending;
+      recordEngineTrace({
+        kind: "worker-bridge",
+        atMs: pendingStoredAt,
+        stage: replacedId === null ? "pending-set" : "pending-replaced",
+        id,
+        relatedId: replacedId,
+        durationMs: pendingStoredAt - pendingCloseStartedAt,
+      });
       return;
     }
     this.#sendWorkerFrame(pending);
@@ -1214,9 +1251,21 @@ export class Deinterlacer extends EventTarget {
     this.#workerFrameInFlight = true;
     const command: WorkerCommand = { type: "frame", ...pending };
     try {
+      const sendStartedAt = performance.now();
       worker.postMessage(command, [pending.frame]);
+      const sentAt = performance.now();
+      this.#workerFrameSentAt = { id: pending.id, atMs: sentAt };
+      recordEngineTrace({
+        kind: "worker-bridge",
+        atMs: sentAt,
+        stage: "sent",
+        id: pending.id,
+        relatedId: null,
+        durationMs: sentAt - sendStartedAt,
+      });
     } catch (error) {
       this.#workerFrameInFlight = false;
+      this.#workerFrameSentAt = null;
       pending.frame.close();
       const message = error instanceof Error ? error.message : String(error);
       // 最初のフレーム転送失敗は機能不足として扱い、実動後の障害だけを再構築の対象にする。
@@ -1914,6 +1963,7 @@ export class Deinterlacer extends EventTarget {
       this.#lost
     )
       return;
+    this.#lastFrameWatchdogAt = 0;
     this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
   }
 
@@ -1922,12 +1972,20 @@ export class Deinterlacer extends EventTarget {
     if (this.#frameWatchdogHandle !== null)
       cancelAnimationFrame(this.#frameWatchdogHandle);
     this.#frameWatchdogHandle = null;
+    this.#lastFrameWatchdogAt = 0;
   }
 
   /** requestAnimationFrame() ごとにフレーム通知の停止を検査し、次の監視を予約する。 */
   #onFrameWatchdog = (now: DOMHighResTimeStamp): void => {
     this.#frameWatchdogHandle = null;
     if (!this.#running || this.#lost) return;
+    recordEngineTrace({
+      kind: "page-raf",
+      atMs: now,
+      gapMs:
+        this.#lastFrameWatchdogAt > 0 ? now - this.#lastFrameWatchdogAt : null,
+    });
+    this.#lastFrameWatchdogAt = now;
     this.#recoverFrameCallback(now);
     this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
   };
