@@ -303,12 +303,16 @@ export class MseSink implements FragmentSink {
     await this.#opened;
     if (this.#closed) return;
     if (!this.#sourceBuffer) {
-      const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
-      sourceBuffer.mode = "segments";
-      sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
-      sourceBuffer.addEventListener("error", this.#onSourceBufferError);
-      this.#sourceBuffer = sourceBuffer;
-      this.#mimeCodec = mimeCodec;
+      try {
+        const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
+        sourceBuffer.mode = "segments";
+        sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
+        sourceBuffer.addEventListener("error", this.#onSourceBufferError);
+        this.#sourceBuffer = sourceBuffer;
+        this.#mimeCodec = mimeCodec;
+      } catch (error) {
+        throw this.#error("add or configure SourceBuffer", error);
+      }
     } else if (mimeCodec !== this.#mimeCodec) {
       // Resuming elsewhere in the same file can turn up a different profile,
       // and only changeType lets a SourceBuffer accept one. It cannot run
@@ -377,7 +381,13 @@ export class MseSink implements FragmentSink {
     // A seek during the drain releases this without the queue having emptied,
     // and what follows is a stream that is not ending after all.
     if (this.#closed || this.#epoch !== epoch) return;
-    if (this.mediaSource.readyState === "open") this.mediaSource.endOfStream();
+    if (this.mediaSource.readyState === "open") {
+      try {
+        this.mediaSource.endOfStream();
+      } catch (error) {
+        throw this.#error("end MediaSource", error);
+      }
+    }
   }
 
   close(): void {
@@ -436,7 +446,7 @@ export class MseSink implements FragmentSink {
       } catch (error) {
         this.#operation = null;
         this.#clearing = false;
-        this.#fail(error);
+        this.#fail("clear SourceBuffer", error);
       }
       return;
     }
@@ -453,7 +463,7 @@ export class MseSink implements FragmentSink {
         sourceBuffer.changeType(mimeCodec);
         this.#mimeCodec = mimeCodec;
       } catch (error) {
-        this.#fail(error);
+        this.#fail("change SourceBuffer type", error);
         return;
       }
     }
@@ -472,7 +482,7 @@ export class MseSink implements FragmentSink {
         // Try at once rather than waiting for playback to raise an event: if
         // the buffer ahead runs out first, nothing will raise one.
         this.#evict();
-      } else this.#fail(error);
+      } else this.#fail("append SourceBuffer", error);
     }
   }
 
@@ -525,7 +535,10 @@ export class MseSink implements FragmentSink {
   };
 
   #onSourceBufferError = (): void => {
-    this.#fail(new Error("the SourceBuffer rejected what was appended"));
+    this.#fail(
+      "complete SourceBuffer update",
+      new Error("the SourceBuffer rejected what was appended"),
+    );
   };
 
   /**
@@ -568,7 +581,7 @@ export class MseSink implements FragmentSink {
     try {
       this.mediaSource.duration = Math.max(duration, end);
     } catch (error) {
-      this.#fail(error);
+      this.#fail("set MediaSource duration", error);
     }
   }
 
@@ -614,7 +627,12 @@ export class MseSink implements FragmentSink {
       this.#randomAccessPoints.shift();
     }
     this.#operation = { type: "remove" };
-    sourceBuffer.remove(0, removeEnd);
+    try {
+      sourceBuffer.remove(0, removeEnd);
+    } catch (error) {
+      this.#operation = null;
+      this.#fail("evict SourceBuffer range", error);
+    }
   }
 
   /** How far past the playhead the buffer reaches, in seconds. */
@@ -655,9 +673,27 @@ export class MseSink implements FragmentSink {
     for (const resolve of waiting) resolve();
   }
 
-  #fail(error: unknown): void {
-    this.#options.onError?.(
-      error instanceof Error ? error : new Error(String(error)),
+  #error(operation: string, error: unknown): Error {
+    const cause = error instanceof Error ? error : new Error(String(error));
+    const sourceBuffer = this.#sourceBuffer;
+    const detail = [
+      `mediaSource=${this.mediaSource.readyState}`,
+      `closed=${this.#closed}`,
+      `sourceBuffer=${sourceBuffer ? "present" : "absent"}`,
+      `updating=${sourceBuffer?.updating ?? false}`,
+      `operation=${this.#operation?.type ?? "none"}`,
+      `queue=${this.#queue.length}`,
+      `epoch=${this.#epoch}`,
+    ].join(", ");
+    const contextual = new Error(
+      `MSE ${operation} failed (${detail}): ${cause.name}: ${cause.message}`,
     );
+    contextual.name = cause.name;
+    contextual.stack += `\nCaused by: ${cause.stack ?? cause.message}`;
+    return contextual;
+  }
+
+  #fail(operation: string, error: unknown): void {
+    this.#options.onError?.(this.#error(operation, error));
   }
 }

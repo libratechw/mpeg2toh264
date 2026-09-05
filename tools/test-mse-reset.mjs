@@ -9,6 +9,7 @@ import { build } from "esbuild";
 class FakeSourceBuffer extends EventTarget {
   mode = "segments";
   updating = false;
+  appendError = null;
   appended = [];
   removed = [];
   buffered = {
@@ -18,6 +19,7 @@ class FakeSourceBuffer extends EventTarget {
   };
 
   appendBuffer(data) {
+    if (this.appendError) throw this.appendError;
     assert.equal(this.updating, false);
     this.updating = true;
     this.appended.push(data);
@@ -95,6 +97,27 @@ try {
   assert.equal(sourceBuffer.appended[1], newInit);
   sourceBuffer.complete();
   assert.equal(sourceBuffer.appended[2], newMedia);
+
+  const diagnosticErrors = [];
+  const diagnosticSink = new MseSink({
+    queueHighWaterMark: 1024 * 1024,
+    maxAheadSeconds: 8,
+    keepBehindSeconds: 10,
+    seek() {},
+    onError(error) {
+      diagnosticErrors.push(error);
+    },
+  });
+  const invalidState = new Error("The object is in an invalid state.");
+  invalidState.name = "InvalidStateError";
+  diagnosticSink.mediaSource.sourceBuffer.appendError = invalidState;
+  await diagnosticSink.open("video/mp4; codecs=avc1.640028", oldInit);
+  assert.equal(diagnosticErrors.length, 1);
+  assert.equal(diagnosticErrors[0].name, "InvalidStateError");
+  assert.match(
+    diagnosticErrors[0].message,
+    /^MSE append SourceBuffer failed \(mediaSource=open, closed=false, sourceBuffer=present, updating=false, operation=none, queue=1, epoch=0\): InvalidStateError: The object is in an invalid state\.$/,
+  );
 } finally {
   delete globalThis.MediaSource;
   await unlink(output).catch(() => {});
