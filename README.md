@@ -120,6 +120,8 @@ Main limitations:
 - Resolution changes or switches between progressive and interlaced sequences during conversion are not supported.
 - Transport-stream audio must be AAC-LC; channel-element rearrangement supports 44.1 kHz and 48 kHz.
 - Corrupt slices, leading B pictures without all references, and unpaired field pictures are skipped.
+- At transport packet loss, the trailing picture whose completion cannot be proved is discarded while earlier pictures with a following picture boundary are preserved.
+- Session tests cover this transport-loss behavior; applications adopting the change must verify damaged-TS recovery in their browser and device environments.
 - Output is lossy because of requantization, and fractional-pixel prediction uses the approximations shown in the table above.
 
 Interlaced-video limitations:
@@ -303,6 +305,8 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
 - 変換中の解像度またはプログレッシブ/インターレースシーケンスの変更は不可
 - TSの音声はAAC-LC、チャンネルエレメントの組み替えは44.1 kHzまたは48 kHzを対象とする
 - 破損スライス、参照が揃わない先頭Bピクチャ、片方だけのフィールドピクチャは読み飛ばす
+- TS packet欠落時は完了を確認できない末尾ピクチャを破棄し、次のピクチャ開始位置まで受信済みの先行ピクチャは保持する
+- この欠落処理はSession testで確認している。変更を取り込む側では、使用するbrowserと端末で異常TSから復帰できることを確認する必要がある
 - 出力は再量子化による非可逆変換であり、小数画素予測には表の通りの近似がある
 
 インターレースの映像の制約:
