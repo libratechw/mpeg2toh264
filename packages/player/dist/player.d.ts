@@ -1,3 +1,4 @@
+import { type DiagnosticLifecycleToken, type LifecycleTraceDetail, type MediaSourceClassName } from "./lifecycle.js";
 import { type AudioTracks, type PlayerState, type PrivateStream, type Progress, type Scan, type VideoState, type Services, type SinkKind, type Stats, type Timing } from "./protocol.js";
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {
@@ -155,6 +156,12 @@ export interface Mpeg2TsPlayerEventMap {
         error: Error;
     }>;
 }
+export interface DiagnosticLifecycleOptions {
+    /** Timestamp already taken with `performance.timeOrigin + performance.now()`. */
+    readonly at?: number;
+    /** Retain this as the first possible cause even after the ring rotates. */
+    readonly critical?: boolean;
+}
 /**
  * Whether a worker can own the MediaSource.
  *
@@ -241,6 +248,22 @@ export declare class Mpeg2TsPlayer extends EventTarget {
     selectDualMono(sub: boolean): void;
     /** Which side of the wire ended up owning the MediaSource. */
     get mediaSourceOwner(): SinkKind;
+    /** The constructor actually opened for this load, once MSE exists. */
+    get mediaSourceClass(): MediaSourceClassName | null;
+    /**
+     * Add a page-owner event to the diagnostic chronology.
+     *
+     * `at` must use `performance.timeOrigin + performance.now()` so it can be
+     * ordered beside worker events. Details are primitives by contract, which
+     * keeps the fatal snapshot cloneable and serializable. A malformed event,
+     * timestamp, detail, or options object is ignored without affecting playback.
+     */
+    recordDiagnosticLifecycle(event: string, detail?: LifecycleTraceDetail, options?: DiagnosticLifecycleOptions): DiagnosticLifecycleToken | null;
+    /**
+     * Release one integration-owned critical entry after its causal operation
+     * succeeds. Only the opaque token returned for that exact entry can do so.
+     */
+    resolveDiagnosticLifecycle(token: DiagnosticLifecycleToken): void;
     /**
      * Whether the picture is being deinterlaced, which is not quite the same as
      * having asked for it: a source that says it is progressive is left alone,

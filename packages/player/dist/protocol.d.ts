@@ -5,6 +5,7 @@
  * those ids and both sides drop anything that does not match the load they are
  * on, which is how a `load()` over a running conversion leaves no stragglers.
  */
+import type { MseLifecycleTrace } from "./lifecycle.js";
 /** Stop handing fragments to the sink above this many bytes waiting to append. */
 export declare const DEFAULT_QUEUE_HIGH_WATER_MARK: number;
 /**
@@ -327,6 +328,12 @@ export type Notification = {
     id: number;
     stats: Stats;
 }
+/** A MediaSource lifecycle event, timestamped on the shared page/worker clock. */
+ | {
+    type: "lifecycle";
+    id: number;
+    trace: MseLifecycleTrace;
+}
 /** The MSE buffer filled up, or made room again. Worker-sink loads only. */
  | {
     type: "blocked";
@@ -346,6 +353,8 @@ export type Notification = {
     type: "error";
     id: number;
     message: string;
+    /** Failure time on the clock shared with page-side lifecycle entries. */
+    at: number;
 };
 /**
  * The steps of getting from a URL to a picture, in the order they happen.

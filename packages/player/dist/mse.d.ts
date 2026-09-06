@@ -1,4 +1,14 @@
 /**
+ * Feeding Media Source Extensions, from wherever the `MediaSource` lives.
+ *
+ * This module compiles into both programs: on the page it uses the DOM's MSE
+ * declarations, in the worker the ones in worker-mse.d.ts. Nothing here
+ * touches a media element -- the two things that need one, moving the playhead
+ * and reading it, go through `seek` and `setCurrentTime` -- so the same buffer
+ * management runs whether MSE is on the page or in the worker.
+ */
+import { type MseLifecycleTrace } from "./lifecycle.js";
+/**
  * Whether Media Source Extensions here will take this codec.
  *
  * Asking the constructor that would be opened rather than `MediaSource`, which
@@ -37,7 +47,7 @@ export interface FragmentSink {
     /** No more fragments: drain what is queued and end the stream. */
     finish(): Promise<void>;
     /** Give up, releasing anyone waiting on `ready` or `finish`. */
-    close(): void;
+    close(reason?: string): void;
 }
 /** A latch a producer can await, so backpressure costs no polling. */
 export declare class ReadyGate {
@@ -73,6 +83,8 @@ export interface MseSinkOptions {
      * The two bracket everything MSE does before playback can begin.
      */
     onMark?(name: "sourceopen" | "appended"): void;
+    /** A bounded-trace input, timestamped before it leaves this realm. */
+    onLifecycle?(trace: MseLifecycleTrace): void;
     onError?(error: Error): void;
 }
 export declare class MseSink implements FragmentSink {
@@ -116,7 +128,7 @@ export declare class MseSink implements FragmentSink {
      */
     reset(): void;
     finish(): Promise<void>;
-    close(): void;
+    close(reason?: string): void;
     /** Tell the sink where playback has got to, so it can evict what is behind. */
     setCurrentTime(time: number): void;
 }
