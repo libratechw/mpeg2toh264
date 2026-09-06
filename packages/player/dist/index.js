@@ -142,11 +142,14 @@ function d(s, e, t) {
     return t;
   }
 }
+function X(s) {
+  return d(s, "name", "Error");
+}
 function f(s, e, t) {
   const i = Object.getOwnPropertyDescriptor(s, e);
   return i === void 0 ? Object.isExtensible(s) : i.configurable ? !0 : "writable" in i && i.writable === !0 && (t === void 0 || i.enumerable === t);
 }
-function X(s) {
+function Y(s) {
   try {
     return f(s, "message") && f(s, "lifecycleEventId", !0) && f(s, "lifecycleTrace", !0);
   } catch {
@@ -169,26 +172,26 @@ function p(s, e, t, i) {
 function b(s, e, t) {
   return p(s, "message", e, !1), p(s, "lifecycleEventId", t.eventId, !0), p(s, "lifecycleTrace", t, !0), s;
 }
-function Y(s, e) {
-  const t = W(e), r = `${d(
+function K(s, e) {
+  const t = W(e), i = d(s, "name", null), n = `${d(
     s,
     "message",
     "the original error message was unavailable"
   )}
 ${t}`;
-  if (X(s))
+  if (i !== null && Y(s))
     try {
-      return b(s, r, e);
+      return b(s, n, e);
     } catch {
     }
-  const n = new Error(r, { cause: s });
-  n.name = d(s, "name", "Error");
-  const a = d(s, "stack", null);
-  return a !== null && (n.stack = `${n.name}: ${n.message}
+  const a = new Error(n, { cause: s });
+  a.name = i ?? "Error";
+  const c = d(s, "stack", null);
+  return c !== null && (a.stack = `${a.name}: ${a.message}
 Caused by original error:
-${a}`), b(n, r, e);
+${c}`), b(a, n, e);
 }
-function he(s) {
+function ue(s) {
   try {
     if (typeof s != "object" || s === null) return !1;
     const e = s, t = e.lifecycleEventId, i = e.lifecycleTrace;
@@ -199,24 +202,24 @@ function he(s) {
     return !1;
   }
 }
-const E = 32 * 1024 * 1024, K = 2, k = 8, w = 10, Q = 200, Z = 1e-3, h = globalThis.ManagedMediaSource;
+const E = 32 * 1024 * 1024, Q = 2, k = 8, w = 10, Z = 200, J = 1e-3, h = globalThis.ManagedMediaSource;
 function v(s = !1) {
   const e = typeof MediaSource > "u" ? null : MediaSource;
   return s && h ? h : e ?? h ?? null;
 }
-function J(s, e = !1) {
+function ee(s, e = !1) {
   return v(e)?.isTypeSupported(s) ?? !1;
 }
-function ee(s = !1) {
+function te(s = !1) {
   return v(s)?.canConstructInDedicatedWorker === !0;
 }
-function ue() {
+function le() {
   return h !== void 0;
 }
-function le() {
+function de() {
   return typeof MediaSource > "u" && h !== void 0;
 }
-class te {
+class ie {
   #t = !0;
   #l = [];
   get open() {
@@ -241,7 +244,7 @@ class te {
     for (const t of e) t();
   }
 }
-class ie {
+class se {
   /**
    * Made in the constructor rather than in `open`, because a caller needs
    * something to attach before the codec is known: the worker sends
@@ -298,7 +301,7 @@ class ie {
   #$ = 0;
   #T = null;
   #N = null;
-  #R = new te();
+  #R = new ie();
   #D = [];
   constructor(e) {
     this.#i = e;
@@ -556,7 +559,7 @@ class ie {
       if (n > t) break;
       i = n;
     }
-    const r = i - Z;
+    const r = i - J;
     if (!(r <= 0)) {
       for (; this.#y.length > 0 && this.#y[0] < i; )
         this.#y.shift();
@@ -574,7 +577,7 @@ class ie {
     return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#L;
   }
   #n() {
-    const e = !this.#d && this.#g && this.#K() < this.#i.maxAheadSeconds && this.#p < this.#i.queueHighWaterMark && this.#c.length < K;
+    const e = !this.#d && this.#g && this.#K() < this.#i.maxAheadSeconds && this.#p < this.#i.queueHighWaterMark && this.#c.length < Q;
     this.#R.set(e) && this.#i.onReadyChange?.(e);
   }
   /**
@@ -660,7 +663,7 @@ Caused by: ${i.stack ?? i.message}`, c;
     this.#i.onError?.(this.#j(e, t));
   }
 }
-const se = "" + new URL("assets/worker-Cy2uYoRF.js", import.meta.url).href, re = se, m = 0.1, M = [
+const re = "" + new URL("assets/worker-Cy2uYoRF.js", import.meta.url).href, ne = re, m = 0.1, M = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
@@ -672,31 +675,31 @@ const se = "" + new URL("assets/worker-Cy2uYoRF.js", import.meta.url).href, re =
   "abort",
   "error"
 ];
-let ne = 0, ae = 0;
+let ae = 0, oe = 0;
 const A = /* @__PURE__ */ new WeakMap();
 let u = new _();
 const g = /* @__PURE__ */ new WeakMap();
-function oe(s) {
+function ce(s) {
   const e = A.get(s);
   if (e !== void 0) return e;
-  const t = ++ae;
+  const t = ++oe;
   return A.set(s, t), t;
 }
 function I(s = !1) {
-  return ee(s);
+  return te(s);
 }
-const ce = 'video/mp4; codecs="mp4v.61"';
-function de(s = !1) {
-  return J(ce, s);
+const he = 'video/mp4; codecs="mp4v.61"';
+function fe(s = !1) {
+  return ee(he, s);
 }
 function l(s) {
   return s instanceof Error ? s : new Error(String(s));
 }
-class fe extends EventTarget {
+class pe extends EventTarget {
   video;
   #t;
   #l;
-  #i = ++ne;
+  #i = ++ae;
   #u;
   #e = null;
   /** Which load messages belong to. Bumped by every load and every stop. */
@@ -729,7 +732,7 @@ class fe extends EventTarget {
   #A = !1;
   #$ = 0;
   constructor(e, t = {}) {
-    super(), this.video = e, this.#u = oe(e), this.#t = t;
+    super(), this.video = e, this.#u = ce(e), this.#t = t;
     const i = t.mediaSource ?? "auto";
     this.#l = i === "auto" ? I(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#z);
     for (const r of M)
@@ -972,7 +975,7 @@ class fe extends EventTarget {
   #_() {
     if (!this.#e) {
       const e = new Worker(
-        this.#t.workerUrl ?? re,
+        this.#t.workerUrl ?? ne,
         {
           type: "module"
         }
@@ -1104,7 +1107,7 @@ class fe extends EventTarget {
     );
   }
   #H(e) {
-    const t = new ie({
+    const t = new se({
       preferManaged: this.#t.preferManagedMediaSource,
       queueHighWaterMark: this.#t.queueHighWaterMark ?? E,
       maxAheadSeconds: this.#t.maxAheadSeconds ?? k,
@@ -1306,7 +1309,7 @@ class fe extends EventTarget {
   #a() {
     this.#w === null && (this.#w = setInterval(
       this.#G,
-      Q
+      Z
     ));
   }
   #j() {
@@ -1328,7 +1331,7 @@ class fe extends EventTarget {
     const t = o();
     this.#n(
       "player-fail",
-      { ...this.#Y(!0), errorName: e.name },
+      { ...this.#Y(!0), errorName: X(e) },
       { at: t, critical: !0 }
     );
     const i = [
@@ -1339,7 +1342,7 @@ class fe extends EventTarget {
       (++this.#$).toString(36)
     ].join("-"), r = u.freeze(i, t);
     u = new _();
-    const n = Y(e, r);
+    const n = K(e, r);
     this.#k("fail"), this.#I("error"), this.#Z(n), this.#S("error", { error: n });
   }
   #J(e) {
@@ -1373,12 +1376,12 @@ export {
   E as DEFAULT_QUEUE_HIGH_WATER_MARK,
   j as LIFECYCLE_EVENT_ID_MAX_LENGTH,
   T as LIFECYCLE_TRACE_CAPACITY,
-  fe as Mpeg2TsPlayer,
-  he as isLifecycleError,
+  pe as Mpeg2TsPlayer,
+  ue as isLifecycleError,
   o as lifecycleNow,
-  le as requiresManagedMediaSource,
-  ue as supportsManagedMediaSource,
-  de as supportsPassthrough,
+  de as requiresManagedMediaSource,
+  le as supportsManagedMediaSource,
+  fe as supportsPassthrough,
   I as supportsWorkerMediaSource
 };
 //# sourceMappingURL=index.js.map

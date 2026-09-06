@@ -93,6 +93,8 @@ export declare class LifecycleTrace {
     resolveCritical(entry: LifecycleTraceEntry): boolean;
     freeze(eventId: string, frozenAt?: number): LifecycleTraceSnapshot;
 }
+/** Read an Error name without allowing a host getter to escape diagnostics. */
+export declare function readErrorName(error: Error): string;
 /**
  * Decorate the same Error instance when its own properties permit it. A
  * readonly or non-extensible error is retained as the cause of a traced Error.
