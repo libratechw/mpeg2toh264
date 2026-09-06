@@ -6,6 +6,8 @@
  * on, which is how a `load()` over a running conversion leaves no stragglers.
  */
 
+import type { MseLifecycleTrace } from "./lifecycle.js";
+
 /** Stop handing fragments to the sink above this many bytes waiting to append. */
 export const DEFAULT_QUEUE_HIGH_WATER_MARK = 32 * 1024 * 1024;
 
@@ -288,13 +290,21 @@ export type Notification =
   | { type: "private_stream_1"; id: number; stream: PrivateStream }
   | { type: "private_stream_2"; id: number; stream: PrivateStream }
   | { type: "stats"; id: number; stats: Stats }
+  /** A MediaSource lifecycle event, timestamped on the shared page/worker clock. */
+  | { type: "lifecycle"; id: number; trace: MseLifecycleTrace }
   /** The MSE buffer filled up, or made room again. Worker-sink loads only. */
   | { type: "blocked"; id: number; blocked: boolean }
   /** No more fragments are coming. Main-sink loads only. */
   | { type: "finish"; id: number }
   /** The whole input has been converted. */
   | { type: "completed"; id: number }
-  | { type: "error"; id: number; message: string };
+  | {
+      type: "error";
+      id: number;
+      message: string;
+      /** Failure time on the clock shared with page-side lifecycle entries. */
+      at: number;
+    };
 
 /**
  * The steps of getting from a URL to a picture, in the order they happen.

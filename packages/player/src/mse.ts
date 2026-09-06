@@ -7,6 +7,12 @@
  * and reading it, go through `seek` and `setCurrentTime` -- so the same buffer
  * management runs whether MSE is on the page or in the worker.
  */
+import {
+  lifecycleNow,
+  type LifecycleTraceDetail,
+  type MediaSourceClassName,
+  type MseLifecycleTrace,
+} from "./lifecycle.js";
 import { QUEUE_HIGH_WATER_FRAGMENTS } from "./protocol.js";
 
 /**
@@ -128,7 +134,7 @@ export interface FragmentSink {
   /** No more fragments: drain what is queued and end the stream. */
   finish(): Promise<void>;
   /** Give up, releasing anyone waiting on `ready` or `finish`. */
-  close(): void;
+  close(reason?: string): void;
 }
 
 /** A latch a producer can await, so backpressure costs no polling. */
@@ -191,6 +197,8 @@ export interface MseSinkOptions {
    * The two bracket everything MSE does before playback can begin.
    */
   onMark?(name: "sourceopen" | "appended"): void;
+  /** A bounded-trace input, timestamped before it leaves this realm. */
+  onLifecycle?(trace: MseLifecycleTrace): void;
   onError?(error: Error): void;
 }
 
@@ -224,6 +232,7 @@ export class MseSink implements FragmentSink {
 
   /** The one the source was made from, and the one that answers for codecs. */
   readonly #class: MediaSourceConstructor;
+  readonly #mediaSourceClass: MediaSourceClassName;
   readonly #options: MseSinkOptions;
   readonly #opened: Promise<void>;
   #sourceBuffer: SourceBuffer | null = null;
@@ -274,6 +283,9 @@ export class MseSink implements FragmentSink {
     this.#class = source;
     this.mediaSource = new source();
     this.managed = source === managedMediaSource;
+    this.#mediaSourceClass = this.managed
+      ? "ManagedMediaSource"
+      : "MediaSource";
     this.mediaSource.addEventListener("sourceopen", this.#onSourceOpen);
     this.mediaSource.addEventListener("sourceclose", this.#onSourceClose);
     if (this.managed) {
@@ -293,6 +305,9 @@ export class MseSink implements FragmentSink {
         { once: true },
       );
     });
+    this.#lifecycle("mse-created", {
+      preferManaged: options.preferManaged === true,
+    });
   }
 
   ready(): Promise<void> {
@@ -310,12 +325,21 @@ export class MseSink implements FragmentSink {
     if (this.#closed) return;
     if (!this.#sourceBuffer) {
       try {
+        this.#lifecycle("sourcebuffer-add-call", {
+          mimeCodec,
+        });
         const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
         sourceBuffer.mode = "segments";
+        sourceBuffer.addEventListener("updatestart", this.#onUpdateStart);
+        sourceBuffer.addEventListener("update", this.#onUpdate);
         sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
+        sourceBuffer.addEventListener("abort", this.#onSourceBufferAbort);
         sourceBuffer.addEventListener("error", this.#onSourceBufferError);
         this.#sourceBuffer = sourceBuffer;
         this.#mimeCodec = mimeCodec;
+        this.#lifecycle("sourcebuffer-added", {
+          mimeCodec,
+        });
       } catch (error) {
         throw this.#error("add or configure SourceBuffer", error);
       }
@@ -358,6 +382,9 @@ export class MseSink implements FragmentSink {
    */
   reset(): void {
     if (this.#closed) return;
+    this.#lifecycle("mse-reset", {
+      nextEpoch: this.#epoch + 1,
+    });
     this.#epoch++;
     this.#queue = [];
     this.#queuedBytes = 0;
@@ -375,6 +402,7 @@ export class MseSink implements FragmentSink {
   }
 
   async finish(): Promise<void> {
+    this.#lifecycle("mse-finish");
     this.#ending = true;
     // Nothing was ever opened, so there is nothing to drain and no stream to
     // end -- an input we could make no track out of takes this path.
@@ -389,6 +417,7 @@ export class MseSink implements FragmentSink {
     if (this.#closed || this.#epoch !== epoch) return;
     if (this.mediaSource.readyState === "open") {
       try {
+        this.#lifecycle("mediasource-end-of-stream-call");
         this.mediaSource.endOfStream();
       } catch (error) {
         throw this.#error("end MediaSource", error);
@@ -396,8 +425,9 @@ export class MseSink implements FragmentSink {
     }
   }
 
-  close(): void {
+  close(reason = "close"): void {
     if (this.#closed) return;
+    this.#lifecycle("mse-close", { reason });
     this.#closed = true;
     this.mediaSource.removeEventListener("sourceopen", this.#onSourceOpen);
     this.mediaSource.removeEventListener("sourceclose", this.#onSourceClose);
@@ -411,7 +441,10 @@ export class MseSink implements FragmentSink {
         this.#onEndStreaming,
       );
     }
+    this.#sourceBuffer?.removeEventListener("updatestart", this.#onUpdateStart);
+    this.#sourceBuffer?.removeEventListener("update", this.#onUpdate);
     this.#sourceBuffer?.removeEventListener("updateend", this.#onUpdateEnd);
+    this.#sourceBuffer?.removeEventListener("abort", this.#onSourceBufferAbort);
     this.#sourceBuffer?.removeEventListener("error", this.#onSourceBufferError);
     this.#sourceBuffer = null;
     this.#queue = [];
@@ -450,6 +483,7 @@ export class MseSink implements FragmentSink {
     if (this.#clearing) {
       this.#operation = { type: "clear" };
       try {
+        this.#lifecycle("sourcebuffer-clear-call");
         sourceBuffer.remove(0, Number.POSITIVE_INFINITY);
       } catch (error) {
         this.#operation = null;
@@ -468,6 +502,7 @@ export class MseSink implements FragmentSink {
       const mimeCodec = this.#retype;
       this.#retype = null;
       try {
+        this.#lifecycle("sourcebuffer-change-type-call", { mimeCodec });
         sourceBuffer.changeType(mimeCodec);
         this.#mimeCodec = mimeCodec;
       } catch (error) {
@@ -477,6 +512,10 @@ export class MseSink implements FragmentSink {
     }
     this.#operation = { type: "append", pending: next, epoch: this.#epoch };
     try {
+      this.#lifecycle("sourcebuffer-append-call", {
+        appendBytes: next.data.byteLength,
+        initSegment: next.init,
+      });
       sourceBuffer.appendBuffer(next.data);
     } catch (error) {
       this.#operation = null;
@@ -485,6 +524,9 @@ export class MseSink implements FragmentSink {
         error.name === "QuotaExceededError"
       ) {
         this.#quotaBlocked = true;
+        this.#lifecycle("sourcebuffer-quota-exceeded", {
+          appendBytes: next.data.byteLength,
+        });
         this.#updateRoom();
         this.#updateBlocked();
         // Try at once rather than waiting for playback to raise an event: if
@@ -496,6 +538,7 @@ export class MseSink implements FragmentSink {
 
   #onUpdateEnd = (): void => {
     const operation = this.#operation;
+    this.#lifecycle("sourcebuffer-updateend");
     if (operation?.type === "append") {
       if (
         operation.epoch === this.#epoch &&
@@ -518,12 +561,22 @@ export class MseSink implements FragmentSink {
     this.#pump();
   };
 
+  #onUpdateStart = (): void => {
+    this.#lifecycle("sourcebuffer-updatestart");
+  };
+
+  #onUpdate = (): void => {
+    this.#lifecycle("sourcebuffer-update");
+  };
+
   /**
    * The managed source asking for data again, which is the only thing that
    * reopens the door `endstreaming` closed.
    */
   #onStartStreaming = (): void => {
+    const previousStreaming = this.#streaming;
     this.#streaming = true;
+    this.#lifecycle("mediasource-startstreaming", { previousStreaming });
     this.#updateRoom();
     this.#updateBlocked();
   };
@@ -537,12 +590,19 @@ export class MseSink implements FragmentSink {
    * knows what the radio and the battery are doing and the page does not.
    */
   #onEndStreaming = (): void => {
+    const previousStreaming = this.#streaming;
     this.#streaming = false;
+    this.#lifecycle("mediasource-endstreaming", { previousStreaming });
     this.#updateRoom();
     this.#updateBlocked();
   };
 
+  #onSourceBufferAbort = (): void => {
+    this.#lifecycle("sourcebuffer-abort", {}, true);
+  };
+
   #onSourceBufferError = (): void => {
+    this.#lifecycle("sourcebuffer-error", {}, true);
     this.#fail(
       "complete SourceBuffer update",
       new Error("the SourceBuffer rejected what was appended"),
@@ -551,12 +611,24 @@ export class MseSink implements FragmentSink {
 
   #onSourceOpen = (): void => {
     this.#sourceOpenCount++;
-    this.#lastSourceOpenAt = performance.now();
+    this.#lastSourceOpenAt = lifecycleNow();
+    this.#lifecycle(
+      "mediasource-sourceopen",
+      {},
+      false,
+      this.#lastSourceOpenAt,
+    );
   };
 
   #onSourceClose = (): void => {
     this.#sourceCloseCount++;
-    this.#lastSourceCloseAt = performance.now();
+    this.#lastSourceCloseAt = lifecycleNow();
+    this.#lifecycle(
+      "mediasource-sourceclose",
+      {},
+      !this.#closed,
+      this.#lastSourceCloseAt,
+    );
   };
 
   /**
@@ -597,7 +669,9 @@ export class MseSink implements FragmentSink {
       buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) : 0;
     this.#pendingDuration = null;
     try {
-      this.mediaSource.duration = Math.max(duration, end);
+      const appliedDuration = Math.max(duration, end);
+      this.#lifecycle("mediasource-set-duration-call", { appliedDuration });
+      this.mediaSource.duration = appliedDuration;
     } catch (error) {
       this.#fail("set MediaSource duration", error);
     }
@@ -646,6 +720,7 @@ export class MseSink implements FragmentSink {
     }
     this.#operation = { type: "remove" };
     try {
+      this.#lifecycle("sourcebuffer-remove-call", { removeEnd });
       sourceBuffer.remove(0, removeEnd);
     } catch (error) {
       this.#operation = null;
@@ -691,10 +766,60 @@ export class MseSink implements FragmentSink {
     for (const resolve of waiting) resolve();
   }
 
+  #stateDetail(): LifecycleTraceDetail {
+    const operation = this.#operation;
+    return {
+      mediaSourceReadyState: this.mediaSource.readyState,
+      sinkClosed: this.#closed,
+      sourceOpenCount: this.#sourceOpenCount,
+      sourceCloseCount: this.#sourceCloseCount,
+      sourceBufferPresent: this.#sourceBuffer !== null,
+      sourceBufferUpdating: this.#sourceBuffer?.updating ?? false,
+      operation: operation?.type ?? "none",
+      operationEpoch: operation?.type === "append" ? operation.epoch : null,
+      queueLength: this.#queue.length,
+      queuedBytes: this.#queuedBytes,
+      epoch: this.#epoch,
+      streaming: this.#streaming,
+      clearing: this.#clearing,
+      quotaBlocked: this.#quotaBlocked,
+      ending: this.#ending,
+    };
+  }
+
+  #lifecycle(
+    event: string,
+    detail: LifecycleTraceDetail = {},
+    critical = false,
+    at = lifecycleNow(),
+  ): void {
+    const trace = Object.freeze({
+      at,
+      event,
+      mediaSourceClass: this.#mediaSourceClass,
+      detail: Object.freeze({ ...this.#stateDetail(), ...detail }),
+      critical,
+    });
+    try {
+      this.#options.onLifecycle?.(trace);
+    } catch {
+      // A diagnostic observer cannot become a new playback failure.
+    }
+  }
+
   #error(operation: string, error: unknown): Error {
     const cause = error instanceof Error ? error : new Error(String(error));
     const sourceBuffer = this.#sourceBuffer;
-    const at = performance.now();
+    const at = lifecycleNow();
+    this.#lifecycle(
+      "mse-error",
+      {
+        failedOperation: operation,
+        errorName: cause.name,
+      },
+      true,
+      at,
+    );
     const detail = [
       `mediaSource=${this.mediaSource.readyState}`,
       `closed=${this.#closed}`,

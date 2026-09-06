@@ -21,15 +21,31 @@ export {
   supportsWorkerMediaSource,
 } from "./player.js";
 export {
+  isLifecycleError,
+  lifecycleNow,
+  LIFECYCLE_EVENT_ID_MAX_LENGTH,
+  LIFECYCLE_TRACE_CAPACITY,
+} from "./lifecycle.js";
+export {
   requiresManagedMediaSource,
   supportsManagedMediaSource,
 } from "./mse.js";
 export type {
   Mpeg2TsPlayerEventMap,
   Mpeg2TsPlayerOptions,
+  DiagnosticLifecycleOptions,
   PlayerDeinterlacer,
   PlayerDeinterlacerFactory,
 } from "./player.js";
+export type {
+  DiagnosticLifecycleToken,
+  LifecycleError,
+  LifecycleTraceDetail,
+  LifecycleTraceEntry,
+  LifecycleTraceSnapshot,
+  LifecycleTraceValue,
+  MediaSourceClassName,
+} from "./lifecycle.js";
 export {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_MAX_AHEAD_SECONDS,

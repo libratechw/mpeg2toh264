@@ -14,6 +14,18 @@ import {
   MseSink,
 } from "./mse.js";
 import {
+  LifecycleTrace,
+  lifecycleNow,
+  sanitizeDiagnosticLifecycleInput,
+  withLifecycleTrace,
+  type DiagnosticLifecycleToken,
+  type LifecycleTraceDetail,
+  type LifecycleTraceEntry,
+  type LifecycleTraceScope,
+  type MediaSourceClassName,
+  type MseLifecycleTrace,
+} from "./lifecycle.js";
+import {
   DEFAULT_KEEP_BEHIND_SECONDS,
   DEFAULT_MAX_AHEAD_SECONDS,
   DEFAULT_QUEUE_HIGH_WATER_MARK,
@@ -62,6 +74,41 @@ const TIMED_EVENTS: TimingMark[] = [
   "playing",
   "waiting",
 ];
+
+const VIDEO_LIFECYCLE_EVENTS = [
+  "loadstart",
+  "emptied",
+  "abort",
+  "error",
+] as const;
+
+let nextPlayerInstance = 0;
+let nextVideoId = 0;
+const videoIds = new WeakMap<HTMLVideoElement, number>();
+
+/**
+ * One page-side chronology spans replacement player instances.
+ *
+ * DPlayer briefly owns an old and a replacement video during a quality
+ * switch. Keeping the journal at module scope is what lets one fatal snapshot
+ * retain the old instance's teardown and the new instance's attachment.
+ */
+let lifecycleJournal = new LifecycleTrace();
+const diagnosticLifecycleTokens = new WeakMap<
+  DiagnosticLifecycleToken,
+  {
+    readonly journal: LifecycleTrace;
+    readonly entry: LifecycleTraceEntry;
+  }
+>();
+
+function lifecycleVideoId(video: HTMLVideoElement): number {
+  const known = videoIds.get(video);
+  if (known !== undefined) return known;
+  const assigned = ++nextVideoId;
+  videoIds.set(video, assigned);
+  return assigned;
+}
 
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {
@@ -217,6 +264,18 @@ export interface Mpeg2TsPlayerEventMap {
   error: CustomEvent<{ error: Error }>;
 }
 
+export interface DiagnosticLifecycleOptions {
+  /** Timestamp already taken with `performance.timeOrigin + performance.now()`. */
+  readonly at?: number;
+  /** Retain this as the first possible cause even after the ring rotates. */
+  readonly critical?: boolean;
+}
+
+interface LifecycleRecordOptions extends DiagnosticLifecycleOptions {
+  readonly scope?: LifecycleTraceScope;
+  readonly generation?: number;
+}
+
 /**
  * Whether a worker can own the MediaSource.
  *
@@ -257,11 +316,6 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-/** The one clock reading the page and the worker both understand. */
-function now(): number {
-  return performance.timeOrigin + performance.now();
-}
-
 /**
  * Plays an MPEG-2 transport stream in a `<video>` by converting it to H.264.
  *
@@ -287,6 +341,8 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   readonly #options: Mpeg2TsPlayerOptions;
   readonly #sinkKind: SinkKind;
+  readonly #instance = ++nextPlayerInstance;
+  readonly #videoId: number;
   #worker: Worker | null = null;
   /** Which load messages belong to. Bumped by every load and every stop. */
   #generation = 0;
@@ -294,6 +350,7 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** The sink, when the page owns the MediaSource. */
   #sink: MseSink | null = null;
   #objectUrl: string | null = null;
+  #mediaSourceClass: MediaSourceClassName | null = null;
   /** The `<source>` child a Managed Media Source needs; see #attachManaged. */
   #source: HTMLSourceElement | null = null;
   /** Whether remote playback was turned off here, and so is ours to turn back. */
@@ -316,10 +373,12 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Whether deinterlacing was asked for. */
   #wanted = false;
   #destroyed = false;
+  #failureSequence = 0;
 
   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
     super();
     this.video = video;
+    this.#videoId = lifecycleVideoId(video);
     this.#options = options;
     const preference = options.mediaSource ?? "auto";
     this.#sinkKind =
@@ -331,6 +390,11 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.video.addEventListener("seeking", this.#onSeeking);
     for (const name of TIMED_EVENTS)
       this.video.addEventListener(name, this.#onTimedEvent);
+    for (const name of VIDEO_LIFECYCLE_EVENTS)
+      this.video.addEventListener(name, this.#onVideoLifecycle);
+    this.#recordLifecycle("player-created", {
+      requestedMediaSource: preference,
+    });
     if (options.deinterlace) this.deinterlace = true;
   }
 
@@ -397,6 +461,58 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Which side of the wire ended up owning the MediaSource. */
   get mediaSourceOwner(): SinkKind {
     return this.#sinkKind;
+  }
+
+  /** The constructor actually opened for this load, once MSE exists. */
+  get mediaSourceClass(): MediaSourceClassName | null {
+    return this.#mediaSourceClass;
+  }
+
+  /**
+   * Add a page-owner event to the diagnostic chronology.
+   *
+   * `at` must use `performance.timeOrigin + performance.now()` so it can be
+   * ordered beside worker events. Details are primitives by contract, which
+   * keeps the fatal snapshot cloneable and serializable. A malformed event,
+   * timestamp, detail, or options object is ignored without affecting playback.
+   */
+  recordDiagnosticLifecycle(
+    event: string,
+    detail: LifecycleTraceDetail = {},
+    options: DiagnosticLifecycleOptions = {},
+  ): DiagnosticLifecycleToken | null {
+    try {
+      const input = sanitizeDiagnosticLifecycleInput(event, detail, options);
+      if (input === null) return null;
+      const journal = lifecycleJournal;
+      const criticalEntry = this.#recordLifecycle(input.event, input.detail, {
+        at: input.at,
+        critical: input.critical,
+        scope: "external",
+      });
+      if (criticalEntry === null) return null;
+      const token = Object.freeze({}) as DiagnosticLifecycleToken;
+      diagnosticLifecycleTokens.set(token, { journal, entry: criticalEntry });
+      return token;
+    } catch {
+      // This integration-only hook must never interrupt the caller's workflow.
+      return null;
+    }
+  }
+
+  /**
+   * Release one integration-owned critical entry after its causal operation
+   * succeeds. Only the opaque token returned for that exact entry can do so.
+   */
+  resolveDiagnosticLifecycle(token: DiagnosticLifecycleToken): void {
+    try {
+      const retained = diagnosticLifecycleTokens.get(token);
+      if (retained === undefined) return;
+      diagnosticLifecycleTokens.delete(token);
+      retained.journal.resolveCritical(retained.entry);
+    } catch {
+      // As above, malformed integration input remains diagnostic-only.
+    }
   }
 
   /**
@@ -517,12 +633,16 @@ export class Mpeg2TsPlayer extends EventTarget {
     }
     this.stop();
     const id = this.#generation;
+    this.#mediaSourceClass = null;
+    this.#recordLifecycle("player-load", {
+      passthrough: this.#options.passthrough === true,
+    });
     this.#duration = null;
     // Nothing is known about this source yet, so it gets whatever was asked
     // for until its first fragment says what it is.
     this.#clearVideoTimeline();
     this.#applyDeinterlace();
-    this.#loadedAt = now();
+    this.#loadedAt = lifecycleNow();
     this.#markedAt = this.#loadedAt;
     const worker = this.#ensureWorker();
     const promise = new Promise<void>((resolve, reject) => {
@@ -560,9 +680,10 @@ export class Mpeg2TsPlayer extends EventTarget {
   /** Abandon the current load. The player stays usable. */
   stop(): void {
     const id = this.#generation;
+    this.#recordLifecycle("player-stop", { stoppedGeneration: id });
     this.#generation++;
     this.#worker?.postMessage({ type: "stop", id } satisfies Command);
-    this.#teardown();
+    this.#teardown("stop", id);
     this.#settle(new Error("the load was stopped"));
     this.#setState("idle");
   }
@@ -575,9 +696,14 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.video.removeEventListener("seeking", this.#onSeeking);
     for (const name of TIMED_EVENTS)
       this.video.removeEventListener(name, this.#onTimedEvent);
+    for (const name of VIDEO_LIFECYCLE_EVENTS)
+      this.video.removeEventListener(name, this.#onVideoLifecycle);
     this.#deinterlacer?.destroy();
     this.#deinterlacer = null;
-    this.#worker?.terminate();
+    if (this.#worker) {
+      this.#recordLifecycle("worker-terminate-call", { reason: "destroy" });
+      this.#worker.terminate();
+    }
     this.#worker = null;
   }
 
@@ -626,9 +752,21 @@ export class Mpeg2TsPlayer extends EventTarget {
         },
       );
       worker.onmessage = this.#onMessage;
-      worker.onerror = (event) =>
+      worker.onerror = (event) => {
+        const at = lifecycleNow();
+        this.#recordLifecycle(
+          "worker-onerror",
+          {
+            messagePresent: event.message.length > 0,
+            line: event.lineno,
+            column: event.colno,
+          },
+          { at, critical: true },
+        );
         this.#fail(new Error(event.message || "the worker failed"));
+      };
       this.#worker = worker;
+      this.#recordLifecycle("worker-created");
     }
     return this.#worker;
   }
@@ -642,11 +780,18 @@ export class Mpeg2TsPlayer extends EventTarget {
         // #attachManaged uses is not on offer here; what a managed source
         // still needs is the element to have given up remote playback.
         if (notification.managed) this.#disableRemotePlayback();
+        this.#mediaSourceClass = notification.managed
+          ? "ManagedMediaSource"
+          : "MediaSource";
         // MediaProvider was last widened before MSE in Workers shipped, so it
         // still does not list MediaSourceHandle. This assignment is the entire
         // point of the handle.
+        this.#recordLifecycle("video-source-attach-call", {
+          attachment: "srcObject",
+          reason: "worker-media-source-handle",
+        });
         this.video.srcObject = notification.handle as unknown as MediaProvider;
-        this.#mark("attached", now());
+        this.#mark("attached", lifecycleNow());
         break;
       case "open":
         this.#openSink(notification.mimeCodec, notification.data);
@@ -700,6 +845,9 @@ export class Mpeg2TsPlayer extends EventTarget {
       case "mark":
         this.#mark(notification.name, notification.at);
         break;
+      case "lifecycle":
+        this.#recordMseLifecycle(notification.trace, "worker");
+        break;
       case "seek":
         if (this.video.currentTime < notification.time)
           this.video.currentTime = notification.time;
@@ -727,6 +875,11 @@ export class Mpeg2TsPlayer extends EventTarget {
         if (this.#sinkKind === "worker") this.#stopPlayhead();
         break;
       case "error":
+        this.#recordLifecycle(
+          "worker-error",
+          { messagePresent: notification.message.length > 0 },
+          { at: notification.at, critical: true, scope: "worker" },
+        );
         this.#fail(new Error(notification.message));
         break;
     }
@@ -774,7 +927,8 @@ export class Mpeg2TsPlayer extends EventTarget {
       seek: (time) => {
         if (this.video.currentTime < time) this.video.currentTime = time;
       },
-      onMark: (name) => this.#mark(name, now()),
+      onMark: (name) => this.#mark(name, lifecycleNow()),
+      onLifecycle: (trace) => this.#recordMseLifecycle(trace, "main", id),
       onReadyChange: (ready) => this.#report(id, { type: "flow", id, ready }),
       onBlocked: (blocked) => {
         if (id === this.#generation)
@@ -787,9 +941,21 @@ export class Mpeg2TsPlayer extends EventTarget {
     });
     this.#sink = sink;
     this.#objectUrl = URL.createObjectURL(sink.mediaSource);
+    this.#recordLifecycle(
+      "object-url-created",
+      { reason: "main-media-source" },
+      { generation: id },
+    );
     if (sink.managed) this.#attachManaged(this.#objectUrl);
-    else this.video.src = this.#objectUrl;
-    this.#mark("attached", now());
+    else {
+      this.#recordLifecycle(
+        "video-source-attach-call",
+        { attachment: "src", reason: "main-media-source" },
+        { generation: id },
+      );
+      this.video.src = this.#objectUrl;
+    }
+    this.#mark("attached", lifecycleNow());
     if (this.#duration !== null) sink.setDuration(this.#duration);
     return sink;
   }
@@ -804,15 +970,26 @@ export class Mpeg2TsPlayer extends EventTarget {
    * arrives and the load waits for a stream that has not begun.
    */
   #attachManaged(url: string): void {
+    this.#recordLifecycle("video-source-detach-call", {
+      attachment: "src",
+      hadAttachment: this.video.hasAttribute("src"),
+      reason: "managed-media-source-attach",
+    });
     this.video.removeAttribute("src");
     this.#disableRemotePlayback();
     const source = document.createElement("source");
     source.type = "video/mp4";
     source.src = url;
+    this.#recordLifecycle("source-element-attach-call", {
+      reason: "managed-media-source-attach",
+    });
     this.video.append(source);
     this.#source = source;
     // A source child is not a src: nothing is loaded until the element is told
     // to look at what it has been given.
+    this.#recordLifecycle("video-load-call", {
+      reason: "managed-media-source-attach",
+    });
     this.video.load();
   }
 
@@ -869,9 +1046,31 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #onTimedEvent = (event: Event): void => {
     if (this.#state === "idle") return;
-    this.#mark(event.type as TimingMark, now());
+    this.#mark(event.type as TimingMark, lifecycleNow());
     if (event.type === "waiting") this.#crossGap();
   };
+
+  #onVideoLifecycle = (event: Event): void => {
+    this.#recordLifecycle(
+      `video-${event.type}`,
+      this.#videoState(event.currentTarget === this.video),
+      { critical: event.type === "error" && this.video.error !== null },
+    );
+  };
+
+  #videoState(currentVideo: boolean): LifecycleTraceDetail {
+    return {
+      mediaErrorCode: this.video.error?.code ?? null,
+      readyState: this.video.readyState,
+      networkState: this.video.networkState,
+      currentVideo,
+      videoConnected: this.video.isConnected,
+      videoPaused: this.video.paused,
+      srcAttributePresent: this.video.hasAttribute("src"),
+      srcObjectPresent: this.video.srcObject !== null,
+      sourceElementPresent: this.#source !== null,
+    };
+  }
 
   /**
    * Move the playhead over a hole in the media, where playback has stopped at
@@ -929,6 +1128,39 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#emit("timing", { name, sinceLoad, sincePrevious });
   }
 
+  #recordMseLifecycle(
+    trace: MseLifecycleTrace,
+    scope: Extract<LifecycleTraceScope, "main" | "worker">,
+    generation = this.#generation,
+  ): void {
+    this.#mediaSourceClass = trace.mediaSourceClass;
+    this.#recordLifecycle(trace.event, trace.detail, {
+      at: trace.at,
+      critical: trace.critical,
+      scope,
+      generation,
+    });
+  }
+
+  #recordLifecycle(
+    event: string,
+    detail: LifecycleTraceDetail = {},
+    options: LifecycleRecordOptions = {},
+  ): LifecycleTraceEntry | null {
+    return lifecycleJournal.record({
+      at: options.at ?? lifecycleNow(),
+      scope: options.scope ?? "main",
+      event,
+      playerInstance: this.#instance,
+      generation: options.generation ?? this.#generation,
+      videoId: this.#videoId,
+      mediaSourceOwner: this.#sinkKind,
+      mediaSourceClass: this.#mediaSourceClass,
+      detail,
+      critical: options.critical,
+    });
+  }
+
   #isBuffered(time: number): boolean {
     const buffered = this.video.buffered;
     for (let index = 0; index < buffered.length; index++) {
@@ -972,29 +1204,66 @@ export class Mpeg2TsPlayer extends EventTarget {
     this.#playhead = null;
   }
 
-  #teardown(): void {
+  #teardown(reason: string, generation = this.#generation): void {
+    const record = (event: string, detail: LifecycleTraceDetail) =>
+      this.#recordLifecycle(event, detail, { generation });
+    record("player-teardown", { reason });
     this.#stopPlayhead();
     this.#clearVideoTimeline();
-    this.#sink?.close();
+    this.#sink?.close(reason);
     this.#sink = null;
-    if (this.#objectUrl) URL.revokeObjectURL(this.#objectUrl);
+    if (this.#objectUrl) {
+      record("object-url-revoke-call", { reason });
+      URL.revokeObjectURL(this.#objectUrl);
+    }
     this.#objectUrl = null;
-    this.#source?.remove();
+    if (this.#source) {
+      record("source-element-detach-call", { reason });
+      this.#source.remove();
+    }
     this.#source = null;
     if (this.#disabledRemotePlayback) {
       this.video.disableRemotePlayback = false;
       this.#disabledRemotePlayback = false;
     }
+    record("video-source-detach-call", {
+      attachment: "src",
+      hadAttachment: this.video.hasAttribute("src"),
+      reason,
+    });
     this.video.removeAttribute("src");
+    record("video-source-detach-call", {
+      attachment: "srcObject",
+      hadAttachment: this.video.srcObject !== null,
+      reason,
+    });
     this.video.srcObject = null;
+    record("video-load-call", { reason });
     this.video.load();
+    this.#mediaSourceClass = null;
   }
 
   #fail(error: Error): void {
-    this.#teardown();
+    const at = lifecycleNow();
+    this.#recordLifecycle(
+      "player-fail",
+      { ...this.#videoState(true), errorName: error.name },
+      { at, critical: true },
+    );
+    const eventId = [
+      "m2h",
+      Math.trunc(at * 1000).toString(36),
+      this.#instance.toString(36),
+      this.#generation.toString(36),
+      (++this.#failureSequence).toString(36),
+    ].join("-");
+    const snapshot = lifecycleJournal.freeze(eventId, at);
+    lifecycleJournal = new LifecycleTrace();
+    const tracedError = withLifecycleTrace(error, snapshot);
+    this.#teardown("fail");
     this.#setState("error");
-    this.#settle(error);
-    this.#emit("error", { error });
+    this.#settle(tracedError);
+    this.#emit("error", { error: tracedError });
   }
 
   #withMseAttachmentContext(error: Error): Error {

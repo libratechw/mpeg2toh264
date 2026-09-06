@@ -12,6 +12,7 @@
  * where the viewer asked to be. See `Playback`.
  */
 import { MseSink, ReadyGate, type FragmentSink } from "./mse.js";
+import { lifecycleNow } from "./lifecycle.js";
 import {
   SEEK_LEAD_SECONDS,
   SEEK_PROBE_ATTEMPTS,
@@ -95,7 +96,7 @@ function mark(id: number, name: TimingMark): void {
     type: "mark",
     id,
     name,
-    at: performance.timeOrigin + performance.now(),
+    at: lifecycleNow(),
   });
 }
 
@@ -200,7 +201,9 @@ function createWorkerSink(command: LoadCommand): MseSink {
     seek: (time) => post({ type: "seek", id, time }),
     onMark: (name) => mark(id, name),
     onBlocked: (blocked) => post({ type: "blocked", id, blocked }),
-    onError: (error) => post({ type: "error", id, message: error.message }),
+    onLifecycle: (trace) => post({ type: "lifecycle", id, trace }),
+    onError: (error) =>
+      post({ type: "error", id, message: error.message, at: lifecycleNow() }),
   });
   const handle = created.mediaSource.handle;
   post({ type: "handle", id, handle, managed: created.managed }, [handle]);
@@ -443,7 +446,7 @@ class Playback {
   }
 
   /** Drop everything this load holds. */
-  stop(): void {
+  stop(reason = "stop"): void {
     this.#life.abort();
     this.#leg?.abort();
     this.#leg = null;
@@ -453,7 +456,7 @@ class Playback {
     this.#pool?.terminate();
     this.#pool = null;
     this.#private = [];
-    this.#sink.close();
+    this.#sink.close(reason);
   }
 
   /**
@@ -590,8 +593,13 @@ class Playback {
       await this.#convert(leg, source, converter);
     } catch (error) {
       if (!this.#running(leg) || signal.aborted) return;
-      post({ type: "error", id: this.#command.id, message: describe(error) });
-      abandon();
+      post({
+        type: "error",
+        id: this.#command.id,
+        message: describe(error),
+        at: lifecycleNow(),
+      });
+      abandon("playback-error");
     }
   }
 
@@ -924,14 +932,14 @@ function describeStreams(streams: AudioStream[]): string {
 }
 
 /** Drop whatever the current load is holding. */
-function abandon(): void {
+function abandon(reason: string): void {
+  playback?.stop(reason);
   current = -1;
-  playback?.stop();
   playback = null;
 }
 
 function load(command: LoadCommand): void {
-  abandon();
+  abandon("superseded-by-load");
   current = command.id;
   mark(command.id, "load");
   const started = new Playback(command);
@@ -948,7 +956,7 @@ self.onmessage = (event: MessageEvent<Command>) => {
   if (command.id !== current) return;
   switch (command.type) {
     case "stop":
-      abandon();
+      abandon("stop-command");
       break;
     case "time":
       playback?.setCurrentTime(command.currentTime);
