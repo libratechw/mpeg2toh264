@@ -1,62 +1,62 @@
-function a() {
+function o() {
   return performance.timeOrigin + performance.now();
 }
-const M = 48, A = 240, C = 51, T = /^m2h-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+$/, _ = /[^0-9a-z-]/, O = /^[A-Za-z0-9]/, j = /[^A-Za-z0-9_.:-]/, N = 64, D = 16, R = 64, P = 256;
-function L(n) {
-  return n === null || typeof n == "string" || typeof n == "boolean" || typeof n == "number" && Number.isFinite(n);
+const T = 48, O = 240, j = 51, N = /^m2h-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+$/, D = /[^0-9a-z-]/, P = 32, $ = 24, R = 8, B = /^[A-Za-z0-9]/, z = /[^A-Za-z0-9_.:-]/, F = 64, x = 16, U = 64, G = 256;
+function C(s) {
+  return s === null || typeof s == "string" || typeof s == "boolean" || typeof s == "number" && Number.isFinite(s);
 }
-function $(n) {
+function q(s) {
   try {
-    if (typeof n != "object" || n === null || Array.isArray(n))
+    if (typeof s != "object" || s === null || Array.isArray(s))
       return null;
-    const e = Object.entries(n);
-    return e.length > D || !e.every(
-      ([t, s]) => t.length > 0 && t.length <= R && L(s) && (typeof s != "string" || s.length <= P)
+    const e = Object.entries(s);
+    return e.length > x || !e.every(
+      ([t, i]) => t.length > 0 && t.length <= U && C(i) && (typeof i != "string" || i.length <= G)
     ) ? null : Object.freeze(Object.fromEntries(e));
   } catch {
     return null;
   }
 }
-function z(n, e, t) {
+function V(s, e, t) {
   try {
-    if (typeof n != "string" || n.length === 0 || n.length > N || !O.test(n) || j.test(n) || typeof t != "object" || t === null || Array.isArray(t))
+    if (typeof s != "string" || s.length === 0 || s.length > F || !B.test(s) || z.test(s) || typeof t != "object" || t === null || Array.isArray(t))
       return null;
-    const s = $(e);
-    if (s === null) return null;
-    const { at: i, critical: r } = t;
-    return i !== void 0 && !Number.isFinite(i) || r !== void 0 && typeof r != "boolean" ? null : Object.freeze({
-      event: n,
-      detail: s,
-      at: i,
-      critical: r === !0
+    const i = q(e);
+    if (i === null) return null;
+    const { at: r, critical: n } = t;
+    return r !== void 0 && !Number.isFinite(r) || n !== void 0 && typeof n != "boolean" ? null : Object.freeze({
+      event: s,
+      detail: i,
+      at: r,
+      critical: n === !0
     });
   } catch {
     return null;
   }
 }
-function m(n) {
-  if (typeof n != "object" || n === null || !Object.isFrozen(n))
+function y(s) {
+  if (typeof s != "object" || s === null || !Object.isFrozen(s))
     return !1;
-  const e = n;
-  return Number.isInteger(e.sequence) && Number.isFinite(e.at) && (e.scope === "main" || e.scope === "worker" || e.scope === "external") && typeof e.event == "string" && Number.isInteger(e.playerInstance) && Number.isInteger(e.generation) && Number.isInteger(e.videoId) && (e.mediaSourceOwner === "main" || e.mediaSourceOwner === "worker") && (e.mediaSourceClass === null || e.mediaSourceClass === "MediaSource" || e.mediaSourceClass === "ManagedMediaSource") && typeof e.detail == "object" && e.detail !== null && Object.isFrozen(e.detail) && Object.values(e.detail).every(L);
+  const e = s;
+  return Number.isInteger(e.sequence) && Number.isFinite(e.at) && (e.scope === "main" || e.scope === "worker" || e.scope === "external") && typeof e.event == "string" && Number.isInteger(e.playerInstance) && Number.isInteger(e.generation) && Number.isInteger(e.videoId) && (e.mediaSourceOwner === "main" || e.mediaSourceOwner === "worker") && (e.mediaSourceClass === null || e.mediaSourceClass === "MediaSource" || e.mediaSourceClass === "ManagedMediaSource") && typeof e.detail == "object" && e.detail !== null && Object.isFrozen(e.detail) && Object.values(e.detail).every(C);
 }
-class I {
+class _ {
   #t;
-  #d = 0;
-  #s = [];
+  #l = 0;
+  #i = [];
   #u = null;
   #e = /* @__PURE__ */ new Set();
-  #i = 0;
-  #c = null;
-  constructor(e = M) {
+  #s = 0;
+  #h = null;
+  constructor(e = T) {
     if (!Number.isInteger(e) || e < 1)
       throw new RangeError("lifecycle trace capacity must be an integer >= 1");
     this.#t = e;
   }
   record(e) {
-    if (this.#c) return null;
+    if (this.#h) return null;
     const t = Object.freeze({
-      sequence: ++this.#d,
+      sequence: ++this.#l,
       at: e.at,
       scope: e.scope,
       event: e.event,
@@ -67,122 +67,181 @@ class I {
       mediaSourceClass: e.mediaSourceClass,
       detail: Object.freeze({ ...e.detail ?? {} })
     });
-    e.critical === !0 && this.#e.add(t), e.critical === !0 && this.#u === null ? this.#u = t : this.#s.push(t);
-    const s = this.#t - (this.#u === null ? 0 : 1);
-    for (; this.#s.length > s; )
-      this.#e.delete(this.#s.shift()), this.#i++;
+    e.critical === !0 && this.#e.add(t), e.critical === !0 && this.#u === null ? this.#u = t : this.#i.push(t);
+    const i = this.#t - (this.#u === null ? 0 : 1);
+    for (; this.#i.length > i; )
+      this.#e.delete(this.#i.shift()), this.#s++;
     return this.#u === t ? t : null;
   }
   /** Return exactly the held entry to normal ring rotation once it resolves. */
   resolveCritical(e) {
-    if (this.#c || this.#u !== e) return !1;
-    const t = this.#s.findIndex(
-      (r) => r.sequence > e.sequence
+    if (this.#h || this.#u !== e) return !1;
+    const t = this.#i.findIndex(
+      (n) => n.sequence > e.sequence
     );
-    t === -1 ? this.#s.push(e) : this.#s.splice(t, 0, e), this.#e.delete(e), this.#u = null;
-    const s = this.#s.find(
-      (r) => this.#e.has(r)
+    t === -1 ? this.#i.push(e) : this.#i.splice(t, 0, e), this.#e.delete(e), this.#u = null;
+    const i = this.#i.find(
+      (n) => this.#e.has(n)
     );
-    s !== void 0 && (this.#s.splice(this.#s.indexOf(s), 1), this.#u = s);
-    const i = this.#t - (this.#u === null ? 0 : 1);
-    for (; this.#s.length > i; )
-      this.#e.delete(this.#s.shift()), this.#i++;
+    i !== void 0 && (this.#i.splice(this.#i.indexOf(i), 1), this.#u = i);
+    const r = this.#t - (this.#u === null ? 0 : 1);
+    for (; this.#i.length > r; )
+      this.#e.delete(this.#i.shift()), this.#s++;
     return !0;
   }
-  freeze(e, t = a()) {
-    if (this.#c) return this.#c;
-    const s = [
+  freeze(e, t = o()) {
+    if (this.#h) return this.#h;
+    const i = [
       ...this.#u === null ? [] : [this.#u],
-      ...this.#s
+      ...this.#i
     ].sort(
-      (i, r) => i.at - r.at || i.sequence - r.sequence
+      (r, n) => r.at - n.at || r.sequence - n.sequence
     );
-    return this.#c = Object.freeze({
+    return this.#h = Object.freeze({
       eventId: e,
       frozenAt: t,
-      dropped: this.#i,
+      dropped: this.#s,
       firstCritical: this.#u,
-      entries: Object.freeze(s)
-    }), this.#c;
+      entries: Object.freeze(i)
+    }), this.#h;
   }
 }
-function g(n) {
-  return n.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 48);
+function S(s, e = P) {
+  return s.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, e);
 }
-function B(n, e) {
-  const t = e.firstCritical?.event ?? "none", s = e.entries.at(-1)?.event ?? "none", r = `[${[
-    `lifecycle=${e.eventId}`,
-    `first=${g(t)}`,
-    `last=${g(s)}`,
-    `entries=${e.entries.length}`,
-    `dropped=${e.dropped}`
-  ].join(" ").slice(0, A - 2)}]`;
-  return n.message = `${n.message}
-${r}`, Object.defineProperties(n, {
-    lifecycleEventId: {
-      value: e.eventId,
-      enumerable: !0
-    },
-    lifecycleTrace: {
-      value: e,
-      enumerable: !0
-    }
-  }), n;
+function H(s) {
+  return S(
+    s.replace(/^mediasource-/, "ms.").replace(/^sourcebuffer-/, "sb.").replace(/^dplayer-/, "dp.").replace(/^player-/, "p.").replace(/^worker-/, "w.").replace(/^video-/, "v.").replace(/^object-url-/, "url.").replace(/^source-element-/, "source."),
+    $
+  );
 }
-function J(n) {
+function W(s) {
+  const e = s.firstCritical?.event ?? "none", t = s.entries.at(-1)?.event ?? "none", i = [
+    `lifecycle=${s.eventId}`,
+    `first=${S(e)}`,
+    `last=${S(t)}`,
+    `entries=${s.entries.length}`,
+    `dropped=${s.dropped}`
+  ].join(" "), r = O - 2 - i.length - 6;
+  let n = [];
+  for (let a = s.entries.length - 1; a >= 0 && n.length < R; a--) {
+    const c = [
+      H(s.entries[a].event),
+      ...n
+    ];
+    if (c.join(">").length > r) break;
+    n = c;
+  }
+  return `[${i}${n.length === 0 ? "" : ` tail=${n.join(">")}`}]`;
+}
+function d(s, e, t) {
   try {
-    if (typeof n != "object" || n === null) return !1;
-    const e = n, t = e.lifecycleEventId, s = e.lifecycleTrace;
-    return typeof t == "string" && t.length <= C && T.test(t) && !_.test(t) && s?.eventId === t && Number.isFinite(s.frozenAt) && Number.isInteger(s.dropped) && s.dropped >= 0 && Object.isFrozen(s) && Array.isArray(s.entries) && s.entries.length > 0 && s.entries.length <= M && Object.isFrozen(s.entries) && s.entries.every(m) && s.entries.every(
-      (i, r) => r === 0 || i.at > s.entries[r - 1].at || i.at === s.entries[r - 1].at && i.sequence > s.entries[r - 1].sequence
-    ) && (s.firstCritical === null || m(s.firstCritical) && s.entries.includes(s.firstCritical));
+    const i = s[e];
+    return typeof i == "string" ? i : t;
+  } catch {
+    return t;
+  }
+}
+function f(s, e, t) {
+  const i = Object.getOwnPropertyDescriptor(s, e);
+  return i === void 0 ? Object.isExtensible(s) : i.configurable ? !0 : "writable" in i && i.writable === !0 && (t === void 0 || i.enumerable === t);
+}
+function X(s) {
+  try {
+    return f(s, "message") && f(s, "lifecycleEventId", !0) && f(s, "lifecycleTrace", !0);
   } catch {
     return !1;
   }
 }
-const v = 32 * 1024 * 1024, F = 2, S = 8, y = 10, U = 200, x = 1e-3, c = globalThis.ManagedMediaSource;
-function p(n = !1) {
+function p(s, e, t, i) {
+  const r = Object.getOwnPropertyDescriptor(s, e);
+  if (r !== void 0 && !r.configurable) {
+    Object.defineProperty(s, e, { value: t });
+    return;
+  }
+  Object.defineProperty(s, e, {
+    value: t,
+    writable: e === "message",
+    enumerable: i,
+    configurable: e === "message"
+  });
+}
+function b(s, e, t) {
+  return p(s, "message", e, !1), p(s, "lifecycleEventId", t.eventId, !0), p(s, "lifecycleTrace", t, !0), s;
+}
+function Y(s, e) {
+  const t = W(e), r = `${d(
+    s,
+    "message",
+    "the original error message was unavailable"
+  )}
+${t}`;
+  if (X(s))
+    try {
+      return b(s, r, e);
+    } catch {
+    }
+  const n = new Error(r, { cause: s });
+  n.name = d(s, "name", "Error");
+  const a = d(s, "stack", null);
+  return a !== null && (n.stack = `${n.name}: ${n.message}
+Caused by original error:
+${a}`), b(n, r, e);
+}
+function he(s) {
+  try {
+    if (typeof s != "object" || s === null) return !1;
+    const e = s, t = e.lifecycleEventId, i = e.lifecycleTrace;
+    return typeof e.name == "string" && typeof e.message == "string" && typeof t == "string" && t.length <= j && N.test(t) && !D.test(t) && i?.eventId === t && Number.isFinite(i.frozenAt) && Number.isInteger(i.dropped) && i.dropped >= 0 && Object.isFrozen(i) && Array.isArray(i.entries) && i.entries.length > 0 && i.entries.length <= T && Object.isFrozen(i.entries) && i.entries.every(y) && i.entries.every(
+      (r, n) => n === 0 || r.at > i.entries[n - 1].at || r.at === i.entries[n - 1].at && r.sequence > i.entries[n - 1].sequence
+    ) && (i.firstCritical === null || y(i.firstCritical) && i.entries.includes(i.firstCritical));
+  } catch {
+    return !1;
+  }
+}
+const E = 32 * 1024 * 1024, K = 2, k = 8, w = 10, Q = 200, Z = 1e-3, h = globalThis.ManagedMediaSource;
+function v(s = !1) {
   const e = typeof MediaSource > "u" ? null : MediaSource;
-  return n && c ? c : e ?? c ?? null;
+  return s && h ? h : e ?? h ?? null;
 }
-function q(n, e = !1) {
-  return p(e)?.isTypeSupported(n) ?? !1;
+function J(s, e = !1) {
+  return v(e)?.isTypeSupported(s) ?? !1;
 }
-function G(n = !1) {
-  return p(n)?.canConstructInDedicatedWorker === !0;
+function ee(s = !1) {
+  return v(s)?.canConstructInDedicatedWorker === !0;
 }
-function ee() {
-  return c !== void 0;
+function ue() {
+  return h !== void 0;
 }
-function te() {
-  return typeof MediaSource > "u" && c !== void 0;
+function le() {
+  return typeof MediaSource > "u" && h !== void 0;
 }
-class H {
+class te {
   #t = !0;
-  #d = [];
+  #l = [];
   get open() {
     return this.#t;
   }
   /** Returns whether this changed anything. */
   set(e) {
-    return e === this.#t ? !1 : (this.#t = e, e && this.#s(), !0);
+    return e === this.#t ? !1 : (this.#t = e, e && this.#i(), !0);
   }
   wait() {
     return this.#t ? Promise.resolve() : new Promise((e) => {
-      this.#d.push(e);
+      this.#l.push(e);
     });
   }
   /** Let everyone through whatever the state is, for teardown. */
   abandon() {
-    this.#s();
+    this.#i();
   }
-  #s() {
-    const e = this.#d;
-    this.#d = [];
+  #i() {
+    const e = this.#l;
+    this.#l = [];
     for (const t of e) t();
   }
 }
-class W {
+class ie {
   /**
    * Made in the constructor rather than in `open`, because a caller needs
    * something to attach before the codec is known: the worker sends
@@ -198,18 +257,18 @@ class W {
   managed;
   /** The one the source was made from, and the one that answers for codecs. */
   #t;
-  #d;
-  #s;
+  #l;
+  #i;
   #u;
   #e = null;
   /** What the `SourceBuffer` was opened with, or last changed to. */
-  #i = "";
+  #s = "";
   /** A codec to move the `SourceBuffer` to before the next append. */
-  #c = null;
-  #h = [];
+  #h = null;
+  #c = [];
   #p = 0;
   #o = null;
-  #l = !1;
+  #d = !1;
   /**
    * Whether a managed source wants data at the moment.
    *
@@ -223,7 +282,7 @@ class W {
   /** The last thing said about there being no room, so it is said once. */
   #w = !1;
   /** Whether everything buffered is waiting to be thrown away; see `reset`. */
-  #S = !1;
+  #v = !1;
   /** Which stretch of timeline is being filled. Bumped by every `reset`. */
   #f = 0;
   /** A duration to put on the MediaSource as soon as it will take one. */
@@ -235,24 +294,24 @@ class W {
   #L = 0;
   #r = !1;
   #b = !1;
-  #I = 0;
-  #P = 0;
-  #C = null;
+  #A = 0;
+  #$ = 0;
+  #T = null;
   #N = null;
-  #$ = new H();
+  #R = new te();
   #D = [];
   constructor(e) {
-    this.#s = e;
-    const t = p(e.preferManaged);
+    this.#i = e;
+    const t = v(e.preferManaged);
     if (!t) throw new Error("this browser has no Media Source Extensions");
-    this.#t = t, this.mediaSource = new t(), this.managed = t === c, this.#d = this.managed ? "ManagedMediaSource" : "MediaSource", this.mediaSource.addEventListener("sourceopen", this.#F), this.mediaSource.addEventListener("sourceclose", this.#U), this.managed && (this.mediaSource.addEventListener(
+    this.#t = t, this.mediaSource = new t(), this.managed = t === h, this.#l = this.managed ? "ManagedMediaSource" : "MediaSource", this.mediaSource.addEventListener("sourceopen", this.#F), this.mediaSource.addEventListener("sourceclose", this.#x), this.managed && (this.mediaSource.addEventListener(
       "startstreaming",
-      this.#V
-    ), this.mediaSource.addEventListener("endstreaming", this.#z)), this.#u = new Promise((s) => {
+      this.#W
+    ), this.mediaSource.addEventListener("endstreaming", this.#B)), this.#u = new Promise((i) => {
       this.mediaSource.addEventListener(
         "sourceopen",
         () => {
-          e.onMark?.("sourceopen"), s();
+          e.onMark?.("sourceopen"), i();
         },
         { once: !0 }
       );
@@ -261,7 +320,7 @@ class W {
     });
   }
   ready() {
-    return this.#$.wait();
+    return this.#R.wait();
   }
   /**
    * Open the stream, or -- for the initialization segment a seek brings with
@@ -272,23 +331,23 @@ class W {
       throw new Error(`unsupported codec: ${e}`);
     if (await this.#u, !this.#r) {
       if (this.#e)
-        e !== this.#i && (this.#c = e);
+        e !== this.#s && (this.#h = e);
       else try {
         this.#a("sourcebuffer-add-call", {
           mimeCodec: e
         });
-        const s = this.mediaSource.addSourceBuffer(e);
-        s.mode = "segments", s.addEventListener("updatestart", this.#H), s.addEventListener("update", this.#W), s.addEventListener("updateend", this.#G), s.addEventListener("abort", this.#Y), s.addEventListener("error", this.#B), this.#e = s, this.#i = e, this.#a("sourcebuffer-added", {
+        const i = this.mediaSource.addSourceBuffer(e);
+        i.mode = "segments", i.addEventListener("updatestart", this.#V), i.addEventListener("update", this.#H), i.addEventListener("updateend", this.#q), i.addEventListener("abort", this.#X), i.addEventListener("error", this.#z), this.#e = i, this.#s = e, this.#a("sourcebuffer-added", {
           mimeCodec: e
         });
-      } catch (s) {
-        throw this.#j("add or configure SourceBuffer", s);
+      } catch (i) {
+        throw this.#j("add or configure SourceBuffer", i);
       }
-      this.#T({ data: t, init: !0 }), this.#x();
+      this.#C({ data: t, init: !0 }), this.#U();
     }
   }
-  push(e, t, s) {
-    this.#r || (s && this.#y.push(t), this.#T({ data: e, init: !1 }));
+  push(e, t, i) {
+    this.#r || (i && this.#y.push(t), this.#C({ data: e, init: !1 }));
   }
   /**
    * How long the whole presentation is.
@@ -298,7 +357,7 @@ class W {
    * of what has been converted so far.
    */
   setDuration(e) {
-    this.#m = e, this.#x();
+    this.#m = e, this.#U();
   }
   /**
    * Throw away everything buffered and everything queued.
@@ -311,7 +370,7 @@ class W {
   reset() {
     this.#r || (this.#a("mse-reset", {
       nextEpoch: this.#f + 1
-    }), this.#f++, this.#h = [], this.#p = 0, this.#y = [], this.#M = !1, this.#b = !1, this.#l = !1, this.#O(), this.#e && (this.#S = !0), this.#q(!0), this.#n(), this.#_());
+    }), this.#f++, this.#c = [], this.#p = 0, this.#y = [], this.#M = !1, this.#b = !1, this.#d = !1, this.#O(), this.#e && (this.#v = !0), this.#G(!0), this.#n(), this.#_());
   }
   async finish() {
     if (this.#a("mse-finish"), this.#b = !0, this.#r || !this.#e) return;
@@ -326,47 +385,47 @@ class W {
       }
   }
   close(e = "close") {
-    this.#r || (this.#a("mse-close", { reason: e }), this.#r = !0, this.mediaSource.removeEventListener("sourceopen", this.#F), this.mediaSource.removeEventListener("sourceclose", this.#U), this.managed && (this.mediaSource.removeEventListener(
+    this.#r || (this.#a("mse-close", { reason: e }), this.#r = !0, this.mediaSource.removeEventListener("sourceopen", this.#F), this.mediaSource.removeEventListener("sourceclose", this.#x), this.managed && (this.mediaSource.removeEventListener(
       "startstreaming",
-      this.#V
+      this.#W
     ), this.mediaSource.removeEventListener(
       "endstreaming",
-      this.#z
-    )), this.#e?.removeEventListener("updatestart", this.#H), this.#e?.removeEventListener("update", this.#W), this.#e?.removeEventListener("updateend", this.#G), this.#e?.removeEventListener("abort", this.#Y), this.#e?.removeEventListener("error", this.#B), this.#e = null, this.#h = [], this.#p = 0, this.#y = [], this.#$.abandon(), this.#q(!0));
+      this.#B
+    )), this.#e?.removeEventListener("updatestart", this.#V), this.#e?.removeEventListener("update", this.#H), this.#e?.removeEventListener("updateend", this.#q), this.#e?.removeEventListener("abort", this.#X), this.#e?.removeEventListener("error", this.#z), this.#e = null, this.#c = [], this.#p = 0, this.#y = [], this.#R.abandon(), this.#G(!0));
   }
   /** Tell the sink where playback has got to, so it can evict what is behind. */
   setCurrentTime(e) {
     this.#L = e, this.#E(), this.#n(), this.#_();
   }
-  #T(e) {
-    this.#h.push(e), this.#p += e.data.byteLength, this.#n(), this.#_();
+  #C(e) {
+    this.#c.push(e), this.#p += e.data.byteLength, this.#n(), this.#_();
   }
   #_() {
     const e = this.#e;
     if (this.#r || !e || e.updating || this.#o)
       return;
-    if (this.#S) {
+    if (this.#v) {
       this.#o = { type: "clear" };
       try {
         this.#a("sourcebuffer-clear-call"), e.remove(0, Number.POSITIVE_INFINITY);
-      } catch (s) {
-        this.#o = null, this.#S = !1, this.#k("clear SourceBuffer", s);
+      } catch (i) {
+        this.#o = null, this.#v = !1, this.#k("clear SourceBuffer", i);
       }
       return;
     }
-    if (this.#l) return;
-    const t = this.#h[0];
+    if (this.#d) return;
+    const t = this.#c[0];
     if (!t) {
-      this.#q(!1);
+      this.#G(!1);
       return;
     }
-    if (this.#c !== null) {
-      const s = this.#c;
-      this.#c = null;
+    if (this.#h !== null) {
+      const i = this.#h;
+      this.#h = null;
       try {
-        this.#a("sourcebuffer-change-type-call", { mimeCodec: s }), e.changeType(s), this.#i = s;
-      } catch (i) {
-        this.#k("change SourceBuffer type", i);
+        this.#a("sourcebuffer-change-type-call", { mimeCodec: i }), e.changeType(i), this.#s = i;
+      } catch (r) {
+        this.#k("change SourceBuffer type", r);
         return;
       }
     }
@@ -376,33 +435,33 @@ class W {
         appendBytes: t.data.byteLength,
         initSegment: t.init
       }), e.appendBuffer(t.data);
-    } catch (s) {
-      this.#o = null, s instanceof DOMException && s.name === "QuotaExceededError" ? (this.#l = !0, this.#a("sourcebuffer-quota-exceeded", {
+    } catch (i) {
+      this.#o = null, i instanceof DOMException && i.name === "QuotaExceededError" ? (this.#d = !0, this.#a("sourcebuffer-quota-exceeded", {
         appendBytes: t.data.byteLength
-      }), this.#n(), this.#O(), this.#E()) : this.#k("append SourceBuffer", s);
+      }), this.#n(), this.#O(), this.#E()) : this.#k("append SourceBuffer", i);
     }
   }
-  #G = () => {
+  #q = () => {
     const e = this.#o;
     if (this.#a("sourcebuffer-updateend"), e?.type === "append") {
-      if (e.epoch === this.#f && this.#h[0] === e.pending) {
-        const t = this.#h.shift();
-        this.#p -= t.data.byteLength, t.init || this.#X();
+      if (e.epoch === this.#f && this.#c[0] === e.pending) {
+        const t = this.#c.shift();
+        this.#p -= t.data.byteLength, t.init || this.#Y();
       }
-    } else e?.type === "remove" ? (this.#l = !1, this.#O()) : e?.type === "clear" && (this.#S = !1);
-    this.#o = null, this.#x(), this.#E(), this.#n(), this.#_();
+    } else e?.type === "remove" ? (this.#d = !1, this.#O()) : e?.type === "clear" && (this.#v = !1);
+    this.#o = null, this.#U(), this.#E(), this.#n(), this.#_();
   };
-  #H = () => {
+  #V = () => {
     this.#a("sourcebuffer-updatestart");
   };
-  #W = () => {
+  #H = () => {
     this.#a("sourcebuffer-update");
   };
   /**
    * The managed source asking for data again, which is the only thing that
    * reopens the door `endstreaming` closed.
    */
-  #V = () => {
+  #W = () => {
     const e = this.#g;
     this.#g = !0, this.#a("mediasource-startstreaming", { previousStreaming: e }), this.#n(), this.#O();
   };
@@ -414,29 +473,29 @@ class W {
    * is taken until it asks. This is the whole point of the managed source: it
    * knows what the radio and the battery are doing and the page does not.
    */
-  #z = () => {
+  #B = () => {
     const e = this.#g;
     this.#g = !1, this.#a("mediasource-endstreaming", { previousStreaming: e }), this.#n(), this.#O();
   };
-  #Y = () => {
+  #X = () => {
     this.#a("sourcebuffer-abort", {}, !0);
   };
-  #B = () => {
+  #z = () => {
     this.#a("sourcebuffer-error", {}, !0), this.#k(
       "complete SourceBuffer update",
       new Error("the SourceBuffer rejected what was appended")
     );
   };
   #F = () => {
-    this.#I++, this.#C = a(), this.#a(
+    this.#A++, this.#T = o(), this.#a(
       "mediasource-sourceopen",
       {},
       !1,
-      this.#C
+      this.#T
     );
   };
-  #U = () => {
-    this.#P++, this.#N = a(), this.#a(
+  #x = () => {
+    this.#$++, this.#N = o(), this.#a(
       "mediasource-sourceclose",
       {},
       !this.#r,
@@ -455,9 +514,9 @@ class W {
    * playhead into the first buffered range by itself; Firefox waits at zero for
    * data that is not coming.
    */
-  #X() {
+  #Y() {
     const e = this.#e?.buffered;
-    this.#M || !e || e.length === 0 || (this.#M = !0, this.#s.onMark?.("appended"), this.#s.seek(e.start(0)));
+    this.#M || !e || e.length === 0 || (this.#M = !0, this.#i.onMark?.("appended"), this.#i.seek(e.start(0)));
   }
   /**
    * Put the length of the file on the MediaSource, once it will take one.
@@ -467,16 +526,16 @@ class W {
    * duration shorter than what is already buffered would evict the difference,
    * so what is buffered wins: it is the file speaking for itself.
    */
-  #x() {
+  #U() {
     const e = this.#m;
     if (e === null || this.#r || this.mediaSource.readyState !== "open" || this.#o || this.#e?.updating) return;
-    const t = this.#e?.buffered, s = t && t.length > 0 ? t.end(t.length - 1) : 0;
+    const t = this.#e?.buffered, i = t && t.length > 0 ? t.end(t.length - 1) : 0;
     this.#m = null;
     try {
-      const i = Math.max(e, s);
-      this.#a("mediasource-set-duration-call", { appliedDuration: i }), this.mediaSource.duration = i;
-    } catch (i) {
-      this.#k("set MediaSource duration", i);
+      const r = Math.max(e, i);
+      this.#a("mediasource-set-duration-call", { appliedDuration: r }), this.mediaSource.duration = r;
+    } catch (r) {
+      this.#k("set MediaSource duration", r);
     }
   }
   /**
@@ -490,22 +549,22 @@ class W {
    */
   #E() {
     const e = this.#e;
-    if (!this.#l || !e || e.updating || this.#o || this.#S || e.buffered.length === 0) return;
-    const t = this.#L - this.#s.keepBehindSeconds;
-    let s = 0;
-    for (const r of this.#y) {
-      if (r > t) break;
-      s = r;
+    if (!this.#d || !e || e.updating || this.#o || this.#v || e.buffered.length === 0) return;
+    const t = this.#L - this.#i.keepBehindSeconds;
+    let i = 0;
+    for (const n of this.#y) {
+      if (n > t) break;
+      i = n;
     }
-    const i = s - x;
-    if (!(i <= 0)) {
-      for (; this.#y.length > 0 && this.#y[0] < s; )
+    const r = i - Z;
+    if (!(r <= 0)) {
+      for (; this.#y.length > 0 && this.#y[0] < i; )
         this.#y.shift();
       this.#o = { type: "remove" };
       try {
-        this.#a("sourcebuffer-remove-call", { removeEnd: i }), e.remove(0, i);
-      } catch (r) {
-        this.#o = null, this.#k("evict SourceBuffer range", r);
+        this.#a("sourcebuffer-remove-call", { removeEnd: r }), e.remove(0, r);
+      } catch (n) {
+        this.#o = null, this.#k("evict SourceBuffer range", n);
       }
     }
   }
@@ -515,8 +574,8 @@ class W {
     return !e || e.length === 0 ? 0 : e.end(e.length - 1) - this.#L;
   }
   #n() {
-    const e = !this.#l && this.#g && this.#K() < this.#s.maxAheadSeconds && this.#p < this.#s.queueHighWaterMark && this.#h.length < F;
-    this.#$.set(e) && this.#s.onReadyChange?.(e);
+    const e = !this.#d && this.#g && this.#K() < this.#i.maxAheadSeconds && this.#p < this.#i.queueHighWaterMark && this.#c.length < K;
+    this.#R.set(e) && this.#i.onReadyChange?.(e);
   }
   /**
    * Say whether conversion is waiting on the buffer, whichever of the two
@@ -524,135 +583,135 @@ class W {
    * now. Both look the same from where the conversion sits.
    */
   #O() {
-    const e = this.#l || !this.#g;
-    e !== this.#w && (this.#w = e, this.#s.onBlocked?.(e));
+    const e = this.#d || !this.#g;
+    e !== this.#w && (this.#w = e, this.#i.onBlocked?.(e));
   }
   /** Wake `finish`, either because everything is appended or because we gave up. */
-  #q(e) {
-    if (!e && (!this.#b || this.#h.length > 0 || this.#o))
+  #G(e) {
+    if (!e && (!this.#b || this.#c.length > 0 || this.#o))
       return;
     const t = this.#D;
     this.#D = [];
-    for (const s of t) s();
+    for (const i of t) i();
   }
   #Q() {
     const e = this.#o;
     return {
       mediaSourceReadyState: this.mediaSource.readyState,
       sinkClosed: this.#r,
-      sourceOpenCount: this.#I,
-      sourceCloseCount: this.#P,
+      sourceOpenCount: this.#A,
+      sourceCloseCount: this.#$,
       sourceBufferPresent: this.#e !== null,
       sourceBufferUpdating: this.#e?.updating ?? !1,
       operation: e?.type ?? "none",
       operationEpoch: e?.type === "append" ? e.epoch : null,
-      queueLength: this.#h.length,
+      queueLength: this.#c.length,
       queuedBytes: this.#p,
       epoch: this.#f,
       streaming: this.#g,
-      clearing: this.#S,
-      quotaBlocked: this.#l,
+      clearing: this.#v,
+      quotaBlocked: this.#d,
       ending: this.#b
     };
   }
-  #a(e, t = {}, s = !1, i = a()) {
-    const r = Object.freeze({
-      at: i,
+  #a(e, t = {}, i = !1, r = o()) {
+    const n = Object.freeze({
+      at: r,
       event: e,
-      mediaSourceClass: this.#d,
+      mediaSourceClass: this.#l,
       detail: Object.freeze({ ...this.#Q(), ...t }),
-      critical: s
+      critical: i
     });
     try {
-      this.#s.onLifecycle?.(r);
+      this.#i.onLifecycle?.(n);
     } catch {
     }
   }
   #j(e, t) {
-    const s = t instanceof Error ? t : new Error(String(t)), i = this.#e, r = a();
+    const i = t instanceof Error ? t : new Error(String(t)), r = this.#e, n = o();
     this.#a(
       "mse-error",
       {
         failedOperation: e,
-        errorName: s.name
+        errorName: i.name
       },
       !0,
-      r
+      n
     );
-    const o = [
+    const a = [
       `mediaSource=${this.mediaSource.readyState}`,
       `closed=${this.#r}`,
-      `sourceOpens=${this.#I}`,
-      `sourceCloses=${this.#P}`,
-      `sinceSourceOpenMs=${this.#C === null ? "none" : Math.round(r - this.#C)}`,
-      `sinceSourceCloseMs=${this.#N === null ? "none" : Math.round(r - this.#N)}`,
-      `sourceBuffer=${i ? "present" : "absent"}`,
-      `updating=${i?.updating ?? !1}`,
+      `sourceOpens=${this.#A}`,
+      `sourceCloses=${this.#$}`,
+      `sinceSourceOpenMs=${this.#T === null ? "none" : Math.round(n - this.#T)}`,
+      `sinceSourceCloseMs=${this.#N === null ? "none" : Math.round(n - this.#N)}`,
+      `sourceBuffer=${r ? "present" : "absent"}`,
+      `updating=${r?.updating ?? !1}`,
       `operation=${this.#o?.type ?? "none"}`,
-      `queue=${this.#h.length}`,
+      `queue=${this.#c.length}`,
       `epoch=${this.#f}`
-    ].join(", "), h = new Error(
-      `MSE ${e} failed (${o}): ${s.name}: ${s.message}`
+    ].join(", "), c = new Error(
+      `MSE ${e} failed (${a}): ${i.name}: ${i.message}`
     );
-    return h.name = s.name, h.stack += `
-Caused by: ${s.stack ?? s.message}`, h;
+    return c.name = i.name, c.stack += `
+Caused by: ${i.stack ?? i.message}`, c;
   }
   #k(e, t) {
-    this.#s.onError?.(this.#j(e, t));
+    this.#i.onError?.(this.#j(e, t));
   }
 }
-const V = "" + new URL("assets/worker-Cy2uYoRF.js", import.meta.url).href, Y = V, l = 0.1, b = [
+const se = "" + new URL("assets/worker-Cy2uYoRF.js", import.meta.url).href, re = se, m = 0.1, M = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
   "playing",
   "waiting"
-], E = [
+], L = [
   "loadstart",
   "emptied",
   "abort",
   "error"
 ];
-let X = 0, K = 0;
-const k = /* @__PURE__ */ new WeakMap();
-let u = new I();
-const f = /* @__PURE__ */ new WeakMap();
-function Q(n) {
-  const e = k.get(n);
+let ne = 0, ae = 0;
+const A = /* @__PURE__ */ new WeakMap();
+let u = new _();
+const g = /* @__PURE__ */ new WeakMap();
+function oe(s) {
+  const e = A.get(s);
   if (e !== void 0) return e;
-  const t = ++K;
-  return k.set(n, t), t;
+  const t = ++ae;
+  return A.set(s, t), t;
 }
-function w(n = !1) {
-  return G(n);
+function I(s = !1) {
+  return ee(s);
 }
-const Z = 'video/mp4; codecs="mp4v.61"';
-function se(n = !1) {
-  return q(Z, n);
+const ce = 'video/mp4; codecs="mp4v.61"';
+function de(s = !1) {
+  return J(ce, s);
 }
-function d(n) {
-  return n instanceof Error ? n : new Error(String(n));
+function l(s) {
+  return s instanceof Error ? s : new Error(String(s));
 }
-class ie extends EventTarget {
+class fe extends EventTarget {
   video;
   #t;
-  #d;
-  #s = ++X;
+  #l;
+  #i = ++ne;
   #u;
   #e = null;
   /** Which load messages belong to. Bumped by every load and every stop. */
-  #i = 0;
-  #c = "idle";
+  #s = 0;
+  #h = "idle";
   /** The sink, when the page owns the MediaSource. */
-  #h = null;
+  #c = null;
   #p = null;
   #o = null;
   /** The `<source>` child a Managed Media Source needs; see #attachManaged. */
-  #l = null;
+  #d = null;
   /** Whether remote playback was turned off here, and so is ours to turn back. */
   #g = !1;
   #w = null;
-  #S = null;
+  #v = null;
   /** How long the input is, when it turned out to be one that can be seeked. */
   #f = null;
   /** Source video properties indexed by presentation time. */
@@ -667,22 +726,22 @@ class ie extends EventTarget {
   #r = null;
   /** Whether deinterlacing was asked for. */
   #b = !1;
-  #I = !1;
-  #P = 0;
+  #A = !1;
+  #$ = 0;
   constructor(e, t = {}) {
-    super(), this.video = e, this.#u = Q(e), this.#t = t;
-    const s = t.mediaSource ?? "auto";
-    this.#d = s === "auto" ? w(t.preferManagedMediaSource) ? "worker" : "main" : s, this.video.addEventListener("seeking", this.#B);
-    for (const i of b)
-      this.video.addEventListener(i, this.#F);
-    for (const i of E)
-      this.video.addEventListener(i, this.#U);
+    super(), this.video = e, this.#u = oe(e), this.#t = t;
+    const i = t.mediaSource ?? "auto";
+    this.#l = i === "auto" ? I(t.preferManagedMediaSource) ? "worker" : "main" : i, this.video.addEventListener("seeking", this.#z);
+    for (const r of M)
+      this.video.addEventListener(r, this.#F);
+    for (const r of L)
+      this.video.addEventListener(r, this.#x);
     this.#n("player-created", {
-      requestedMediaSource: s
+      requestedMediaSource: i
     }), t.deinterlace && (this.deinterlace = !0);
   }
   get state() {
-    return this.#c;
+    return this.#h;
   }
   /**
    * How long the input is, or null while it is a stream that plays as it
@@ -715,7 +774,7 @@ class ie extends EventTarget {
   selectAudio(e) {
     this.#e?.postMessage({
       type: "audio",
-      id: this.#i,
+      id: this.#s,
       pid: e,
       dualMonoSub: null
     });
@@ -731,14 +790,14 @@ class ie extends EventTarget {
   selectDualMono(e) {
     this.#e?.postMessage({
       type: "audio",
-      id: this.#i,
+      id: this.#s,
       pid: null,
       dualMonoSub: e
     });
   }
   /** Which side of the wire ended up owning the MediaSource. */
   get mediaSourceOwner() {
-    return this.#d;
+    return this.#l;
   }
   /** The constructor actually opened for this load, once MSE exists. */
   get mediaSourceClass() {
@@ -752,18 +811,18 @@ class ie extends EventTarget {
    * keeps the fatal snapshot cloneable and serializable. A malformed event,
    * timestamp, detail, or options object is ignored without affecting playback.
    */
-  recordDiagnosticLifecycle(e, t = {}, s = {}) {
+  recordDiagnosticLifecycle(e, t = {}, i = {}) {
     try {
-      const i = z(e, t, s);
-      if (i === null) return null;
-      const r = u, o = this.#n(i.event, i.detail, {
-        at: i.at,
-        critical: i.critical,
+      const r = V(e, t, i);
+      if (r === null) return null;
+      const n = u, a = this.#n(r.event, r.detail, {
+        at: r.at,
+        critical: r.critical,
         scope: "external"
       });
-      if (o === null) return null;
-      const h = Object.freeze({});
-      return f.set(h, { journal: r, entry: o }), h;
+      if (a === null) return null;
+      const c = Object.freeze({});
+      return g.set(c, { journal: n, entry: a }), c;
     } catch {
       return null;
     }
@@ -774,9 +833,9 @@ class ie extends EventTarget {
    */
   resolveDiagnosticLifecycle(e) {
     try {
-      const t = f.get(e);
+      const t = g.get(e);
       if (t === void 0) return;
-      f.delete(e), t.journal.resolveCritical(t.entry);
+      g.delete(e), t.journal.resolveCritical(t.entry);
     } catch {
     }
   }
@@ -803,7 +862,7 @@ class ie extends EventTarget {
     return this.#r;
   }
   set deinterlace(e) {
-    this.#b = e, this.#C();
+    this.#b = e, this.#T();
   }
   /**
    * Run the filter where it is both wanted and called for.
@@ -814,62 +873,62 @@ class ie extends EventTarget {
    * since an interlaced picture left unfiltered is the more visible mistake of
    * the two.
    */
-  #C() {
-    if (!this.#I)
+  #T() {
+    if (!this.#A)
       try {
         this.#b && !this.#r && this.#t.deinterlacer && (this.#r = this.#t.deinterlacer(this.video)), this.#r && (this.#r.videoTimeline = this.#m, this.#r.enabled = this.#b);
       } catch (e) {
-        this.#v("error", { error: d(e) });
+        this.#S("error", { error: l(e) });
       }
   }
-  #N(e, t, s) {
-    e <= 0 || t <= 0 || this.#D({ start: s, codedSize: { width: e, height: t } });
+  #N(e, t, i) {
+    e <= 0 || t <= 0 || this.#D({ start: i, codedSize: { width: e, height: t } });
   }
   /** Add source metadata now, but apply it only when its picture is shown. */
-  #$(e) {
-    for (const { start: t, interlaced: s, topFieldFirst: i } of e)
+  #R(e) {
+    for (const { start: t, interlaced: i, topFieldFirst: r } of e)
       this.#D({
         start: t,
-        scan: { interlaced: s, topFieldFirst: i }
+        scan: { interlaced: i, topFieldFirst: r }
       });
   }
   #D(e) {
-    const t = this.#m.at(-1), s = {
+    const t = this.#m.at(-1), i = {
       start: e.start,
       codedSize: e.codedSize ?? t?.codedSize,
       scan: e.scan ?? t?.scan
     };
-    if (t?.start === s.start) this.#m.pop();
-    else if (t?.codedSize?.width === s.codedSize?.width && t?.codedSize?.height === s.codedSize?.height && t?.scan?.interlaced === s.scan?.interlaced && t?.scan?.topFieldFirst === s.scan?.topFieldFirst)
+    if (t?.start === i.start) this.#m.pop();
+    else if (t?.codedSize?.width === i.codedSize?.width && t?.codedSize?.height === i.codedSize?.height && t?.scan?.interlaced === i.scan?.interlaced && t?.scan?.topFieldFirst === i.scan?.topFieldFirst)
       return;
-    if (this.#m.push(s), this.video.buffered.length > 0) {
-      const i = this.video.buffered.start(0);
-      let r = 0;
-      for (; r + 1 < this.#m.length && this.#m[r + 1].start <= i; )
-        r++;
-      r > 0 && this.#m.splice(0, r);
+    if (this.#m.push(i), this.video.buffered.length > 0) {
+      const r = this.video.buffered.start(0);
+      let n = 0;
+      for (; n + 1 < this.#m.length && this.#m[n + 1].start <= r; )
+        n++;
+      n > 0 && this.#m.splice(0, n);
     }
     this.#r && (this.#r.videoTimeline = this.#m);
   }
-  #T() {
+  #C() {
     this.#m = [], this.#r && (this.#r.videoTimeline = []);
   }
   load(e) {
-    if (this.#I)
+    if (this.#A)
       return Promise.reject(new Error("the player has been destroyed"));
-    if (this.#d === "worker" && !w(this.#t.preferManagedMediaSource))
+    if (this.#l === "worker" && !I(this.#t.preferManagedMediaSource))
       return Promise.reject(
         new Error("this browser cannot construct a MediaSource in a worker")
       );
     this.stop();
-    const t = this.#i;
+    const t = this.#s;
     this.#o = null, this.#n("player-load", {
       passthrough: this.#t.passthrough === !0
-    }), this.#f = null, this.#T(), this.#C(), this.#M = a(), this.#L = this.#M;
-    const s = this.#_(), i = new Promise((r, o) => {
-      this.#S = { resolve: r, reject: o };
+    }), this.#f = null, this.#C(), this.#T(), this.#M = o(), this.#L = this.#M;
+    const i = this.#_(), r = new Promise((n, a) => {
+      this.#v = { resolve: n, reject: a };
     });
-    return this.#A("loading"), s.postMessage({
+    return this.#I("loading"), i.postMessage({
       type: "load",
       id: t,
       url: String(e),
@@ -881,45 +940,45 @@ class ie extends EventTarget {
       passthrough: this.#t.passthrough ?? !1,
       pictureWorkers: this.#t.pictureWorkers,
       serviceId: this.#t.serviceId ?? null,
-      sink: this.#d,
+      sink: this.#l,
       preferManagedMediaSource: this.#t.preferManagedMediaSource ?? !1,
-      queueHighWaterMark: this.#t.queueHighWaterMark ?? v,
-      maxAheadSeconds: this.#t.maxAheadSeconds ?? S,
-      keepBehindSeconds: this.#t.keepBehindSeconds ?? y
-    }), this.#a(), i;
+      queueHighWaterMark: this.#t.queueHighWaterMark ?? E,
+      maxAheadSeconds: this.#t.maxAheadSeconds ?? k,
+      keepBehindSeconds: this.#t.keepBehindSeconds ?? w
+    }), this.#a(), r;
   }
   /** Abandon the current load. The player stays usable. */
   stop() {
-    const e = this.#i;
-    this.#n("player-stop", { stoppedGeneration: e }), this.#i++, this.#e?.postMessage({ type: "stop", id: e }), this.#k("stop", e), this.#Z(new Error("the load was stopped")), this.#A("idle");
+    const e = this.#s;
+    this.#n("player-stop", { stoppedGeneration: e }), this.#s++, this.#e?.postMessage({ type: "stop", id: e }), this.#k("stop", e), this.#Z(new Error("the load was stopped")), this.#I("idle");
   }
   /** Stop, and give up the worker. The player cannot be loaded again. */
   destroy() {
-    if (!this.#I) {
-      this.stop(), this.#I = !0, this.video.removeEventListener("seeking", this.#B);
-      for (const e of b)
+    if (!this.#A) {
+      this.stop(), this.#A = !0, this.video.removeEventListener("seeking", this.#z);
+      for (const e of M)
         this.video.removeEventListener(e, this.#F);
-      for (const e of E)
-        this.video.removeEventListener(e, this.#U);
+      for (const e of L)
+        this.video.removeEventListener(e, this.#x);
       this.#r?.destroy(), this.#r = null, this.#e && (this.#n("worker-terminate-call", { reason: "destroy" }), this.#e.terminate()), this.#e = null;
     }
   }
-  addEventListener(e, t, s) {
-    super.addEventListener(e, t, s);
+  addEventListener(e, t, i) {
+    super.addEventListener(e, t, i);
   }
-  removeEventListener(e, t, s) {
-    super.removeEventListener(e, t, s);
+  removeEventListener(e, t, i) {
+    super.removeEventListener(e, t, i);
   }
   #_() {
     if (!this.#e) {
       const e = new Worker(
-        this.#t.workerUrl ?? Y,
+        this.#t.workerUrl ?? re,
         {
           type: "module"
         }
       );
-      e.onmessage = this.#G, e.onerror = (t) => {
-        const s = a();
+      e.onmessage = this.#q, e.onerror = (t) => {
+        const i = o();
         this.#n(
           "worker-onerror",
           {
@@ -927,24 +986,28 @@ class ie extends EventTarget {
             line: t.lineno,
             column: t.colno
           },
-          { at: s, critical: !0 }
-        ), this.#R(new Error(t.message || "the worker failed"));
+          { at: i, critical: !0 }
+        ), this.#P(new Error(t.message || "the worker failed"));
       }, this.#e = e, this.#n("worker-created");
     }
     return this.#e;
   }
-  #G = (e) => {
+  #q = (e) => {
     const t = e.data;
-    if (t.id === this.#i)
+    if (t.type === "lifecycle") {
+      this.#K(t.trace, "worker", t.id);
+      return;
+    }
+    if (t.id === this.#s)
       switch (t.type) {
         case "handle":
-          t.managed && this.#z(), this.#o = t.managed ? "ManagedMediaSource" : "MediaSource", this.#n("video-source-attach-call", {
+          t.managed && this.#B(), this.#o = t.managed ? "ManagedMediaSource" : "MediaSource", this.#n("video-source-attach-call", {
             attachment: "srcObject",
             reason: "worker-media-source-handle"
-          }), this.video.srcObject = t.handle, this.#E("attached", a());
+          }), this.video.srcObject = t.handle, this.#E("attached", o());
           break;
         case "open":
-          this.#H(t.mimeCodec, t.data);
+          this.#V(t.mimeCodec, t.data);
           break;
         case "video-config":
           this.#N(
@@ -954,123 +1017,120 @@ class ie extends EventTarget {
           );
           break;
         case "fragment":
-          this.#h?.push(
+          this.#c?.push(
             t.data,
             t.start,
             t.randomAccess
           );
           break;
         case "opened":
-          this.#A("converting"), this.#Z(null);
+          this.#I("converting"), this.#Z(null);
           break;
         case "seekable":
-          this.#f = t.duration, this.#h?.setDuration(t.duration), this.#v("seekable", { duration: t.duration });
+          this.#f = t.duration, this.#c?.setDuration(t.duration), this.#S("seekable", { duration: t.duration });
           break;
         case "reset":
-          this.#T(), this.#h?.reset();
+          this.#C(), this.#c?.reset();
           break;
         case "scans":
-          this.#$(t.scans);
+          this.#R(t.scans);
           break;
         case "workers":
-          this.#v("workers", {
+          this.#S("workers", {
             pictureWorkers: t.pictureWorkers
           });
           break;
         case "services":
-          this.#v("services", t.services);
+          this.#S("services", t.services);
           break;
         case "audio":
-          this.#y = t.audio, this.#v("audio", t.audio);
+          this.#y = t.audio, this.#S("audio", t.audio);
           break;
         case "private_stream_1":
         case "private_stream_2":
-          this.#v(t.type, t.stream);
+          this.#S(t.type, t.stream);
           break;
         case "mark":
           this.#E(t.name, t.at);
-          break;
-        case "lifecycle":
-          this.#K(t.trace, "worker");
           break;
         case "seek":
           this.video.currentTime < t.time && (this.video.currentTime = t.time);
           break;
         case "progress":
-          this.#v("progress", {
+          this.#S("progress", {
             bytesRead: t.bytesRead,
             totalBytes: t.totalBytes
           });
           break;
         case "stats":
-          this.#v("stats", t.stats);
+          this.#S("stats", t.stats);
           break;
         case "blocked":
-          this.#A(t.blocked ? "buffer-full" : "converting");
+          this.#I(t.blocked ? "buffer-full" : "converting");
           break;
         case "finish":
-          this.#Y();
+          this.#X();
           break;
         case "completed":
-          this.#A("completed"), this.#d === "worker" && this.#j();
+          this.#I("completed"), this.#l === "worker" && this.#j();
           break;
         case "error":
           this.#n(
             "worker-error",
             { messagePresent: t.message.length > 0 },
             { at: t.at, critical: !0, scope: "worker" }
-          ), this.#R(new Error(t.message));
+          ), this.#P(new Error(t.message));
           break;
       }
   };
   /** Open a MediaSource here, for browsers that cannot have one in a worker. */
-  #H(e, t) {
-    const s = this.#i;
-    let i;
+  #V(e, t) {
+    const i = this.#s;
+    let r;
     try {
-      i = this.#h ?? this.#W(s);
-    } catch (r) {
-      this.#R(d(r));
+      r = this.#c ?? this.#H(i);
+    } catch (n) {
+      this.#P(l(n));
       return;
     }
-    i.open(e, t).then(
+    r.open(e, t).then(
       // The worker is waiting on flow to know the open succeeded. Going
       // through ready() rather than saying true covers the case where the
       // append filled the queue on its own.
-      () => i.ready().then(() => this.#Q(s, { type: "flow", id: s, ready: !0 })),
-      (r) => {
-        s === this.#i && this.#R(this.#J(d(r)));
+      () => r.ready().then(() => this.#Q(i, { type: "flow", id: i, ready: !0 })),
+      (n) => {
+        i === this.#s && this.#P(this.#J(l(n)));
       }
     );
   }
-  #W(e) {
-    const t = new W({
+  #H(e) {
+    const t = new ie({
       preferManaged: this.#t.preferManagedMediaSource,
-      queueHighWaterMark: this.#t.queueHighWaterMark ?? v,
-      maxAheadSeconds: this.#t.maxAheadSeconds ?? S,
-      keepBehindSeconds: this.#t.keepBehindSeconds ?? y,
-      seek: (s) => {
-        this.video.currentTime < s && (this.video.currentTime = s);
+      queueHighWaterMark: this.#t.queueHighWaterMark ?? E,
+      maxAheadSeconds: this.#t.maxAheadSeconds ?? k,
+      keepBehindSeconds: this.#t.keepBehindSeconds ?? w,
+      seek: (i) => {
+        this.video.currentTime < i && (this.video.currentTime = i);
       },
-      onMark: (s) => this.#E(s, a()),
-      onLifecycle: (s) => this.#K(s, "main", e),
-      onReadyChange: (s) => this.#Q(e, { type: "flow", id: e, ready: s }),
-      onBlocked: (s) => {
-        e === this.#i && this.#A(s ? "buffer-full" : "converting");
+      onMark: (i) => this.#E(i, o()),
+      onLifecycle: (i) => this.#K(i, "main", e),
+      onReadyChange: (i) => this.#Q(e, { type: "flow", id: e, ready: i }),
+      onBlocked: (i) => {
+        e === this.#s && this.#I(i ? "buffer-full" : "converting");
       },
-      onError: (s) => {
-        e === this.#i && this.#R(this.#J(s));
+      onError: (i) => {
+        e === this.#s && this.#P(this.#J(i));
       }
     });
-    return this.#h = t, this.#p = URL.createObjectURL(t.mediaSource), this.#n(
+    return this.#c = t, this.#p = URL.createObjectURL(t.mediaSource), this.#n(
       "object-url-created",
       { reason: "main-media-source" },
       { generation: e }
-    ), t.managed ? this.#V(this.#p) : (this.#n(
+    ), t.managed ? this.#W(this.#p) : (this.#n(
       "video-source-attach-call",
       { attachment: "src", reason: "main-media-source" },
       { generation: e }
-    ), this.video.src = this.#p), this.#E("attached", a()), this.#f !== null && t.setDuration(this.#f), t;
+    ), this.video.src = this.#p), this.#E("attached", o()), this.#f !== null && t.setDuration(this.#f), t;
   }
   /**
    * Put a Managed Media Source on the element, which takes more than a `src`.
@@ -1081,16 +1141,16 @@ class ie extends EventTarget {
    * than the attribute. Neither is optional: miss one and `sourceopen` never
    * arrives and the load waits for a stream that has not begun.
    */
-  #V(e) {
+  #W(e) {
     this.#n("video-source-detach-call", {
       attachment: "src",
       hadAttachment: this.video.hasAttribute("src"),
       reason: "managed-media-source-attach"
-    }), this.video.removeAttribute("src"), this.#z();
+    }), this.video.removeAttribute("src"), this.#B();
     const t = document.createElement("source");
     t.type = "video/mp4", t.src = e, this.#n("source-element-attach-call", {
       reason: "managed-media-source-attach"
-    }), this.video.append(t), this.#l = t, this.#n("video-load-call", {
+    }), this.video.append(t), this.#d = t, this.#n("video-load-call", {
       reason: "managed-media-source-attach"
     }), this.video.load();
   }
@@ -1100,17 +1160,17 @@ class ie extends EventTarget {
    * belongs to whoever made it, so it is put back on the way out -- unless it
    * was already off, and theirs to keep.
    */
-  #z() {
+  #B() {
     this.video.disableRemotePlayback || (this.video.disableRemotePlayback = !0, this.#g = !0);
   }
-  #Y() {
-    const e = this.#i, t = this.#h;
+  #X() {
+    const e = this.#s, t = this.#c;
     t && t.finish().then(
       () => {
-        e === this.#i && this.#j();
+        e === this.#s && this.#j();
       },
-      (s) => {
-        e === this.#i && this.#R(d(s));
+      (i) => {
+        e === this.#s && this.#P(l(i));
       }
     );
   }
@@ -1122,26 +1182,26 @@ class ie extends EventTarget {
    * What is left is a real seek: the worker throws the buffer away and reads
    * the input again from where the viewer asked to be.
    */
-  #B = () => {
-    if (this.#f === null || this.#c === "idle" || this.#c === "error") return;
+  #z = () => {
+    if (this.#f === null || this.#h === "idle" || this.#h === "error") return;
     const e = this.video.currentTime;
-    this.#O(e) || (this.#A("seeking"), this.#T(), this.#a(), this.#e?.postMessage({
+    this.#O(e) || (this.#I("seeking"), this.#C(), this.#a(), this.#e?.postMessage({
       type: "seek",
-      id: this.#i,
+      id: this.#s,
       time: e
     }));
   };
   #F = (e) => {
-    this.#c !== "idle" && (this.#E(e.type, a()), e.type === "waiting" && this.#x());
+    this.#h !== "idle" && (this.#E(e.type, o()), e.type === "waiting" && this.#U());
   };
-  #U = (e) => {
+  #x = (e) => {
     this.#n(
       `video-${e.type}`,
-      this.#X(e.currentTarget === this.video),
+      this.#Y(e.currentTarget === this.video),
       { critical: e.type === "error" && this.video.error !== null }
     );
   };
-  #X(e) {
+  #Y(e) {
     return {
       mediaErrorCode: this.video.error?.code ?? null,
       readyState: this.video.readyState,
@@ -1151,7 +1211,7 @@ class ie extends EventTarget {
       videoPaused: this.video.paused,
       srcAttributePresent: this.video.hasAttribute("src"),
       srcObjectPresent: this.video.srcObject !== null,
-      sourceElementPresent: this.#l !== null
+      sourceElementPresent: this.#d !== null
     };
   }
   /**
@@ -1173,17 +1233,17 @@ class ie extends EventTarget {
    * it is the one reading available whether the `MediaSource` is here or in the
    * worker.
    */
-  #x() {
+  #U() {
     if (this.video.seeking) return;
     const e = this.video.currentTime, t = this.video.buffered;
-    let s = null;
-    for (let i = 0; i < t.length; i++) {
-      const r = t.start(i);
-      if (e >= r - l && e < t.end(i) - l)
+    let i = null;
+    for (let r = 0; r < t.length; r++) {
+      const n = t.start(r);
+      if (e >= n - m && e < t.end(r) - m)
         return;
-      r > e + l && (s === null || r < s) && (s = r);
+      n > e + m && (i === null || n < i) && (i = n);
     }
-    s !== null && (this.video.currentTime = s);
+    i !== null && (this.video.currentTime = i);
   }
   /**
    * Report where a step of the load fell on the clock `load()` started.
@@ -1194,35 +1254,36 @@ class ie extends EventTarget {
    */
   #E(e, t) {
     if (this.#M === 0) return;
-    const s = t - this.#M, i = Math.max(0, t - this.#L);
-    this.#L = Math.max(this.#L, t), this.#v("timing", { name: e, sinceLoad: s, sincePrevious: i });
+    const i = t - this.#M, r = Math.max(0, t - this.#L);
+    this.#L = Math.max(this.#L, t), this.#S("timing", { name: e, sinceLoad: i, sincePrevious: r });
   }
-  #K(e, t, s = this.#i) {
-    this.#o = e.mediaSourceClass, this.#n(e.event, e.detail, {
+  #K(e, t, i = this.#s) {
+    i === this.#s && (this.#o = e.mediaSourceClass), this.#n(e.event, e.detail, {
       at: e.at,
       critical: e.critical,
       scope: t,
-      generation: s
+      generation: i,
+      mediaSourceClass: e.mediaSourceClass
     });
   }
-  #n(e, t = {}, s = {}) {
+  #n(e, t = {}, i = {}) {
     return u.record({
-      at: s.at ?? a(),
-      scope: s.scope ?? "main",
+      at: i.at ?? o(),
+      scope: i.scope ?? "main",
       event: e,
-      playerInstance: this.#s,
-      generation: s.generation ?? this.#i,
+      playerInstance: this.#i,
+      generation: i.generation ?? this.#s,
       videoId: this.#u,
-      mediaSourceOwner: this.#d,
-      mediaSourceClass: this.#o,
+      mediaSourceOwner: this.#l,
+      mediaSourceClass: i.mediaSourceClass ?? this.#o,
       detail: t,
-      critical: s.critical
+      critical: i.critical
     });
   }
   #O(e) {
     const t = this.video.buffered;
-    for (let s = 0; s < t.length; s++)
-      if (e >= t.start(s) && e < t.end(s))
+    for (let i = 0; i < t.length; i++)
+      if (e >= t.start(i) && e < t.end(i))
         return !0;
     return !1;
   }
@@ -1231,93 +1292,93 @@ class ie extends EventTarget {
    * behind. This cannot ride on `timeupdate`: that event stops firing exactly
    * when playback stalls, which is when eviction matters most.
    */
-  #q = () => {
+  #G = () => {
     const e = this.video.currentTime;
-    this.#d === "main" ? this.#h?.setCurrentTime(e) : this.#e?.postMessage({
+    this.#l === "main" ? this.#c?.setCurrentTime(e) : this.#e?.postMessage({
       type: "time",
-      id: this.#i,
+      id: this.#s,
       currentTime: e
     });
   };
   #Q(e, t) {
-    e === this.#i && this.#e?.postMessage(t);
+    e === this.#s && this.#e?.postMessage(t);
   }
   #a() {
     this.#w === null && (this.#w = setInterval(
-      this.#q,
-      U
+      this.#G,
+      Q
     ));
   }
   #j() {
     this.#w !== null && (clearInterval(this.#w), this.#w = null);
   }
-  #k(e, t = this.#i) {
-    const s = (i, r) => this.#n(i, r, { generation: t });
-    s("player-teardown", { reason: e }), this.#j(), this.#T(), this.#h?.close(e), this.#h = null, this.#p && (s("object-url-revoke-call", { reason: e }), URL.revokeObjectURL(this.#p)), this.#p = null, this.#l && (s("source-element-detach-call", { reason: e }), this.#l.remove()), this.#l = null, this.#g && (this.video.disableRemotePlayback = !1, this.#g = !1), s("video-source-detach-call", {
+  #k(e, t = this.#s) {
+    const i = (r, n) => this.#n(r, n, { generation: t });
+    i("player-teardown", { reason: e }), this.#j(), this.#C(), this.#c?.close(e), this.#c = null, this.#p && (i("object-url-revoke-call", { reason: e }), URL.revokeObjectURL(this.#p)), this.#p = null, this.#d && (i("source-element-detach-call", { reason: e }), this.#d.remove()), this.#d = null, this.#g && (this.video.disableRemotePlayback = !1, this.#g = !1), i("video-source-detach-call", {
       attachment: "src",
       hadAttachment: this.video.hasAttribute("src"),
       reason: e
-    }), this.video.removeAttribute("src"), s("video-source-detach-call", {
+    }), this.video.removeAttribute("src"), i("video-source-detach-call", {
       attachment: "srcObject",
       hadAttachment: this.video.srcObject !== null,
       reason: e
-    }), this.video.srcObject = null, s("video-load-call", { reason: e }), this.video.load(), this.#o = null;
+    }), this.video.srcObject = null, i("video-load-call", { reason: e }), this.video.load(), this.#o = null;
   }
-  #R(e) {
-    const t = a();
+  #P(e) {
+    const t = o();
     this.#n(
       "player-fail",
-      { ...this.#X(!0), errorName: e.name },
+      { ...this.#Y(!0), errorName: e.name },
       { at: t, critical: !0 }
     );
-    const s = [
+    const i = [
       "m2h",
       Math.trunc(t * 1e3).toString(36),
-      this.#s.toString(36),
       this.#i.toString(36),
-      (++this.#P).toString(36)
-    ].join("-"), i = u.freeze(s, t);
-    u = new I();
-    const r = B(e, i);
-    this.#k("fail"), this.#A("error"), this.#Z(r), this.#v("error", { error: r });
+      this.#s.toString(36),
+      (++this.#$).toString(36)
+    ].join("-"), r = u.freeze(i, t);
+    u = new _();
+    const n = Y(e, r);
+    this.#k("fail"), this.#I("error"), this.#Z(n), this.#S("error", { error: n });
   }
   #J(e) {
-    const t = this.#l, s = this.#p, i = [
+    const t = this.#d, i = this.#p, r = [
       `videoConnected=${this.video.isConnected}`,
       `videoReadyState=${this.video.readyState}`,
       `videoNetworkState=${this.video.networkState}`,
       `videoPaused=${this.video.paused}`,
       `sourceElement=${t ? "present" : "absent"}`,
       `sourceConnected=${t?.isConnected ?? !1}`,
-      `sourceMatchesObjectUrl=${t !== null && s !== null && t.src === s}`,
-      `currentSrcMatchesObjectUrl=${s !== null && this.video.currentSrc === s}`
-    ].join(", "), r = new Error(`${e.message} (${i})`);
-    return r.name = e.name, r.stack += `
-Caused by: ${e.stack ?? e.message}`, r;
+      `sourceMatchesObjectUrl=${t !== null && i !== null && t.src === i}`,
+      `currentSrcMatchesObjectUrl=${i !== null && this.video.currentSrc === i}`
+    ].join(", "), n = new Error(`${e.message} (${r})`);
+    return n.name = e.name, n.stack += `
+Caused by: ${e.stack ?? e.message}`, n;
   }
   #Z(e) {
-    const t = this.#S;
-    t && (this.#S = null, e ? t.reject(e) : t.resolve());
+    const t = this.#v;
+    t && (this.#v = null, e ? t.reject(e) : t.resolve());
   }
-  #A(e) {
-    this.#c !== e && (this.#c = e, this.#v("statechange", { state: e }));
+  #I(e) {
+    this.#h !== e && (this.#h = e, this.#S("statechange", { state: e }));
   }
-  #v(e, t) {
+  #S(e, t) {
     this.dispatchEvent(new CustomEvent(e, { detail: t }));
   }
 }
 export {
-  y as DEFAULT_KEEP_BEHIND_SECONDS,
-  S as DEFAULT_MAX_AHEAD_SECONDS,
-  v as DEFAULT_QUEUE_HIGH_WATER_MARK,
-  C as LIFECYCLE_EVENT_ID_MAX_LENGTH,
-  M as LIFECYCLE_TRACE_CAPACITY,
-  ie as Mpeg2TsPlayer,
-  J as isLifecycleError,
-  a as lifecycleNow,
-  te as requiresManagedMediaSource,
-  ee as supportsManagedMediaSource,
-  se as supportsPassthrough,
-  w as supportsWorkerMediaSource
+  w as DEFAULT_KEEP_BEHIND_SECONDS,
+  k as DEFAULT_MAX_AHEAD_SECONDS,
+  E as DEFAULT_QUEUE_HIGH_WATER_MARK,
+  j as LIFECYCLE_EVENT_ID_MAX_LENGTH,
+  T as LIFECYCLE_TRACE_CAPACITY,
+  fe as Mpeg2TsPlayer,
+  he as isLifecycleError,
+  o as lifecycleNow,
+  le as requiresManagedMediaSource,
+  ue as supportsManagedMediaSource,
+  de as supportsPassthrough,
+  I as supportsWorkerMediaSource
 };
 //# sourceMappingURL=index.js.map

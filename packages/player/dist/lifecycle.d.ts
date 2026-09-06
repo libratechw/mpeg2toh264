@@ -94,7 +94,8 @@ export declare class LifecycleTrace {
     freeze(eventId: string, frozenAt?: number): LifecycleTraceSnapshot;
 }
 /**
- * Decorate the same Error instance with the immutable trace.
+ * Decorate the same Error instance when its own properties permit it. A
+ * readonly or non-extensible error is retained as the cause of a traced Error.
  *
  * The full trace is intentionally kept out of `message`: DPlayer displays that
  * string directly. Consumers that want the chronology read `lifecycleTrace`.
