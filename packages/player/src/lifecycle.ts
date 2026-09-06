@@ -357,6 +357,11 @@ function readableErrorString(
   }
 }
 
+/** Read an Error name without allowing a host getter to escape diagnostics. */
+export function readErrorName(error: Error): string {
+  return readableErrorString(error, "name", "Error")!;
+}
+
 function canDefineValue(
   error: Error,
   property: "message" | "lifecycleEventId" | "lifecycleTrace",
@@ -426,6 +431,7 @@ export function withLifecycleTrace(
   snapshot: LifecycleTraceSnapshot,
 ): LifecycleError {
   const suffix = lifecycleMessageSuffix(snapshot);
+  const originalName = readableErrorString(error, "name", null);
   const originalMessage = readableErrorString(
     error,
     "message",
@@ -433,7 +439,7 @@ export function withLifecycleTrace(
   )!;
   const message = `${originalMessage}\n${suffix}`;
 
-  if (canDecorateInPlace(error)) {
+  if (originalName !== null && canDecorateInPlace(error)) {
     try {
       return decorateError(error, message, snapshot);
     } catch {
@@ -442,7 +448,7 @@ export function withLifecycleTrace(
   }
 
   const fallback = new Error(message, { cause: error });
-  fallback.name = readableErrorString(error, "name", "Error")!;
+  fallback.name = originalName ?? "Error";
   const originalStack = readableErrorString(error, "stack", null);
   if (originalStack !== null) {
     fallback.stack = `${fallback.name}: ${fallback.message}\nCaused by original error:\n${originalStack}`;

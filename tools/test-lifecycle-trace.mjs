@@ -37,6 +37,7 @@ try {
     LIFECYCLE_TRACE_CAPACITY,
     isLifecycleError,
     lifecycleNow,
+    readErrorName,
     sanitizeDiagnosticLifecycleInput,
     sanitizeLifecycleDetail,
     withLifecycleTrace,
@@ -259,9 +260,25 @@ try {
   assert.equal(isLifecycleError(tracedFrozen), true);
   assert.equal(Object.isFrozen(frozen), true);
 
+  const throwingName = new Error("throwing name failure");
+  Object.defineProperty(throwingName, "name", {
+    get() {
+      throw new Error("name getter failed");
+    },
+    configurable: false,
+  });
+  assert.equal(readErrorName(throwingName), "Error");
+  const tracedThrowingName = withLifecycleTrace(throwingName, snapshot);
+  assert.notEqual(tracedThrowingName, throwingName);
+  assert.equal(tracedThrowingName.cause, throwingName);
+  assert.equal(tracedThrowingName.name, "Error");
+  assert.equal(isLifecycleError(tracedThrowingName), true);
+
   assert.equal(isLifecycleError(new Error("plain")), false);
   assert.equal(
     isLifecycleError({
+      name: "Error",
+      message: "unfrozen trace",
       lifecycleEventId: "m2h-abc-7-b-1",
       lifecycleTrace: { ...snapshot },
     }),
@@ -270,6 +287,8 @@ try {
   const newlineEventId = `${snapshot.eventId}\n`;
   assert.equal(
     isLifecycleError({
+      name: "Error",
+      message: "invalid event ID",
       lifecycleEventId: newlineEventId,
       lifecycleTrace: Object.freeze({
         ...snapshot,
@@ -280,6 +299,8 @@ try {
   );
   assert.equal(
     isLifecycleError({
+      name: "Error",
+      message: "empty trace",
       lifecycleEventId: "m2h-abc-7-b-1",
       lifecycleTrace: Object.freeze({
         eventId: "m2h-abc-7-b-1",
@@ -319,6 +340,8 @@ try {
   });
   assert.equal(
     isLifecycleError({
+      name: "Error",
+      message: "non-finite detail",
       lifecycleEventId: snapshot.eventId,
       lifecycleTrace: nonFiniteTrace,
     }),
@@ -450,6 +473,8 @@ try {
   const replaceAt = failSource.indexOf("lifecycleJournal = new LifecycleTrace");
   const teardownAt = failSource.indexOf('this.#teardown("fail")');
   assert.equal(freezeAt >= 0, true);
+  assert.equal(failSource.includes("error.name"), false);
+  assert.match(failSource, /errorName: readErrorName\(error\)/);
   assert.equal(freezeAt < replaceAt, true);
   assert.equal(replaceAt < teardownAt, true);
 

@@ -16,6 +16,7 @@ import {
 import {
   LifecycleTrace,
   lifecycleNow,
+  readErrorName,
   sanitizeDiagnosticLifecycleInput,
   withLifecycleTrace,
   type DiagnosticLifecycleToken,
@@ -1254,7 +1255,7 @@ export class Mpeg2TsPlayer extends EventTarget {
     const at = lifecycleNow();
     this.#recordLifecycle(
       "player-fail",
-      { ...this.#videoState(true), errorName: error.name },
+      { ...this.#videoState(true), errorName: readErrorName(error) },
       { at, critical: true },
     );
     const eventId = [
