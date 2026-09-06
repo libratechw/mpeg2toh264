@@ -41,13 +41,13 @@ await player.load('https://example.com/video.ts');
 - `seekable`: Rangeシーク可能な入力の再生時間
 - `private_stream_1` / `private_stream_2`: 選択サービスのprivate PES
 - `timing`: 読み込み開始から各段階までの所要時間
-- `error`: 読み込み中を含むすべてのエラー。再生失敗時の`event.detail.error`は元の`Error`と同じオブジェクトで、診断用の`lifecycleEventId`と`lifecycleTrace`を持つ。再生を継続するdeinterlacer初期化エラーは従来どおり通常の`Error`
+- `error`: 読み込み中を含むすべてのエラー。再生失敗時の`event.detail.error`は診断用の`lifecycleEventId`と`lifecycleTrace`を持つ。元の`Error`へ安全にpropertyを追加できる場合は同じオブジェクトを使い、readonlyまたは拡張不能な場合は元の`Error`を`cause`に保持する診断付き`Error`を渡す。再生を継続するdeinterlacer初期化エラーは従来どおり通常の`Error`
 
 ## iOS lifecycle診断契約
 
 `lifecycleTrace`は、同じページで画質切替により交代するmpeg2toh264インスタンスをまたぐリングバッファーの凍結snapshotです。各entryの`at`とsnapshotの`frozenAt`は、WindowとWorkerのどちらでも`performance.timeOrigin + performance.now()`を使うため、realmをまたいで時系列に並べられます。MSEの実ownerと実class、内部generation、SourceBufferの操作・queue・epochも各entryに含まれます。event IDは`m2h-<freeze_us_base36>-<mpeg_instance_base36>-<generation_base36>-<failure_sequence_base36>`形式で、最大51文字です。
 
-最初に異常原因の候補として記録されたentryは、後続イベントでリングが回転しても保持します。失敗時は`src` / `srcObject`の解除、Object URLのrevoke、`video.load()`より先にsnapshot全体、entry配列、各entryとdetailを凍結します。完全なsnapshotは`error.lifecycleTrace`だけに置き、画面へ直接表示される`error.message`には最大240文字のevent IDと概要だけを追加します。
+最初に異常原因の候補として記録されたentryは、後続イベントでリングが回転しても保持します。失敗時は`src` / `srcObject`の解除、Object URLのrevoke、`video.load()`より先にsnapshot全体、entry配列、各entryとdetailを凍結します。完全なsnapshotは`error.lifecycleTrace`だけに置き、画面へ直接表示される`error.message`には最大240文字のevent ID、最初と最後のevent、直近最大8件のevent名だけのtail、件数を追加します。tailは古い側から表示領域へ収まる分だけ省略し、URL、path、detailは含めません。
 
 DPlayerなどのpage側ownerは`recordDiagnosticLifecycle(event, detail, { at, critical })`で、画質切替世代などを同じ時系列へ追加できます。critical eventが保持枠を取得した場合だけopaque tokenを返し、その操作が成功したときに同じtokenを`resolveDiagnosticLifecycle(token)`へ渡すと、そのentryを通常のリング回転へ戻します。別entryや別snapshotのtokenでは保持枠を解放しません。
 

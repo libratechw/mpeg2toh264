@@ -274,6 +274,7 @@ export interface DiagnosticLifecycleOptions {
 interface LifecycleRecordOptions extends DiagnosticLifecycleOptions {
   readonly scope?: LifecycleTraceScope;
   readonly generation?: number;
+  readonly mediaSourceClass?: MediaSourceClassName;
 }
 
 /**
@@ -773,6 +774,13 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #onMessage = (event: MessageEvent<Notification>): void => {
     const notification = event.data;
+    // Teardown lifecycle messages are diagnostic-only and can arrive after
+    // stop() advances the accepted playback generation. Keep their own exact
+    // generation without admitting any other stale notification type.
+    if (notification.type === "lifecycle") {
+      this.#recordMseLifecycle(notification.trace, "worker", notification.id);
+      return;
+    }
     if (notification.id !== this.#generation) return;
     switch (notification.type) {
       case "handle":
@@ -844,9 +852,6 @@ export class Mpeg2TsPlayer extends EventTarget {
         break;
       case "mark":
         this.#mark(notification.name, notification.at);
-        break;
-      case "lifecycle":
-        this.#recordMseLifecycle(notification.trace, "worker");
         break;
       case "seek":
         if (this.video.currentTime < notification.time)
@@ -1133,12 +1138,14 @@ export class Mpeg2TsPlayer extends EventTarget {
     scope: Extract<LifecycleTraceScope, "main" | "worker">,
     generation = this.#generation,
   ): void {
-    this.#mediaSourceClass = trace.mediaSourceClass;
+    if (generation === this.#generation)
+      this.#mediaSourceClass = trace.mediaSourceClass;
     this.#recordLifecycle(trace.event, trace.detail, {
       at: trace.at,
       critical: trace.critical,
       scope,
       generation,
+      mediaSourceClass: trace.mediaSourceClass,
     });
   }
 
@@ -1155,7 +1162,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       generation: options.generation ?? this.#generation,
       videoId: this.#videoId,
       mediaSourceOwner: this.#sinkKind,
-      mediaSourceClass: this.#mediaSourceClass,
+      mediaSourceClass: options.mediaSourceClass ?? this.#mediaSourceClass,
       detail,
       critical: options.critical,
     });

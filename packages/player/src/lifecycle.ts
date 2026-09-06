@@ -84,6 +84,9 @@ const MAX_MESSAGE_SUFFIX_LENGTH = 240;
 export const LIFECYCLE_EVENT_ID_MAX_LENGTH = 51;
 const LIFECYCLE_EVENT_ID = /^m2h-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+$/;
 const INVALID_LIFECYCLE_EVENT_ID_CHARACTER = /[^0-9a-z-]/;
+const MAX_COMPACT_EVENT_LENGTH = 32;
+const MAX_COMPACT_TAIL_EVENT_LENGTH = 24;
+const MAX_MESSAGE_TAIL_EVENTS = 8;
 const DIAGNOSTIC_EVENT_START = /^[A-Za-z0-9]/;
 const INVALID_DIAGNOSTIC_EVENT_CHARACTER = /[^A-Za-z0-9_.:-]/;
 const MAX_DIAGNOSTIC_EVENT_LENGTH = 64;
@@ -295,12 +298,125 @@ export class LifecycleTrace {
   }
 }
 
-function compactEvent(event: string): string {
-  return event.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 48);
+function compactEvent(event: string, limit = MAX_COMPACT_EVENT_LENGTH): string {
+  return event.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, limit);
+}
+
+function compactTailEvent(event: string): string {
+  return compactEvent(
+    event
+      .replace(/^mediasource-/, "ms.")
+      .replace(/^sourcebuffer-/, "sb.")
+      .replace(/^dplayer-/, "dp.")
+      .replace(/^player-/, "p.")
+      .replace(/^worker-/, "w.")
+      .replace(/^video-/, "v.")
+      .replace(/^object-url-/, "url.")
+      .replace(/^source-element-/, "source."),
+    MAX_COMPACT_TAIL_EVENT_LENGTH,
+  );
+}
+
+function lifecycleMessageSuffix(snapshot: LifecycleTraceSnapshot): string {
+  const first = snapshot.firstCritical?.event ?? "none";
+  const last = snapshot.entries.at(-1)?.event ?? "none";
+  const summary = [
+    `lifecycle=${snapshot.eventId}`,
+    `first=${compactEvent(first)}`,
+    `last=${compactEvent(last)}`,
+    `entries=${snapshot.entries.length}`,
+    `dropped=${snapshot.dropped}`,
+  ].join(" ");
+  const tailBudget = MAX_MESSAGE_SUFFIX_LENGTH - 2 - summary.length - 6;
+  let tail: string[] = [];
+  for (
+    let index = snapshot.entries.length - 1;
+    index >= 0 && tail.length < MAX_MESSAGE_TAIL_EVENTS;
+    index--
+  ) {
+    const candidate = [
+      compactTailEvent(snapshot.entries[index]!.event),
+      ...tail,
+    ];
+    if (candidate.join(">").length > tailBudget) break;
+    tail = candidate;
+  }
+  return `[${summary}${tail.length === 0 ? "" : ` tail=${tail.join(">")}`}]`;
+}
+
+function readableErrorString(
+  error: Error,
+  property: "message" | "name" | "stack",
+  fallback: string | null,
+): string | null {
+  try {
+    const value = error[property];
+    return typeof value === "string" ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function canDefineValue(
+  error: Error,
+  property: "message" | "lifecycleEventId" | "lifecycleTrace",
+  enumerable?: boolean,
+): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(error, property);
+  if (descriptor === undefined) return Object.isExtensible(error);
+  if (descriptor.configurable) return true;
+  return (
+    "writable" in descriptor &&
+    descriptor.writable === true &&
+    (enumerable === undefined || descriptor.enumerable === enumerable)
+  );
+}
+
+function canDecorateInPlace(error: Error): boolean {
+  try {
+    return (
+      canDefineValue(error, "message") &&
+      canDefineValue(error, "lifecycleEventId", true) &&
+      canDefineValue(error, "lifecycleTrace", true)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function defineValue(
+  error: Error,
+  property: "message" | "lifecycleEventId" | "lifecycleTrace",
+  value: unknown,
+  enumerable: boolean,
+): void {
+  const descriptor = Object.getOwnPropertyDescriptor(error, property);
+  if (descriptor !== undefined && !descriptor.configurable) {
+    Object.defineProperty(error, property, { value });
+    return;
+  }
+  Object.defineProperty(error, property, {
+    value,
+    writable: property === "message",
+    enumerable,
+    configurable: property === "message",
+  });
+}
+
+function decorateError(
+  error: Error,
+  message: string,
+  snapshot: LifecycleTraceSnapshot,
+): LifecycleError {
+  defineValue(error, "message", message, false);
+  defineValue(error, "lifecycleEventId", snapshot.eventId, true);
+  defineValue(error, "lifecycleTrace", snapshot, true);
+  return error as LifecycleError;
 }
 
 /**
- * Decorate the same Error instance with the immutable trace.
+ * Decorate the same Error instance when its own properties permit it. A
+ * readonly or non-extensible error is retained as the cause of a traced Error.
  *
  * The full trace is intentionally kept out of `message`: DPlayer displays that
  * string directly. Consumers that want the chronology read `lifecycleTrace`.
@@ -309,28 +425,29 @@ export function withLifecycleTrace(
   error: Error,
   snapshot: LifecycleTraceSnapshot,
 ): LifecycleError {
-  const first = snapshot.firstCritical?.event ?? "none";
-  const last = snapshot.entries.at(-1)?.event ?? "none";
-  const content = [
-    `lifecycle=${snapshot.eventId}`,
-    `first=${compactEvent(first)}`,
-    `last=${compactEvent(last)}`,
-    `entries=${snapshot.entries.length}`,
-    `dropped=${snapshot.dropped}`,
-  ].join(" ");
-  const suffix = `[${content.slice(0, MAX_MESSAGE_SUFFIX_LENGTH - 2)}]`;
-  error.message = `${error.message}\n${suffix}`;
-  Object.defineProperties(error, {
-    lifecycleEventId: {
-      value: snapshot.eventId,
-      enumerable: true,
-    },
-    lifecycleTrace: {
-      value: snapshot,
-      enumerable: true,
-    },
-  });
-  return error as LifecycleError;
+  const suffix = lifecycleMessageSuffix(snapshot);
+  const originalMessage = readableErrorString(
+    error,
+    "message",
+    "the original error message was unavailable",
+  )!;
+  const message = `${originalMessage}\n${suffix}`;
+
+  if (canDecorateInPlace(error)) {
+    try {
+      return decorateError(error, message, snapshot);
+    } catch {
+      // Host errors and proxies can still reject a definition after preflight.
+    }
+  }
+
+  const fallback = new Error(message, { cause: error });
+  fallback.name = readableErrorString(error, "name", "Error")!;
+  const originalStack = readableErrorString(error, "stack", null);
+  if (originalStack !== null) {
+    fallback.stack = `${fallback.name}: ${fallback.message}\nCaused by original error:\n${originalStack}`;
+  }
+  return decorateError(fallback, message, snapshot);
 }
 
 export function isLifecycleError(error: unknown): error is LifecycleError {
@@ -340,6 +457,8 @@ export function isLifecycleError(error: unknown): error is LifecycleError {
     const eventId = candidate.lifecycleEventId;
     const trace = candidate.lifecycleTrace;
     return (
+      typeof candidate.name === "string" &&
+      typeof candidate.message === "string" &&
       typeof eventId === "string" &&
       eventId.length <= LIFECYCLE_EVENT_ID_MAX_LENGTH &&
       LIFECYCLE_EVENT_ID.test(eventId) &&

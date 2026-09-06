@@ -158,10 +158,53 @@ try {
   assert.equal(decorated.lifecycleEventId, "m2h-abc-7-b-1");
   assert.equal(decorated.lifecycleTrace, snapshot);
   assert.equal(isLifecycleError(decorated), true);
+  assert.equal(
+    isLifecycleError({
+      lifecycleEventId: snapshot.eventId,
+      lifecycleTrace: snapshot,
+    }),
+    false,
+  );
+  assert.equal(
+    isLifecycleError({
+      name: "Error",
+      message: "cross-realm structural error",
+      lifecycleEventId: snapshot.eventId,
+      lifecycleTrace: snapshot,
+    }),
+    true,
+  );
   assert.equal(decorated.message.includes(serialized), false);
   assert.equal(
     decorated.message.slice("original failure\n".length).length <= 240,
     true,
+  );
+  const screenshotTrace = new LifecycleTrace(8);
+  screenshotTrace.record(entry(1, "dplayer-quality-switch-start", true));
+  screenshotTrace.record(entry(2, "mediasource-sourceclose"));
+  screenshotTrace.record(entry(3, "sourcebuffer-append-call"));
+  screenshotTrace.record(entry(4, "mse-error"));
+  screenshotTrace.record(entry(5, "worker-error"));
+  screenshotTrace.record(entry(6, "player-fail"));
+  const screenshotSnapshot = screenshotTrace.freeze(
+    "m2h-zzzzzzzzzz-zzzzzzzzzzz-zzzzzzzzzzz-zzzzzzzzzzz",
+    7,
+  );
+  const screenshotError = withLifecycleTrace(
+    new Error("screenshot failure"),
+    screenshotSnapshot,
+  );
+  const screenshotSuffix = screenshotError.message.slice(
+    "screenshot failure\n".length,
+  );
+  assert.equal(screenshotSuffix.length <= 240, true);
+  assert.match(
+    screenshotSuffix,
+    /tail=.*ms\.sourceclose>sb\.append-call>mse-error>w\.error>p\.fail/,
+  );
+  assert.equal(
+    screenshotError.message.includes(JSON.stringify(screenshotSnapshot)),
+    false,
   );
   const serializedError = JSON.parse(JSON.stringify(decorated));
   assert.equal(serializedError.lifecycleEventId, "m2h-abc-7-b-1");
@@ -169,6 +212,53 @@ try {
     serializedError.lifecycleTrace.entries.map(({ at }) => at),
     [10, 20, 40, 50],
   );
+
+  const domException = new DOMException(
+    "the MediaSource is closed",
+    "InvalidStateError",
+  );
+  const tracedDomException = withLifecycleTrace(domException, snapshot);
+  assert.equal(tracedDomException, domException);
+  assert.equal(tracedDomException.name, "InvalidStateError");
+  assert.match(tracedDomException.message, /the MediaSource is closed/);
+  assert.equal(isLifecycleError(tracedDomException), true);
+
+  const readonlyMessage = new Error("placeholder");
+  Object.defineProperty(readonlyMessage, "message", {
+    get: () => "readonly DOMException-like message",
+    configurable: false,
+  });
+  readonlyMessage.name = "InvalidStateError";
+  readonlyMessage.stack =
+    "InvalidStateError: readonly DOMException-like message";
+  const tracedReadonlyMessage = withLifecycleTrace(readonlyMessage, snapshot);
+  assert.notEqual(tracedReadonlyMessage, readonlyMessage);
+  assert.equal(tracedReadonlyMessage.cause, readonlyMessage);
+  assert.equal(tracedReadonlyMessage.name, "InvalidStateError");
+  assert.match(
+    tracedReadonlyMessage.message,
+    /readonly DOMException-like message/,
+  );
+  assert.match(tracedReadonlyMessage.stack, /Caused by original error/);
+  assert.equal(isLifecycleError(tracedReadonlyMessage), true);
+
+  const nonExtensible = Object.preventExtensions(
+    new Error("non-extensible failure"),
+  );
+  const tracedNonExtensible = withLifecycleTrace(nonExtensible, snapshot);
+  assert.notEqual(tracedNonExtensible, nonExtensible);
+  assert.equal(tracedNonExtensible.cause, nonExtensible);
+  assert.match(tracedNonExtensible.message, /non-extensible failure/);
+  assert.equal(isLifecycleError(tracedNonExtensible), true);
+
+  const frozen = Object.freeze(new Error("frozen failure"));
+  const tracedFrozen = withLifecycleTrace(frozen, snapshot);
+  assert.notEqual(tracedFrozen, frozen);
+  assert.equal(tracedFrozen.cause, frozen);
+  assert.match(tracedFrozen.message, /frozen failure/);
+  assert.equal(isLifecycleError(tracedFrozen), true);
+  assert.equal(Object.isFrozen(frozen), true);
+
   assert.equal(isLifecycleError(new Error("plain")), false);
   assert.equal(
     isLifecycleError({
@@ -312,6 +402,43 @@ try {
   assert.equal(after >= before, true);
 
   const playerSource = await readFile("packages/player/src/player.ts", "utf8");
+  const onMessageSource = playerSource.slice(
+    playerSource.indexOf("  #onMessage ="),
+    playerSource.indexOf(
+      "  /** Open a MediaSource here",
+      playerSource.indexOf("  #onMessage ="),
+    ),
+  );
+  const staleFilterAt = onMessageSource.indexOf(
+    "if (notification.id !== this.#generation) return",
+  );
+  const lifecycleAt = onMessageSource.indexOf(
+    'if (notification.type === "lifecycle")',
+  );
+  assert.equal(lifecycleAt >= 0, true);
+  assert.equal(lifecycleAt < staleFilterAt, true);
+  assert.match(
+    onMessageSource,
+    /this\.#recordMseLifecycle\(\s*notification\.trace,\s*"worker",\s*notification\.id,?\s*\);\s*return;/,
+  );
+  assert.equal(
+    onMessageSource.slice(staleFilterAt).includes('case "lifecycle":'),
+    false,
+  );
+
+  const recordMseSource = playerSource.slice(
+    playerSource.indexOf("  #recordMseLifecycle("),
+    playerSource.indexOf(
+      "  #recordLifecycle(",
+      playerSource.indexOf("  #recordMseLifecycle("),
+    ),
+  );
+  assert.match(
+    recordMseSource,
+    /if \(generation === this\.#generation\)\s*this\.#mediaSourceClass = trace\.mediaSourceClass;/,
+  );
+  assert.match(recordMseSource, /mediaSourceClass: trace\.mediaSourceClass/);
+
   const failSource = playerSource.slice(
     playerSource.indexOf("  #fail(error: Error"),
     playerSource.indexOf(
