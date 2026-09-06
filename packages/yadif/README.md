@@ -32,6 +32,15 @@ Worker 内で OffscreenCanvas、WebGL2、Worker の `requestAnimationFrame()`、
 
 `probeDecoder()`と`decoderDeinterlaces()`は、ブラウザーのデコーダーがすでにデインターレースしているかを確認します。二重処理を避けるため、フィルターの有効化前に利用できます。
 
+### ページ表示の更新（適応型の予備策）
+
+再生中 interlaced かつ `doubleRate` で Worker 描画が有効で、Worker からの stats 通知で video と確認できている場合に、ページ側の `requestAnimationFrame()` が約 30Hz 付近で安定していると、Deinterlacer は 1x1 CSS ピクセルの表示更新を 250ms ごとに切り替える短時間の試行を開始します。
+stats 通知前の cadence 不明期間や film 区間では試行しません。
+この更新は実際に合成される必要があるため、`display:none` や `visibility:hidden`、透明化、内容を変えないタイマーは代用になりません。小さく `pointer-events:none` で配置し、入力やレイアウト、 fullscreen を妨げません。
+
+試行中にページ側の周期が約 60Hz へ持続的に回復した場合だけ、その再生セッションの間は更新を維持します。回復がなければ試行を終了して要素とタイマーを除去し、実際の 30Hz ディスプレーなどでは恒常的なコストを払わないよう一定時間の再試行抑制に入ります。
+`stop()`、`destroy()`、Worker への fallback や障害、プログレッシブへの切り替わり、`doubleRate` の無効化、pause/ended、ページの非表示では更新を破棄し、条件がそろえば観測からやり直します。デバイスやベンダーの判定は使っていません。
+
 ### `autoFilm`
 
 `autoFilm` を有効にすると、FFmpeg の `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` を移植したフィールド選択と、縮小画像上で `decimate=cycle=5:mixed=1` と同じ重複閾値を使うライブ向け周期判定により、3:2 プルダウン区間を 24000/1001fps で表示します。  

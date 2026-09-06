@@ -25,11 +25,12 @@
     "packages:build": "npm run build --workspace @mpeg2toh264/player && npm run build --workspace @mpeg2toh264/yadif",
     "test:ivtc": "node tools/test-ivtc.cjs",
     "test:mse": "node tools/test-mse-reset.mjs",
+    "test:surface": "node --experimental-strip-types tools/test-adaptive-surface.mjs",
     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
     "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "format:check": "prettier --check 'packages/**/*.{ts,js,json}' 'tools/**/*.{cjs,js,json}' package.json",
-    "format:write": "prettier --write 'packages/**/*.{ts,js,json}' 'tools/**/*.{cjs,js,json}' package.json"
+    "format:check": "prettier --check 'packages/**/*.{ts,js,json}' 'tools/**/*.{cjs,js,mjs,json}' package.json",
+    "format:write": "prettier --write 'packages/**/*.{ts,js,json}' 'tools/**/*.{cjs,js,mjs,json}' package.json"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
