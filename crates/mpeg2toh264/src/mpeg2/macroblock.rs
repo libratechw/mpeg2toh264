@@ -363,7 +363,7 @@ fn decode_block(
     } else {
         &V_COEFF0
     };
-    let mut n: usize;
+    let n: usize;
 
     if intra {
         let is_luma = block_index < 4;
@@ -389,21 +389,45 @@ fn decode_block(
         }
     }
 
+    decode_coefficient_run(r, table, scan, n, out)?;
+    Ok(())
+}
+
+/// The run/level loop shared by intra and inter blocks: decode symbols until
+/// EOB, writing each level to the position `scan` names. `n` is the first scan
+/// index to use (1 when the DC position is already set, 0 otherwise).
+///
+/// This is the block layer's hottest loop (one symbol per non-zero level), so
+/// the symbol lookup is inlined here and each run/level code is consumed
+/// together with its sign bit in a single reservoir operation.
+fn decode_coefficient_run(
+    r: &mut BitReader<'_>,
+    table: &VlcTable,
+    scan: &[usize; 64],
+    mut n: usize,
+    out: &mut [i16; 64],
+) -> Result<()> {
     loop {
-        let sym = table.decode(r)?;
+        let Some((sym, len)) = table.peek_symbol_and_len(r) else {
+            return Err(table.invalid_code(r));
+        };
         if sym == EOB {
+            r.skip(len);
             break;
         }
         let (run, level) = if sym == ESCAPE {
+            r.skip(len);
             let run = r.u(6) as usize;
             let raw = r.u(12) as i32;
             (run, if raw >= 2048 { raw - 4096 } else { raw })
         } else {
             let run = (sym >> 8) as usize;
-            let mut level = sym & 0xff;
-            if r.flag() {
-                level = -level;
-            }
+            let level = sym & 0xff;
+            // The run/level code is immediately followed by its sign bit;
+            // reading both in one operation halves the reservoir traffic per
+            // coefficient.
+            let combined = r.u(len + 1);
+            let level = if combined & 1 != 0 { -level } else { level };
             (run, level)
         };
         n += run;
@@ -667,12 +691,216 @@ fn decode_macroblock(
 
 #[cfg(test)]
 mod tests {
-    use super::mirror_single_vector_predictors;
+    use super::*;
+    use crate::mpeg2::constants::ZIGZAG_SCAN;
+    use crate::mpeg2::vlc_tables::{DCT_COEFF_TABLE0, DCT_COEFF_TABLE1};
 
     #[test]
     fn one_vector_motion_updates_both_r_predictors() {
         let mut pmv = [11, -12, 21, -22, 99, 99, 99, 99];
         mirror_single_vector_predictors(&mut pmv, true, true);
         assert_eq!(pmv, [11, -12, 21, -22, 11, -12, 21, -22]);
+    }
+
+    /// A run of [`usize::MAX`] marks a raw bit pattern to emit verbatim, which
+    /// is how an invalid code (one no table entry covers) reaches the loop.
+    const INVALID_BITS: usize = usize::MAX;
+
+    /// Encode `(run, level)` pairs plus an EOB into bytes using the real
+    /// coefficient table's codes, with a sign bit after every run/level code.
+    /// A pair whose value is not in the table uses the escape form, which is
+    /// how out-of-range runs and levels reach the loop. A pair whose run is
+    /// [`INVALID_BITS`] emits `level` zero bits verbatim instead.
+    fn encode_blocks(
+        table: &'static [(&'static str, i32)],
+        blocks: &[&[(usize, i32, bool)]],
+    ) -> Vec<u8> {
+        let eob = table.iter().find(|(_, v)| *v == EOB).unwrap().0;
+        let escape = table.iter().find(|(_, v)| *v == ESCAPE).unwrap().0;
+        let mut bits: Vec<u32> = Vec::new();
+        for pairs in blocks {
+            for &(run, level, negative) in *pairs {
+                if run == INVALID_BITS {
+                    bits.extend(std::iter::repeat_n(u32::from(negative), level as usize));
+                    continue;
+                }
+                let value = ((run as i32) << 8) | level;
+                match table.iter().find(|(_, v)| *v == value) {
+                    Some((code, _)) => {
+                        for ch in code.chars() {
+                            bits.push(ch.to_digit(2).unwrap());
+                        }
+                        bits.push(u32::from(negative));
+                    }
+                    None => {
+                        for ch in escape.chars() {
+                            bits.push(ch.to_digit(2).unwrap());
+                        }
+                        for b in (0..6).rev() {
+                            bits.push((run as u32 >> b) & 1);
+                        }
+                        let raw = if negative {
+                            4096 - level as u32
+                        } else {
+                            level as u32
+                        };
+                        for b in (0..12).rev() {
+                            bits.push((raw >> b) & 1);
+                        }
+                    }
+                }
+            }
+            for ch in eob.chars() {
+                bits.push(ch.to_digit(2).unwrap());
+            }
+        }
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
+        bits.chunks(8)
+            .map(|c| c.iter().fold(0u8, |b, bit| (b << 1) | *bit as u8))
+            .collect()
+    }
+
+    /// The pre-stage block-layer loop, kept as the reference the inlined fast
+    /// path must match bit for bit: one `decode` call per symbol and the sign
+    /// read as its own bit.
+    fn reference_coefficient_run(
+        r: &mut BitReader<'_>,
+        table: &VlcTable,
+        scan: &[usize; 64],
+        mut n: usize,
+        out: &mut [i16; 64],
+    ) -> Result<()> {
+        loop {
+            let sym = table.decode(r)?;
+            if sym == EOB {
+                break;
+            }
+            let (run, level) = if sym == ESCAPE {
+                let run = r.u(6) as usize;
+                let raw = r.u(12) as i32;
+                (run, if raw >= 2048 { raw - 4096 } else { raw })
+            } else {
+                let run = (sym >> 8) as usize;
+                let mut level = sym & 0xff;
+                if r.flag() {
+                    level = -level;
+                }
+                (run, level)
+            };
+            n += run;
+            if n > 63 {
+                bail!("coefficient index {n} out of range at bit {}", r.bit_pos());
+            }
+            out[scan[n]] = level as i16;
+            n += 1;
+        }
+        Ok(())
+    }
+
+    /// Run both loops over one encoded stream and check they agree on the
+    /// decoded levels, the final bit position, and the error if there is one.
+    fn compare_loops(
+        entries: &'static [(&'static str, i32)],
+        name: &'static str,
+        blocks: &[&[(usize, i32, bool)]],
+    ) {
+        let table = VlcTable::new(name, entries);
+        let data = encode_blocks(entries, blocks);
+        let mut reference = BitReader::new(&data);
+        let mut candidate = BitReader::new(&data);
+        for block_index in 0..blocks.len() {
+            let mut reference_out = [0i16; 64];
+            let mut candidate_out = [0i16; 64];
+            let reference_result = reference_coefficient_run(
+                &mut reference,
+                &table,
+                &ZIGZAG_SCAN,
+                0,
+                &mut reference_out,
+            );
+            let candidate_result =
+                decode_coefficient_run(&mut candidate, &table, &ZIGZAG_SCAN, 0, &mut candidate_out);
+            match (&reference_result, &candidate_result) {
+                (Ok(()), Ok(())) => {
+                    assert_eq!(
+                        candidate_out, reference_out,
+                        "{name} block {block_index}: decoded levels differ"
+                    );
+                    assert_eq!(
+                        candidate.bit_pos(),
+                        reference.bit_pos(),
+                        "{name} block {block_index}: the two loops consumed different numbers of bits"
+                    );
+                }
+                (Err(reference_error), Err(candidate_error)) => {
+                    assert_eq!(
+                        candidate_error.message(),
+                        reference_error.message(),
+                        "{name} block {block_index}: the error strings differ"
+                    );
+                    assert_eq!(
+                        candidate.bit_pos(),
+                        reference.bit_pos(),
+                        "{name} block {block_index}: the two loops failed at different bit positions"
+                    );
+                    assert_eq!(
+                        candidate_out, reference_out,
+                        "{name} block {block_index}: levels before the error differ"
+                    );
+                    return;
+                }
+                (reference_result, candidate_result) => {
+                    panic!(
+                        "{name} block {block_index}: one loop decoded and the other failed: reference {reference_result:?}, candidate {candidate_result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_inlined_coefficient_loop_matches_the_reference_run_level_decode() {
+        let blocks: &[&[(usize, i32, bool)]] = &[
+            // run 0 and 1, levels 1 and 2, both signs
+            &[
+                (0, 1, false),
+                (0, 1, true),
+                (0, 2, true),
+                (1, 1, false),
+                (0, 2, false),
+            ],
+            // a longer run and a larger level, still inside the table
+            &[(2, 1, true), (5, 1, false), (0, 8, true)],
+            // escape: positive and negative run/level pairs absent from the table
+            &[(0, 1, false), (5, 5, false), (5, 5, true), (0, 1, true)],
+        ];
+        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
+            compare_loops(entries, name, blocks);
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_run_is_reported_by_both_loops_with_the_same_error() {
+        // A run of 63 fills the block and the next symbol must then exceed it.
+        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
+            compare_loops(entries, name, &[&[(63, 1, false), (1, 1, false)]]);
+        }
+    }
+
+    #[test]
+    fn an_invalid_code_is_reported_by_both_loops_with_the_same_error_and_position() {
+        // Sixteen zero bits before the appended EOB are not a code in either table: no
+        // B.14/B.15 entry starts with sixteen zeroes, so the primary lookup
+        // finds nothing and both loops must name the same invalid pattern at
+        // the same bit position.
+        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
+            compare_loops(
+                entries,
+                name,
+                &[&[(0, 1, false), (INVALID_BITS, 16, false)]],
+            );
+        }
     }
 }

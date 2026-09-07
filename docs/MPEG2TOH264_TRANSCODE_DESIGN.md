@@ -663,6 +663,50 @@ scratch worktreeでの実装可能性確認では、`lookup()`が呼び出しと
 性能結果でも採用の主張でもない。実装baselineはこの節を固定するcommitとし、最終treeで
 上記gateを再測定する。
 
+#### stage 8の実装結果（2026-09-08、全採否基準を満たしコードを保持）
+
+実装baselineはこの節を固定するcommit（`f0c419e336d6281e39339b2b12f982d7580c61c1`）の
+作業ツリー、candidateは同じtreeへ下記を適用した最終treeである。上記scratchの実装可能性確認
+とは別に、最終treeでgateを再測定した。
+
+- 変更は`crates/mpeg2toh264/src/mpeg2/vlc.rs`と`crates/mpeg2toh264/src/mpeg2/macroblock.rs`だけ。
+  `VlcTable::lookup`を`#[inline(always)]`とし、未使用だった`peek_symbol()`を、symbolとcode長を
+  消費せず返す`peek_symbol_and_len()`と、cold pathの`invalid_code()`（`decode`と同一のエラー
+  文字列・bit位置）へ置き換えた。係数run/levelループは`decode_block`からprivate
+  `decode_coefficient_run()`へ切り出し、通常係数のcode+符号を`BitReader::u(len+1)`で一体に読む。
+  EOB/ESCAPE・intra DC・inter先頭係数の特例・`n > 63`の文言と時点・scan配置・他VLC表の挙動は
+  不変。依存追加・`unsafe`・CAVLC API・level配列の配置は変更していない。
+- 追加テスト（5本、debug/releaseとも全通過。既存262本と合わせ267本）:
+  - `macroblock.rs`: 実B.14/B.15のcodeで符号化した決定的stream（複数run、level、正負、EOB、
+    ESCAPE）を旧ループ参照実装と新ループで復号し、64要素出力と最終`bit_pos()`を完全一致。
+    `n > 63`とinvalid-code（16 bit zero）も両ループで発生させ、エラー文字列全体と`bit_pos()`
+    を比較。
+  - `vlc.rs`: 両表の全有効codeについて`peek_symbol_and_len`と`decode`のsymbol・code長・消費後
+    `bit_pos()`を照合し、invalid-codeのエラー文字列と`bit_pos()`を`decode`と完全一致。
+- codegen（release buildを逆アセンブル）: 係数ループのper-symbol呼び出しが消え、
+  `lookup`/`peek_symbol_and_len`/`decode_coefficient_run`がhot loopへ展開された
+  （バイナリ中にシンボルなし）。`invalid_code`のみcold関数として残る。productionの
+  `decode`呼び出し8箇所は係数表以外のVLC表（V_MB_ADDR/V_MB_TYPE/V_CBP/V_DMV/V_DC_*等）で、
+  test内の旧係数ループ参照実装に1箇所残る。
+
+| 経路 | baseline | candidate | 差 |
+| --- | --- | --- | --- |
+| native（raw Annex B、1 thread、8組交互） | 平均 2715.922 ms | 平均 2600.996 ms | **4.2315% 短縮** |
+| WASM（`compare-wasm.cjs`、6回交互） | 平均 3276 ms・best 3225 ms | 平均 3164 ms・best 3096 ms | 3.4% 速い方向（gate外） |
+
+- nativeは8組すべてでcandidateが短く、差（candidate − baseline）の平均 −114.925 ms・
+  標本標準偏差36.734 ms、対応のあるt統計量 −8.85（df=7）。出力SHA-256は全16回とも
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`で一致した。
+- WASMは`tools/compare-wasm.cjs`が全fragmentのdataを順に入力したSHA-256 digestの
+  全64桁を内部比較し、baseline・candidateで一致した。共通prefixは
+  `d98c963f47d54e498029929724e7571b`、video sampleは607個だった。
+- 採否判定: 「出力完全一致」「全8組でcandidateが速い」「平均削減0.5%以上」
+  「t ≤ −2.365」をすべて満たしたため、**コードとテストを保持する**。
+  WASMは性能を採否条件・性能主張に使わない。
+- **この結果は上記の入力とhostに限る測定記録であり、採用の主張や他の素材・端末での
+  改善保証ではない。** 生timingは`.opencode/bench/native-times-stage8.tsv`、
+  baseline/candidateの出力は`.opencode/bench/stage8-{baseline,candidate}`に固定している。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか
