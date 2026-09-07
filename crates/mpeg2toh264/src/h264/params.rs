@@ -300,4 +300,26 @@ mod tests {
             seen[p] = true;
         }
     }
+
+    /// Table 8-13 as the column and row each entry names, which is how the
+    /// standard prints it. Stating the table a second way is the point:
+    /// comparing the array with itself says nothing about whether it is right.
+    #[test]
+    fn zigzag_4x4_visits_the_positions_table_8_13_names() {
+        #[rustfmt::skip]
+        let coordinates: [(usize, usize); 16] = [
+            (0, 0), (1, 0), (0, 1), (0, 2),
+            (1, 1), (2, 0), (3, 0), (2, 1),
+            (1, 2), (0, 3), (1, 3), (2, 2),
+            (3, 1), (3, 2), (2, 3), (3, 3),
+        ];
+        let expected: Vec<usize> = coordinates.iter().map(|&(x, y)| y * 4 + x).collect();
+        assert_eq!(ZIGZAG_4X4.to_vec(), expected);
+
+        let mut seen = [false; 16];
+        for &p in &ZIGZAG_4X4 {
+            assert!(!seen[p], "position {p} is scanned twice");
+            seen[p] = true;
+        }
+    }
 }
