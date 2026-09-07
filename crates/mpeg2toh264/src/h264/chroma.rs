@@ -51,7 +51,7 @@ static CHROMA_RECIPROCAL_GAIN: LazyLock<([[f32; 16]; 40], [f32; 40])> = LazyLock
     (ac, dc)
 });
 
-/// H.264 Table 8-14: 4x4 field scan for field-coded macroblocks.
+/// H.264 Table 8-13: 4x4 field scan for field-coded macroblocks.
 pub static FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
 
 /// Chroma QP for a given luma QP and PPS offset, via Table 8-15.

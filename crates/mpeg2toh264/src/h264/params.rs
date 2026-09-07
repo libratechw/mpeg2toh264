@@ -17,7 +17,7 @@
 use crate::h264::bitwriter::{nal_type, to_nal_unit, BitWriter};
 use crate::mpeg2::headers::SampleAspectRatio;
 
-/// H.264's 8x8 zig-zag scan (Table 8-13), used to serialise scaling lists.
+/// H.264's 8x8 zig-zag scan (Table 8-14), used to serialise scaling lists.
 /// Identical to the MPEG-2 scan, but repeated here so the H.264 writer does not
 /// reach into the MPEG-2 module for it.
 pub static ZIGZAG_8X8: [usize; 64] = [
@@ -269,4 +269,35 @@ pub fn write_pps(cfg: &PpsConfig<'_>) -> Vec<u8> {
 
     w.rbsp_trailing_bits();
     to_nal_unit(w.bytes(), 3, nal_type::PPS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Table 8-14 as the column and row each entry names, which is how the
+    /// standard prints it. Stating the table a second way is the point:
+    /// comparing the array with itself says nothing about whether it is right.
+    #[test]
+    fn zigzag_8x8_visits_the_positions_table_8_14_names() {
+        #[rustfmt::skip]
+        let coordinates: [(usize, usize); 64] = [
+            (0, 0), (1, 0), (0, 1), (0, 2), (1, 1), (2, 0), (3, 0), (2, 1),
+            (1, 2), (0, 3), (0, 4), (1, 3), (2, 2), (3, 1), (4, 0), (5, 0),
+            (4, 1), (3, 2), (2, 3), (1, 4), (0, 5), (0, 6), (1, 5), (2, 4),
+            (3, 3), (4, 2), (5, 1), (6, 0), (7, 0), (6, 1), (5, 2), (4, 3),
+            (3, 4), (2, 5), (1, 6), (0, 7), (1, 7), (2, 6), (3, 5), (4, 4),
+            (5, 3), (6, 2), (7, 1), (7, 2), (6, 3), (5, 4), (4, 5), (3, 6),
+            (2, 7), (3, 7), (4, 6), (5, 5), (6, 4), (7, 3), (7, 4), (6, 5),
+            (5, 6), (4, 7), (5, 7), (6, 6), (7, 5), (7, 6), (6, 7), (7, 7),
+        ];
+        let expected: Vec<usize> = coordinates.iter().map(|&(x, y)| y * 8 + x).collect();
+        assert_eq!(ZIGZAG_8X8.to_vec(), expected);
+
+        let mut seen = [false; 64];
+        for &p in &ZIGZAG_8X8 {
+            assert!(!seen[p], "position {p} is scanned twice");
+            seen[p] = true;
+        }
+    }
 }

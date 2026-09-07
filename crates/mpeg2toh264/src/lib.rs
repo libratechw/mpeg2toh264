@@ -64,3 +64,41 @@ pub(crate) fn round_half_up(value: f64) -> f64 {
 pub(crate) fn round_half_up_i32(value: f32) -> i32 {
     (value + 0.5).floor() as i32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_half_up_i32_breaks_f32_ties_toward_positive_infinity() {
+        assert_eq!(round_half_up_i32(0.5), 1);
+        assert_eq!(round_half_up_i32(1.5), 2);
+        assert_eq!(round_half_up_i32(2.5), 3);
+        assert_eq!(round_half_up_i32(-0.5), 0);
+        assert_eq!(round_half_up_i32(-1.5), -1);
+        assert_eq!(round_half_up_i32(-2.5), -2);
+    }
+
+    #[test]
+    fn round_half_up_i32_rounds_off_halves_to_the_nearest_integer() {
+        for (value, expected) in [
+            (0.4f32, 0),
+            (2.3, 2),
+            (2.7, 3),
+            (-2.3, -2),
+            (-2.7, -3),
+            (100.0, 100),
+            (-100.0, -100),
+        ] {
+            assert_eq!(round_half_up_i32(value), expected, "value {value}");
+        }
+    }
+
+    #[test]
+    fn round_half_up_keeps_the_same_tie_rule_in_double_precision() {
+        assert_eq!(round_half_up(0.5), 1.0);
+        assert_eq!(round_half_up(1.5), 2.0);
+        assert_eq!(round_half_up(-0.5), 0.0);
+        assert_eq!(round_half_up(-1.5), -1.0);
+    }
+}
