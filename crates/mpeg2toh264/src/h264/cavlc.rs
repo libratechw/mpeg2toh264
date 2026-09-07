@@ -13,7 +13,9 @@ use crate::h264::cavlc_tables::{
 
 #[inline]
 fn write_code(w: &mut BitWriter, code: Vlc) {
-    w.u(code.len, code.bits);
+    // `code.bits` is the value of the `code.len`-bit codeword the generated
+    // tables were built from, so it always fits in `code.len` bits.
+    w.u_fitted(code.len, code.bits);
 }
 
 /// Which total_zeros table applies, given the block size being coded.
@@ -90,10 +92,14 @@ fn write_level(w: &mut BitWriter, level_code: i32, suffix_length: u32) -> Result
     // exceed its 32-bit input and need the split form.
     let codeword_bits = prefix + 1 + suffix_bits;
     if codeword_bits <= 32 {
-        w.u(codeword_bits, (1 << suffix_bits) | suffix);
+        // The prefix's leading one plus a suffix_bits-wide suffix: the value
+        // is < 2^(suffix_bits+1) and codeword_bits is at least that wide.
+        w.u_fitted(codeword_bits, (1 << suffix_bits) | suffix);
     } else {
-        w.u(prefix + 1, 1);
-        w.u(suffix_bits, suffix);
+        // Escape: prefix 15 (or more) with a widening suffix, all fields
+        // constructed to their own width.
+        w.u_fitted(prefix + 1, 1);
+        w.u_fitted(suffix_bits, suffix);
     }
     Ok(())
 }
@@ -171,7 +177,8 @@ pub fn write_masked_levels(
     // while identifying the run, so emit them as one codeword and continue
     // from the already-reduced mask.
     if trailing_ones > 0 {
-        w.u(trailing_ones as u32, trailing_signs);
+        // One sign bit was shifted in per trailing one.
+        w.u_fitted(trailing_ones as u32, trailing_signs);
     }
 
     // Remaining levels, still highest frequency first.
