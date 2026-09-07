@@ -66,7 +66,32 @@ impl BitWriter {
         // Fewer than 32 bits are held, so at most 63 end up in the accumulator
         // and nothing is shifted out of the top.
         let value = (value as u64) & (u64::MAX >> (64 - n));
-        self.acc = (self.acc << n) | value;
+        self.u_fitted(n, value as u32);
+    }
+
+    /// Write the low `n` bits of `value`, most significant first, without
+    /// masking the value against `n`.
+    ///
+    /// The caller must ensure `value` already fits in `n` bits -- only the
+    /// low `n` set. The debug assertions check that, with `n == 32`
+    /// short-circuited so no shift is ever out of range. The CAVLC writers
+    /// call this because their codewords and fields are constructed to fit
+    /// exactly, and skipping the mask removes several instructions from every
+    /// codeword they emit. Everything else goes through [`Self::u`], whose
+    /// masking keeps the "low `n` bits" contract self-contained.
+    #[inline]
+    pub(crate) fn u_fitted(&mut self, n: u32, value: u32) {
+        debug_assert!(n <= 32, "u_fitted({n}) exceeds 32 bits");
+        debug_assert!(
+            n == 32 || value < (1u32 << n),
+            "u_fitted({n}) value {value:#x} exceeds its width"
+        );
+        if n == 0 {
+            return;
+        }
+        // Fewer than 32 bits are held, so at most 63 end up in the accumulator
+        // and nothing is shifted out of the top.
+        self.acc = (self.acc << n) | value as u64;
         self.bits += n;
         if self.bits >= 32 {
             self.bits -= 32;
@@ -209,6 +234,56 @@ mod tests {
             let mut expected = BitWriter::new();
             expected.ue(code_num);
             assert_eq!(bits(&w), bits(&expected), "se({value})");
+        }
+    }
+
+    #[test]
+    fn u_masks_upper_bits_of_the_value() {
+        // The public contract of u(n, value) is "the low n bits": whatever
+        // the value carries above its width must stay out of the stream.
+        for n in [1u32, 4, 13, 17, 31] {
+            let fit = (1u32 << n) - 1;
+            let mut masked = BitWriter::new();
+            let mut wide = BitWriter::new();
+            for _ in 0..5 {
+                masked.u(n, fit);
+                wide.u(n, fit | 0x8000_0000);
+                masked.u(3, 0b101);
+                wide.u(3, 0b101);
+            }
+            assert_eq!(masked.buf, wide.buf, "n = {n}");
+            assert_eq!(masked.bits, wide.bits);
+        }
+    }
+
+    #[test]
+    fn u_fitted_matches_u_for_fitted_values_across_widths_and_flushes() {
+        // u_fitted skips the mask; for a value that already fits, u must
+        // produce exactly the same stream, across the flush boundary and at
+        // the width extremes.
+        for n in [0u32, 1, 4, 13, 17, 31, 32] {
+            let fitted = if n == 0 {
+                0
+            } else if n == 32 {
+                u32::MAX
+            } else {
+                (1u32 << n) - 1
+            };
+            let mut fast = BitWriter::new();
+            let mut plain = BitWriter::new();
+            for _ in 0..5 {
+                fast.ue(7);
+                plain.ue(7);
+                fast.u_fitted(n, fitted);
+                plain.u(n, fitted);
+                fast.u_fitted(3, 0b101);
+                plain.u(3, 0b101);
+            }
+            fast.u_fitted(3, 0b101);
+            plain.u(3, 0b101);
+            assert_eq!(fast.buf, plain.buf, "n = {n}");
+            assert_eq!(fast.bits, plain.bits);
+            assert_eq!(fast.acc, plain.acc, "n = {n}: no masking leaves no residue");
         }
     }
 
