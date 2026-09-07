@@ -478,27 +478,34 @@ fn write_luma_residual_8x8(
     luma: &[Option<&[i32; 64]>; 4],
     cbp_luma: u32,
 ) -> Result<()> {
-    let mut sub = [0i32; 16];
+    let mut sub = [[0i32; 16]; 4];
     for i8x8 in 0..4 {
-        let block = luma[i8x8];
+        let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, luma[i8x8]) else {
+            for i4x4 in 0..4 {
+                let blk_idx = i8x8 * 4 + i4x4;
+                let (x, y) = LUMA_4X4_XY[blk_idx];
+                let bx = mb_x * 4 + x;
+                let by = mb_y * 4 + y;
+                counts.set(bx, by, 0);
+            }
+            continue;
+        };
+
+        let mut masks = [0u32; 4];
+        for i in 0..16 {
+            let base = 4 * i;
+            for i4x4 in 0..4 {
+                let level = block[base + i4x4];
+                sub[i4x4][i] = level;
+                masks[i4x4] |= u32::from(level != 0) << i;
+            }
+        }
         for i4x4 in 0..4 {
             let blk_idx = i8x8 * 4 + i4x4;
             let (x, y) = LUMA_4X4_XY[blk_idx];
             let bx = mb_x * 4 + x;
             let by = mb_y * 4 + y;
-
-            let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, block) else {
-                counts.set(bx, by, 0);
-                continue;
-            };
-
-            let mut mask = 0u32;
-            for i in 0..16 {
-                let level = block[4 * i + i4x4];
-                sub[i] = level;
-                mask |= u32::from(level != 0) << i;
-            }
-            let total = write_masked_levels(w, &sub, mask, 16, counts.n_c(bx, by))?;
+            let total = write_masked_levels(w, &sub[i4x4], masks[i4x4], 16, counts.n_c(bx, by))?;
             counts.set(bx, by, total);
         }
     }
@@ -606,5 +613,124 @@ mod tests {
         assert_eq!(counts.n_c(1, 0), 0);
         counts.set(1, 0, 8);
         assert_eq!(counts.n_c(2, 0), 8, "an absent upper neighbour is skipped");
+    }
+
+    fn reference_write_luma_residual_8x8(
+        w: &mut BitWriter,
+        counts: &mut CoeffCountMap,
+        mb_x: usize,
+        mb_y: usize,
+        luma: &[Option<&[i32; 64]>; 4],
+        cbp_luma: u32,
+    ) -> Result<()> {
+        let mut sub = [0i32; 16];
+        for i8x8 in 0..4 {
+            let block = luma[i8x8];
+            for i4x4 in 0..4 {
+                let blk_idx = i8x8 * 4 + i4x4;
+                let (x, y) = LUMA_4X4_XY[blk_idx];
+                let bx = mb_x * 4 + x;
+                let by = mb_y * 4 + y;
+
+                let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, block) else {
+                    counts.set(bx, by, 0);
+                    continue;
+                };
+
+                let mut mask = 0u32;
+                for i in 0..16 {
+                    let level = block[4 * i + i4x4];
+                    sub[i] = level;
+                    mask |= u32::from(level != 0) << i;
+                }
+                let total = write_masked_levels(w, &sub, mask, 16, counts.n_c(bx, by))?;
+                counts.set(bx, by, total);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_luma_residual(
+        write: fn(
+            &mut BitWriter,
+            &mut CoeffCountMap,
+            usize,
+            usize,
+            &[Option<&[i32; 64]>; 4],
+            u32,
+        ) -> Result<()>,
+        luma: &[Option<&[i32; 64]>; 4],
+        cbp_luma: u32,
+        seeds: &[(usize, usize, i16)],
+    ) -> (usize, Vec<u8>, Vec<i16>) {
+        let mut counts = CoeffCountMap::new(12, 12);
+        for &(bx, by, total) in seeds {
+            counts.counts[by * 12 + bx] = total;
+        }
+        let mut w = BitWriter::new();
+        write(&mut w, &mut counts, 1, 1, luma, cbp_luma).expect("writes the residual");
+        let bit_length = w.bit_length();
+        while !w.is_byte_aligned() {
+            w.u(1, 0);
+        }
+        (bit_length, w.bytes().to_vec(), counts.counts)
+    }
+
+    fn deinterleave_blocks() -> [[i32; 64]; 4] {
+        std::array::from_fn(|b| {
+            std::array::from_fn(|i| ((i as i32 * 13 + b as i32 * 17 + 5) % 6) - 2)
+        })
+    }
+
+    #[test]
+    fn the_deinterleaved_write_matches_the_reference_gather_for_every_cbp() {
+        let blocks = deinterleave_blocks();
+        let seeds = [(3, 4, 5), (4, 3, 3)];
+        for cbp_luma in 0..16u32 {
+            let mut luma: [Option<&[i32; 64]>; 4] = [None; 4];
+            for b in 0..4 {
+                if cbp_luma & (1 << b) != 0 {
+                    luma[b] = Some(&blocks[b]);
+                }
+            }
+            let reference =
+                run_luma_residual(reference_write_luma_residual_8x8, &luma, cbp_luma, &seeds);
+            let candidate = run_luma_residual(write_luma_residual_8x8, &luma, cbp_luma, &seeds);
+            assert_eq!(
+                candidate, reference,
+                "cbp_luma pattern {cbp_luma:#06b} changed the bit column or the counts update"
+            );
+        }
+    }
+
+    #[test]
+    fn a_coded_8x8_reads_left_and_upper_neighbours_into_n_c_in_the_same_order() {
+        let mut block = [0i32; 64];
+        block[0] = 2;
+        block[5] = -1;
+        block[10] = 1;
+        block[20] = 3;
+        let luma: [Option<&[i32; 64]>; 4] = [Some(&block), None, None, None];
+
+        let plain = run_luma_residual(write_luma_residual_8x8, &luma, 1, &[]);
+        let (seeded_bits, seeded_bytes, seeded_counts) =
+            run_luma_residual(write_luma_residual_8x8, &luma, 1, &[(3, 4, 5), (4, 3, 3)]);
+        assert_ne!(
+            (plain.0, &plain.1),
+            (seeded_bits, &seeded_bytes),
+            "left and upper neighbour totals must reach n_c and change the coeff_token table"
+        );
+
+        let reference = run_luma_residual(
+            reference_write_luma_residual_8x8,
+            &luma,
+            1,
+            &[(3, 4, 5), (4, 3, 3)],
+        );
+        assert_eq!(
+            (seeded_bits, seeded_bytes, seeded_counts),
+            reference,
+            "with the same neighbours the de-interleaved write must update counts identically"
+        );
     }
 }
