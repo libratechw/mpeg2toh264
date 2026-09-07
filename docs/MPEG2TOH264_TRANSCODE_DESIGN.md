@@ -523,6 +523,39 @@ debug_assert付き）。**CAVLC writer（`h264/cavlc.rs`）の3箇所だけ**が
 - **この結果は上記の入力とhostに限る測定記録であり、採用の主張ではない。** nativeの
   短縮量は約1.4%と小さく、反復確認と公開レビューを経て初めて実験の範囲を出る。
 
+### stage 7: 輝度CAVLC入力の連続読み出し（実装前の採否基準、2026-09-08）
+
+stage 4後の`write_luma_residual_8x8()`は、1個の8x8 level配列から4個のCAVLC 4x4
+サブブロックを順に取り出す。現行ループは各サブブロックについて16個の
+`block[4 * i + i4x4]`を読むため、x86-64のrelease codegenでは4回合計64個のscalar loadに
+なる。4要素を連続して読み、`sub[i4x4][i]`へde-interleaveする試案では、scratchの同形
+ループが16回の128-bit loadとshuffleへvectorizeされた。ただしこれは単独ループのcodegen
+観察であり、実関数の短縮やWASMの改善を示す測定ではない。両方式が読むsource範囲は同じ
+256 byte（一般的な64 byte cache lineなら4本）であり、cache削減は根拠にしない。
+
+試す場合もCAVLC API、level配列の意味、4サブブロックの書き込み順、`n_c()`参照と
+`counts.set()`の順序は変えない。写像は各位置で
+`sub[i4x4][i] = block[4 * i + i4x4]`のままなので、整数値、非零mask、bitstreamを完全一致で
+維持できる。追加スタックは現行の64 byte一時配列に対して192 byteである。
+
+採否基準は実装前に次で固定する。
+
+- 旧gatherをtest内参照実装として残し、決定的な入力と全16 `cbp_luma` patternで、4個の
+  サブブロックとmaskが完全一致することを確認する。`n_c`へ影響する左・上近傍を持つ
+  2x2 coded blockについても、生成bit列と係数数の更新結果を比較する。
+- debug `cargo test`と`cargo test --release`を通し、6 fixtureのgolden Annex B hash、長尺
+  native出力のSHA-256
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`、WASMの
+  full-fragment digest（既知prefix `d98c963f47d54e498029929724e7571b`、607 samples）を
+  baselineと完全一致させる。
+- nativeは同一入力・1 thread・交互8組で全組candidateが速く、平均削減0.5%以上、対応のある
+  t値が`t <= -2.365`（df=7）のときだけ残す。いずれかを満たさなければコードをrevertし、
+  棄却記録だけを残す。
+- WASMはdigest一致を必須とするが、この候補では性能を採否条件にも性能主張にも使わない。
+  `compare-wasm.cjs`は平均とbestしか出さず、対応差の不確実性を判定できないためである。
+
+実装baselineはこの節を固定するcommitとする。現時点では実装・性能向上の主張はない。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか
