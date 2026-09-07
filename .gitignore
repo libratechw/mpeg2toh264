@@ -17,3 +17,6 @@ packages/player/wasm/
 
 # Per-machine Claude Code permissions, not shared state.
 .claude/settings.local.json
+
+# Per-workspace OpenCode session state.
+.opencode/
