@@ -155,6 +155,144 @@ H.264 側のブロック数が MPEG-2 側より 22 万個多いのは、frame→
 
 色差側の `spatial_to_chroma_levels` も同じ形で、`scan[k]` で 60 個の AC 係数を引いている。
 
+### 現行実装の契約
+
+本節は、提案A stage 1の実装前に現行コードの入出力契約を固定するための記録である。
+調査対象は `760dfaee6c14333c568f9dc4a66d6b6356ed08bc` で、その親は固定済み比較基準
+`upstream/main@faf1464e66693133fc9f4b8618992b0f557f0bc3` である。2026-09-08の
+`git fetch upstream` 後も `upstream/main` は同じcommitだった。本節は性能を測定しておらず、
+stage 1の改善を示すものではない。
+
+#### コードから確認できる現在の挙動
+
+輝度の係数は次の順に流れる。配列の添字の意味を変えず、浮動小数点演算と走査順への
+並べ替えの間だけを分けることがstage 1で許される変更である。
+
+1. `mpeg2::macroblock::decode_block()` はMPEG-2のrun/levelを
+   `out[scan[n]]`へ書く。`scan`はMPEG-2ヘッダーの`alternate_scan`により
+   `ZIGZAG_SCAN`または`ALTERNATE_SCAN`になるが、出力`[i16; 64]`はどちらの場合も
+   `pos = y * 8 + x`の**ラスタ順**である。`Macroblock::blocks`もこの順序を契約としている。
+2. `intra_targets()`、`inter_targets()`、`field_dct_to_frame_targets()`、
+   `frame_dct_to_field_targets()`の`[f32; 64]`もラスタ順である。
+   `Quantiser8x8::gain`と`reciprocal_gain`は`qp * 64 + pos`で同じ位置に対応する。
+3. `Quantiser8x8::scanned_levels_for()`は、callerが渡したH.264の`scan`について、
+   64要素をすべて次の式で上書きする。`g32`への変換、逆数、乗算、丸めはすべて現行どおり
+   `f32`で行う必要がある。
+
+       g64(qp, pos) = BASE_GAIN_8X8[qp % 6][pos >> 3][pos & 7]
+                      * weight_scale[pos] * 2^(qp / 6)
+       g32(qp, pos) = g64(qp, pos) as f32
+       reciprocal_gain[qp, pos] = 1.0f32 / g32(qp, pos)
+       out[k] = round_half_up_i32(targets[scan[k]]
+                                  * reciprocal_gain[qp, scan[k]])
+
+   これは`level_for()`の`target / gain`とは同じ式ではない。`quant.rs`のコメントが明記する
+   とおり、逆数との乗算は厳密なhalf-stepで除算と異なる丸め結果を取りうる。stage 1では
+   除算へ戻したり、逆数を`f64`で再計算したりしない。
+4. `scanned_levels_for()`の`out`は**H.264のcoding scan順**であり、戻り値は
+   64要素のうち1つでも非零なら`true`である。callerはこの値から`Option<&[i32; 64]>`と
+   coded block patternを作るため、配列が同じでもboolが変わればbitstreamが変わる。
+5. `write_luma_residual_8x8()`はscan順の64要素から
+   `block[4 * i + i4x4]`を取り、4個の16要素CAVLC blockへ分ける。
+   `write_residual_levels()`と`write_masked_levels()`は受け取った配列を低周波側からの
+   coding scan順として扱い、末尾側から`TrailingOnes`と残りのlevelを符号化する。
+
+`round_half_up_i32(value)`は`(value + 0.5).floor() as i32`である。有限で`i32`に収まる
+内部入力について、最寄り整数へ丸め、ちょうど半分なら正の無限大側を選ぶ。
+例えば`1.5 -> 2`、`-1.5 -> -1`、`-0.5 -> 0`である。Rustの`f32::round()`は
+負のtieを0から遠ざけるため代用できない。関数自体は有限性や範囲を検査しないが、現在の経路では
+`qp`は`0..=51`、scaling listの値は正、MPEG-2の逆量子化結果はsaturation後に
+`-2048..=2047`となる内部値を起点とする。stage 1はこの前提を広げる変更ではない。
+
+色差では`spatial_to_chroma_levels()`が4個の4x4 blockをラスタ位置から変換する。
+各`coeff4`はラスタ順で、ACは`k = 1..15`について
+`out.ac[b][k - 1] = round_half_up_i32(coeff4[scan[k]] * ac_reciprocal[scan[k]])`
+と書かれる。したがって`out.ac[b]`はDCを除いた4x4 coding scan順である。
+`ChromaBlockLevels::dc`だけは4個の4x4 sub-blockのラスタ順を入力として2x2変換した
+4要素で、`write_chroma_residual()`が専用のchroma DC CAVLC blockとして先に渡す。
+
+H.264側のscanは、MPEG-2の`alternate_scan`やsourceの`dct_type`ではなく、**出力する
+H.264 macroblockがframeかfieldか**で決まる。
+
+- frame macroblockでは輝度に`ZIGZAG_8X8`、色差ACに`ZIGZAG_4X4`を使う。
+- `paired_field.is_some()`のfield picture経路では`direct_field_pair`が真となり、輝度に
+  `FIELD_SCAN_8X8`、色差ACに`FIELD_SCAN_4X4`を使う。
+- MBAFFの非I pictureでは`picture_field_pairs`が真となり、現在は全pairをfield pairとして
+  符号化する。輝度は`FIELD_SCAN_8X8`、`convert_field_chroma_pair()`は
+  `field_scan = true`を使い、`mb_field_decoding_flag`も真で出力する。
+- MBAFFのI pictureはframe pairとして処理し、`mb_field_decoding_flag`を偽で出力する。
+  sourceがfield-DCTなら先にframe基底へ変換するが、その後のCAVLC入力はframe scanである。
+
+native CLIとWASM frontendは、どちらもcore crateの`Session`と`PictureEncoder`を呼ぶ。
+したがって上記の配列順、量子化式、丸め、bool、scan選択、CAVLC入力は両buildで共有する契約である。
+ただし`frame_dct_to_field_targets()`にはnative版とWASM SIMD版があり、現行テストは
+nativeとWASMの相互digest一致を直接は保証していない。stage 1の比較は、各targetでcandidateを
+同じtargetの固定baselineと比較し、target間の同一性を未確認のまま主張しない。
+
+#### 規格上維持すべき要件
+
+- [ITU-T H.262 (02/2000)](https://www.itu.int/rec/T-REC-H.262-200002-S/en)
+  7.3節とFigure 7-2/7-3は、bitstream上の一次元`QFS[n]`を`alternate_scan`に従って
+  二次元`QF[v][u]`へinverse scanする。`decode_block()`がMPEG-2側のscanを使って
+  ラスタ位置へ書くのはこの要件に対応する。7.4.1、7.4.2.3、7.4.3、7.4.4節は、
+  intra DC、その他の係数、saturation、mismatch controlの順と算術を定める。
+- [ITU-T H.264 (V16) (06/2026)](https://www.itu.int/rec/T-REC-H.264-202606-I/en)
+  8.5.6節とTable 8-13は4x4、8.5.7節とTable 8-14は8x8について、frame macroblockには
+  inverse zig-zag scan、field macroblockにはinverse field scanを使うと定める。
+  7.3.5.3.1節は8x8 transformとCAVLCの組合せを4個の4x4 listとして符号化し、
+  `level8x8[i8x8][4 * i + i4x4]`へ再構成する対応を定める。
+  7.3.5.3.2節と9.2節は、そのscan上のlevel列をCAVLCで符号化する構文と過程を定める。
+- `reciprocal_gain`の事前計算、`f32`での丸め、`round_half_up_i32()`のtie規則は
+  encoderがどのlevelを選ぶかという**現行実装の契約**であり、H.264が要求する丸め規則ではない。
+  規格適合だけなら別levelも符号化できるが、それではstage 1の「挙動を変えない」という
+  比較条件を満たさない。
+
+#### 既存テストで保証されている範囲
+
+- `crates/mpeg2toh264/tests/fixtures.rs::transcodes_every_fixture_to_the_expected_bitstream`
+  は6 fixtureの変換picture数、Annex B byte数、FNV-1aを固定する。量子化、scan、CAVLCの
+  どれかが最終出力を変えれば検出できるが、個々の契約を独立に特定するテストではない。
+- `h264::mb`の`field_scan_visits_the_positions_table_8_14_names`と`h264::chroma`の
+  `field_scan_visits_the_positions_table_8_13_names`は、field scan表を規格の座標列から
+  独立に照合する。`field_scan_serialises_raster_coefficients_in_field_order`と
+  `an_all_zero_block_reports_nothing_to_code`は`to_zigzag_8x8()`の並べ替えとboolを確認するが、
+  `scanned_levels_for()`を呼んではいない。`to_zigzag_8x8()`自体も現在のproduction経路では
+  呼ばれていないため、このテストを量子化経路全体の保証とはみなさない。
+- `h264::quant`のテストはQP選択、`level_for()`の誤差、MPEG-2逆量子化、saturation、
+  mismatch controlを確認する。`scanned_levels_for()`の逆数乗算やhalf-stepは直接確認しない。
+- `crates/mpeg2toh264/tests/parallel.rs`は、分離した`PictureEncoder`、逆順実行、4 thread、
+  deferred sessionでもnativeのbitstreamまたはfragment列が逐次経路と一致することを確認する。
+- `tools/compare-wasm.cjs`は複数の`--target nodejs` buildをroundごとに交互実行し、各buildの
+  再実行が安定することと、全`fragment.data`を順に連結して計算したSHA-256がbuild間で一致する
+  ことを検査する。これは通常の`cargo test`には含まれず、比較対象buildと入力を明示して別途走らせる。
+
+#### 不足している回帰テストと未確認事項
+
+- `round_half_up_i32()`には、正負の値、`-0.5`、正負のhalf-stepを直接固定するテストがない。
+- `scanned_levels_for()`には、frame/field両scanで64要素が期待順に全上書きされること、
+  全零なら偽、1要素でも非零なら真となること、逆数との`f32`乗算とhalf-step付近の結果を
+  固定する直接テストがない。
+- 色差ACにはfield scan表のテストはあるが、`spatial_to_chroma_levels()`の量子化結果と
+  `any_ac`をframe/fieldで直接比較するテストがない。
+- `ZIGZAG_8X8`と`ZIGZAG_4X4`には、規格の座標列から独立に全要素を照合するテストがない。
+  配列値はH.264 Table 8-14およびTable 8-13と照合したが、現状はレビュー時の確認に留まる。
+- 規格照合により、`h264/params.rs`の`ZIGZAG_8X8`コメントがTable 8-13、
+  `h264/chroma.rs`の`FIELD_SCAN_4X4`コメントがTable 8-14を参照しており、正しい表番号と逆で
+  あることを確認した。配列値とfield scanの独立テストは正しい。このタスクは文書変更だけに
+  限定するため、コードコメントは変更していない。
+- nativeとWASMの同一入力に対するcross-target bitstream一致は未確認である。
+  target別のbaseline/candidate一致とは別の主張として扱う。
+- `tools/compare-wasm.cjs`のdigestは全`fragment.data`の連結bytesを覆うが、fragment境界、
+  `kind`、`start`、`randomAccess`、`videoSamples`、`audioSamples`自体はhashへ入れない。
+  nativeの逐次/deferred比較はこれらをfragment単位で確認するが、WASMのbaseline/candidate比較で
+  同じ範囲まで保証するには追加の回帰検査が必要である。
+
+stage 1は上記の不足を「同じはず」という推測で埋めない。少なくとも既存fixtureのAnnex Bと
+WASM比較の全出力bytesが固定baselineと完全一致しなければ、同値な最適化ではない。
+量子化levelが1個でも変わるとCAVLCの`TotalCoeff`、`TrailingOnes`、level、run、後続blockの
+`nC`が変わりうる。さらにpictureの符号化結果はfMP4のsample内容になるため、bitstream差を
+decoderが受理することや画が似ていることでは、stage 1の等価性を証明できない。
+
 ### 設計
 
 最初の実験を**stage 1**とし、走査順の並べ替えを浮動小数点の演算から分離する。
@@ -176,9 +314,9 @@ stage 1が有効で並べ替え費用が支配的だと確認できた場合だ�
 `decode_block` は非零位置を既に知っているので、非零位置のビットマスクを
 `Macroblock` へ持たせれば追加の走査は要らない。ただし条件が2つある。
 
-- **mismatch control** は係数 63 を常に奇数にするため、source のレベルが零でも
-  位置 63 は非零になりうる。値は ±1 と分かっているので、
-  64 位置の走査ではなく1個の条件分岐で扱える。
+- **mismatch control** はsaturation後の64係数の総和が偶数なら、位置63のLSBを反転して
+  総和を奇数にする。そのためsourceの位置63が零でも非零になり、この場合の補正値は`+1`である。
+  非零位置を別途保持する案では、この条件付き更新を落としてはならない。
 - **frame→field 基底変換を通ったブロック**は密になる（非零レベル 43.82/64）ので、
   疎性は使えない。提案 B が入れば、この経路を通る符号化済み pair は 18% まで減る。
 
