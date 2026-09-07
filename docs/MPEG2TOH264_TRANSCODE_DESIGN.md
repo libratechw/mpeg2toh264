@@ -455,6 +455,74 @@ tie規則と`+0.5`は不変で、public API・CAVLC入力契約・scan・bitstre
 - 共有実装の測定値（native 11.66%）は棄却された実装の記録であり、**採用候補は最終実装の
   上記の値だけである。** この結果は上記の入力とhostに限る測定記録であり、採用の主張ではない。
 
+### stage 4: CAVLC書き込みのマスク省略パス `u_fitted`（2026-09-08）
+
+stage 3確定後のHEAD（`5bba2b231caf97425c5b5d969b6845e5e155f7f1`）をbaselineとして、
+CAVLC/mb_writeに絞って区間計測と生成assemblyを行った。`perf_event_paranoid=4`のため
+`perf`は使えず、`rdtsc`区間計測付きbuildをscratch worktreeで再現した（呼び出し数は
+コード構造と一致することを確認してから削除。生データは
+`.opencode/bench/stage4-profile-head.txt`）。
+
+**計測事実（5bba2b2、長尺ES）:**
+
+| 区間 | 計測割合 | 呼び出し |
+| --- | --- | --- |
+| `mb_write`（inter+intra） | 39.7% | 3,672,000（= 600ピクチャ×6120 MB） |
+| `cavlc_core`（`write_masked_levels`＋`write_residual_levels`） | 38.9%（**重複あり**: 後者は前者を呼ぶ。ガード分も上振れ） | 18,599,092 |
+| `luma_residual`（`write_luma_residual_8x8`、`mb_write`の内側） | 20.6% | 650,751 |
+| `decode_picture`（MPEG-2 VLC復号） | 15.0% | 600 |
+| `luma_quant`（`scanned_levels_for`） | 8.2% | 2,219,840 |
+| `chroma_quant` | 5.5% | 1,297,200 |
+| `dequant` | 5.0% | 3,142,560 |
+| `chroma_xform`（`idct8`） | 2.7% | 1,147,000 |
+
+参考観察として、stage 3前後の別々の計装buildでは`luma_quant`の割合が15.1%から8.2%へ
+低下した。これは同一buildの統制比較ではない。stage 4の計装buildで最大だった残区間は
+CAVLC書き込み経路である。
+`cavlc_core`は係数ごとの`BitWriter::u()`呼び出しで構成され、assembly上、共通パスの約13命令の
+うち**約6命令が値のマスク**（`(value as u64) & (u64::MAX >> (64-n))`の`negb`＋2シフト降下）に
+使われる。これは`ue`/`se`/ヘッダーを含む全`u()`呼び出しに掛かる。
+
+**実装した変更:** `BitWriter::u`の公開契約（「valueの下位nビットを書く」＝上位ビットの
+マスク）は**変更しない**。代わりに内部専用（`pub(crate)`）の`u_fitted`を追加し、
+マスクを省いた本体だけを実行する（`n == 32`のときシフトを短絡し、`n == 0`を安全に処理する
+debug_assert付き）。**CAVLC writer（`h264/cavlc.rs`）の3箇所だけ**が`u_fitted`を使う:
+
+- `write_code`（coeff_token・total_zeros・run_before）: 生成テーブルの`code.bits`は
+  `code.len`ビットの符号語の値そのものなので `< 2^len` が構造的に保証される。
+- `write_level`の共通パス: 値は`(1 << suffix_bits) | suffix`で `< 2^(suffix_bits+1)`、
+  `codeword_bits = prefix+1+suffix_bits`（`prefix >= 0`）なので収まる。escape経路の
+  `u(prefix+1, 1)`と`u(suffix_bits, suffix)`も各フィールド幅に構築済み。
+- trailing sign: 1 trailing oneごとに1ビットずつシフトした値なので `< 2^trailing_ones`。
+
+他の全呼び出し元（`ue`/`se`/`flag`/ヘッダー書き込み/テスト）は`u`のまま。
+**棄却した代替案:** 当初、`u()`本体からマスクを除去する設計を試したが、公開契約
+（任意の上位ビットをマスクする）を変えるためレビューで棄却した。`u`は下位nビット契約を
+維持し、`u_masks_upper_bits_of_the_value`テストで固定する。
+
+- 追加テスト: `u_masks_upper_bits_of_the_value`（公開`u`が上位ビットをマスクすること）、
+  `u_fitted_matches_u_for_fitted_values_across_widths_and_flushes`（n = 0, 1, 4, 13, 17, 31, 32で
+  適合値についてflush境界をまたいで`u_fitted`と`u`が完全一致すること）。
+- 検証: **debug** `cargo test`（debug_assert有効）と`cargo test --release`の両方で全通過
+  （fixtureのAnnex B hash不変）。
+
+**計測結果（baselineは固定した5bba2b2の無計装build、長尺ES・raw Annex B・1 thread）:**
+
+| 経路 | baseline | candidate | 差 |
+| --- | --- | --- | --- |
+| native（8組交互） | 平均 2.668659 s | 平均 2.631079 s | **1.41% 短縮** |
+| WASM（6回交互） | 平均 3284 ms・best 3248 ms | 平均 3235 ms・best 3222 ms | 1.5% 速い方向（gate外） |
+
+- nativeは8組すべてでcandidateが短く、差の平均 −37.580 ms・標本標準偏差15.432 ms、
+  対応のあるt統計量 −6.89（df=7）。出力SHA-256は全16回とも
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`で一致した。
+- WASMは`tools/compare-wasm.cjs`が全fragmentのデータを順に入力したSHA-256 digestの
+  **全64桁**を内部比較し、baseline・candidateで一致した。表示された共通prefixは
+  `d98c963f47d54e498029929724e7571b`、video sampleは607個だった。WASM性能はgateではなく、
+  今回のセッションでは1.5%速い方向で退行はなかった。
+- **この結果は上記の入力とhostに限る測定記録であり、採用の主張ではない。** nativeの
+  短縮量は約1.4%と小さく、反復確認と公開レビューを経て初めて実験の範囲を出る。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか
