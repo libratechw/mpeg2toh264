@@ -51,7 +51,7 @@ static CHROMA_RECIPROCAL_GAIN: LazyLock<([[f32; 16]; 40], [f32; 40])> = LazyLock
     (ac, dc)
 });
 
-/// H.264 Table 8-14: 4x4 field scan for field-coded macroblocks.
+/// H.264 Table 8-13: 4x4 field scan for field-coded macroblocks.
 pub static FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
 
 /// Chroma QP for a given luma QP and PPS offset, via Table 8-15.
@@ -162,15 +162,7 @@ fn spatial_to_chroma_levels(
     for b in 0..4 {
         forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, &mut coeff4);
         dc_target[b] = coeff4[0];
-        let ac_out = &mut out.ac[b];
-        for k in 1..16 {
-            let pos = scan[k];
-            let level = round_half_up_i32(coeff4[pos] * ac_reciprocal[pos]);
-            ac_out[k - 1] = level;
-            if level != 0 {
-                out.any_ac = true;
-            }
-        }
+        out.any_ac |= ac_levels_for(&coeff4, ac_reciprocal, scan, &mut out.ac[b]);
     }
 
     let f0 = dc_target[0] * dc_reciprocal;
@@ -182,6 +174,36 @@ fn spatial_to_chroma_levels(
     out.dc[2] = round_half_up_i32((f0 + f1 - f2 - f3) / 4.0);
     out.dc[3] = round_half_up_i32((f0 - f1 - f2 + f3) / 4.0);
     out.any_dc = out.dc.iter().any(|&v| v != 0);
+}
+
+/// Quantise the 15 AC coefficients of one 4x4 block into the coding scan
+/// order `scan` names, which is the order the residual writer consumes.
+///
+/// Each level is first computed in raster order -- position by position, so
+/// the loads from `coeff4` and `ac_reciprocal` are contiguous and no scan
+/// dereference sits between the f32 product and the rounding -- and the
+/// integer levels are then copied to where `scan` puts them. The arithmetic is
+/// exactly what the previous single gather loop performed: every element is
+/// still `round_half_up_i32(coeff4[pos] * ac_reciprocal[pos])` for its own
+/// position, and the reorder is pure integer copying. Returns whether any of
+/// the 15 levels is non-zero, which is the caller's coded-block-pattern bit.
+fn ac_levels_for(
+    coeff4: &[f32; 16],
+    ac_reciprocal: &[f32; 16],
+    scan: &[usize; 16],
+    out: &mut [i32; 15],
+) -> bool {
+    let mut raster = [0i32; 16];
+    let mut any = false;
+    for pos in 1..16 {
+        let level = round_half_up_i32(coeff4[pos] * ac_reciprocal[pos]);
+        raster[pos] = level;
+        any |= level != 0;
+    }
+    for k in 1..16 {
+        out[k - 1] = raster[scan[k]];
+    }
+    any
 }
 
 fn dequant_chroma(
@@ -452,5 +474,89 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(out.dc, [0; 4]);
         assert!(out.ac.iter().all(|block| block.iter().all(|&v| v == 0)));
+    }
+
+    #[test]
+    fn the_raster_reorder_path_is_identical_to_the_gather_loop() {
+        // The reorder must not change a single level, so a test-local copy of
+        // the previous one-pass algorithm is the reference and the two are
+        // compared over deterministic pseudo-random blocks, both scans, and a
+        // spread of chroma QPs.
+        fn reference_ac(
+            samples: &[f32; 64],
+            qp_c: i32,
+            field_scan: bool,
+        ) -> ([[i32; 15]; 4], bool) {
+            let qp_c = qp_c as usize;
+            let ac_reciprocal = &CHROMA_RECIPROCAL_GAIN.0[qp_c];
+            let scan: &[usize; 16] = if field_scan {
+                &FIELD_SCAN_4X4
+            } else {
+                &ZIGZAG_4X4
+            };
+            let mut out = [[0i32; 15]; 4];
+            let mut any_ac = false;
+            let mut coeff4 = [0.0f32; 16];
+            for b in 0..4 {
+                forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, &mut coeff4);
+                for k in 1..16 {
+                    let pos = scan[k];
+                    let level = round_half_up_i32(coeff4[pos] * ac_reciprocal[pos]);
+                    out[b][k - 1] = level;
+                    if level != 0 {
+                        any_ac = true;
+                    }
+                }
+            }
+            (out, any_ac)
+        }
+
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0 - 0.5
+        };
+        for qp_c in [0, 13, 26, 39] {
+            for field_scan in [false, true] {
+                for _ in 0..100 {
+                    let mut samples = [0.0f32; 64];
+                    for sample in samples.iter_mut() {
+                        *sample = next() * 600.0;
+                    }
+                    let mut candidate = ChromaBlockLevels::default();
+                    spatial_to_chroma_levels(&samples, qp_c, &mut candidate, field_scan);
+                    let (expected_ac, expected_any) = reference_ac(&samples, qp_c, field_scan);
+                    assert_eq!(
+                        candidate.ac, expected_ac,
+                        "qp_c {qp_c} field_scan {field_scan}"
+                    );
+                    assert_eq!(
+                        candidate.any_ac, expected_any,
+                        "qp_c {qp_c} field_scan {field_scan}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_all_zero_block_stays_empty_and_a_nonzero_one_reports_ac_for_either_scan() {
+        for field_scan in [false, true] {
+            let mut out = ChromaBlockLevels::default();
+            spatial_to_chroma_levels(&[0.0; 64], 20, &mut out, field_scan);
+            assert!(out.is_empty(), "no samples, no levels, {field_scan}");
+
+            let mut samples = [0.0f32; 64];
+            // An impulse in the top-left sub-block puts energy into that
+            // block's own AC and DC; the other three sub-blocks read none of
+            // it. Either scan still has to carry it in the top-left block's AC.
+            samples[0] = 400.0;
+            spatial_to_chroma_levels(&samples, 20, &mut out, field_scan);
+            assert!(out.any_ac, "the impulse lands on AC, {field_scan}");
+            assert!(
+                out.ac.iter().any(|block| block.iter().any(|&v| v != 0)),
+                "the AC record itself holds it, {field_scan}"
+            );
+        }
     }
 }

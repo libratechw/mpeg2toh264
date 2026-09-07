@@ -94,9 +94,36 @@ impl Quantiser8x8 {
         round_half_up_i32(target / self.gain[qp as usize * 64 + pos])
     }
 
-    /// Quantise a whole block directly into the scan order the residual coder
-    /// consumes. This avoids first writing raster levels and then copying all
-    /// 64 of them through a separate scan pass.
+    /// Quantise a whole block in raster order: `out[pos]` is the level for
+    /// position `pos`.
+    ///
+    /// The per-position arithmetic is exactly what the residual coder has
+    /// always received -- the same f32 product with the precomputed reciprocal,
+    /// rounded by [`crate::round_half_up_i32`] -- but the loop walks `targets`
+    /// and `reciprocal_gains` in the order they are laid out, so no scan-table
+    /// dereference separates the loads from the multiply. The levels only reach
+    /// scan order afterwards, in `reorder_levels`, which is pure integer
+    /// copying.
+    #[inline]
+    fn raster_levels_for(&self, targets: &[f32; 64], qp: i32, out: &mut [i32; 64]) {
+        let base = qp as usize * 64;
+        let reciprocal_gains: &[f32; 64] = self.reciprocal_gain[base..base + 64]
+            .try_into()
+            .expect("64 reciprocal gains");
+        for pos in 0..64 {
+            out[pos] = round_half_up_i32(targets[pos] * reciprocal_gains[pos]);
+        }
+    }
+
+    /// Quantise a whole block into the scan order the residual coder consumes:
+    /// the private `raster_levels_for` pass followed by `reorder_levels`. Every
+    /// level is computed from its own position and then copied to where `scan`
+    /// puts it, which produces the same 64 levels as quantising through `scan`
+    /// in one pass would.
+    ///
+    /// Returns whether any of the 64 written levels is non-zero. The caller
+    /// turns that into the coded block pattern, so an all-zero block must
+    /// report `false` no matter which scan the levels were written in.
     #[inline]
     pub fn scanned_levels_for(
         &self,
@@ -105,18 +132,9 @@ impl Quantiser8x8 {
         scan: &[usize; 64],
         out: &mut [i32; 64],
     ) -> bool {
-        let base = qp as usize * 64;
-        let reciprocal_gains: &[f32; 64] = self.reciprocal_gain[base..base + 64]
-            .try_into()
-            .expect("64 reciprocal gains");
-        let mut any = false;
-        for k in 0..64 {
-            let pos = scan[k];
-            let level = round_half_up_i32(targets[pos] * reciprocal_gains[pos]);
-            out[k] = level;
-            any |= level != 0;
-        }
-        any
+        let mut raster = [0i32; 64];
+        self.raster_levels_for(targets, qp, &mut raster);
+        reorder_levels(&raster, scan, out)
     }
 
     /// Pick the QP whose step is `oversample` times finer than the MPEG-2 step.
@@ -140,6 +158,25 @@ impl Quantiser8x8 {
         }
         best_qp
     }
+}
+
+/// Move a block from raster order into the coding scan order `scan` names,
+/// which is the order the residual coder and the intra reconstruction expect.
+/// Integer copies only: the levels have already been rounded, so this pass
+/// touches nothing that decides a level's value.
+///
+/// Returns whether any of the 64 written levels is non-zero, which is the
+/// caller's coded-block-pattern bit and so must be true for exactly the blocks
+/// whose levels are non-zero.
+#[inline]
+fn reorder_levels(raster: &[i32; 64], scan: &[usize; 64], out: &mut [i32; 64]) -> bool {
+    let mut any = false;
+    for k in 0..64 {
+        let level = raster[scan[k]];
+        out[k] = level;
+        any |= level != 0;
+    }
+    any
 }
 
 /// The constant an intra macroblock is predicted from; see
@@ -405,6 +442,8 @@ pub fn frame_dct_to_field_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::h264::mb::FIELD_SCAN_8X8;
+    use crate::h264::params::ZIGZAG_8X8;
     use crate::mpeg2::constants::{DEFAULT_INTRA_QUANT, DEFAULT_NON_INTRA_QUANT};
 
     #[test]
@@ -505,6 +544,94 @@ mod tests {
     /// of them; a basis that was actually wrong would be out by whole units, so
     /// nothing is given up by checking to a thousandth.
     const ROUND_TRIP_TOLERANCE: f32 = 1e-3;
+
+    #[test]
+    fn raster_levels_are_what_the_scanned_levels_reorder() {
+        // A target of gain * k quantises to exactly k: the f32 product with the
+        // reciprocal comes back within a couple of ulps of k, which is nowhere
+        // near the half-step that would change the rounded level. Every
+        // position gets its own k, several of them zero, so the whole block is
+        // pinned at once.
+        for qp in [0, 13, 26, 39, 51] {
+            let quant = Quantiser8x8::new(&DEFAULT_INTRA_QUANT);
+            let mut targets = [0.0f32; 64];
+            let mut expected = [0i32; 64];
+            for pos in 0..64 {
+                let k = ((pos as i32 * 17) % 23) - 11;
+                targets[pos] = quant.gain_at(qp, pos) * k as f32;
+                expected[pos] = k;
+            }
+
+            let mut raster = [i32::MIN; 64];
+            quant.raster_levels_for(&targets, qp, &mut raster);
+            assert_eq!(raster, expected, "qp {qp} quantises in place per position");
+
+            for (scan_name, scan) in [("zigzag", ZIGZAG_8X8), ("field", FIELD_SCAN_8X8)] {
+                let mut scanned = [i32::MIN; 64];
+                let active = quant.scanned_levels_for(&targets, qp, &scan, &mut scanned);
+                let reordered: Vec<i32> = scan.iter().map(|&pos| expected[pos]).collect();
+                assert_eq!(scanned.to_vec(), reordered, "qp {qp} {scan_name} order");
+                assert_eq!(
+                    active,
+                    expected.iter().any(|&level| level != 0),
+                    "qp {qp} {scan_name} reports the block the levels make"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_all_zero_block_reports_nothing_for_either_scan_and_writes_zeros() {
+        let quant = Quantiser8x8::new(&DEFAULT_NON_INTRA_QUANT);
+        for scan in [&ZIGZAG_8X8, &FIELD_SCAN_8X8] {
+            let mut out = [i32::MAX; 64];
+            assert!(!quant.scanned_levels_for(&[0.0; 64], 17, scan, &mut out));
+            assert_eq!(out, [0; 64], "every one of the 64 slots is overwritten");
+        }
+        let mut raster = [i32::MAX; 64];
+        quant.raster_levels_for(&[0.0; 64], 17, &mut raster);
+        assert_eq!(raster, [0; 64]);
+    }
+
+    #[test]
+    fn a_half_step_rounds_against_the_reciprocal_product_not_the_division() {
+        // `target * (1 / gain)` and `target / gain` agree almost everywhere,
+        // but the f32 rounding of the reciprocal can tip a level that sits on
+        // an exact half-step, which is why the hot path must keep multiplying.
+        // Find one position where the two differ and pin the multiplication.
+        let quant = Quantiser8x8::new(&DEFAULT_INTRA_QUANT);
+        let mut picked = None;
+        'positions: for qp in 0..52 {
+            for pos in 0..64 {
+                let gain = quant.gain_at(qp, pos);
+                let reciprocal = quant.reciprocal_gain[qp as usize * 64 + pos];
+                for n in -40..=40 {
+                    let target = gain * (n as f32 + 0.5);
+                    let product = round_half_up_i32(target * reciprocal);
+                    if product != round_half_up_i32(target / gain) {
+                        picked = Some((qp, pos, target, product));
+                        break 'positions;
+                    }
+                }
+            }
+        }
+        let (qp, pos, target, expected) =
+            picked.expect("no position distinguishes multiplication from division");
+        let mut block = [0.0f32; 64];
+        block[pos] = target;
+        let mut out = [0i32; 64];
+        let scanned_index = ZIGZAG_8X8
+            .iter()
+            .position(|&p| p == pos)
+            .expect("every position is scanned");
+        quant.scanned_levels_for(&block, qp, &ZIGZAG_8X8, &mut out);
+        let mut expected_block = [0i32; 64];
+        expected_block[scanned_index] = expected;
+        assert_eq!(
+            out, expected_block,
+            "the half-step at position {pos} follows the reciprocal product"
+        );
+    }
 
     #[test]
     fn the_field_and_frame_dct_bases_are_inverses_of_each_other() {
