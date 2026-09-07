@@ -793,6 +793,62 @@ SD入力もなかった。したがって、この入力集合はfield-picture�
 
 実装baselineはこの節を固定するcommitとする。現時点では実装・性能向上の主張はない。
 
+#### stage 9の実装結果（2026-09-08、全採否基準を満たしコードを保持）
+
+実装baselineはこの節を固定するcommit（`44d6844a38dee94976ceb35e4daba90557609e50`）の
+作業ツリー、candidateは同じtreeへ下記を適用した最終treeである。上記scratchの実装可能性確認
+（MIN mask前の試案、4.49–6.55%）とは別に、**MIN mask込みの最終式**でgateを再測定した。
+
+- 変更は`crates/mpeg2toh264/src/lib.rs`の非wasm32版`round_half_up_i32()`だけ。
+  `let x = value + 0.5; let truncated = x as i32;
+   let correction = i32::from(x < truncated as f32) & i32::from(truncated != i32::MIN);
+   truncated - correction`へ置き換え、全`f32`入力の完全な場合分け証明をコメントへ書いた。
+  wasm32版`(value + 0.5).floor() as i32`、public API、依存、`unsafe`、量子化演算入力、
+  CAVLC入力・bitstream契約は不変。将来のLLVMのcodegenを主張しない。
+- 等価性テストは、既存の到達域比較に`f32::NEG_INFINITY`、`f32::INFINITY`、`f32::NAN`、
+  `-2_147_483_648.0`（-2^31 = i32::MIN）、`-2_147_483_904.0`（-2^31-256）、
+  `2_147_483_648.0`（2^31）、`2_147_483_904.0`（2^31+256）を加え、
+  `(value + 0.5).floor() as i32`と完全一致。乱数filterは±infと大値有限を除き、NaNは
+  `NaN > 4e6`が偽で通るため乱数でも検査され、境界リストが除外ケースを覆うことをコメントで
+  明記。debug `cargo test`と`cargo test --release`は267本全通過、6 fixtureのgolden
+  Annex B hashは不変。
+- **codegen（release binaryを逆アセンブル）**: baselineも乗算・加算とfloor補正の比較までは
+  4-wide SSE2だったが、補正後の`f32`を`i32`へ戻すため、4要素ごとに2回目のスカラー飽和castを
+  行っていた。candidateでは`write_picture`内の9個所の量子化ループが、要素ごとの最初のcast後、
+  `cvtdq2ps`（truncated as f32）→`cmpltps`（x < truncated）→`pcmpgtd`
+  （truncated > i32::MIN、到達可能な整数では`!=`と同値）→`pand`（2条件のAND）→`paddd`
+  （truncated - correction。真の比較maskが-1なので加算になる）→`movdqu`（4要素整数store）を
+  使う。飽和する最初の`x as i32`は、SSE2の`cvttps2dq`だけではRustの飽和意味論を実装できない
+  ため、従来どおり要素ごとのスカラー`cvttss2si`と上限・NaN処理のままである。
+  `write_picture`シンボル内の`cvttss2si`はbaseline 74個からcandidate 38個へ36個減り、これは
+  9ループから4要素ごとの第2castが1回ずつ消えた数と一致する。したがって確認できた変化は、
+  丸め全体の完全SIMD化ではなく、**既存の部分ベクトル化を保ったまま第2scalar castを除いたこと**
+  である。命令数はループ範囲の切り方に依存するため採否根拠に使わない。
+
+| 経路 | baseline | candidate | 差 |
+| --- | --- | --- | --- |
+| native（raw Annex B、1 thread、8組交互） | 平均 2504.211 ms | 平均 2361.682 ms | **5.6916% 短縮** |
+| WASM（長尺TS、`compare-wasm.cjs`、6回交互） | 平均 3082 ms | 平均 3080 ms | 0.1%（gate外） |
+
+- nativeは8組すべてでcandidateが短く、差（candidate − baseline）の平均 −142.529 ms・
+  標本標準偏差21.294 ms、対応のあるt統計量 −18.93（df=7）。出力SHA-256は全16回とも
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`で一致した。
+- 長尺WASMは全fragment内部digest完全一致（prefix `d98c963f47d54e498029929724e7571b`、
+  607 samples）。WASM性能は採否条件・性能主張に使わない。
+- **多様化等価性gate（実入力）**: `gr061-sid2072-smoke-fixture.ts`（SHA-256
+  `1895e4b3…`、351 picture、密度0.0622）と`kazuhunkan-no-yell-wo-autofilm-23.976.ts`
+  （SHA-256 `82929015…`、1584 picture、密度0.0615）について、native出力SHA-256が
+  baseline/candidateで一致（gr061 `26c145bf…`、kazuhunkan `4a75b743…`）し、
+  `tools/compare-wasm.cjs`の**全64桁**full-fragment digestも一致（"output identical"）。
+  合成`fixture.ts`（`1d5472f7…`）はnative（`8464cb71…`）・WASMとも一致のsmokeのみ。
+  これらの短尺TSから性能は主張しない。正常性が正規gate相当に確認されていない暫定候補
+  （nogizaka/madder-e05/iruma等）は合否に使わない。
+- 採否判定: 「出力完全一致」「全8組でcandidateが速い」「平均削減0.5%以上」
+  「t ≤ −2.365」をすべて満たしたため、**コードとテストを保持する**。
+- **この結果は上記の入力とhostに限る測定記録であり、採用の主張や他の素材・端末での
+  改善保証ではない。** 生timingは`.opencode/bench/native-times-stage9.tsv`、
+  baseline/candidateは`.opencode/bench/stage9-{baseline,candidate}`に固定している。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか

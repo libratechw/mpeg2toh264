@@ -69,33 +69,43 @@ pub(crate) fn round_half_up(value: f64) -> f64 {
 ///   truncation formulation measured consistently slower in the tested WASM
 ///   setup, so it was kept for native only; why it is slower there was not
 ///   established.
-/// - other targets compute the same floor without a per-coefficient call to
-///   libm's `floorf`, which is what `f32::floor` lowers to on this target. The
-///   truncation round-trip `x as i32 as f32` is exact for `|x| < 2^24`, and
-///   every input the codec produces stays far inside that: the largest is
-///   the luma level input, bounded by about 1.31e6. The chain is: dequant
-///   clamps to ±2048 and removing `FLAT_PREDICTION_DC` puts the largest
-///   target within 3064 in magnitude; the field/frame basis conversion
-///   multiplies by at most 16 (two orthonormal 8-point passes, each bounded
-///   by its basis row sums of at most 4); the random-access intra path can
-///   then adjust DC by at most 1024; and the largest reciprocal is
-///   `1 / (0.0385049076 * 1)` ≈ 25.97 -- the smallest `BASE_GAIN_8X8` entry
-///   with scaling weight 1. Thus `(3064 * 16 + 1024) * 25.97` is about 1.30e6.
-///   Chroma AC and DC inputs are lower. Within that domain `t` is the exact
-///   truncation of `x`, `t > x` holds exactly when `x` is a negative
-///   non-integer, and `t - 1` is exact too, so the result is identical to
-///   `floor(x)`.
+/// - other targets compute the same floor as an integer expression that the
+///   compiler can vectorise: `x as i32` is a saturating truncation, and the
+///   comparison `x < truncated as f32` is false for NaN, so the `& mask` turns
+///   exactly the negative non-integer correction. The reachable codec inputs
+///   are far inside `|x| < 2^24` (the largest luma level input is bounded by
+///   about 1.31e6; see the chain from dequant ±2048 and `FLAT_PREDICTION_DC`
+///   through the ≤16 basis conversion and the largest reciprocal ≈25.97), but
+///   the case proof below covers every `f32` input, so no out-of-domain
+///   difference is accepted:
+///
+///   - `x` NaN: the saturating cast gives 0 and `NaN < 0.0` is false, so the
+///     result is 0, exactly what `NaN.floor() as i32` saturates to.
+///   - `x` `+inf` or a finite value `>= 2^31`: the cast saturates to
+///     `i32::MAX`; `x < 2^31` is false, the mask is 1, and the result is
+///     `i32::MAX`, the floor's saturated cast.
+///   - `x` `-inf` or a finite value `< -2^31`: the cast saturates to
+///     `i32::MIN`, and the `truncated != i32::MIN` mask suppresses the
+///     correction so the result stays `i32::MIN` instead of wrapping to
+///     `i32::MAX`. This is the case the mask exists for; the floor's saturated
+///     cast also gives `i32::MIN`.
+///   - `-2^31 <= x < 2^31` finite: `x as i32` is the exact truncation (every
+///     representable `f32` here is an integer, or its integer truncation
+///     round-trips exactly). For `x >= 0` and for negative integers,
+///     `x < trunc(x)` is false and the result is `trunc(x) = floor(x)`. For
+///     negative non-integers `x < trunc(x)` is true and the result is
+///     `trunc(x) - 1 = floor(x)`.
+///
+///   The result is `floor(x)` for every `f32` input, matching
+///   `(value + 0.5).floor() as i32`. No claim is made about future compiler
+///   versions producing the same vectorised code as the current one.
 #[inline]
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn round_half_up_i32(value: f32) -> i32 {
     let x = value + 0.5;
-    let truncated = x as i32 as f32;
-    let floored = if truncated > x {
-        truncated - 1.0
-    } else {
-        truncated
-    };
-    floored as i32
+    let truncated = x as i32;
+    let correction = i32::from(x < truncated as f32) & i32::from(truncated != i32::MIN);
+    truncated - correction
 }
 
 /// WASM variant: the contract and the tie rule are those of the non-wasm32
@@ -140,9 +150,14 @@ mod tests {
         // These tests run on the host and exercise only the non-wasm32
         // implementation. The wasm32 branch is `(value + 0.5).floor() as i32`
         // itself, so that expression is kept here as a test-local reference
-        // and the two are compared over the whole reachable domain, far
-        // inside |x| < 2^24. The end-to-end WASM evidence is the
-        // compare-wasm digest comparison, not these tests.
+        // and the two are compared over the reachable domain plus the
+        // saturating boundary cases the randomized filter cannot reach. The
+        // randomized filter below skips infinities and large finite values
+        // (`v.abs() > 4e6` is true for both infinities), while NaN passes the
+        // comparison (`NaN > 4e6` is false) and so is exercised by the random
+        // loop; the explicit boundary list covers the excluded cases. The
+        // end-to-end WASM evidence is the compare-wasm digest comparison, not
+        // these tests.
         let reference = |value: f32| (value + 0.5).floor() as i32;
         for k in -2_000_000..2_000_000 {
             let v = k as f32;
@@ -168,6 +183,13 @@ mod tests {
             -4_000_000.0,
             0.5,
             -0.5,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+            -2_147_483_648.0, // -2^31, exactly i32::MIN
+            -2_147_483_904.0, // -2^31 - 256, the first representable f32 below
+            2_147_483_648.0,  // 2^31, just past i32::MAX
+            2_147_483_904.0,  // 2^31 + 256, the next representable f32 above
         ] {
             assert_eq!(round_half_up_i32(v), reference(v), "boundary {v}");
         }
