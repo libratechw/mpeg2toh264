@@ -605,6 +605,64 @@ baseline、同じtreeにde-interleaveを適用したものをcandidateとした�
   改善保証ではない。** 生タイミングは`.opencode/bench/native-times-stage7.tsv`、
   baseline/candidateの出力は`.opencode/bench/stage7-{baseline,candidate}`に固定している。
 
+### stage 8: MPEG-2係数VLC復号の高速パス（実装前の採否基準、2026-09-08）
+
+stage 4の長尺計装buildでは、まだ変更していないMPEG-2側の`decode_picture`が全体の
+14.95%だった。`decode_block()`（`crates/mpeg2toh264/src/mpeg2/macroblock.rs`）の係数
+run/levelループは、通常係数ごとに`VlcTable::decode()`から`lookup()`を呼び、続けて
+`BitReader::flag()`で符号bitを読む。現行x86-64 release codegenではこの2段が実関数呼び出し
+として残る。次の実験では、係数VLCを消費せずsymbolとcode長を得る高速パスを
+`crates/mpeg2toh264/src/mpeg2/vlc.rs`へ置き、通常係数のcodeと符号を
+`BitReader::u(len + 1)`で一体に読む。依存、`unsafe`、H.264 CAVLC API、level配列の配置は
+変更しない。
+
+保存する現行契約は次のとおりである。
+
+- `decode_block()`の`out.fill(0)`、intra DC、inter先頭係数の1-bit特例は変更しない。
+  係数は従来どおりrunを加算し、`n > 63`を検査してから`out[scan[n]]`へ置く。
+- 通常係数では、現行の`decode()`によるcode長`len`の消費と直後の`flag()`による符号bitの
+  消費を、同じ開始位置からの`u(len + 1)`へ置き換える。`BitReader`のreservoir/refill境界を
+  またいでも、消費するbit列、最終`bit_pos()`、levelの符号を一致させる。
+- `EOB`はcode長だけを消費して終了し、`ESCAPE`はcode長を消費してからrun 6 bitとlevel
+  12 bitを読む。両sentinelへ符号bitを追加してはならない。
+- invalid VLCは入力を消費せず、table名、`max_len`幅のbit pattern、code先頭のbit位置を含む
+  現行エラー文字列を完全一致させる。`n > 63`のエラー文言と発生時点も変えない。
+- B.14/B.15の係数表はいずれも最長16 bitなので、通常係数の`len + 1`は最大17で、
+  `BitReader::u()`の`n <= 32`という前提内にある。他のVLC表と
+  `decode()`／`decode_or_zero_stuffing()`の挙動は変更しない。
+
+実装では、既存の未使用`VlcTable::peek_symbol()`を、symbolとcode長を返す新しい内部APIへ
+置き換え、dead codeを併存させない。`lookup()`を含む高速パスはhot loopへ確実に展開される
+inline指定とし、invalid-codeのエラー生成だけをcold pathへ分ける。係数run/levelループは、
+参照比較の対称性とinliningを制御できる実ロジック単位としてprivate helperへ切り出す。
+test専用に代入だけのhelperを本番コードへ追加するものではなく、旧実装の参照ループは
+test module内だけに置く。
+
+採否基準は実装前に次で固定する。
+
+- 実際のB.14/B.15表を使う決定的なstreamで、通常係数（複数run、level、正負）、`EOB`、
+  `ESCAPE`について、旧ループと新ループの64要素出力と最終`bit_pos()`を完全一致させる。
+  `n > 63`とinvalid-codeも両ループで発生させ、エラー文字列全体と`bit_pos()`を比較する。
+- 新しいsymbol/code長APIは、B.14とB.15の有効codeについて、現行`decode()`とsymbol、code長、
+  消費後のbit位置を照合する。片方だけを網羅する場合は、両表のcode構造が同じで値だけが
+  異なることをtestまたは文書で実コードから示す。
+- debug `cargo test`と`cargo test --release`、`cargo fmt --check`を通し、6 fixtureのgolden
+  Annex B hash、長尺native出力のSHA-256
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`、WASMの
+  full-fragment digest（既知prefix `d98c963f47d54e498029929724e7571b`、607 samples）を
+  baselineと完全一致させる。
+- nativeは同一の長尺入力・1 thread・交互8組で全組candidateが速く、平均削減0.5%以上、
+  対応のあるt値が`t <= -2.365`（df=7）のときだけ残す。いずれかを満たさなければコードを
+  revertし、棄却記録だけを残す。生timingと比較出力は`.opencode/bench`へ固定する。
+- WASMはdigest一致を必須とするが、性能は採否条件にも性能主張にも使わない。
+
+scratch worktreeでの実装可能性確認では、`lookup()`が呼び出しとして残る形は7/8勝・平均
+1.157%短縮、完全にinline化した形は別々の2回の交互8組で各8/8勝・平均2.87%および2.34%
+短縮となり、各runの出力hashは一致した。ただしhost負荷によりbaselineの絶対時間が
+約2.6秒から約3.8秒へ変動している。これらは候補を実装実験へ進める根拠であって、最終treeの
+性能結果でも採用の主張でもない。実装baselineはこの節を固定するcommitとし、最終treeで
+上記gateを再測定する。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか
