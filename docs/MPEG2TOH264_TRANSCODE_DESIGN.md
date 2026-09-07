@@ -266,20 +266,31 @@ nativeとWASMの相互digest一致を直接は保証していない。stage 1の
   再実行が安定することと、全`fragment.data`を順に連結して計算したSHA-256がbuild間で一致する
   ことを検査する。これは通常の`cargo test`には含まれず、比較対象buildと入力を明示して別途走らせる。
 
-#### 不足している回帰テストと未確認事項
+#### 不足していた回帰テストと未確認事項
 
-- `round_half_up_i32()`には、正負の値、`-0.5`、正負のhalf-stepを直接固定するテストがない。
-- `scanned_levels_for()`には、frame/field両scanで64要素が期待順に全上書きされること、
-  全零なら偽、1要素でも非零なら真となること、逆数との`f32`乗算とhalf-step付近の結果を
-  固定する直接テストがない。
-- 色差ACにはfield scan表のテストはあるが、`spatial_to_chroma_levels()`の量子化結果と
-  `any_ac`をframe/fieldで直接比較するテストがない。
-- `ZIGZAG_8X8`と`ZIGZAG_4X4`には、規格の座標列から独立に全要素を照合するテストがない。
-  配列値はH.264 Table 8-14およびTable 8-13と照合したが、現状はレビュー時の確認に留まる。
+実装前の調査時点では次のテストがなく、stage 1の実装で追加した。この節は
+実装前の状態の記録を兼ねる。
+
+- `round_half_up_i32()`の正負の値、`-0.5`、正負のhalf-stepを直接固定するテストは
+  `lib.rs`の`round_half_up_i32_breaks_f32_ties_toward_positive_infinity`ほかで追加した。
+- `scanned_levels_for()`のframe/field両scanでの64要素全上書き、全零で偽・1要素でも非零で真、
+  逆数との`f32`乗算とhalf-stepの結果を固定する直接テストは`h264::quant`の
+  `raster_levels_are_what_the_scanned_levels_reorder`、
+  `an_all_zero_block_reports_nothing_for_either_scan_and_writes_zeros`、
+  `a_half_step_rounds_against_the_reciprocal_product_not_the_division`で追加した。
+- `ZIGZAG_8X8`の規格の座標列からの独立照合は`h264::params`の
+  `zigzag_8x8_visits_the_positions_table_8_14_names`で追加した。
 - 規格照合により、`h264/params.rs`の`ZIGZAG_8X8`コメントがTable 8-13、
   `h264/chroma.rs`の`FIELD_SCAN_4X4`コメントがTable 8-14を参照しており、正しい表番号と逆で
-  あることを確認した。配列値とfield scanの独立テストは正しい。このタスクは文書変更だけに
-  限定するため、コードコメントは変更していない。
+  あることを確認した。配列値とfield scanの独立テストは正しい。実装前の調査は文書変更だけに
+  限定したが、stage 1の実装でこの2つのコメント番号を修正した。
+
+stage 1後も次は未確認のままである。
+
+- 色差ACにはfield scan表のテストはあるが、`spatial_to_chroma_levels()`の量子化結果と
+  `any_ac`をframe/fieldで直接比較するテストがない。
+- `ZIGZAG_4X4`には、規格の座標列から独立に全要素を照合するテストがない。
+  配列値はH.264 Table 8-13と照合したが、現状はレビュー時の確認に留まる。
 - nativeとWASMの同一入力に対するcross-target bitstream一致は未確認である。
   target別のbaseline/candidate一致とは別の主張として扱う。
 - `tools/compare-wasm.cjs`のdigestは全`fragment.data`の連結bytesを覆うが、fragment境界、
@@ -331,6 +342,36 @@ stage 1では、各係数に対する`f32`の乗算と`round_half_up_i32`を変�
 
 明示的なSIMD命令などにより丸めや変換の意味を変える案はstage 1と分ける。その場合は
 「ビットストリーム不変」とは呼ばず、許容する差と品質評価を先に決める。
+
+### stage 1の結果（実験扱い）
+
+2026-09-08に、この文書の「設計」どおりの2パス実装（ラスタ順の量子化と整数の並べ替え）を
+`experiment/quant-raster-autovec`で測った。**この節は計測記録であり、採用の判断でも
+速度改善の証明でもない。** 比較対象は固定基準`faf1464e66693133fc9f4b8618992b0f557f0bc3`の
+作業ツリーを実装前の状態（調査対象`760dfaee6c14333c568f9dc4a66d6b6356ed08bc`の内容）へ
+戻したbaselineと、同じtreeにstage 1を適用したcandidateで、source、compiler、build option、
+入力、runnerを固定した。
+
+| 経路 | 条件 | baseline | candidate | 差 |
+| --- | --- | --- | --- | --- |
+| native | raw Annex B、1 thread、6回交互実行 | 平均 3.126667 s | 平均 3.083333 s | 約 1.4% 短縮 |
+| native確認測定 | 同じ条件、10組の交互実行 | 平均 3135.471 ms | 平均 3086.996 ms | 1.55% 短縮 |
+| WASM | `tools/compare-wasm.cjs`、6回交互実行 | 平均 3436 ms・best 3424 ms | 平均 3333 ms・best 3327 ms | 3.0% 短縮 |
+
+- 環境はrustc 1.93.0。入力は`testdata/hd1080i.m2v`を40回連結した長尺ES
+  （49,388,840バイト、600 source picture）で、nativeはこれをraw Annex Bへ1 threadで変換した。
+- nativeの最終出力は全バイトのSHA-256が一致した:
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`。
+- nativeの確認測定ではcandidateが10組すべてでbaselineより短かった。組ごとの差は平均
+  48.475 ms、標本標準偏差20.654 ms、t分布による平均差の95%信頼区間は
+  33.701–63.249 msだった。この入力と実行環境では、差をrun間のばらつきから分離できた。
+- WASMは同じESを再エンコードせずremuxした50,624,640バイトのMPEG-TSを入力に、
+  Node v24.19.0、wasm-bindgen 0.2.126で実行した。compare-wasmは全fragmentのdigest一致を
+  検査し、prefix `d98c963f47d54e498029929724e7571b`を出力した。報告されたvideo sampleは607個。
+- 参考: ES直接をWASMへ渡す最初の実行はvideo sampleが0個・digestが空になり、
+  このrunは誤りとして棄却した。計測には上記のTS remux経路だけを使う。
+- nativeの短縮量は1.4–1.55%と小さいが、追加の10組でも再現した。**この結果は上記の
+  入力とhostに限る測定記録であり、採用の主張や他の素材・端末での改善保証ではない。**
 
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
@@ -695,8 +736,9 @@ KonomiTV はチューナー出力をプロセス間でパイプするので、
   `testdata/hd1080i.m2v` の統計であり、実放送の統計ではない。
   提案 B に着手する前に、実放送の録画を複数本で同じ統計を取ることを勧める。
   **判断が変わる境界は、符号化済み pair 基準で概ね 50% を下回るあたりにある。**
-- **提案 A と C の削減量を測っていない。** どちらも対象区間の割合は測ったが、
-  SIMD 化と融合で実際に何%縮むかは実装して測るまで分からない。
+- **提案 A stage 1 の削減量は測ったが、提案 C の削減量は測っていない。**
+  提案 A は第2章の結果節のとおり native で1.4–1.55%・WASM で3.0%の短縮で、出力は完全一致
+  だった。これは実験扱いであり、提案 C は実装していないため未測定のままである。
 - **提案 B の作業量を見積もっていない。** mixed MBAFF の近傍導出は
   仕様上は完全に定義されているが、`CoeffCountMap` と `mvmap` の
   座標系変更がどこまで波及するかは、実際に触るまで分からない。
