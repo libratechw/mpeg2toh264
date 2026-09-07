@@ -707,6 +707,92 @@ scratch worktreeでの実装可能性確認では、`lookup()`が呼び出しと
   改善保証ではない。** 生timingは`.opencode/bench/native-times-stage8.tsv`、
   baseline/candidateの出力は`.opencode/bench/stage8-{baseline,candidate}`に固定している。
 
+### stage 9: native丸めループのベクトル化（実装前の採否基準、2026-09-08）
+
+stage 8確定後のHEAD（`a0e317718b8a2efaed24981f6fea50a7705756c0`）を調べると、
+非wasm32版`round_half_up_i32()`の切り捨て式は、release binaryの実量子化ループで
+`cvttss2si`と`cvtsi2ss`を使うスカラーcodegenのままだった。次の実験では、同じ値を返す
+比較ベースの整数式へ書き換え、コンパイラが量子化ループをSIMD化できるかを試す。
+wasm32版の`(value + 0.5).floor() as i32`、関数の呼び出し元、量子化式、scan、CAVLC入力は
+変更しない。
+
+候補式は次のとおりとする。単純な`truncated - i32::from(x < truncated as f32)`では、
+`x <= -2^31`（`-inf`を含む）の飽和cast後に`i32::MIN - 1`となり、debugではpanic、
+releaseではwrapして現行式と異なる。このため`i32::MIN`を明示的にマスクする。
+
+```rust
+let x = value + 0.5;
+let truncated = x as i32;
+let correction = i32::from(x < truncated as f32) & i32::from(truncated != i32::MIN);
+truncated - correction
+```
+
+この式はcodecの現在の到達域だけでなく、全`f32`入力について現行の
+`(value + 0.5).floor() as i32`と同じ結果を返す必要がある。`|x| < 2^24`では、正数と整数は
+切り捨てがfloorと一致し、負の非整数だけ比較が真になって1を引く。`2^24 <= |x| < 2^31`では
+表現可能な`f32`が整数なので切り捨てとの往復は恒等である。`x <= -2^31`と`-inf`はmaskにより
+`i32::MIN`、正側の飽和域と`+inf`は`i32::MAX`、NaNは0となり、いずれも現行のfloor式からの
+飽和castと一致する。この場合分けを実装コメントにも残し、codec到達域だけを根拠に契約外の
+入力差を許容しない。
+
+scratch worktreeでMIN mask前の同形ループを調べた範囲では、SSE2の`cmpps`等を使う
+ベクトル化が起き、合成マイクロベンチは1要素あたり1.32 nsから0.54 nsになった。実際の
+長尺ESでも別々の交互8組を3回行い、全組candidateが速く、平均短縮は4.49%、5.24%、
+6.55%だった。ただしこれはMIN mask前の試案による実装可能性確認であり、最終treeの結果でも
+採用・性能向上の主張でもない。MIN maskを含む最終式でcodegenと性能を再確認する。
+コンパイラの将来版でも同じcodegenになるとは主張しない。
+
+同じ探索で、stage 8後に残るMPEG-2 VLC呼び出しもinline化する案は、`decode_slice`が
+11.6 KiBから17 KiBへ46%肥大し、交互8組中candidateが速かったのは1組、平均では1.63%遅かった。
+命令cache上の不利と推定できるが原因は確定していない。この案は**棄却済み**であり、stage 9の
+実装対象へ混ぜない。
+
+#### 入力スクリーニングと適用範囲
+
+`.opencode/bench/stage9-screen`の一時的な計装buildで、13本についてcoded 8x8 block当たりの
+非零密度、MPEG-2係数symbol中のESCAPE率、frame picture内のfield-DCT率、5 bitの
+`quantiser_scale_code`分布を数えた。全入力でmalformed sliceは0だった。正規gateに使える
+根拠が確認済みの入力は次の3本に限定する。
+
+| 役割 | 入力とSHA-256 | スクリーニング結果 | gateでの用途 |
+| --- | --- | --- | --- |
+| 実放送1080i | `gr061-sid2072-smoke-fixture.ts`、`1895e4b38464a43ea689eb82d13f507231e9e170b68b0eba5fdf2bf5db9c81c8` | 351 picture、非零密度0.0622、ESCAPE 0.8334%、field-DCT 58.52%、qscale 4–22（平均13.33） | native/WASM等価性 |
+| 検証済み3:2 | `kazuhunkan-no-yell-wo-autofilm-23.976.ts`、`829290158323b01116145ace9bd1a7e7789522578384025f5cbbbeaa3a99e1f8` | 1584 picture、非零密度0.0615、ESCAPE 2.5152%、field-DCT 66.33%、qscale 3–14（平均3.52） | native/WASM等価性と既存の3:2検証 |
+| 合成progressive | `fixture.ts`、`1d5472f7a59f2e360add21cc9e90180d9b25307ae4ba8baf980991557f647e91` | 720p30、1080 picture、非零密度0.1952、ESCAPE 1.2598%、field-DCT 0% | progressive経路のsmokeだけ |
+
+スクリーニング上の暫定候補は、高密度の`nogizaka-video-control-200-260.ts`（0.0726）、
+低密度の`madder-e05-3to2.ts`（0.0405）、field-DCT率の高い
+`iruma-autofilm-23.976.ts`（79.55%）だった。ただし入力の正常性を正規gate相当には確認して
+いないため、今回の合否には使わない。13本はすべてframe pictureで`field_picture_mbs = 0`、
+SD入力もなかった。したがって、この入力集合はfield-picture経路とSDを保証しない。この不足を
+実入力のdigest一致で埋まったものとして扱わない。
+
+採否基準は実装前に次で固定する。
+
+- 非wasm32版だけを候補式へ変え、wasm32版、public API、依存、`unsafe`、量子化演算の入力、
+  CAVLC入力とbitstream契約は変更しない。MIN mask込みの最終release binaryで、実際の
+  輝度・色差量子化ループがSIMD化されたことを逆アセンブルで確認する。codegenが変わらない
+  場合は、性能gateだけで判断し、ベクトル化を事実として記録しない。
+- host上の単体回帰では、既存の到達域比較に`f32::NEG_INFINITY`、`f32::INFINITY`、
+  `f32::NAN`、`-2_147_483_648.0`、`-2_147_483_904.0`、`2_147_483_648.0`、
+  `2_147_483_904.0`を加え、floor参照式と完全一致させる。debug `cargo test`、
+  `cargo test --release`、`cargo fmt --check`を通し、6 fixtureのgolden Annex B hashを維持する。
+- 長尺ESのnative出力SHA-256
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`、WASMの
+  full-fragment digest（既知prefix `d98c963f47d54e498029929724e7571b`、607 samples）を
+  baselineと完全一致させる。
+- `gr061`と`kazuhunkan`は、入力ごとにnative出力SHA-256と
+  `tools/compare-wasm.cjs`の**全64桁**full-fragment digestをbaseline/candidateで完全一致
+  させる。後者は既存証拠のanomaly 0/316 complete cycle、combed 0、映像・音声PTS gap 0、
+  decode warning 0も維持する。合成`fixture.ts`はnative/WASMのprogressive smoke一致だけに
+  使う。これらの短尺TSから性能を主張しない。
+- 性能採否は既存の同一長尺ES・raw Annex B・1 thread・交互8組だけで行う。全組candidateが
+  速く、平均削減0.5%以上、対応のあるt値が`t <= -2.365`（df=7）のときだけコードを残す。
+  いずれかを満たさなければrevertし、棄却記録だけを残す。WASM性能は採否条件にも性能主張にも
+  使わない。
+
+実装baselineはこの節を固定するcommitとする。現時点では実装・性能向上の主張はない。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか
