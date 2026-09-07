@@ -298,6 +298,14 @@ stage 1後も次は未確認のままである。
   nativeの逐次/deferred比較はこれらをfragment単位で確認するが、WASMのbaseline/candidate比較で
   同じ範囲まで保証するには追加の回帰検査が必要である。
 
+stage 2（色差AC量子化、第4章の結果節）で、上記のうち2つを追加した。
+
+- `spatial_to_chroma_levels()`の量子化結果と`any_ac`をframe/field両scanで直接比較する
+  参照実装テスト（`h264::chroma`の`the_raster_reorder_path_is_identical_to_the_gather_loop`）と、
+  全零・非零を両scanで確認する`an_all_zero_block_stays_empty_and_a_nonzero_one_reports_ac_for_either_scan`。
+- `ZIGZAG_4X4`の規格の座標列からの独立照合は`h264::params`の
+  `zigzag_4x4_visits_the_positions_table_8_13_names`で追加した。
+
 stage 1は上記の不足を「同じはず」という推測で埋めない。少なくとも既存fixtureのAnnex Bと
 WASM比較の全出力bytesが固定baselineと完全一致しなければ、同値な最適化ではない。
 量子化levelが1個でも変わるとCAVLCの`TotalCoeff`、`TrailingOnes`、level、run、後続blockの
@@ -551,6 +559,95 @@ DC を取り出した後に別途適用する。M が置き換えるのは `idct
 提案Cは浮動小数点の演算順序を変えるため、出力完全一致を必須とした提案A stage 1とは
 検証条件が異なる。実装前に、許容する係数差、画質、decoder適合性の基準を決める。
 
+### A後の再評価（2026-09-08、stage 2）
+
+提案A stage 1の確定後、提案Cの対象区間を現在のHEAD（`155886748c7d66d9989aff907275f6cb3b6fc58d`、
+stage 1実装込み）で測り直した。このhostのカーネル設定（`perf_event_paranoid=4`）により
+`perf`は使えず、第1章と同じ方式（`rdtsc`区間計測付きbuild）をscratch worktreeで再現した。
+計測後にworktreeは削除したため、保存した数値から正確な計測ガードの挿入位置を再検証する
+ことはできない。
+
+計測ガードの挿入は2パスで行ったため、1行署名の関数（`idct8`、`forward4x4`）ではガードが
+2重に計上された可能性が高い。呼び出し数の算術がこれを裏付ける。`forward4x4`は
+`spatial_to_chroma_levels`の呼び出し1回につき4回呼ばれるので、`chroma_quant`の1,297,200回に
+対する期待値は5,188,800回だが、計測値はちょうど2倍の10,377,600回だった。`idct8`は
+符号化済み色差ブロック1個につき1回呼ばれる（単独経路とpair経路の合計で`chroma_dequant`の
+1,147,000回に一致するはず）が、計測値はちょうど2倍の2,294,000回だった。一方、複数行署名の
+関数（`dequant_chroma`、`spatial_to_chroma_levels`）と`scanned_levels_for`の呼び出し数
+（それぞれ1,147,000、1,297,200、2,219,840）はコード構造と一致する。したがって
+`chroma_xform`と`chroma_fwd4x4`の割合は、1回分のガード費用を余分に含む**上限**として読む。
+**以下はstage 2の計測記録であり、第4章冒頭の古い割合を現状の内訳として扱うこともしない。**
+
+| 区間 | 計測割合 | 呼び出し | 内容 |
+| --- | --- | --- | --- |
+| `chroma_dequant` | 1.749% | 1,147,000 | 色差の逆量子化 |
+| `chroma_xform` | 4.726%（上限） | 2,294,000（2倍計上） | `idct8` |
+| `chroma_fwd4x4` | 5.396%（上限） | 10,377,600（2倍計上） | `chroma_quant`の内側。4x4順変換 |
+| `chroma_quant` | 12.937% | 1,297,200 | `spatial_to_chroma_levels` の全体 |
+| `luma_quant` | 14.903% | 2,219,840 | stage 1後の `scanned_levels_for` |
+
+cycles/callは計測したが、区間計測buildごとにガード位置とbuildが異なるため、第2章の
+旧実装の「1係数あたり1.46サイクル」と直接比較できない。本節では呼び出し数と割合だけを
+記録する。`chroma_quant`から`chroma_fwd4x4`の計測値を差し引いた7.54%は、AC量子化ループと
+DC Hadamardの費用の**下界**である（`chroma_fwd4x4`が上振れのため、実際の順変換費用は
+計測値より小さく、ループ側はこれより大きい）。AC量子化ループは輝度stage 1と同じ形
+（`scan[k]`の間接参照を挟む乗算と丸め）であり、輝度で1.4–1.55%の短縮を得た並べ替えを
+色差ACへも適用できる。逆に`idct8`＋順変換の融合（この章の当初案）はbit-exactではなく、
+下記の理由でstage 2では採用しない。
+
+#### 融合（当初案）を採用しない判断
+
+`M·X·Mᵀ`融合はf32の演算順序を変えるため、量子化levelが丸め境界で変化しうる。
+その場合は許容する係数差・画質・decoder適合性の基準を先に決める必要がある。
+decoder適合性の基準には`tools/vtdec.swift`（VideoToolbox）と`tools/sdpdec.m`
+（AVStreamDataParser経由のMSE相当）が含まれるが、どちらもmacOS専用で、このLinux hostでは
+実行できない。ffmpeg復号だけでは十分な証拠にならないため、**融合の実装は停止し、
+下記のbit-exact候補だけを実装した。** macOSで受け入れ計画を実行できる環境では、
+実装前に係数差の測定、PSNRの基準、両harnessでの復号を計画として確定する必要がある。
+
+また融合の積和削減見積もり（1536→1024）は4x4順変換を行列積として数えたもので、
+実装の`forward4x4`はbutterflyで1ブロックあたり16乗算に過ぎない。融合の実質的な対象は
+`idct8`と順変換で、その計測割合は上表のとおり`chroma_xform` 4.7%・`chroma_fwd4x4` 5.4%
+（どちらも上限）であり、第4章の「約1.25ポイント」は命令数からの上限推定であって実測ではない。
+
+#### 実装した候補: 色差AC量子化のラスタ順計算と並べ替え（bit-exact）
+
+`spatial_to_chroma_levels()`のAC量子化ループを、輝度stage 1と同じ2パスに分けた。
+各levelは`round_half_up_i32(coeff4[pos] * ac_reciprocal[pos])`をラスタ順（`pos = 1..15`）で
+計算してから、`scan[k]`で整数のコピーだけを並べ替える。演算は1要素ごとに完全に同じなので
+出力はbit-exactであり、`any_ac`の意味、DC Hadamard、frame/field scan、field pair、intraの
+各契約は変わらない。実装は`h264/chroma.rs`の`ac_levels_for()`で、CAVLC APIと
+`ChromaBlockLevels`は不変。
+
+- 追加テスト: 旧ワンパスをtest内の参照実装として保持し、両scan・複数QP・決定性疑似乱数
+  ブロックで完全一致を確認する`the_raster_reorder_path_is_identical_to_the_gather_loop`、
+  全零で空・非零で`any_ac`を両scanで確認する
+  `an_all_zero_block_stays_empty_and_a_nonzero_one_reports_ac_for_either_scan`、
+  Table 8-13の座標列からの独立照合`zigzag_4x4_visits_the_positions_table_8_13_names`。
+- 検証: `cargo test --release`全通過（fixtureのAnnex B hash不変）、native出力のSHA-256が
+  baselineと一致、`tools/compare-wasm.cjs`の全fragment digestが一致しvideo sample 607個。
+
+計測（入力と実行手順はstage 1と同じ長尺ES・交互実行だが、baselineはstage 1実装込みの
+HEAD `1558867`の無計装buildであり、固定基準`faf1464`との直接比較ではない）:
+
+| 経路 | baseline | candidate | 差 |
+| --- | --- | --- | --- |
+| native（raw Annex B、1 thread、8組交互） | 平均 3.052371 s | 平均 3.001425 s | 1.67% 短縮 |
+| WASM（`compare-wasm.cjs`、6回交互） | 平均 3882 ms・best 3343 ms | 平均 3604 ms・best 3244 ms | n=6では性能差を結論できない |
+
+- nativeは8組すべてでcandidateが短く、差（candidate − baseline）の平均 −50.946 ms・
+  標本標準偏差21.505 ms、対応のあるt統計量 −6.70（df=7）。出力SHA-256は全16回とも
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`で一致した。
+- WASMのdigest prefixはbaseline・candidateとも`d98c963f47d54e498029929724e7571b`
+  （stage 1の記録と同じ）で一致し、video sampleは607個だった。WASM時間はばらつきが大きく
+  （baseline 3343–4503 ms）、n=6では性能差を結論できない。確実なのはdigest一致と
+  video sample数だけである。ES直接の実行はstage 1と同様にvideo sample 0個になるため
+  使っていない。
+- **この結果は上記の入力とhostに限る測定記録であり、採用の主張や他の素材・端末での
+  改善保証ではない。** nativeの短縮量は約1.7%と小さく、反復確認を経て初めて実験の範囲を
+  出る。融合は未実装のまま残り、受け入れ計画（係数差・PSNR・macOS harness）を確定できる
+  環境でのみ再評価する。
+
 ## 5. CAVLC 出力について
 
 `mb_write` の 33.3% は単一では最大の区間だが、独立した提案にはしていない。
@@ -736,9 +833,13 @@ KonomiTV はチューナー出力をプロセス間でパイプするので、
   `testdata/hd1080i.m2v` の統計であり、実放送の統計ではない。
   提案 B に着手する前に、実放送の録画を複数本で同じ統計を取ることを勧める。
   **判断が変わる境界は、符号化済み pair 基準で概ね 50% を下回るあたりにある。**
-- **提案 A stage 1 の削減量は測ったが、提案 C の削減量は測っていない。**
-  提案 A は第2章の結果節のとおり native で1.4–1.55%・WASM で3.0%の短縮で、出力は完全一致
-  だった。これは実験扱いであり、提案 C は実装していないため未測定のままである。
+- **提案 A stage 1 と、その色差AC版（stage 2）の削減量はnativeで測ったが、融合型の
+  提案 C は未実装のままである。** stage 1はnative 1.4–1.55%・WASM 3.0%、stage 2
+  （色差ACのラスタ順計算と並べ替え、bit-exact）はnative 1.67%の短縮で、出力は完全一致
+  だった。stage 2のWASMはn=6で分散が大きく性能差は結論できず、digest一致のみ確認した。
+  融合（`M·X·Mᵀ`）はf32演算順序を変えるため、許容基準とmacOS専用の
+  decoder適合性harness（`vtdec.swift`、`sdpdec.m`）を含む受け入れ計画を確定できる環境まで
+  実装しない（第4章の結果節）。
 - **提案 B の作業量を見積もっていない。** mixed MBAFF の近傍導出は
   仕様上は完全に定義されているが、`CoeffCountMap` と `mvmap` の
   座標系変更がどこまで波及するかは、実際に触るまで分からない。
