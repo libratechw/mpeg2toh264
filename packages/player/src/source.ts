@@ -38,6 +38,70 @@ interface Range {
   totalBytes: number;
 }
 
+/**
+ * Whether this failure is the server refusing an unsatisfiable byte range.
+ *
+ * Only a numeric 416 on the error's structured `cause` counts. That cause
+ * is attached by `openSource` below from the response status, so no message
+ * text is ever parsed -- including messages that merely mention 416.
+ */
+export function isRangeNotSatisfiable(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const cause: unknown = error.cause;
+  if (typeof cause !== "object" || cause === null) return false;
+  return (cause as { status?: unknown }).status === 416;
+}
+
+/**
+ * Whether a read-loop failure is the natural end of a finite recording.
+ *
+ * True only when the failed reopen asked at or past the total the server
+ * stated and the failure carries a structured 416. A null total -- a live
+ * input, or one whose length was never stated -- never drains, since there
+ * is no end to reach. A 416 below the known total means the file changed
+ * under the load and stays fatal, as does every other failure.
+ */
+export function isRangeExhaustion(
+  nextByte: number,
+  totalBytes: number | null,
+  error: unknown,
+): boolean {
+  return (
+    totalBytes !== null &&
+    nextByte >= totalBytes &&
+    isRangeNotSatisfiable(error)
+  );
+}
+
+/** The failure text with where reading stood, for the error surface. */
+function describeRangeError(
+  error: unknown,
+  offset: number,
+  totalBytes: number | null,
+): string {
+  const base = error instanceof Error ? error.message : String(error);
+  const total = totalBytes === null ? "unknown" : String(totalBytes);
+  return `${base} (range bytes=${offset}-, totalBytes=${total})`;
+}
+
+/**
+ * Annotate a range-request failure with where reading stood, for the error
+ * surface. Applied only at the two boundaries that own a range request --
+ * the leg open and the read-loop reopen; failures from WASM, the pool, the
+ * transcoder, or the sink reach the leg catch unmodified. Carries no
+ * headers, URLs, or credentials.
+ */
+export function withRangeContext(
+  error: unknown,
+  nextByte: number,
+  totalBytes: number | null,
+): Error {
+  const out = new Error(describeRangeError(error, nextByte, totalBytes));
+  if (error instanceof Error && error.cause !== undefined)
+    out.cause = error.cause;
+  return out;
+}
+
 export async function openSource(
   url: string,
   signal: AbortSignal,
@@ -77,8 +141,11 @@ export async function openSource(
   }
   if (!response.ok) {
     close();
+    // The numeric status travels on `cause` so the worker can classify a
+    // 416 without parsing the message, which DPlayer surfaces verbatim.
     throw new Error(
       `could not fetch the input: HTTP ${response.status} ${response.statusText}`,
+      { cause: { status: response.status } },
     );
   }
   if (!response.body) {

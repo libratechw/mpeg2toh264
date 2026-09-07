@@ -27,7 +27,14 @@ import {
   type TimingMark,
 } from "./protocol.js";
 import { defaultPoolSize, PicturePool } from "./pool.js";
-import { openSource, readSlice, readTail, type Source } from "./source.js";
+import {
+  isRangeExhaustion,
+  openSource,
+  readSlice,
+  readTail,
+  withRangeContext,
+  type Source,
+} from "./source.js";
 import {
   detach,
   firstTimestamp,
@@ -556,7 +563,15 @@ class Playback {
       mark(id, "wasm");
       await this.#openPool(module);
       if (!this.#running(leg)) return;
-      const source = await openSource(this.#command.url, signal, offset);
+      let source: Source;
+      try {
+        source = await openSource(this.#command.url, signal, offset);
+      } catch (error) {
+        // The range open owns this failure, so it carries where reading
+        // stood. Everything below -- WASM, pool, transcoder, and sink --
+        // reaches the leg catch unmodified.
+        throw withRangeContext(error, offset, this.#totalBytes);
+      }
       if (!this.#running(leg)) return;
       mark(id, "response");
       this.#totalBytes ??= source.totalBytes;
@@ -696,7 +711,17 @@ class Playback {
           if (!reopen) continue;
         }
       } catch (error) {
-        if (this.#running(leg) && !this.#leg!.signal.aborted) readError = error;
+        if (this.#running(leg) && !this.#leg!.signal.aborted) {
+          // A reopen refused at or past the known total is the natural end
+          // of a finite recording: drop the error so the queued tail still
+          // converts and the load completes. Anything else stays fatal,
+          // with where reading stood attached for the error surface.
+          if (isRangeExhaustion(nextByte, this.#totalBytes, error)) {
+            readError = null;
+          } else {
+            readError = withRangeContext(error, nextByte, this.#totalBytes);
+          }
+        }
       } finally {
         ended = true;
         available.abandon();
