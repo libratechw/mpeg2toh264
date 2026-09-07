@@ -381,6 +381,80 @@ stage 1では、各係数に対する`f32`の乗算と`round_half_up_i32`を変�
 - nativeの短縮量は1.4–1.55%と小さいが、追加の10組でも再現した。**この結果は上記の
   入力とhostに限る測定記録であり、採用の主張や他の素材・端末での改善保証ではない。**
 
+### stage 3: 量子化の丸めからfloorf呼び出しを外す（2026-09-08）
+
+stage 2確定後のHEAD（`e983fdd770a7ed8065e65a012fe73fdef4630e49`）で、bit-exact候補を
+絞るための区間計測と生成assemblyを行った。`perf_event_paranoid=4`のため`perf`は使えず、
+`rdtsc`区間計測付きbuildをscratch worktreeで再現した（呼び出し数はコード構造と一致する
+ことを確認してからworktreeを削除。生データは`.opencode/bench/stage3-profile-head.txt`）。
+
+**計測事実（e983fdd、長尺ES）:**
+
+| 区間 | 割合 | 呼び出し |
+| --- | --- | --- |
+| `mb_write`（inter+intra） | 32.2% | 3,672,000（= 600ピクチャ×6120 MB） |
+| `luma_quant`（`scanned_levels_for`） | 15.1% | 2,219,840 |
+| `decode_picture`（MPEG-2 VLC復号） | 14.2% | 600 |
+| `chroma_quant`（`spatial_to_chroma_levels`） | 8.6% | 1,297,200 |
+| `dequant`（`intra_targets`＋`inter_targets`） | 4.8% | 3,142,560 |
+| `chroma_xform`（`idct8`） | 2.3% | 1,147,000 |
+| `mv_pred` | 0.07% | 238,680 |
+
+**assembly上の事実:** release buildで`raster_levels_for`を単体シンボル化して逆アセンブル
+すると、ループは完全スカラーで、**1係数ごとにlibm `floorf`への間接呼び出し**
+（`movq floorf@GOTPCREL`＋`call *%r12`）を挟んでいた。原因は
+`round_half_up_i32`の`(value + 0.5).floor() as i32`が、SSE4.1を持たない既定ターゲットで
+floorf呼び出しへ降下することである。同じ関数は輝度ラスタ量子化・色差AC・色差DC Hadamardの
+全ての量子化経路で使われる。
+
+**最初の実装（共有）とその棄却:** まず`round_half_up_i32`のfloorを、切り捨てを使う等価計算へ
+全ターゲット共通で置き換えた。`x = value + 0.5`を切り捨てて`t`とし、`t > x`のときだけ
+`t - 1`を選ぶ。nativeではfloorf呼び出しが消えて11.66%の短縮（8組、t = −18.49、hash完全一致）
+を得たが、**WASMでは2セッションともcandidateが全12 roundでbaselineより遅く、約1.5–2%の
+一貫した退行が観測された。** 両経路を改善するという目的に合わないため、共有実装は棄却した。
+
+**最終実装（ターゲット別、採用候補）:** `round_half_up_i32`をcfgで2定義に分けた。
+wasm32は、共有の切り捨て式が計測したWASM環境で一貫して遅かったため従来どおり
+`(value + 0.5).floor() as i32`を維持する（遅い理由の正確な機構は未確定）。非wasm32は
+切り捨てベースの等価式で、nativeで係数ごとのlibm `floorf`呼び出しを除く（ベクトル化の
+有無は最終assemblyでは確認していない）。両ターゲットが同じhalf-up丸め（tieは正の
+無限大側）を返す契約をコメントで明記し、テスト（後述）で固定する。非wasm32式の正確性の
+範囲は**`|x| < 2^24`**（f32整数が常にexactなのはそこまで）で、codecの到達域はその範囲内。
+到達域の保守的な上限は**約1.31e6**である（導出: 逆量子化のclamp ±2048、intra予測調整
+`FLAT_PREDICTION_DC`−8×予測値（clip済みサンプル平均≦255）でtargetの大きさは約3072以内、
+field/frame基底変換は最大×16（正規直交8点変換2回、各パスの基底行和≦4）、最大の逆数は
+`1/(0.0385049076×1)`≈25.97（`BASE_GAIN_8X8`の最小要素×scaling weight 1）→
+3072×16×25.97≈1.28e6に変換後の調整を足して約1.31e6。色差AC・DCはこれより低い:
+ACは4x4順変換出力（≦36×32,896）×ac逆数（≦0.4、`CHROMA_AC_GAIN_4X4`使用位置の最小値2.5）
+≈0.47e6、DCは(Σf)/4 ≦ 約0.42e6）。2^24≈16.78e6より一桁以上小さい。
+tie規則と`+0.5`は不変で、public API・CAVLC入力契約・scan・bitstream・unsafe・依存は全て不変。
+
+- 回帰テスト: 等価性テストはhost上で**非wasm32実装だけを**実行し、wasm32側の実装式と
+  同一表現のtest内参照`(value + 0.5).floor() as i32`と比較する（全half-integer
+  ±2,000,000、決定性疑似乱数1,000,000点（±符号）、境界値（2^24、2^25、±4,000,000など）で
+  完全一致を確認する`round_half_up_i32_matches_the_floor_formulation_everywhere_in_range`）。
+  **WASM側のエンドツーエンド証拠は`tools/compare-wasm.cjs`のdigest比較であり、
+  このテストではない。**
+- 検証: `cargo test --release`全通過（fixtureのAnnex B hash不変）。
+
+**最終計測（cfg修正後のbinary、baselineは固定したe983fddの無計装build、
+長尺ES・raw Annex B・1 thread）:**
+
+| 経路 | baseline | candidate | 差 |
+| --- | --- | --- | --- |
+| native（8組交互、再測定） | 平均 3.029652 s | 平均 2.713007 s | **10.45% 短縮** |
+| WASM（6回交互） | 平均 3416 ms・best 3306 ms | 平均 3441 ms・best 3337 ms | roundごとの勝敗3対3で方向交錯（noise） |
+
+- nativeは8組すべてでcandidateが短く、差の平均 −316.645 ms・標本標準偏差40.797 ms、
+  対応のあるt統計量 −21.95（df=7）。出力SHA-256は全16回とも
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`で一致した。
+- WASMのdigest prefixはbaseline・candidateとも`d98c963f47d54e498029929724e7571b`で一致し、
+  video sampleは607個だった。wasm32はbaselineと同じ丸め式なので同等が期待値で、roundの
+  勝敗は交錯して共有実装の一貫した退行（12/12）は消えた。平均 −0.7%はこのセッションの
+  noiseの範囲とみなし、WASMの性能主張はしない。
+- 共有実装の測定値（native 11.66%）は棄却された実装の記録であり、**採用候補は最終実装の
+  上記の値だけである。** この結果は上記の入力とhostに限る測定記録であり、採用の主張ではない。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか
@@ -840,6 +914,12 @@ KonomiTV はチューナー出力をプロセス間でパイプするので、
   融合（`M·X·Mᵀ`）はf32演算順序を変えるため、許容基準とmacOS専用の
   decoder適合性harness（`vtdec.swift`、`sdpdec.m`）を含む受け入れ計画を確定できる環境まで
   実装しない（第4章の結果節）。
+- **stage 3（丸めからのfloorf除去）は、共有実装のWASM退行（2セッションで全12 round遅い）を
+  棄却し、ターゲット別実装（wasm32は従来のfloor、非wasm32は切り捨て等価式）を採用候補とした。**
+  最終実装はnative 10.45%の短縮（8組、t = −21.95、hash完全一致）、WASMはdigest一致で
+  性能はroundごとに方向が交錯するnoiseとなり、共有実装の一貫した退行は消えた。
+  両ターゲットが同じround-half-up結果を返す契約はコメントと等価性テストで固定した
+  （第2章の結果節）。
 - **提案 B の作業量を見積もっていない。** mixed MBAFF の近傍導出は
   仕様上は完全に定義されているが、`CoeffCountMap` と `mvmap` の
   座標系変更がどこまで波及するかは、実際に触るまで分からない。
