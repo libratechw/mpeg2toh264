@@ -1,5 +1,25 @@
 # Repository instructions
 
+## Optimization experiment
+
+- Start with `docs/MPEG2TOH264_TRANSCODE_DESIGN.md`. It is the experiment plan
+  and fixed record of earlier measurements, not an accepted implementation
+  design or proof of a speedup.
+- Before editing, fetch `upstream` and confirm the exact base. Pull `main` from
+  its tracking remote with `--ff-only` when it advanced; never carry an old
+  measurement across a changed source tree without revalidation.
+- The first implementation experiment is Proposal A stage 1 only: compute the
+  existing quantisation operation in raster order, then reorder the integer
+  levels for the residual coder. Do not combine sparse-coefficient metadata,
+  CAVLC API changes, Proposal B, or Proposal C into that comparison.
+- Proposal A stage 1 passes only if repeated native and WASM comparisons show a
+  reproducible improvement and every output digest remains identical to the
+  baseline. An output difference is a failed equivalence experiment, not an
+  acceptable performance result.
+- Keep the branch classified as an experiment until its effect and relevant
+  regressions are measured. Do not publish or present it as an adoption or
+  provisional candidate without the separate publication review and records.
+
 ## Scope
 
 - `crates/mpeg2toh264` is the codec/container core. Keep it dependency-free unless a dependency is clearly justified; `unsafe_code` is forbidden.

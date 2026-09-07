@@ -177,6 +177,7 @@ packages/yadif/           WebGL yadif
 packages/demo/            Browser demo
 testdata/                 Test data
 tools/                    Table generation, WASM builds, and test-data creation
+docs/MPEG2TOH264_TRANSCODE_DESIGN.md  Experimental optimization plan (Japanese)
 ```
 
 The interface for each library is documented in the README in its directory.
@@ -360,6 +361,7 @@ packages/yadif/           WebGL yadif
 packages/demo/            ブラウザーデモ
 testdata/                 テストデータ
 tools/                    テーブル生成、WASMビルド、テストデータ作成
+docs/MPEG2TOH264_TRANSCODE_DESIGN.md  最適化の実験計画・設計記録
 ```
 
 各ライブラリのインターフェースはそれぞれのディレクトリにあるREADMEに記載しています。
