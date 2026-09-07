@@ -556,6 +556,55 @@ stage 4後の`write_luma_residual_8x8()`は、1個の8x8 level配列から4個�
 
 実装baselineはこの節を固定するcommitとする。現時点では実装・性能向上の主張はない。
 
+#### stage 7の実装結果（2026-09-08、全採否基準を満たしコードを保持）
+
+この節を固定するcommit（`90f15023e70cd94103011f845a9d11676ae3c877`）の作業ツリーを
+baseline、同じtreeにde-interleaveを適用したものをcandidateとした。実装は
+`write_luma_residual_8x8`（`crates/mpeg2toh264/src/h264/mb.rs`）だけである。
+
+- 変更は、符号化された各i8x8について、`block[4 * i + i4x4]`の4要素を位置iのグループで
+  まとめて読み、4個の`sub[i4x4][i]`とmaskを同時に組み立ててから、書き込みを従来と
+  同一のi4x4順（0..4）で行う形。`counts.n_c()`参照と`counts.set()`の順序は不変で、
+  CAVLC API・level配列の意味・cbp・bitstream契約は変えていない。依存追加も
+  `unsafe`もない。追加スタックは計画どおり192 byte（一時配列64 → 256 byte）。
+- **cache削減は主張しない。** 両方式が読むsource範囲は同じ256 byte、すなわち
+  一般的な64 byte cache lineなら4本であり、方式間でbyte単位のcache占有は変わらない。
+  また要素ごとのaddress演算の有無を性能根拠にしない（4連続loadとshuffleへ
+  並べ替えるだけで、要素数の削減ではない）。
+
+- 追加テスト（`h264::mb`のtest module）:
+  - 旧gatherをtest内参照実装`reference_write_luma_residual_8x8`として保持。
+  - `the_deinterleaved_write_matches_the_reference_gather_for_every_cbp`: 決定的な
+    8x8ブロックと全16 `cbp_luma` pattern、左・上近傍をseedした`CoeffCountMap`で、
+    生成bit列（bit長＋padding後のbytes）と係数数更新結果（counts map全体）を参照実装と
+    完全一致させる。
+  - `a_coded_8x8_reads_left_and_upper_neighbours_into_n_c_in_the_same_order`:
+    seedした左=5・上=3によりnCが0→4へ変わりcoeff_token表が変わることを、bit列が
+    実際に変わることで観測し、同じseedでは参照実装と完全一致することを確認する。
+    書き込み順が変われば後続4x4のnCが変わるため、この比較は順序を観測する。
+- 検証: debug `cargo test`と`cargo test --release`を両方とも全通過（262テスト、
+  うちfixtureのAnnex B golden hash不変）。`cargo fmt --check`通過。
+
+| 経路 | baseline | candidate | 差 |
+| --- | --- | --- | --- |
+| native（raw Annex B、1 thread、8組交互） | 平均 2630.734 ms | 平均 2611.167 ms | **0.7438% 短縮** |
+| WASM（`compare-wasm.cjs`、6回交互） | 平均 3334 ms・best 3234 ms | 平均 3316 ms・best 3229 ms | 0.6% 速い方向（gate外） |
+
+- nativeは8組すべてでcandidateが短く、差（candidate − baseline）の平均 −19.568 ms・
+  標本標準偏差10.822 ms、対応のあるt統計量 −5.11（df=7）。8組の計測後に保存された
+  baseline・candidateの最終出力は、SHA-256
+  `12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`で一致した。
+- WASMは`tools/compare-wasm.cjs`が全fragmentのdataを順に入力したSHA-256 digestの
+  全64桁を内部比較し、baseline・candidateで一致した。共通prefixは
+  `d98c963f47d54e498029929724e7571b`、video sampleは607個だった。
+- 採否判定: 「出力完全一致」「全8組でcandidateが速い」「平均削減0.5%以上」
+  「t ≤ −2.365」をすべて満たしたため、**コードとテストを保持する**。
+  WASMは性能を採否条件・性能主張に使わない（`compare-wasm.cjs`は対応差の不確実性を
+  判定できないため）。
+- **この結果は上記の入力とhostに限る測定記録であり、採用の主張や他の素材・端末での
+  改善保証ではない。** 生タイミングは`.opencode/bench/native-times-stage7.tsv`、
+  baseline/candidateの出力は`.opencode/bench/stage7-{baseline,candidate}`に固定している。
+
 ## 3. 提案 B: MBAFF を pair 単位で適応させる
 
 ### 何が起きているか
