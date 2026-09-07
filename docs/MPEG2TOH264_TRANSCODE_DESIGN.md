@@ -710,6 +710,57 @@ DC を取り出した後に別途適用する。M が置き換えるのは `idct
 提案Cは浮動小数点の演算順序を変えるため、出力完全一致を必須とした提案A stage 1とは
 検証条件が異なる。実装前に、許容する係数差、画質、decoder適合性の基準を決める。
 
+#### 受け入れ計画（prospective、実装前に合意する基準）
+
+融合の実装に先立ち、以下の受け入れ計画を定める。この節は**計画の記録であり、
+結果の主張ではない**。基準は実装後にこの節と結果節で照合する。
+
+- **決定論的合成比較**: 現行2段階計算（`idct8`＋`forward4x4`）と融合計算を、frame/field
+  両scan、代表的なQP、intra/interおよびfield-pair入口経路で比較する。量子化係数の
+  整数差は**最大1**とし、差の個数と分布を報告する。完全一致が達成できた場合は通常の
+  digest一致を合格条件とする。
+- **実fixture品質**: 各fixtureで復号輝度はbaselineと**バイト一致**。Cb・Crそれぞれの
+  candidate対baseline PSNRは**70 dB以上**。source参照のCb/Cr PSNRはfixtureごとに
+  **0.01 dB以上の低下なし**。フレーム数・ジオメトリ・タイミング/sample数・fragment構造は
+  不変とする。
+- **native採否**: 交互8組で**全組がcandidate側が速く**、平均削減**0.5%以上**、
+  対応のあるt値が **t <= -2.365（df=7）**。
+- **WASM**: 確立した`compare-wasm.cjs`交互方式で**統計的に支持される退行なし**。
+  best-of-Nではなく不確実性を報告する。
+- **decoder適合性**: ffmpeg復号に加え、macOSのVideoToolbox（`tools/vtdec.swift`、
+  hardware/software）とAVStreamDataParser（`tools/sdpdec.m`）が期待したフレーム数・
+  sample数で失敗ゼロで完了する。macOS gateはparentが実行する。
+
+#### 融合の実装結果（2026-09-08、native採否基準不達によりコードはrevert）
+
+融合（M = T·C8ᵀ、Y = M·X·Mᵀ、定数は`C8`＝`COS_PI_OVER_16`由来）を
+`convert_chroma_block`と`convert_intra_chroma_block`へ試験実装し、上記の受け入れ計画に
+照合した。`convert_field_chroma_pair`はfield sampleの行インターリーブを含む別の変換を
+導出する必要があるため現行2段階計算のままとし、融合候補の比較対象には含めなかった。
+比較baselineは`601b7045ea366a8df604db10b9c54ddb53497bcb`である。
+
+- **合成比較（実装した経路は合格、field-pairは未評価）**: 両scan・QP 0/13/26/39・
+  intra/inter＋intra予測の各入口・対抗的ブロック
+  12,000個で768,000レベルを比較し、**28レベルが±1移動（最大1）**、ブロック内移動数分布は
+  [0: 11,972, 1: 28, 2+: 0]。実装した経路は係数基準（最大1）を満たしたが、受け入れ計画が
+  要求したfield-pair入口の融合比較は不足している。
+- **実入力の完全一致（合格、最良の場合）**: 6 fixtureのAnnex B hashが不変、長尺入力の
+  native SHA-256（`12e1392c12d53b25d53534afa9618c09ab971c3c8ddc3853c83d0e49b06a03c1`）と
+  WASM full-fragment digest（`d98c963f…`、607 samples）がbaselineと**完全一致**。
+  復号画質gate（輝度バイト一致・Cb/Cr PSNR 70 dB以上・source参照の0.01 dB以内）は
+  bitstream一致により自明に満たす。
+- **native性能（不達）**: 交互8組でbaseline平均2.783357sに対しcandidate平均2.758679s、
+  差 −24.678 ms（名目0.89%）だが、**速い組は5/8**・paired t = −1.23（df=7）で、
+  「全組速い・t ≤ −2.365」の採否基準を満たさず、noiseから分離できない。
+- **WASM（未判定）**: 交互6 roundの平均はbaseline 3,244 ms、candidate 3,253 ms
+  （candidateが名目0.3%遅い）でdigestは一致した。`compare-wasm.cjs`の出力には対応差の
+  分散や検定値がないため、「統計的に支持される退行なし」は確認できていない。
+- **判定**: 実装した経路の係数基準と実入力の完全一致は達成したが、field-pair比較が不足し、
+  native採否基準も満たさなかったため、
+  受け入れ計画に従い**コードはrevert**した（この節の結果は棄却記録）。macOS gate
+  （`vtdec.swift`・`sdpdec.m`）は未実施（parent境界）。再測定・基準変更・別実装形での
+  再評価は、この記録を前提に判断できる。
+
 ### A後の再評価（2026-09-08、stage 2）
 
 提案A stage 1の確定後、提案Cの対象区間を現在のHEAD（`155886748c7d66d9989aff907275f6cb3b6fc58d`、
