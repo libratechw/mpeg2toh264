@@ -4,9 +4,18 @@ MPEG-2 VideoからH.264/AVCへの変換、MPEG-TSの分離、AAC-LCの処理、f
 
 ## 統合検証用の演算試作
 
-このブランチは統合検証用で、全体をそのまま採用するためのPR候補ではありません。`experimental-symmetric-idct`は色差IDCTの演算順序を変える試作で、既定では無効です。明示的に有効にしてソースからbuildした場合だけ適用され、出力は旧経路と完全一致しません。
+このブランチは統合検証用で、全体をそのまま採用するためのPR候補ではありません。次の演算試作は、個別または両方を明示的に有効にしてソースからbuildした場合だけ適用されます。どちらも既定では無効で、有効時の出力は旧経路と完全一致しません。
 
-画質・ブラウザー・実機での検証が残るため、通常利用への既定化はしていません。旧品質の演算経路へ戻すには、このfeatureを指定せずに再buildしてください。チェックイン済みの`packages/*/dist`は、この試作を有効にした配布物ではありません。
+- `experimental-symmetric-idct`: 色差IDCTの対称性を使った演算削減。
+- `experimental-symmetric-field-basis`: frame→field基底変換の対称性を使った演算削減。単独の性能効果は未確定で、組み合わせの評価用にも残しています。
+
+画質・ブラウザー・実機での検証が残るため、通常利用への既定化はしていません。旧品質の演算経路へ戻すには、両featureを指定せずに再buildしてください。チェックイン済みの`packages/*/dist`は、これらの試作を有効にした配布物ではありません。
+
+CLIで両方を試すbuild例（片方だけの評価ではfeature名も片方だけ指定します）:
+
+```bash
+cargo build --release -p mpeg2toh264-cli --features mpeg2toh264/experimental-symmetric-idct,mpeg2toh264/experimental-symmetric-field-basis
+```
 
 ## 一括変換
 
