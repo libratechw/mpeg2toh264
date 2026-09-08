@@ -340,6 +340,65 @@ E/Fとも保存ログの再集計で同じ指標値・局所判定を再現し�
 
 追加証拠の対応はartifact directoryの`s1-idct-followup-validation.json`、評価用コードは`s1-followup-tools-20260909.tar.gz`（SHA-256 `5eb866629c4e9f2c1cadb297fd579813d117580fa13fe927dfc583a07018c449`）に保存した。S1は小幅な利益が複数素材・実行環境で観測されたため実験候補として残すが、既定化・clean PR候補への昇格はしない。browserの負荷管理付き再測定、ジャンルを明確にした追加素材・長時間、VideoToolbox/Safari/MSEと実機視聴、独立S1コードレビュー、人間による文字・肌・色・ちらつきの確認が残る。旧品質へ戻すfeature-off経路と従来のclean bit-exact PR候補branchは維持する。
 
+### 独立候補S2: frame→field基底変換の鏡映対称性（2026-09-09）
+
+S2は`crates/mpeg2toh264/src/h264/quant.rs::frame_dct_to_field_targets()`だけを演算削減する試作で、`experimental-symmetric-field-basis` featureでのみ有効になる。固定B・oversample=2と比較し、S1と適応MBAFFは有効にしない。今回の差分は既定経路、逆方向の`field_dct_to_frame_targets()`、基底値、量子化、scan、呼び出し条件、timelineを変更しない。S2 buildにはB以降の既存修正も含むが、固定B buildには含めない。以下は両build全体の比較であり、後続修正とS2演算変更の性能効果を分離した同一基点feature on/off比較は未実施である。Bを新しいcommitへ更新するものではない。
+
+固定Bの素材B Node profileでは、呼び出し元`transcode.rs::source_field_targets()`のself timeが10.613%だった。この関数には逆量子化等も含まれるので、全量をS2で削減できる割合とは扱わない。profileは初回を含む2回の診断用サンプリングで、nativeの内訳や定常性能ではない。生記録は`/data/ssd/mpeg2-quality-wasm-profile-B-20260909/baseline.cpuprofile`。固定Bから今回の基点まで`quant.rs`の変更がないことを確認して再利用した。
+
+丸め済み基底Dはsample/frequency順で、`D[7-y,k] = (-1)^k D[y,k]`を満たす。上下blockをそれぞれ偶数・奇数周波数の和E/Oから`E+O`・`E-O`へ逆変換し、fieldごとに上側の`2*y+field`と下側の`6-2*y+field`を組にする。和を偶数周波数へ、差を奇数周波数へ順変換する。水平周波数は混ぜない。上下8×8 blockの組当たり、ソース上の乗算は2,048回から1,024回になるが、命令数や所要時間が半分になるという主張ではない。
+
+`source_field_targets()`が選んだframe-DCTの輝度blockに適用され、非参照pictureだけには限定しない。f32加算順序が変わるため、量子化境界をまたぐlevel差と参照連鎖への影響を評価する。これは係数省略や粗い基底近似ではないが、数式の同値性だけでは視覚的同等を保証しない。S1の色差品質結果をS2へ流用しない。
+
+#### S2の数値回帰とbuildの固定
+
+`dct8_basis_has_the_exact_rounded_mirror_identity`はDの鏡映32組をbit単位で検査する。`frame_dct_to_field_targets_matches_the_f64_direct_reference`は両fieldの直接合成f64行列積と照合し、ゼロ、DC、上下128基底の正負入力、疎・密の決定的入力、相殺を含む。許容差は`16 * f32::EPSILON * sum(abs(term))`で、相殺前の絶対寄与を使う数値回帰条件であり、画質閾値ではない。nativeとWASM SIMDは各laneで同じ演算順序にする。
+
+defaultの`cargo test --release`は旧goldenを含む272件成功。S2有効時は旧6素材中`hd1080i.m2v`だけが変化し、`transcodes_every_fixture_to_the_expected_bitstream`が失敗した。旧goldenは更新せず、`cargo test --release --features mpeg2toh264/experimental-symmetric-field-basis -- --skip transcodes_every_fixture_to_the_expected_bitstream`で再実行して271件成功した。skipしたのは6素材を照合するtest case全体1件であり、その中のHD素材だけではない。native/WASM release buildと`cargo fmt --all --check`も成功した。初期試作のmutable参照のmoveによるcompile errorは修正し、初回失敗ログも保存した。独立した差分レビューではfield選択・符号・軸・SIMD・独立oracleについて修正必須の問題は見つからなかったが、レビュー自体を実行性能・画質の証拠にはしない。
+
+sourceは`bb8d0ac65463382460486f4e7a693cf65e305c78`に対する保存済み差分（SHA-256 `2771bd3aaa9e450a3d17439baf21926b805b2ba666e471396bf6faeb391aaa1c`）で、実装commit `52b601774005c52ba80afc283298168888142783`のcore差分と一致する。差分の保存先`/data/ssd/mpeg2toh264-proposal-b-artifacts/s2-field-basis-source.patch`、全core source hash、buildコマンド、テストログは同directoryの`build-manifest-s2-field-basis.json`に固定した。native binary SHA-256は`e453c482d812e28fde4a132a6d64cd5db7cc03e9e5b91c1f9e17ebe78f092c17`、raw WASMは`b1f740d5d47294c8a53e7dc52a260a7c701954309c2e60e28eff4e9d017e7411`。既存`.cargo/config.toml`のWASM target flagsを使用する。旧品質へ戻すにはS2・S1・適応MBAFFのfeatureを付けずにbuildする。S2は実験であり、既定化・clean PR候補への昇格はしない。
+
+#### S2の最初の性能比較
+
+素材B全編（59.726333秒）を、固定B対S2で各8組、順序を交互に反転して比較した。各buildの最初のwarmupを除き、推定外部CPU使用量が平均1 coreを超えた組は全体を除外する既存条件を維持した。全試行と採否はnativeの`results.json`の`pair_policy`・`interference_detection`・`runs`、Nodeの同ファイルの`policy`・`runs`に記録した。nativeはCLI process開始から終了（入出力を含む）、Nodeは新規Session構築から1 MiB chunkでのpush/finish・freeまでで、hash・MP4解析・保存は計時外である。以下はGOP単位や実機視聴の数値ではない。
+
+| 経路 | B → S2の平均時間 | 時間短縮率 | 短縮した組 | 組ごとの短縮時間の95% paired t区間 |
+| --- | ---: | ---: | ---: | ---: |
+| native CLI | 11.822625 → 11.728100秒 | 0.800% | 8/8 | 38.336〜150.715 ms |
+| Node WASM | 14,117.823 → 14,060.291 ms | 0.408% | 6/8 | 10.280〜104.786 ms |
+
+nativeの映像1秒当たりwall/CPU時間は0.197947/0.197931秒 → 0.196364/0.196339秒。Annex Bは259,609,856 → 259,609,967 bytesで、S2のSHA-256は`88c99b86f8ed3e4542bac54d196dcd3ae4c0ad1518e71240e0b70d3270dbecc6`。Nodeは1,809 video samples、init・fragment metadata・sample timing/flagsが一致し、各buildの全runで完全出力digestが安定した。S2の完全フラグメントdigestは`bc2d3137b5e7e3481e0dc22597bfc6c9099462511680bce14e1adafa3f09d0d5`。Node初回14,224.249 / 14,093.368 msは定常集計から除いた。
+
+生記録・ばらつき・集約は`/data/ssd/mpeg2-quality-native-B-s2-field-basis-20260909/`と`/data/ssd/mpeg2-quality-wasm-B-s2-field-basis-20260909/`の`{results,pair-summary}.json`。S2にも初期利益はあるが小さく、S1より優先する根拠にはならない。知覚可能な劣化と交換する利益とは扱わず、品質と他素材・browserでの再現性を確認するまでは実験に留める。S1との組み合わせも未測定で、短縮率を足し合わせない。
+
+#### S2の素材Bの品質と互換性確認
+
+ここではRを元MPEG-2の復号結果、Bを固定Bの出力、CをS2の出力とする（入力素材の名前は「素材B」）。既存v5評価器でRの`[30,330)`と対応するB/Cの`[31,331)`、300 frames・10.010秒・600 bob fieldsを比較した。元TSの保持対象pictureの実PES PTS・decode順を、各出力の包装MP4のPTS/DTSへ照合して初期lead-in/cloneの1枚差を確認した。NAL payload・順序・数の一致は各build内の包装前後を確認するもので、固定BとS2のpayload同士の一致ではない。固定BとS2の実行probeはそれぞれ測定時Annex Bと完全一致し、両者とも1,790 pictures変換・先頭2 pictures除外、実際の`undecodable`は空だった。前処理、色・レンジ・表示形状、TFFの時間情報、モデルと集約規則はS1のv5条件を変更していない。閾値と採否上の役割は[品質の対応付けと判定](#品質の対応付けと判定)を適用する。
+
+局所窓の平均VMAFはR/B 96.822479 → R/C 96.822380。各時刻の非負追加低下は平均0.000548、最悪連続1秒0.001161で、そのsource PTSは11.396422〜12.396422秒だった。輝度PSNRは47.072070 → 47.072183 dB、Cb/Crは両者56.692332 / 55.735306 dB。固定窓は「視覚的同等を狙う」数値条件を満たす。ログの再集計でも同じ指標値と判定を再現した。改善時刻で悪化を相殺した平均VMAF差だけから合格させていない。
+
+全編1,790 framesも、確認済み対応付けを使い原interlaced planeの整数SSEからPSNRを集約した。Rに対するY/Cb/Cr PSNR低下は−0.00000513 / 0 / 0 dBで全編PSNR条件を満たす。B/CのCb/Crは全画素で一致し、Yは164,052 samplesが異なり、絶対差は最大3、差があるframeは1,109枚だった。参照を通じた差の持続も含む。全編B/C SSE最大のsource frameは1212、PTS 42.160489秒、Y SSEは3,968。これは全編VMAFの最悪区間や知覚上の最悪場面の証明ではない。
+
+指標・対応付け・人間用の[元映像](../.opencode/eval/proposal-b/B-s2-pts-evaluated-v5/B-source-preview-reencoded.mp4)・[固定B](../.opencode/eval/proposal-b/B-s2-pts-evaluated-v5/B-baseline-preview-reencoded.mp4)・[S2](../.opencode/eval/proposal-b/B-s2-pts-evaluated-v5/B-candidate-preview-reencoded.mp4)は`.opencode/eval/proposal-b/B-s2-pts-evaluated-v5/`へ保存した。SSE最大frame前後のsource PTS 41.159489〜43.161489秒、2.002秒の動画も`B-s2-worst-sse-preview/`に置いた。動画はCRF18再符号化で指標の入力ではなく、Gitに含めないローカル成果物である。**視聴確認待ち**であり、数値だけで文字・肌・色・ちらつきの問題がないとは判定しない。
+
+Session全編のS2 native逐次・`-j 2`・Node WASMのMP4は`cmp`で完全一致した。Session出力をFFmpegでnullへ復号する初回確認では、固定BとS2に同じDTS警告が出た。出力encoderへsource time baseを引き継ぐ`-enc_time_base -1`を指定した再確認は両者exit 0・stderr空だった。codecや入力timestampsは変更していない。この診断ログと完全出力は`/data/ssd/mpeg2-quality-B-s2-session-validation-20260909/`に残す。AAC入り合成素材でも`compare-deferred.cjs`を3 round実行し、ツールが比較する初回sequential/deferredのdigest一致を確認した（603 jobs）。性能測定とは重ねず、この機能確認の所要時間を性能結果に混ぜない。
+
+包装証拠・再現コマンド・全編PSNRは`/data/ssd/mpeg2-quality-B-s2-pts-pack-20260909/`にある。Session途中の追加RAPの品質は単一unitのraw出力評価で保証していない。S2は独立実験として残すが、他素材、browser WASM、実機、VideoToolbox/Safari/MSE、起動・シーク・長時間、人間の視聴、S1との組み合わせは未検証であり、clean PR候補には含めない。
+
+### oversample 2→1.5の独立screen（2026-09-09）
+
+固定Bの同じnative binaryだけを使い、素材B全編でoversample=2と1.5を交互8組比較した。平均11.816399 → 11.636394秒、1.523%短縮、8/8組で短縮し、短縮時間の95% paired t区間は139.121〜220.889 msだった。出力は259,609,856 → 236,406,893 bytes。既存の`Quantiser8x8::choose_qp()`へ渡す設定値だけを変え、S1・S2・適応MBAFFは含めない。量子化精度を下げる操作なので、未検証の画質を犠牲にしてよい根拠にはしない。知覚可能な劣化に対する15%短縮目安には届かず、視聴上の別の利益も未確認である。
+
+初回の測定は親が試作担当のformatter実行と重ねたため、既存process監視により無効となった。途中の数値は採用せず、全build・formatter終了後に別directoryへ全8組を再測定した。除外規則は変えていない。有効な生記録は`/data/ssd/mpeg2-quality-native-B-oversample15-20260909-r2/{results,pair-summary}.json`。初回の無効記録は`/data/ssd/mpeg2-quality-native-B-oversample15-20260909/results.json`に残す。
+
+品質は同じ素材Bの固定10.010秒窓と全編を、既存v5のPTS/NAL対応付け・前処理で評価した。oversample=1.5の専用probeは固定Bのsourceからbuildし、測定時Annex Bと完全一致してから実際の除外記録を渡した。初期lead-in/cloneの1枚差を確認し、S2と同様に変換1,790 pictures・先頭2 pictures除外、`undecodable`は空だった。
+
+固定窓の平均VMAFは96.822479 → 96.636143、非負追加低下は平均0.191028、最悪連続1秒0.372332（source PTS 10.795822〜11.795822秒）。一方、Y/Cb/Cr PSNR低下は0.547752 / 0.814621 / 0.702933 dBで、輝度が「小さな劣化を許容する」上限0.5 dBを超えた。全編整数SSEからのPSNR低下は0.291234 / 0.774295 / 0.689672 dBで、全編平均だけなら同上限内だが、事前に固定した局所窓の失敗をそれで相殺しない。各ログの再集計でも同じ不合格判定を再現した。
+
+この設定は**今回の採用候補から除外する**。根拠は固定窓のPSNR条件未達と小さなnative利益であり、hash不一致やVMAFだけの判定ではない。人間が知覚できると断定したものでもない。WASM・実機へ評価を広げず、設定や既定値は変えない。証拠は`/data/ssd/mpeg2-quality-B-oversample15-pts-pack-20260909/`、指標と[元映像](../.opencode/eval/proposal-b/B-oversample15-pts-evaluated-v5/B-source-preview-reencoded.mp4)・[固定B](../.opencode/eval/proposal-b/B-oversample15-pts-evaluated-v5/B-baseline-preview-reencoded.mp4)・[oversample 1.5](../.opencode/eval/proposal-b/B-oversample15-pts-evaluated-v5/B-candidate-preview-reencoded.mp4)は`.opencode/eval/proposal-b/B-oversample15-pts-evaluated-v5/`に保存した。人間用動画は再符号化した補助資料で、視聴未確認である。1.25/1の性能・画質はこの結果から推定しない。
+
+S2とoversample=1.5のsource・build・計測・品質・互換性記録の対応はartifact directoryの`s2-and-oversample15-validation.json`に保存した。評価用コード一式は`s2-evaluation-tools-v5-20260909.tar.gz`（SHA-256 `907b80e014f2896013cca0dcd01cfc8a37065203d3d8c60a59e9db4b2d356e57`）。これらはローカル成果物であり、Gitだけでは素材と生記録までは取得できない。
+
 ### 素材EのPTS付き局所品質と評価手順の修正（2026-09-09）
 
 最新の結果は`.opencode/eval/proposal-b/E-pts-evaluated-v4/manifest.json`。
