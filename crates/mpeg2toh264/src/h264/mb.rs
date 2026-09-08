@@ -206,29 +206,42 @@ impl CoeffCountMap {
 
     #[cfg(feature = "experimental-adaptive-mbaff")]
     fn mixed_n_c(&self, modes: &MbaffModes, bx: usize, by: usize) -> i32 {
-        let mb_x = bx / self.mb_blk_w;
-        let mb_y = by / self.mb_blk_h;
+        let local_bx = bx % self.mb_blk_w;
+        let local_by = by % self.mb_blk_h;
         // Both luma and chroma counts describe 4x4 sample blocks. Chroma
         // macroblocks have fewer blocks, not larger sample blocks.
-        let block_w = 4;
-        let block_h = 4;
-        let max_w = self.mb_blk_w as i32 * block_w;
-        let max_h = self.mb_blk_h as i32 * block_h;
-        let local_x = (bx % self.mb_blk_w) as i32 * block_w;
-        let local_y = (by % self.mb_blk_h) as i32 * block_h;
         let value = |x_n: i32, y_n: i32| {
             modes
-                .neighbour_with_size(mb_x, mb_y, x_n, y_n, max_w, max_h)
+                .neighbour_with_size(
+                    bx / self.mb_blk_w,
+                    by / self.mb_blk_h,
+                    x_n,
+                    y_n,
+                    self.mb_blk_w as i32 * 4,
+                    self.mb_blk_h as i32 * 4,
+                )
                 .and_then(|(nx, ny, x_w, y_w)| {
-                    let n_bx = nx * self.mb_blk_w + x_w / block_w as usize;
-                    let n_by = ny * self.mb_blk_h + y_w / block_h as usize;
+                    let n_bx = nx * self.mb_blk_w + x_w / 4;
+                    let n_by = ny * self.mb_blk_h + y_w / 4;
                     self.counts.get(n_by * self.blk_w + n_bx).copied()
                 })
-                .map(i32::from)
-                .filter(|&v| v >= 0)
         };
-        let a = value(local_x - 1, local_y);
-        let b = value(local_x, local_y - 1);
+        // Inside the current macroblock the count grid is contiguous for
+        // either pair mode. Only crossing its edges needs the MBAFF mapping.
+        let a = if local_bx != 0 {
+            self.counts.get(by * self.blk_w + bx - 1).copied()
+        } else {
+            value(-1, local_by as i32 * 4)
+        }
+        .map(i32::from)
+        .filter(|&v| v >= 0);
+        let b = if local_by != 0 {
+            self.counts.get((by - 1) * self.blk_w + bx).copied()
+        } else {
+            value(local_bx as i32 * 4, -1)
+        }
+        .map(i32::from)
+        .filter(|&v| v >= 0);
         match (a, b) {
             (Some(a), Some(b)) => (a + b + 1) >> 1,
             (Some(a), None) => a,
@@ -720,6 +733,64 @@ mod tests {
         // Lower chroma 4x4 of the current top field MB: yN=4
         // maps to yW=0 in the left bottom frame MB (Table 6-4).
         assert_eq!(counts.n_c(2, 1), 11);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn mixed_counts_match_sample_neighbours_for_all_pair_modes() {
+        // Three pair columns and two pair rows exercise picture boundaries,
+        // internal blocks, and both directions of frame/field transitions.
+        for mode_bits in 0..64 {
+            let modes = MbaffModes::new(3, 2, (0..6).map(|i| mode_bits & (1 << i) != 0).collect());
+            for size in [2, 4] {
+                let mut counts = CoeffCountMap::new_with_mb_blocks(3 * size, 4 * size, size, size);
+                counts.enable_mixed(modes.clone());
+                // Include absent, coded-empty and every legal TotalCoeff.
+                for seed in 0..18 {
+                    for (i, count) in counts.counts.iter_mut().enumerate() {
+                        *count = ((i * 7 + seed) % 18) as i16 - 1;
+                    }
+                    for by in 0..counts.blk_h {
+                        for bx in 0..counts.blk_w {
+                            let x = (bx % size * 4) as i32;
+                            let y = (by % size * 4) as i32;
+                            // The unchanged sample-location derivation is
+                            // the reference even for same-MB neighbours.
+                            let neighbours: Vec<i32> = [(x - 1, y), (x, y - 1)]
+                                .into_iter()
+                                .filter_map(|(xn, yn)| {
+                                    modes.neighbour_with_size(
+                                        bx / size,
+                                        by / size,
+                                        xn,
+                                        yn,
+                                        size as i32 * 4,
+                                        size as i32 * 4,
+                                    )
+                                })
+                                .map(|(mx, my, sx, sy)| {
+                                    counts.counts
+                                        [(my * size + sy / 4) * counts.blk_w + mx * size + sx / 4]
+                                        as i32
+                                })
+                                .filter(|&n| n >= 0)
+                                .collect();
+                            let expected = match neighbours.as_slice() {
+                                [] => 0,
+                                [n] => *n,
+                                [a, b] => (a + b + 1) / 2,
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(
+                                counts.n_c(bx, by),
+                                expected,
+                                "modes={mode_bits:#08b}, size={size}, seed={seed}, block=({bx},{by})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(feature = "experimental-adaptive-mbaff")]

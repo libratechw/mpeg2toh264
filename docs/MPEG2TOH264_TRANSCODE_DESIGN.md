@@ -176,6 +176,8 @@ Bのraw WASMは`741b99933f425331d7c220b41365f9713a4f7045c241bf5eb280b2d663cc8111
 | native、hd1080i-x40（20.02秒） | 2.332564 → 2.312412 s | 0.864% | 8.589〜31.715 ms | 7/8 |
 | Node WASM、同TSの短区間（6.006秒） | 899.557 → 863.348 ms | 4.025% | 31.765〜40.653 ms | 8/8 |
 | native、実放送素材E全体（59.692967秒） | 10.505159 → 10.048377 s | 4.348% | 435.991〜477.573 ms | 8/8 |
+| native、実放送素材B全体（59.726333秒） | 11.784370 → 13.297375 s | −12.839% | −1578.902〜−1447.110 ms | 0/8 |
+| native、実放送素材F全体（60.026633秒） | 12.124264 → 12.918079 s | −6.547% | −829.895〜−757.734 ms | 0/8 |
 
 native hd1080iの初期3.508%から最終0.864%への差は無視できないため、初期値を最終実装の利益として使わない。
 この差の原因をsource変更・code layout・host変動のいずれかへ特定した証拠はない。
@@ -197,10 +199,47 @@ SHA-256 `eb17129e54d245c4b7ffcbd2f10347ae032f0909ae7695562bba56c2b26d874f`。
 WASM短区間では181 output samples、init bytes、fragment metadata、sample timing/flagsの一致を再確認した。
 nativeとWASMは入力形式・区間・計時範囲が異なるため、短縮率の直接比較や乗算はしない。
 
-この時点の優先順位は適応MBAFFの品質・互換性確認、未使用素材への拡張、追加候補の順とする。
-実素材Eで再現性のある利益があり、量子化を粗くする変更を加えずに出力も減ったためである。
-ただし既定化・PR候補への昇格は行わない。browser WASM、実機の起動・シーク、長時間再生の利益は未確認であり、
+素材B/Fの追加測定では全8組が遅くなったため、`202cdff`の適応MBAFFを全素材向けの性能改善としては採用しない。
+優先順位は、この退行の内訳確認と小さな処理削減の比較、利益が成立した候補の品質・互換性確認、追加候補の順へ変更する。
+Eの短縮だけでは素材Bの12.839%増・Fの6.547%増を正当化できない。いずれも出力は小さくなったが、処理時間の改善ではない。
+B/Fの出力bytesはそれぞれ259,609,856 → 237,090,640（8.674%減）、245,751,546 → 216,484,059（11.909%減）。
+入力は既存`mpeg2toh264-pair-profile-gMA6GX/segments/{B,F}.ts`で、source表示framesは1,790/1,799、30000/1001 fps。
+生記録は`/data/ssd/mpeg2-quality-native-B-202cdff-20260909/results.json`と
+`/data/ssd/mpeg2-quality-native-F-202cdff-20260909/results.json`で、全試行・入力hash・実行buildを固定している。
+これらは全編のnative速度結果であり、B/Fの旧局所品質指標は下記の理由でまだ使えない。
+既定化・PR候補への昇格は行わない。browser WASM、実機の起動・シーク、長時間再生の利益は未確認であり、
 Nodeの32 MiB再開ポイントの変化も別gateとして残る。
+
+### 適応MBAFFの近傍計算を減らす試作C2（2026-09-09）
+
+C1を上記`202cdff`、C2を`CoeffCountMap::mixed_n_c()`の同一macroblock内参照だけを直接化した試作と呼ぶ。
+frame/field間の境界は既存`MbaffModes::neighbour_with_size()`を使い、量子化・走査・係数数の意味は変えない。
+C2はC1との完全一致を要求する。固定比較基準BをC1へ更新するものではない。
+
+素材Bで交互8組を再測定すると、固定B平均11.925387秒に対しC2は12.839804秒で、まだ7.668%遅かった。
+各組の短縮時間はすべて負、95% paired t区間は−989.111〜−839.724 ms。C1の試行とは同時の三者比較ではないため、
+別run間の平均差をC2単独の確定短縮量とは扱わない。C2も全素材向けの採用条件を満たしていない。
+生記録は`/data/ssd/mpeg2-quality-native-B-c2-neighbour-20260909/results.json`、build・全core source hash・
+基点commitに対する差分は`/data/ssd/mpeg2toh264-proposal-b-artifacts/build-manifest-c2-neighbour.json`にある。
+native binaryのSHA-256は`b129698c83a5c2eb1d624c09a10ef6c432a237755ae48ac86fec733e19db7c97`。
+
+nativeの素材B全8組、およびE/Fの全編再生成はC1の原H.264と完全一致した。
+`tools/compare-wasm.cjs`でも素材B全編のC1/C2を交互2周し、1,809 video samplesを含む完全フラグメントdigestが一致した。
+この2周は機能確認であり、warmup・負荷除外を備えた正式性能比較には数えない。
+raw WASM SHA-256は`f4a7f3e8d0512e93ca52c8fb9e19342c295c3e7fb33e6492d5f967bf1ce145f6`。
+ログはartifact directoryの`c2-neighbour-{feature,default}-tests.log`、`c2-neighbour-wasm-B-equality.log`、
+native E/F出力は`/data/ssd/mpeg2-quality-c2-native-equality-20260909/`に置く。
+既定経路269テスト、feature有効時282テストが成功し、旧goldenは値を変えずfeature有効時だけ該当1件を除外した。
+追加回帰は輝度・色差、64通りのpair mode、全block位置、未符号化−1と0〜16の係数数を既存の汎用座標導出と照合する。
+これは省略前後の同値性検査であり、座標導出自体の規格適合を独立に証明するテストではない。
+独立したテキスト差分レビューでも、この範囲に修正必須の問題は見つからなかった。
+
+既存`tools/profile-wasm.cjs`をNode v24.19.0の`--cpu-prof-interval=1000`で実行した素材Bの診断では、
+C2の`CoeffCountMap::n_c`と`MbaffModes::neighbour_with_size`の自己時間が合計10.830%だった。
+各buildは初回を含む2回を別processで測ったサンプリングであり、定常性能差やnative内訳の証拠にはしない。
+生profileは`/data/ssd/mpeg2-quality-wasm-profile-B-20260909/{baseline,c1,c2}.cpuprofile`。
+native C2の逆アセンブルでも`n_c`内に動的除算が残ることを確認したため、次は既知の2/4 block幅を使う座標計算の削減を個別に試す。
+ネイティブのハードウェア・サンプリングは権限不足で未実施であり、権限設定は変更していない。
 
 ### 素材EのPTS付き局所品質と評価手順の修正（2026-09-09）
 
