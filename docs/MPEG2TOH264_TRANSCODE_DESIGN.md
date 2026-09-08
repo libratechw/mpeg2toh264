@@ -161,6 +161,111 @@ MP4のsample durations/composition offsets/flagsの一致とbuild別出力hash�
 生記録は`/data/ssd/mpeg2-quality-wasm-pb-short-20260909/results.json`。
 これはbrowser再生の証拠ではなく、長区間の再開間隔の変化によるシーク影響も未確認である。
 
+### 最終commitの再測定（2026-09-09）
+
+geometry修正と適応MBAFFを実験branchへ取り込んだcommitは、それぞれ`5a2f90f`、`b0617d6`である。
+`b0617d6`の`crates/`は測定したscratch commit `202cdff0dad5be314e89729950c99bac5eced484`と差分なし。
+buildとsourceの対応は`/data/ssd/mpeg2toh264-proposal-b-artifacts/build-manifest-202cdff.json`に固定した。
+native候補binaryのSHA-256は`c6327f729f3b9847dedd794b12c0730513e867bc8aa3c14f66e3d08ba869113f`、
+候補raw WASMは`e94bc50f1ee256e4d6d266dc5429bd5e8d1ac60e2d998304024f19e4e98e754f`。
+Bのraw WASMは`741b99933f425331d7c220b41365f9713a4f7045c241bf5eb280b2d663cc8111`である。
+同じ固定B・既定設定・前節の交互測定と負荷除外規則を使い、各8組を測定した。
+
+| 環境・入力 | B平均 → C平均 | 時間短縮率 | 短縮時間の95% paired t区間 | 短縮した組 |
+| --- | --- | ---: | --- | ---: |
+| native、hd1080i-x40（20.02秒） | 2.332564 → 2.312412 s | 0.864% | 8.589〜31.715 ms | 7/8 |
+| Node WASM、同TSの短区間（6.006秒） | 899.557 → 863.348 ms | 4.025% | 31.765〜40.653 ms | 8/8 |
+| native、実放送素材E全体（59.692967秒） | 10.505159 → 10.048377 s | 4.348% | 435.991〜477.573 ms | 8/8 |
+
+native hd1080iの初期3.508%から最終0.864%への差は無視できないため、初期値を最終実装の利益として使わない。
+この差の原因をsource変更・code layout・host変動のいずれかへ特定した証拠はない。
+最終nativeの標準偏差はhd1080iでB/C 12.371/5.768 ms、Eで15.162/16.654 ms。
+Nodeでは3.357/2.616 ms、除外した初回実行は929.852/892.967 msである。
+いずれもGOP完了時間の分布や実機視聴時間を測った値ではない。
+
+Eの入力は`/home/akio/src/mpeg2toh264-pair-profile-gMA6GX/segments/E.ts`、97,101,436 bytes、
+SHA-256 `eb17129e54d245c4b7ffcbd2f10347ae032f0909ae7695562bba56c2b26d874f`。
+1,789 source表示frames、30000/1001 fpsから映像時間を求めた。
+映像1秒当たりのwall/CPU秒はBが0.175987/0.175954、Cが0.168334/0.168307。
+全編の出力は234,361,894 → 184,731,333 bytes（21.177%減）、全runでbuild別hashが安定した。
+この入力はvideo-onlyであり、音声やA/V同期の検証には使わない。
+
+生記録は`/data/ssd/mpeg2-quality-native-final-202cdff-20260909/results.json`、
+`/data/ssd/mpeg2-quality-wasm-final-202cdff-20260909/results.json`、
+`/data/ssd/mpeg2-quality-native-E-202cdff-20260909/results.json`にある。
+測定runnerのsnapshotは`/data/ssd/mpeg2toh264-proposal-b-artifacts/performance-runners-20260909.tar.gz`。
+WASM短区間では181 output samples、init bytes、fragment metadata、sample timing/flagsの一致を再確認した。
+nativeとWASMは入力形式・区間・計時範囲が異なるため、短縮率の直接比較や乗算はしない。
+
+この時点の優先順位は適応MBAFFの品質・互換性確認、未使用素材への拡張、追加候補の順とする。
+実素材Eで再現性のある利益があり、量子化を粗くする変更を加えずに出力も減ったためである。
+ただし既定化・PR候補への昇格は行わない。browser WASM、実機の起動・シーク、長時間再生の利益は未確認であり、
+Nodeの32 MiB再開ポイントの変化も別gateとして残る。
+
+### 素材EのPTS付き局所品質と評価手順の修正（2026-09-09）
+
+最新の結果は`.opencode/eval/proposal-b/E-pts-evaluated-v4/manifest.json`。
+Rは上記E.ts、B/Cは同じ固定binaryから再生成した原H.264で、全編のSHA-256はそれぞれ
+`5c69e6b5ef08b0ae271689e16bc53575b70cc8ca9be17e5372e8f378b480582d`、
+`53d145812c0599379c837b387383e8447470adc96a35537f5a048d045c791cb1`である。
+sourceのPTS 2.756356〜12.766356秒（終端除外）、300 frames・10.010秒を固定窓とした。
+品質の対象はこの窓だけであり、全編の速度・出力サイズの測定範囲とは異なる。
+
+原H.264をcoreの`mpeg2_video_timeline`・`h264_to_fmp4`で包装し、1,789 retained source picturesの
+実PES PTSとMP4の1,790 AUsのpacket PTS/DTSをdecode順でも照合した。
+先頭lead-in AU0を除き、reference clone AU1をsource picture 0へ対応付ける。
+単なるframe番号合わせではない。包装前後の全NAL payloadと順序が一致し、Annex Bの3/4-byte start code差だけを除外する。
+この包装は評価用であり、Sessionの追加RAPや実機A/V同期を検証したものではない。
+
+1440×1080、yuv420p、SAR 4:3・DAR 16:9、source由来のTFF・limited-range BT.709を揃えた。
+B/Cで欠ける色タグは評価時だけsourceの明示値で補う。`setparams`によるmetadata設定であり、
+codec出力の色タグや実機の表示処理を変更したものではない。
+主指標はdeinterlaceしない成分別MSEをclip内で集約して算出するPSNR。
+補助VMAFは同じ`bwdif=send_field:parity=tff:deint=all`、前後1 frameのcontext、
+60000/1001 fps・600 fields、FFmpeg 8.1.2、`vmaf_v0.6.1`を使った。fps補間・拡大縮小はしない。
+
+| 指標 | R対B | R対C | 追加劣化の判定に使う値 |
+| --- | ---: | ---: | --- |
+| raw Y PSNR | 43.898290 dB | 44.301632 dB | 低下なし（B−C = −0.403342 dB） |
+| raw Cb PSNR | 46.207081 dB | 46.439842 dB | 低下なし（−0.232761 dB） |
+| raw Cr PSNR | 45.084965 dB | 45.399710 dB | 低下なし（−0.314745 dB） |
+| bob VMAF平均 | 98.233779 | 98.689267 | 各時刻の非負損失平均 0.000136、最悪連続1秒 0.000553 |
+
+B/C直接のraw PSNRはY/Cb/Cr 49.974583/56.101382/55.062266 dBであり、出力差は実在する。
+直接差は補助記録とし、R対B/Cの追加劣化判定を置き換えない。
+VMAF最悪1秒は比較動画の3.020683〜4.020683秒、元TS PTSの5.777039〜6.777039秒。
+各field区間内のscoreを一定として積分し、frame境界と「境界−1秒」の両方を窓の候補に含めた。
+PSNRログのframe別MSEはFFmpeg出力の小数2桁精度に制限されるため、それ以上の精度を測ったとは扱わない。
+この窓は「視覚的同等を狙う候補」の暫定数値gateを満たしたが、知覚的同等・全編画質・採用の判定ではない。
+
+旧`E-candidate-eval`との数値差は、旧FFmpeg graphがsource側だけに
+`auto_scale`（BT.709 → unknown）を挿入していたことによる。
+旧新の入力hash・区間・FFmpeg version・timebaseは同じで、新graphでは色解釈を揃えることで自動変換がなくなった。
+raw/bobの短いverbose診断を`/data/ssd/mpeg2toh264-proposal-b-artifacts/quality-color-negotiation-audit-20260909.json`
+へ保存した。metadata-onlyの根拠は[FFmpeg 8.1.2のsetparams実装](https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavfilter/vf_setparams.c)。
+旧B/F/Eの指標は現契約の品質証拠から外し、生ログだけを履歴として残す。閾値・素材・窓を候補に合わせて変更したものではない。
+
+独立レビューで見つかった再集計の弱い合否条件、provenance sidecarの未固定、SAR/DAR未検証、
+B/C直接比較の不足はrunnerで修正した。同じAU/PTS・NAL判定をevaluate/reaggregateで使い、
+実際に解析したsidecar bytesをhashとともに保存する。selftest、再集計、v4の全再実行と再レビューで確認した。
+runnerのSHA-256は`41d0c8e5808d3583ce152419af3d139f0cf4ab25376d63cb4918c6a999ba7a9f`。
+検証途中の失敗記録とv3は上書きせず、評価用sourceはartifact directoryの
+`quality-evaluator-v4-20260909.tar.gz`へarchiveした。
+比較動画と再実行手順は`.opencode/eval/proposal-b/README.md`。**視聴確認待ち**である。
+
+### WASMの機能確認範囲（2026-09-09）
+
+最終buildのWASM短区間出力はB/CともFFmpeg `-v error -xerror`で復号できた。
+通常/deferred比較は、video-onlyのEでの一致を音声gateに数えず、hd1080i TSへ48 kHz stereo AACの
+合成無音をmuxした入力で`tools/compare-deferred.cjs`を1往復ずつ独立に3回実行し、各回の完全フラグメントdigestの一致を確認した。
+同一process内の分離確認であり、並列worker性能・実録画の多音声・実機同期の試験ではない。
+このrun中の時間値は機能検査の付随出力で、性能実績には使わない。
+入力SHA-256は`b528174471757095eb0c915da757730ef830bfb3d13b363026f0dfdbbda03d94`、
+出力に939 AAC framesが含まれることを確認し、video/audioともFFmpegで復号できた。
+null出力の時刻丸めによる警告を避けるため、`-fps_mode:v passthrough -enc_time_base:v demux`で
+元の1/90000 time baseを維持した。失敗した既定time baseの診断も保存し、出力PTSを作り直して隠してはいない。
+生成・再実行手順とログはartifact directoryの`compatibility-202cdff.json`にある。
+
 ## 用語
 
 | 語 | 意味 |
