@@ -6,6 +6,9 @@
 //! so both 16x16 and 16x8 macroblock partitions can use the same neighbour
 //! derivation.
 
+#[cfg(feature = "experimental-adaptive-mbaff")]
+use crate::h264::mba::MbaffModes;
+
 /// Motion state of one macroblock, as neighbours need to see it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MbMotion {
@@ -47,6 +50,8 @@ pub struct MotionField {
     ref_idx: Vec<i8>,
     mv: Vec<i32>,
     coded: Vec<u8>,
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    mixed_modes: Option<MbaffModes>,
 }
 
 impl MotionField {
@@ -59,7 +64,19 @@ impl MotionField {
             ref_idx: vec![0; blk_w * blk_h * 2],
             mv: vec![0; blk_w * blk_h * 4],
             coded: vec![0; blk_w * blk_h],
+            #[cfg(feature = "experimental-adaptive-mbaff")]
+            mixed_modes: None,
         }
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn enable_mixed(&mut self, modes: MbaffModes) {
+        self.mixed_modes = Some(modes);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn disable_mixed(&mut self) {
+        self.mixed_modes = None;
     }
 
     /// Empty the field for a new picture.
@@ -152,6 +169,114 @@ impl MotionField {
         predict_from_neighbours(a, b, c, ref_idx)
     }
 
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn predict_mixed(
+        &self,
+        mb_x: usize,
+        mb_y: usize,
+        list: usize,
+        ref_idx: i32,
+    ) -> [i32; 2] {
+        let modes = self
+            .mixed_modes
+            .as_ref()
+            .expect("mixed predictor requires MBAFF modes");
+        self.predict_mixed_at(modes, mb_x, mb_y, 0, 0, 16, list, ref_idx)
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn predict_16x8_mixed(
+        &self,
+        mb_x: usize,
+        mb_y: usize,
+        part: usize,
+        list: usize,
+        ref_idx: i32,
+    ) -> [i32; 2] {
+        let modes = self
+            .mixed_modes
+            .as_ref()
+            .expect("mixed predictor requires MBAFF modes");
+        let by = part as i32 * 8;
+        let a = self.mixed_at(modes, mb_x, mb_y, -1, by, list);
+        let b = self.mixed_at(modes, mb_x, mb_y, 0, by - 1, list);
+        let same_ref = |n: &Neighbour| n.available && n.ref_idx == ref_idx;
+        if part == 0 && same_ref(&b) {
+            return vector_of(&b);
+        }
+        if part == 1 && same_ref(&a) {
+            return vector_of(&a);
+        }
+        let mut c = self.mixed_at(modes, mb_x, mb_y, 16, by - 1, list);
+        if !c.available {
+            c = self.mixed_at(modes, mb_x, mb_y, -1, by - 1, list);
+        }
+        predict_from_neighbours(a, b, c, ref_idx)
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    fn predict_mixed_at(
+        &self,
+        modes: &MbaffModes,
+        mb_x: usize,
+        mb_y: usize,
+        bx: i32,
+        by: i32,
+        width: i32,
+        list: usize,
+        ref_idx: i32,
+    ) -> [i32; 2] {
+        // Table 6-2 offsets are in samples. Convert to a 4x4 index only
+        // after Table 6-4 has mapped the frame/field neighbour location.
+        let a = self.mixed_at(modes, mb_x, mb_y, bx - 1, by, list);
+        let b = self.mixed_at(modes, mb_x, mb_y, bx, by - 1, list);
+        let mut c = self.mixed_at(modes, mb_x, mb_y, bx + width, by - 1, list);
+        if !c.available {
+            c = self.mixed_at(modes, mb_x, mb_y, bx - 1, by - 1, list);
+        }
+        predict_from_neighbours(a, b, c, ref_idx)
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    fn mixed_at(
+        &self,
+        modes: &MbaffModes,
+        mb_x: usize,
+        mb_y: usize,
+        x_n: i32,
+        y_n: i32,
+        list: usize,
+    ) -> Neighbour {
+        let Some((nx, ny, x_w, y_w)) = modes.neighbour(mb_x, mb_y, x_n, y_n) else {
+            return UNAVAILABLE;
+        };
+        let mut n = self.at(
+            nx as isize * 4 + x_w as isize / 4,
+            ny as isize * 4 + y_w as isize / 4,
+            list,
+        );
+        if !n.available {
+            return n;
+        }
+        // Clause 8.4.1.3.2 excludes unused lists (and intra neighbours)
+        // from scaling. In particular, -1 / 2 must not become reference 0.
+        if n.ref_idx < 0 {
+            n.mv_x = 0;
+            n.mv_y = 0;
+            return n;
+        }
+        let current_field = !modes.frame[(mb_y / 2) * modes.mb_width + mb_x];
+        let neighbour_field = !modes.frame[(ny / 2) * modes.mb_width + nx];
+        if current_field && !neighbour_field {
+            n.mv_y /= 2;
+            n.ref_idx *= 2;
+        } else if !current_field && neighbour_field {
+            n.mv_y *= 2;
+            n.ref_idx /= 2;
+        }
+        n
+    }
+
     fn predict_at(
         &self,
         bx: isize,
@@ -206,6 +331,8 @@ fn vector_of(n: &Neighbour) -> [i32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    use crate::h264::mba::MbaffModes;
 
     fn motion(ref_idx: i32, x: i32, y: i32) -> MbMotion {
         MbMotion {
@@ -223,6 +350,75 @@ mod tests {
         let mut field = MotionField::new(4, 4);
         field.reset();
         assert_eq!(field.predict(0, 0, 0, 0), [0, 0]);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn mixed_unused_list_does_not_become_reference_zero() {
+        let mut field = MotionField::new(2, 4);
+        field.enable_mixed(MbaffModes::new(2, 2, vec![true, true, false, true]));
+        // Current frame MB (1,2): A is a field neighbour not using L0;
+        // B alone uses reference 0, while C is outside the picture.
+        field.set(0, 2, &motion(-1, 0, 0));
+        field.set(1, 1, &motion(0, 18, 22));
+        assert_eq!(field.predict_mixed(1, 2, 0, 0), [18, 22]);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn mixed_above_location_is_mapped_before_selecting_a_4x4_block() {
+        let mut field = MotionField::new(1, 4);
+        field.enable_mixed(MbaffModes::new(1, 2, vec![true, false]));
+        field.set(0, 1, &motion(1, 8, 10));
+        // Table 6-4: top field MB's B sample maps to yW=14 in the
+        // bottom frame MB, hence its last 4x4 row, not row 2.
+        field.set_rect(0, 7, 4, 1, &motion(1, 24, -7));
+        assert_eq!(field.predict_16x8_mixed(0, 2, 0, 0, 2), [24, -3]);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn mixed_field_reference_and_vertical_vector_are_scaled_for_frame() {
+        let mut field = MotionField::new(2, 2);
+        field.enable_mixed(MbaffModes::new(2, 1, vec![false, true]));
+        field.set(0, 0, &motion(3, 9, -5));
+        assert_eq!(field.predict_16x8_mixed(1, 0, 1, 0, 1), [9, -10]);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn uniform_mbaff_modes_preserve_existing_partition_predictors() {
+        for frame in [true, false] {
+            let mut mixed = MotionField::new(3, 4);
+            mixed.enable_mixed(MbaffModes::new(3, 2, vec![frame; 6]));
+            let mut reference_frame = MotionField::new(3, 4);
+            let mut reference_fields = [MotionField::new(3, 2), MotionField::new(3, 2)];
+            for pair_y in 0..2 {
+                for x in 0..3 {
+                    for parity in 0..2 {
+                        let y = pair_y * 2 + parity;
+                        let (reference, reference_y) = if frame {
+                            (&mut reference_frame, y)
+                        } else {
+                            (&mut reference_fields[parity], pair_y)
+                        };
+                        for part in 0..2 {
+                            for ref_idx in 0..3 {
+                                assert_eq!(
+                                    mixed.predict_16x8_mixed(x, y, part, 0, ref_idx),
+                                    reference.predict_16x8(x, reference_y, part, 0, ref_idx),
+                                    "frame={frame} x={x} y={y} part={part} ref={ref_idx}"
+                                );
+                            }
+                            let id = (y * 6 + x * 2 + part) as i32;
+                            let state = motion(id % 3, 7 * id - 13, 11 - 5 * id);
+                            mixed.set_16x8(x, y, part, &state);
+                            reference.set_16x8(x, reference_y, part, &state);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

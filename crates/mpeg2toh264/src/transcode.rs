@@ -34,6 +34,8 @@ use crate::h264::mb::{
     write_inter_macroblock, write_intra_macroblock, ChromaCounts, CoeffCountMap, InterMacroblock,
     MotionPartition, PredictionMode, FIELD_SCAN_8X8,
 };
+#[cfg(feature = "experimental-adaptive-mbaff")]
+use crate::h264::mba::MbaffModes;
 use crate::h264::mvmap::{map_vector, native_position, VectorKind};
 use crate::h264::mvpred::{MbMotion, MotionField};
 use crate::h264::params::{
@@ -2130,6 +2132,29 @@ fn qp_for_scale(
     *slot as i32
 }
 
+#[cfg(feature = "experimental-adaptive-mbaff")]
+/// Whether a source macroblock can be represented by a frame-coded MBAFF
+/// macroblock without converting field motion. Intra residuals remain eligible
+/// even when their source uses field DCT: the frame path below converts those
+/// coefficients with `field_dct_to_frame_targets`, while intra has no field
+/// motion to convert. Skipped and absent macroblocks carry no residual
+/// contract of their own and are therefore frame-compatible.
+fn frame_pair_macroblock_possible(mb: Option<&Macroblock>) -> bool {
+    let Some(mb) = mb else { return true };
+    mb.skipped
+        || mb.is_intra()
+        || (mb.dct_type == 0
+            && matches!(
+                mb.motion_type,
+                motion_type::NONE | motion_type::FRAME_OR_16X8
+            ))
+}
+
+#[cfg(feature = "experimental-adaptive-mbaff")]
+fn frame_pair_possible(top: Option<&Macroblock>, bottom: Option<&Macroblock>) -> bool {
+    frame_pair_macroblock_possible(top) && frame_pair_macroblock_possible(bottom)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_picture(
     pic: &Picture,
@@ -2193,8 +2218,45 @@ fn write_picture(
         l1_short_term_delta: None,
         anchor_second_field: true,
     };
+    #[cfg(not(feature = "experimental-adaptive-mbaff"))]
     let picture_field_pairs =
         direct_field_pair || (ctx.mbaff && pic.header.picture_coding_type != PictureType::I);
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    let adaptive_mbaff =
+        ctx.mbaff && !direct_field_pair && pic.header.picture_coding_type != PictureType::I;
+    #[cfg(not(feature = "experimental-adaptive-mbaff"))]
+    let adaptive_mbaff = false;
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    // PictureScratch is reused across pictures.  Do not let a previous
+    // adaptive picture's coordinate mapping leak into an I, direct-field, or
+    // non-MBAFF picture.
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    counts.disable_mixed();
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    chroma_counts.disable_mixed();
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    motion.disable_mixed();
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    let pair_modes = if adaptive_mbaff {
+        (0..(g.mb_height / 2))
+            .flat_map(|pair_y| {
+                (0..g.mb_width).map(move |mb_x| {
+                    let top = by_address.get((pair_y * 2) * g.mb_width + mb_x);
+                    let bottom = by_address.get((pair_y * 2 + 1) * g.mb_width + mb_x);
+                    frame_pair_possible(top, bottom)
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    if adaptive_mbaff {
+        let modes = MbaffModes::new(g.mb_width, g.mb_height / 2, pair_modes.clone());
+        counts.enable_mixed(modes.clone());
+        chroma_counts.enable_mixed(modes.clone());
+        motion.enable_mixed(modes);
+    }
     let mut cached_pair_address: isize = -1;
     let mut cached_pair_targets = [FieldTargetSet::default(); 2];
     let mut cached_pair_qp = PPS_INIT_QP;
@@ -2468,9 +2530,17 @@ fn write_picture(
         } else {
             by_address.get(((mb_y & !1) + 1) * g.mb_width + mb_x)
         };
-        // Use a uniform coding mode across an MBAFF picture. This makes every
-        // horizontal and vertical neighbour live in the same field coordinate
-        // system, so thousands of pair-isolating slices are unnecessary.
+        #[cfg(feature = "experimental-adaptive-mbaff")]
+        let pair_index = (mb_y >> 1) * g.mb_width + mb_x;
+        #[cfg(feature = "experimental-adaptive-mbaff")]
+        let field_pair = if direct_field_pair {
+            true
+        } else if adaptive_mbaff {
+            !pair_modes[pair_index]
+        } else {
+            false
+        };
+        #[cfg(not(feature = "experimental-adaptive-mbaff"))]
         let field_pair = picture_field_pairs;
         let intra = match source {
             Some(mb) if !mb.skipped => mb.is_intra(),
@@ -2845,6 +2915,19 @@ fn write_picture(
 
         let uses_l0 = pred.mb_type != b_mb_type::L1_16X16;
         let uses_l1 = pred.mb_type != b_mb_type::L0_16X16;
+        #[cfg(feature = "experimental-adaptive-mbaff")]
+        let pred_l0 = if direct_field_pair && uses_l0 {
+            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 0, pred.ref_idx_l0)
+        } else if !field_pair && uses_l0 {
+            if adaptive_mbaff {
+                motion.predict_mixed(mb_x, mb_y, 0, pred.ref_idx_l0)
+            } else {
+                motion.predict(mb_x, mb_y, 0, pred.ref_idx_l0)
+            }
+        } else {
+            [0, 0]
+        };
+        #[cfg(not(feature = "experimental-adaptive-mbaff"))]
         let pred_l0 = if direct_field_pair && uses_l0 {
             field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 0, pred.ref_idx_l0)
         } else if !field_pair && uses_l0 {
@@ -2852,6 +2935,19 @@ fn write_picture(
         } else {
             [0, 0]
         };
+        #[cfg(feature = "experimental-adaptive-mbaff")]
+        let pred_l1 = if direct_field_pair && uses_l1 {
+            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 1, pred.ref_idx_l1)
+        } else if !field_pair && uses_l1 {
+            if adaptive_mbaff {
+                motion.predict_mixed(mb_x, mb_y, 1, pred.ref_idx_l1)
+            } else {
+                motion.predict(mb_x, mb_y, 1, pred.ref_idx_l1)
+            }
+        } else {
+            [0, 0]
+        };
+        #[cfg(not(feature = "experimental-adaptive-mbaff"))]
         let pred_l1 = if direct_field_pair && uses_l1 {
             field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 1, pred.ref_idx_l1)
         } else if !field_pair && uses_l1 {
@@ -2860,44 +2956,50 @@ fn write_picture(
             [0, 0]
         };
 
-        let split_frame_mb = ctx.mbaff && !field_pair;
-        let mode = PredictionMode::from_mb_type(pred.mb_type);
-
         let mut partitions: Option<[MotionPartition; 2]> = None;
         let mut field_modes: Option<[PredictionMode; 2]> = None;
+        #[cfg(not(feature = "experimental-adaptive-mbaff"))]
+        let split_frame_mb = ctx.mbaff && !field_pair;
+        #[cfg(feature = "experimental-adaptive-mbaff")]
+        let split_frame_mb = false;
+        #[cfg(not(feature = "experimental-adaptive-mbaff"))]
+        let mode = PredictionMode::from_mb_type(pred.mb_type);
 
         if split_frame_mb {
-            let mut built = [MotionPartition::default(); 2];
-            for (part, slot) in built.iter_mut().enumerate() {
-                let p_l0 = if uses_l0 {
-                    motion.predict_16x8(mb_x, mb_y, part, 0, pred.ref_idx_l0)
-                } else {
-                    [0, 0]
-                };
-                let p_l1 = if uses_l1 {
-                    motion.predict_16x8(mb_x, mb_y, part, 1, pred.ref_idx_l1)
-                } else {
-                    [0, 0]
-                };
-                let state = MbMotion {
-                    ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
-                    ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
-                    mv_l0x: if uses_l0 { pred.mv_l0[0] } else { 0 },
-                    mv_l0y: if uses_l0 { pred.mv_l0[1] } else { 0 },
-                    mv_l1x: if uses_l1 { pred.mv_l1[0] } else { 0 },
-                    mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
-                };
-                motion.set_16x8(mb_x, mb_y, part, &state);
-                *slot = MotionPartition {
-                    ref_idx_l0: state.ref_idx_l0,
-                    ref_idx_l1: state.ref_idx_l1,
-                    mvd_l0x: if uses_l0 { pred.mv_l0[0] - p_l0[0] } else { 0 },
-                    mvd_l0y: if uses_l0 { pred.mv_l0[1] - p_l0[1] } else { 0 },
-                    mvd_l1x: if uses_l1 { pred.mv_l1[0] - p_l1[0] } else { 0 },
-                    mvd_l1y: if uses_l1 { pred.mv_l1[1] - p_l1[1] } else { 0 },
-                };
+            #[cfg(not(feature = "experimental-adaptive-mbaff"))]
+            {
+                let mut built = [MotionPartition::default(); 2];
+                for (part, slot) in built.iter_mut().enumerate() {
+                    let p_l0 = if uses_l0 {
+                        motion.predict_16x8(mb_x, mb_y, part, 0, pred.ref_idx_l0)
+                    } else {
+                        [0, 0]
+                    };
+                    let p_l1 = if uses_l1 {
+                        motion.predict_16x8(mb_x, mb_y, part, 1, pred.ref_idx_l1)
+                    } else {
+                        [0, 0]
+                    };
+                    let state = MbMotion {
+                        ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
+                        ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
+                        mv_l0x: if uses_l0 { pred.mv_l0[0] } else { 0 },
+                        mv_l0y: if uses_l0 { pred.mv_l0[1] } else { 0 },
+                        mv_l1x: if uses_l1 { pred.mv_l1[0] } else { 0 },
+                        mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
+                    };
+                    motion.set_16x8(mb_x, mb_y, part, &state);
+                    *slot = MotionPartition {
+                        ref_idx_l0: state.ref_idx_l0,
+                        ref_idx_l1: state.ref_idx_l1,
+                        mvd_l0x: if uses_l0 { pred.mv_l0[0] - p_l0[0] } else { 0 },
+                        mvd_l0y: if uses_l0 { pred.mv_l0[1] - p_l0[1] } else { 0 },
+                        mvd_l1x: if uses_l1 { pred.mv_l1[0] - p_l1[0] } else { 0 },
+                        mvd_l1y: if uses_l1 { pred.mv_l1[1] - p_l1[1] } else { 0 },
+                    };
+                }
+                partitions = Some(built);
             }
-            partitions = Some(built);
         } else if direct_field_pair
             && source
                 .is_some_and(|mb| mb.motion_type == motion_type::FRAME_OR_16X8 && mb.mv_count >= 2)
@@ -2982,6 +3084,23 @@ fn write_picture(
                 let field_pred = field_preds[part];
                 let uses_field_l0 = field_pred.ref_idx_l0 >= 0;
                 let uses_field_l1 = field_pred.ref_idx_l1 >= 0;
+                #[cfg(feature = "experimental-adaptive-mbaff")]
+                let p_l0 = if uses_field_l0 {
+                    if adaptive_mbaff {
+                        motion.predict_16x8_mixed(mb_x, mb_y, part, 0, field_pred.ref_idx_l0)
+                    } else {
+                        field_motion[field].predict_16x8(
+                            mb_x,
+                            mb_y >> 1,
+                            part,
+                            0,
+                            field_pred.ref_idx_l0,
+                        )
+                    }
+                } else {
+                    [0, 0]
+                };
+                #[cfg(not(feature = "experimental-adaptive-mbaff"))]
                 let p_l0 = if uses_field_l0 {
                     field_motion[field].predict_16x8(
                         mb_x,
@@ -2993,6 +3112,23 @@ fn write_picture(
                 } else {
                     [0, 0]
                 };
+                #[cfg(feature = "experimental-adaptive-mbaff")]
+                let p_l1 = if uses_field_l1 {
+                    if adaptive_mbaff {
+                        motion.predict_16x8_mixed(mb_x, mb_y, part, 1, field_pred.ref_idx_l1)
+                    } else {
+                        field_motion[field].predict_16x8(
+                            mb_x,
+                            mb_y >> 1,
+                            part,
+                            1,
+                            field_pred.ref_idx_l1,
+                        )
+                    }
+                } else {
+                    [0, 0]
+                };
+                #[cfg(not(feature = "experimental-adaptive-mbaff"))]
                 let p_l1 = if uses_field_l1 {
                     field_motion[field].predict_16x8(
                         mb_x,
@@ -3004,35 +3140,38 @@ fn write_picture(
                 } else {
                     [0, 0]
                 };
-                field_motion[field].set_16x8(
-                    mb_x,
-                    mb_y >> 1,
-                    part,
-                    &MbMotion {
-                        ref_idx_l0: field_pred.ref_idx_l0,
-                        ref_idx_l1: field_pred.ref_idx_l1,
-                        mv_l0x: if uses_field_l0 {
-                            field_pred.mv_l0[0]
-                        } else {
-                            0
-                        },
-                        mv_l0y: if uses_field_l0 {
-                            field_pred.mv_l0[1]
-                        } else {
-                            0
-                        },
-                        mv_l1x: if uses_field_l1 {
-                            field_pred.mv_l1[0]
-                        } else {
-                            0
-                        },
-                        mv_l1y: if uses_field_l1 {
-                            field_pred.mv_l1[1]
-                        } else {
-                            0
-                        },
+                let field_state = MbMotion {
+                    ref_idx_l0: field_pred.ref_idx_l0,
+                    ref_idx_l1: field_pred.ref_idx_l1,
+                    mv_l0x: if uses_field_l0 {
+                        field_pred.mv_l0[0]
+                    } else {
+                        0
                     },
-                );
+                    mv_l0y: if uses_field_l0 {
+                        field_pred.mv_l0[1]
+                    } else {
+                        0
+                    },
+                    mv_l1x: if uses_field_l1 {
+                        field_pred.mv_l1[0]
+                    } else {
+                        0
+                    },
+                    mv_l1y: if uses_field_l1 {
+                        field_pred.mv_l1[1]
+                    } else {
+                        0
+                    },
+                };
+                #[cfg(feature = "experimental-adaptive-mbaff")]
+                if adaptive_mbaff {
+                    motion.set_16x8(mb_x, mb_y, part, &field_state);
+                } else {
+                    field_motion[field].set_16x8(mb_x, mb_y >> 1, part, &field_state);
+                }
+                #[cfg(not(feature = "experimental-adaptive-mbaff"))]
+                field_motion[field].set_16x8(mb_x, mb_y >> 1, part, &field_state);
                 *slot = MotionPartition {
                     ref_idx_l0: field_pred.ref_idx_l0,
                     ref_idx_l1: field_pred.ref_idx_l1,
@@ -3066,7 +3205,14 @@ fn write_picture(
         }
 
         let mb_type = if split_frame_mb {
-            b16x8_mb_type(mode, mode)
+            #[cfg(not(feature = "experimental-adaptive-mbaff"))]
+            {
+                b16x8_mb_type(mode, mode)
+            }
+            #[cfg(feature = "experimental-adaptive-mbaff")]
+            {
+                unreachable!("feature-on split_frame_mb is always false")
+            }
         } else if let Some(modes) = field_modes {
             b16x8_mb_type(modes[0], modes[1])
         } else {
@@ -3075,7 +3221,11 @@ fn write_picture(
         let ref_count = layout.count as i32;
         let mb = InterMacroblock {
             mb_x,
-            mb_y: if field_pair { mb_y >> 1 } else { mb_y },
+            mb_y: if field_pair && !adaptive_mbaff {
+                mb_y >> 1
+            } else {
+                mb_y
+            },
             p_slice: output_slice_type == SliceType::P,
             mb_type,
             ref_idx_l0: pred.ref_idx_l0,
@@ -3155,12 +3305,16 @@ fn write_picture(
             writer.flag(field_pair);
         }
         let field = mb_y & 1;
-        let active_counts: &mut CoeffCountMap = if field_pair {
+        let active_counts: &mut CoeffCountMap = if adaptive_mbaff {
+            &mut *counts
+        } else if field_pair {
             &mut field_counts[field]
         } else {
             &mut *counts
         };
-        let active_chroma_counts: &mut ChromaCounts = if field_pair {
+        let active_chroma_counts: &mut ChromaCounts = if adaptive_mbaff {
+            &mut *chroma_counts
+        } else if field_pair {
             &mut field_chroma_counts[field]
         } else {
             &mut *chroma_counts

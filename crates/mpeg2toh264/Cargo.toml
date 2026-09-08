@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+experimental-adaptive-mbaff = []
+
 [lints.rust]
 unsafe_code = "forbid"
 
