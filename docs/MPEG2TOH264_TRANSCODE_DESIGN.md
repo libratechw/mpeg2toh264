@@ -451,6 +451,12 @@ S1・S2は個別選択できるCargo featureとして既定OFFにした。S2は�
 
 対応するsource/build/入力・テスト・同値確認のmanifestは`/data/ssd/mpeg2toh264-proposal-b-artifacts/promising-integration-validation.json`（SHA-256 `afc664dd05086db0754bb98a478142fe9b4e1489c70128ca87e483d109b38fda`）。S1＋S2 screenと統合確認の実行用コードは同directoryの`s12-integration-tools-20260909.tar.gz`（SHA-256 `7c74c31f366cae6d42a1fd3a59288b553f16f5e8d84b7ad10e0990214f016b25`）に保存した。素材・生記録はローカル成果物で、統合branchには含めない。
 
+#### 統合配布版のユーザー視聴結果（2026-09-09）
+
+ユーザーから、[配布commit `832ffcb2d1ecf9c85511fba0883414ecb8e82e37`](https://github.com/libratechw/mpeg2toh264/commit/832ffcb2d1ecf9c85511fba0883414ecb8e82e37)を使い「画質は全く問題ない」との報告を得た。同commitのWASM crateは`2018fa9`でS1・S2の両featureを依存先coreに指定している。`h264/chroma.rs`、`h264/quant.rs`、`h264/params.rs`は統合検証branch `834e53b`と差分がない。したがって、S1＋S2を有効にした配布版についての人間の視聴結果として扱う。
+
+これはユーザーが視聴した範囲での肯定的な品質確認であり、素材、端末、ブラウザー、視聴時間、比較方法、実際にロードされたWASMのhashはこの報告だけでは特定できない。上記B/E/F比較動画や最悪区間を視聴済みとは読み替えず、その個別確認待ちは維持する。配布版には演算以外の変更もあるため、性能・起動・シーク・長時間安定性の改善をこの報告から推定しない。固定B、数値閾値、統合検証branchの既定OFFは変更しない。
+
 ### oversample 2→1.5の独立screen（2026-09-09）
 
 固定Bの同じnative binaryだけを使い、素材B全編でoversample=2と1.5を交互8組比較した。平均11.816399 → 11.636394秒、1.523%短縮、8/8組で短縮し、短縮時間の95% paired t区間は139.121〜220.889 msだった。出力は259,609,856 → 236,406,893 bytes。既存の`Quantiser8x8::choose_qp()`へ渡す設定値だけを変え、S1・S2・適応MBAFFは含めない。量子化精度を下げる操作なので、未検証の画質を犠牲にしてよい根拠にはしない。知覚可能な劣化に対する15%短縮目安には届かず、視聴上の別の利益も未確認である。
