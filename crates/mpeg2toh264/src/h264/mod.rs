@@ -7,6 +7,8 @@ pub mod chroma;
 pub mod cos_table;
 pub mod intra;
 pub mod mb;
+#[cfg(feature = "experimental-adaptive-mbaff")]
+pub(crate) mod mba;
 pub mod mvmap;
 pub mod mvpred;
 pub mod params;

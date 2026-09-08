@@ -16,6 +16,8 @@ use crate::h264::bitwriter::BitWriter;
 use crate::h264::cavlc::{write_masked_levels, write_residual_levels};
 use crate::h264::cavlc_tables::{CBP_TO_CODE_NUM_INTER, CBP_TO_CODE_NUM_INTRA};
 use crate::h264::chroma::ChromaBlockLevels;
+#[cfg(feature = "experimental-adaptive-mbaff")]
+use crate::h264::mba::MbaffModes;
 use crate::h264::params::ZIGZAG_8X8;
 
 /// H.264 Table 8-14: 8x8 field scan for field-coded macroblocks.
@@ -118,16 +120,51 @@ pub struct CoeffCountMap {
     counts: Vec<i16>,
     pub blk_w: usize,
     pub blk_h: usize,
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    mb_blk_w: usize,
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    mb_blk_h: usize,
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    mixed_modes: Option<MbaffModes>,
 }
 
 impl CoeffCountMap {
     /// Dimensions are in 4x4 blocks, which differ between luma and chroma.
+    #[cfg(not(feature = "experimental-adaptive-mbaff"))]
     pub fn new(blk_w: usize, blk_h: usize) -> Self {
         Self {
             counts: vec![-1; blk_w * blk_h],
             blk_w,
             blk_h,
         }
+    }
+
+    /// Dimensions are in 4x4 blocks, which differ between luma and chroma.
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub fn new(blk_w: usize, blk_h: usize) -> Self {
+        Self::new_with_mb_blocks(blk_w, blk_h, 4, 4)
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    fn new_with_mb_blocks(blk_w: usize, blk_h: usize, mb_blk_w: usize, mb_blk_h: usize) -> Self {
+        Self {
+            counts: vec![-1; blk_w * blk_h],
+            blk_w,
+            blk_h,
+            mb_blk_w,
+            mb_blk_h,
+            mixed_modes: None,
+        }
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn enable_mixed(&mut self, modes: MbaffModes) {
+        self.mixed_modes = Some(modes);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn disable_mixed(&mut self) {
+        self.mixed_modes = None;
     }
 
     pub fn reset(&mut self) {
@@ -141,6 +178,10 @@ impl CoeffCountMap {
     /// nC from the left and upper neighbours. A block that was coded but carries
     /// no coefficients counts as 0, which is different from being unavailable.
     pub fn n_c(&self, bx: usize, by: usize) -> i32 {
+        #[cfg(feature = "experimental-adaptive-mbaff")]
+        if let Some(modes) = &self.mixed_modes {
+            return self.mixed_n_c(modes, bx, by);
+        }
         let a = if bx > 0 {
             self.counts[by * self.blk_w + bx - 1] as i32
         } else {
@@ -162,6 +203,39 @@ impl CoeffCountMap {
         }
         0
     }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    fn mixed_n_c(&self, modes: &MbaffModes, bx: usize, by: usize) -> i32 {
+        let mb_x = bx / self.mb_blk_w;
+        let mb_y = by / self.mb_blk_h;
+        // Both luma and chroma counts describe 4x4 sample blocks. Chroma
+        // macroblocks have fewer blocks, not larger sample blocks.
+        let block_w = 4;
+        let block_h = 4;
+        let max_w = self.mb_blk_w as i32 * block_w;
+        let max_h = self.mb_blk_h as i32 * block_h;
+        let local_x = (bx % self.mb_blk_w) as i32 * block_w;
+        let local_y = (by % self.mb_blk_h) as i32 * block_h;
+        let value = |x_n: i32, y_n: i32| {
+            modes
+                .neighbour_with_size(mb_x, mb_y, x_n, y_n, max_w, max_h)
+                .and_then(|(nx, ny, x_w, y_w)| {
+                    let n_bx = nx * self.mb_blk_w + x_w / block_w as usize;
+                    let n_by = ny * self.mb_blk_h + y_w / block_h as usize;
+                    self.counts.get(n_by * self.blk_w + n_bx).copied()
+                })
+                .map(i32::from)
+                .filter(|&v| v >= 0)
+        };
+        let a = value(local_x - 1, local_y);
+        let b = value(local_x, local_y - 1);
+        match (a, b) {
+            (Some(a), Some(b)) => (a + b + 1) >> 1,
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => 0,
+        }
+    }
 }
 
 /// Coefficient counts for the chroma 4x4 blocks, one map per component.
@@ -174,7 +248,13 @@ impl ChromaCounts {
     /// 4:2:0 chroma is a 2x2 grid of 4x4 blocks per macroblock.
     pub fn new(mb_width: usize, mb_height: usize) -> Self {
         Self {
+            #[cfg(feature = "experimental-adaptive-mbaff")]
+            cb: CoeffCountMap::new_with_mb_blocks(mb_width * 2, mb_height * 2, 2, 2),
+            #[cfg(not(feature = "experimental-adaptive-mbaff"))]
             cb: CoeffCountMap::new(mb_width * 2, mb_height * 2),
+            #[cfg(feature = "experimental-adaptive-mbaff")]
+            cr: CoeffCountMap::new_with_mb_blocks(mb_width * 2, mb_height * 2, 2, 2),
+            #[cfg(not(feature = "experimental-adaptive-mbaff"))]
             cr: CoeffCountMap::new(mb_width * 2, mb_height * 2),
         }
     }
@@ -182,6 +262,18 @@ impl ChromaCounts {
     pub fn reset(&mut self) {
         self.cb.reset();
         self.cr.reset();
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn enable_mixed(&mut self, modes: MbaffModes) {
+        self.cb.enable_mixed(modes.clone());
+        self.cr.enable_mixed(modes);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    pub(crate) fn disable_mixed(&mut self) {
+        self.cb.disable_mixed();
+        self.cr.disable_mixed();
     }
 }
 
@@ -604,6 +696,43 @@ mod tests {
         assert_eq!(counts.n_c(1, 1), 5, "only the left neighbour");
         counts.set(1, 0, 2);
         assert_eq!(counts.n_c(1, 1), 4, "(5 + 2 + 1) >> 1");
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn mixed_luma_above_reads_the_last_sample_row_of_the_frame_mb() {
+        let mut counts = CoeffCountMap::new(4, 16);
+        counts.enable_mixed(MbaffModes::new(1, 2, vec![true, false]));
+        counts.set(0, 6, 2);
+        counts.set(0, 7, 9);
+        // Top field MB below a frame pair: yN=-1 maps to yW=14,
+        // the last 4x4 row of the preceding bottom frame MB.
+        assert_eq!(counts.n_c(0, 8), 9);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn mixed_chroma_uses_eight_sample_macroblocks() {
+        let mut counts = CoeffCountMap::new_with_mb_blocks(4, 4, 2, 2);
+        counts.enable_mixed(MbaffModes::new(2, 1, vec![true, false]));
+        counts.set(1, 1, 3);
+        counts.set(1, 2, 11);
+        // Lower chroma 4x4 of the current top field MB: yN=4
+        // maps to yW=0 in the left bottom frame MB (Table 6-4).
+        assert_eq!(counts.n_c(2, 1), 11);
+    }
+
+    #[cfg(feature = "experimental-adaptive-mbaff")]
+    #[test]
+    fn leaving_mbaff_restores_raster_neighbours_on_an_odd_height_picture() {
+        let mut counts = CoeffCountMap::new(4, 12);
+        counts.enable_mixed(MbaffModes::new(1, 1, vec![false]));
+        counts.reset();
+        counts.disable_mixed();
+        counts.set(0, 7, 9);
+        // A progressive picture can end with an unpaired macroblock row.
+        // Its above neighbour must not depend on the preceding MBAFF map.
+        assert_eq!(counts.n_c(0, 8), 9);
     }
 
     #[test]
