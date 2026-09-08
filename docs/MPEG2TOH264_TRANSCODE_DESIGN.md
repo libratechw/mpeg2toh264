@@ -304,7 +304,41 @@ sourceは`efb0b872d8cdb813ad7cca0d483da10180ea5782`に対する保存済みS1差
 
 品質manifestと人間用の[元映像](../.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/B-source-preview-reencoded.mp4)・[固定B](../.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/B-baseline-preview-reencoded.mp4)・[S1](../.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/B-candidate-preview-reencoded.mp4)は`.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/`に保存した。リンク先はローカル評価成果物で、Gitには含めない。動画はCRF18の再符号化で指標の入力ではなく、**視聴確認待ち**。数値だけから文字・肌・色・ちらつきの問題がないとは断定しない。
 
-再集計でも同じ品質差と局所判定を再現した。build・性能・品質・probe・cross-target比較の対応はartifact directoryの`s1-idct-validation.json`、評価用コード一式は`s1-evaluation-tools-v5-20260909.tar.gz`（SHA-256 `a9f6f1adbabb9e292501776ac502251372d75d99437c7451afd76fc8110dd97a`）に保存した。採否は「既定無効の実験候補として検証継続」。利益と画質差の測定は素材Bに限られ、未使用素材、実機、独立コードレビュー、人間の視聴が残る。従来のclean bit-exact PR候補branchは変更しない。
+再集計でも同じ品質差と局所判定を再現した。build・性能・品質・probe・cross-target比較の対応はartifact directoryの`s1-idct-validation.json`、評価用コード一式は`s1-evaluation-tools-v5-20260909.tar.gz`（SHA-256 `a9f6f1adbabb9e292501776ac502251372d75d99437c7451afd76fc8110dd97a`）に保存した。この初回測定の対象は素材Bであり、続く追加確認を以下に分けて記録する。
+
+#### S1の追加素材とChrome Worker予備測定
+
+追加確認のsourceは`54f2bc4a1b7889b50a3dc1e9772dc8f7de66f4e4`。同commitのcore差分は上記build manifestの保存済み差分と一致する。固定B・S1のbinary、oversample=2、初回除外、外部負荷による組単位の採否条件を変えず、素材E/Fを各8組で交互比較した。upstreamの固定比較点`faf1464e66693133fc9f4b8618992b0f557f0bc3`も変更していない。
+
+| 素材 | B → S1のnative平均時間 | 時間短縮率 | 組ごとの短縮時間の95% paired t区間 |
+| --- | ---: | ---: | ---: |
+| E（1,789 frames、59.692967秒） | 10.461025 → 10.309226秒 | 1.451% | 122.125〜181.474 ms |
+| F（1,799 frames、60.026633秒） | 12.165069 → 12.030578秒 | 1.106% | 76.125〜192.857 ms |
+
+どちらも8/8組で短縮し、各build内の全出力digestが安定した。出力サイズはEが234,361,894 → 234,361,904 bytes、Fが245,751,546 → 245,751,469 bytes。生結果・ばらつき・wall/CPU時間・集約は`/data/ssd/mpeg2-quality-native-{E,F}-s1-idct-20260909/{results,pair-summary}.json`にある。素材Bを含むnativeの短縮は約1.1〜1.9%であり、知覚可能な劣化と交換する根拠にはしない。
+
+Linux Chrome 152.0.7977.82のheadless dedicated Workerでも素材B全編を交互8組で実行し、平均14,170.888 → 14,015.825 ms、1.094%短縮、8/8組で短縮した。記述的な95% paired t区間は141.719〜168.406 ms。初回14,218.900 / 13,972.400 msは除外した。同じWorker内に両moduleを保持し、各runは新しいSessionを構築して1 MiB chunkで入力する。Session構築からfreeまでを計時し、検証・digest・MP4解析・保存は計時外とした。固定raw WASMから`wasm-bindgen --target web`で生成し、WorkerはSHAを確認したbinding JSとWASMの同一bytesを読み込む。
+
+これは**ブラウザー内変換の予備測定**である。既知のcodec/build高負荷processを0.2秒間隔で監視し、該当processは観測しなかったが、Chromeの複数processを分離した外部CPU量は未測定（null）。native/Nodeの外部CPU上限を通過した測定とは同列にせず、CPU時間・GOP p95・描画・MSE・起動・シーク・実機視聴の改善も主張しない。各buildの全18 runの完全出力digest、bytes、1,809 video samples、init・metadata・timing shapeは、対応するNode出力と一致した。記録は`/data/ssd/mpeg2-quality-browser-B-s1-idct-20260909/{results,pair-summary,host-observation}.json`。
+
+#### S1の素材E/Fの品質と残る採用条件
+
+素材E/FもBと同じv5評価器・前処理・固定窓で検証した。source `[30,330)`、B/C `[31,331)`の300 frames・600 bob fieldsで、source PTSの開始はEが2.756356秒、Fが2.501100秒、期間は各10.010秒。全編の実PES PTS・decode order・NAL等価性を検査し、lead-in/cloneの1枚差を確認した。再実行したprobeはそれぞれ測定時Annex Bと完全一致し、両buildともEは1,789、Fは1,799 pictures変換・先頭2 pictures除外、実際の`undecodable`配列は空だった。
+
+| 素材 | R/BとR/Cの平均VMAF（両者同値） | 平均／最悪連続1秒の追加VMAF低下 | Y / Cb / Cr PSNR低下（dB） |
+| --- | ---: | ---: | ---: |
+| E | 98.233779 | 0 / 0 | 0 / −0.0000930 / 0.0001436 |
+| F | 97.803222 | 0 / 0 | 0 / 0 / 0 |
+
+両固定窓とも「視覚的同等を狙う」数値条件を満たす。各600時刻の追加VMAF低下が0なので、最悪1秒の先頭窓は全窓同率であり、固有の悪化区間ではない。raw PSNRはログのMSE精度に依存するため、同値だけを画素一致の証明にはしない。R/B・R/Cそれぞれの成分PSNR、指標ログ、前処理、対応付け、比較用動画は`.opencode/eval/proposal-b/{E,F}-s1-pts-evaluated-v5/`に保存した。
+
+さらに既存の全編PTS対応を用い、原interlaced planeの整数SSEから全編PSNRを集約した。YはE/Fとも全画素でB/C一致。EのCb/Crは18,546 / 16,366 samplesが異なり、絶対差の最大は2 / 1、差のあるframeは1,123枚。Fは101,148 / 41,591 samples、最大2 / 2、1,626枚だった。参照を通じた持続も含む。全編PSNR低下はEがY/Cb/Cr = 0 / −0.00000599 / −0.00000231 dB、Fが0 / −0.00002759 / −0.00006525 dBで、全編PSNR条件を満たす。小さな改善で局所悪化が消えたとは扱わず、全編VMAF・時間方向の知覚判断は未検証として残す。
+
+全編B/C合計SSEが最大のsource frameの一つは、Eが1615（PTS 55.642523秒、Cb/Cr SSE 96 / 111）、Fが252（PTS 9.908500秒、207 / 274）。前後2.002秒の人間用R/B/C動画を`.opencode/eval/proposal-b/{E,F}-s1-worst-sse-preview/`に保存した。これはVMAFの最悪区間を意味せず、採否用の固定窓も変えていない。動画はCRF18再符号化で指標の入力ではなく、**視聴確認待ち**。全編の生集約・包装証拠・probe・再現コマンドは`/data/ssd/mpeg2-quality-{E,F}-s1-pts-pack-20260909/`にある。
+
+E/Fとも保存ログの再集計で同じ指標値・局所判定を再現した（`{E,F}-s1-v5-reaggregate/`）。これは新たな復号・対応付けの証拠ではない。またS1 Node buildで`tools/compare-deferred.cjs`を48 kHz stereo AAC入り合成TSに対して3 round実行し、ツールが比較する初回sequential/deferredの完全digest一致を確認した（603 jobs）。単一threadの受け渡し確認であり、実音声・並列Worker・長時間・実機A/V同期の検証ではない。
+
+追加証拠の対応はartifact directoryの`s1-idct-followup-validation.json`、評価用コードは`s1-followup-tools-20260909.tar.gz`（SHA-256 `5eb866629c4e9f2c1cadb297fd579813d117580fa13fe927dfc583a07018c449`）に保存した。S1は小幅な利益が複数素材・実行環境で観測されたため実験候補として残すが、既定化・clean PR候補への昇格はしない。browserの負荷管理付き再測定、ジャンルを明確にした追加素材・長時間、VideoToolbox/Safari/MSEと実機視聴、独立S1コードレビュー、人間による文字・肌・色・ちらつきの確認が残る。旧品質へ戻すfeature-off経路と従来のclean bit-exact PR候補branchは維持する。
 
 ### 素材EのPTS付き局所品質と評価手順の修正（2026-09-09）
 
