@@ -385,6 +385,36 @@ Session全編のS2 native逐次・`-j 2`・Node WASMのMP4は`cmp`で完全一�
 
 包装証拠・再現コマンド・全編PSNRは`/data/ssd/mpeg2-quality-B-s2-pts-pack-20260909/`にある。Session途中の追加RAPの品質は単一unitのraw出力評価で保証していない。S2は独立実験として残すが、他素材、browser WASM、実機、VideoToolbox/Safari/MSE、起動・シーク・長時間、人間の視聴、S1との組み合わせは未検証であり、clean PR候補には含めない。
 
+### S1＋S2の組み合わせと同一ソース対照（2026-09-09）
+
+この後続screenでは固定Bを変更せず、実験branch `198ec8511e0a09cc6a50abe221efbc8e2094d784`から全feature OFFの対照H0とS1＋S2有効の組合せを隔離buildした。適応MBAFFは両者とも無効で、oversample=2。H0は固定Bの代替ではなく、S2の増分効果を調べる対照である。素材B全編のH0 native出力は固定Bと`cmp`で完全一致した。S2単独は既存の固定buildを再利用し、そのmanifest中の全source file hashが`198ec85`のファイルと一致することを確認した。
+
+素材B全編を既存の外部CPU・組単位除外条件で交互8組ずつ比較した。native、Nodeの計時範囲は直前のS2 screenと同じで、buildや復号とは重ねず順に実行した。定常集計から各buildのwarmupを除き、経過時間の大小による除外はしていない。
+
+| 比較・経路 | 平均時間 | 時間短縮率 | 短縮した組 | 組ごとの短縮時間の95% paired t区間 |
+| --- | ---: | ---: | ---: | ---: |
+| 固定B → S1＋S2、native | 11.770324 → 11.540420秒 | 1.953% | 8/8 | 201.689〜258.120 ms |
+| H0 → S2単独、Node WASM | 14,210.389 → 14,278.073 ms | −0.476% | 1/8 | −133.379〜−1.989 ms |
+| 固定B → S1＋S2、Node WASM | 14,102.881 → 13,954.133 ms | 1.055% | 8/8 | 134.459〜163.036 ms |
+
+組合せの初期利益は確認できたが、S2単独は同一ソース比較で遅くなった。したがって、前節の固定B対S2の小幅な短縮だけではS2自体の利益を確定できない。S1を優先し、S2は組合せの寄与を追加確認する選択式試作に留める。別々に測ったS1・S2の短縮率を足さない。組合せの累積品質・負荷管理付きbrowser・実機・長時間・人間視聴は未検証であり、既定化しない。
+
+組合せのnative Annex Bは259,609,951 bytes、SHA-256 `67b81232f7deb9ac91f4225f079fba0d8078c2e0fdb3d6ca58d6851dea01e594`。Nodeの完全フラグメントは261,774,416 bytes、SHA-256 `5c973ecdf3d56244f645191dabc4be62f428080f19814b85e23466ad561a2dcb`。Nodeでは各build内の全runでdigestが安定し、固定Bと1,809 video samples・init・metadata・sample timing/flagsが一致した。これは画質の同等性ではない。
+
+source/buildは`/data/ssd/mpeg2toh264-proposal-b-artifacts/build-manifest-s12-{control,combined,control-v-s2}.json`、生記録と集約は`/data/ssd/mpeg2-quality-native-B-s12-combined-20260909/`、`/data/ssd/mpeg2-quality-wasm-B-s12-control-v-s2-20260909/`、`/data/ssd/mpeg2-quality-wasm-B-s12-combined-20260909/`の`{results,pair-summary}.json`に固定した。組合せbuildのrelease testは272件成功、旧goldenを照合するcase全体1件を除外した。既存hashは変更していない。
+
+### 有力案をまとめた統合検証branch（2026-09-09）
+
+`integration/promising-transcode@834e53bbe40b66e570b2f871ddcd55e3ee112235`は、既存clean PR候補 `perf/bit-exact-transcode-hot-paths@581f2b78f398423d864b10a27040778595c6d289`を基点に作った統合検証用branchである。既存の完全一致最適化5 commitに、インターレース寸法のpadding修正、S1、S2をそれぞれ意味単位で追加した。基点からの追加commitは`0f8a097`、`b4e2d22`、`834e53b`。S1・S2の実装ファイルとpadding修正の実装・テストは実験branch `198ec85`とbyte単位で同一である。
+
+S1・S2は個別選択できるCargo featureとして既定OFFにした。S2は単独の利益が確定していないため、組合せ評価用にも保持する。適応MBAFFとその近傍処理変更、不採用のoversample設定、実験記録・評価動画は含めない。既存の公開VLC APIを保持し、チェックイン済み`dist`は変更していない。使い方と旧品質へ戻す方法だけをcoreの既存READMEに置いた。
+
+このbranchは全体をそのまま取り込めるPR候補への昇格ではない。既存clean PR候補は変更せず、上の`198ec85` buildの速度値をこの別treeへ転用しない。比較基準Bと`upstream/main@faf1464`も維持する。
+
+この統合tree自身でdefaultのrelease test 271件が旧goldenを含め成功した。S1＋S2有効時も271件成功し、旧goldenを照合するcase全体1件は除外した。native両設定とWASM組合せのrelease build、`cargo fmt --all --check`が成功した。素材B全編のnative defaultは固定B、組合せは`198ec85`組合せとそれぞれ`cmp`で完全一致し、Node組合せも完全フラグメントdigest・bytes・sample数・metadataが元の試作と一致した。これらは抽出時の回帰確認で、速度や人間の視聴品質の証拠ではない。独立した統合差分レビューは委任実行がエラーで終わったため未完了と記録し、再試行やレビュー済みへの読み替えはしていない。
+
+対応するsource/build/入力・テスト・同値確認のmanifestは`/data/ssd/mpeg2toh264-proposal-b-artifacts/promising-integration-validation.json`（SHA-256 `afc664dd05086db0754bb98a478142fe9b4e1489c70128ca87e483d109b38fda`）。S1＋S2 screenと統合確認の実行用コードは同directoryの`s12-integration-tools-20260909.tar.gz`（SHA-256 `7c74c31f366cae6d42a1fd3a59288b553f16f5e8d84b7ad10e0990214f016b25`）に保存した。素材・生記録はローカル成果物で、統合branchには含めない。
+
 ### oversample 2→1.5の独立screen（2026-09-09）
 
 固定Bの同じnative binaryだけを使い、素材B全編でoversample=2と1.5を交互8組比較した。平均11.816399 → 11.636394秒、1.523%短縮、8/8組で短縮し、短縮時間の95% paired t区間は139.121〜220.889 msだった。出力は259,609,856 → 236,406,893 bytes。既存の`Quantiser8x8::choose_qp()`へ渡す設定値だけを変え、S1・S2・適応MBAFFは含めない。量子化精度を下げる操作なので、未検証の画質を犠牲にしてよい根拠にはしない。知覚可能な劣化に対する15%短縮目安には届かず、視聴上の別の利益も未確認である。
