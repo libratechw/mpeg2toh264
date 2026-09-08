@@ -20,7 +20,7 @@
   the separate quality/performance contract in
   `docs/MPEG2TOH264_TRANSCODE_DESIGN.md` (2026-09-09). A changed hash alone does
   not reject these candidates. Keep the original baseline and golden hashes,
-  evaluate cumulative degradation, retain the old-quality path, and keep
+  evaluate cumulative degradation and keep
   unvalidated changes off by default. Codec, timeline, decoder compatibility,
   malformed-input, licensing, and operational invariants still apply.
 - Keep the branch classified as an experiment until its effect and relevant

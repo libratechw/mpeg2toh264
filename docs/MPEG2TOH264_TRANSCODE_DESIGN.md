@@ -93,7 +93,7 @@ native、Node WASM、対象browser WASM、デコード・描画・受け渡し�
 参照関係、decoder互換性、既存の運用・ライセンス制約は維持する。追加欠落・停止・シーク退行を画質との交換にしない。
 非参照限定を採るならslice名ではなく実際の参照関係で保証する。
 core、並列/deferred、異常入力、FFmpeg、VideoToolbox、Safari/MSEの試験を影響範囲に応じて行い、未実施環境は未検証とする。
-既存golden hashは変更せず、旧品質へ戻せる経路を残し、未検証の候補は既定で無効にする。
+比較基準の既存golden hashは変更せず、未検証の候補は既定で無効にする。2026-09-09のユーザー指示により、旧品質へ戻す実装を恒久的に残す要件は撤回した。採用する演算変更は、旧経路との切替を廃止できる。採用後の通常出力を固定するgoldenは、従来の基準・測定記録と区別し、変更理由と採用前の候補出力との対応を確認する。
 利益または品質条件が成立しない案は採用せず、試した実装・結果・不採用理由と残る課題を保存する。
 
 既存Proposal Bの品質成果物は`.opencode/eval/proposal-b/`にある。
@@ -456,6 +456,14 @@ S1・S2は個別選択できるCargo featureとして既定OFFにした。S2は�
 ユーザーから、[配布commit `832ffcb2d1ecf9c85511fba0883414ecb8e82e37`](https://github.com/libratechw/mpeg2toh264/commit/832ffcb2d1ecf9c85511fba0883414ecb8e82e37)を使い「画質は全く問題ない」との報告を得た。同commitのWASM crateは`2018fa9`でS1・S2の両featureを依存先coreに指定している。`h264/chroma.rs`、`h264/quant.rs`、`h264/params.rs`は統合検証branch `834e53b`と差分がない。したがって、S1＋S2を有効にした配布版についての人間の視聴結果として扱う。
 
 これはユーザーが視聴した範囲での肯定的な品質確認であり、素材、端末、ブラウザー、視聴時間、比較方法、実際にロードされたWASMのhashはこの報告だけでは特定できない。上記B/E/F比較動画や最悪区間を視聴済みとは読み替えず、その個別確認待ちは維持する。配布版には演算以外の変更もあるため、性能・起動・シーク・長時間安定性の改善をこの報告から推定しない。固定B、数値閾値、統合検証branchの既定OFFは変更しない。
+
+#### S1を通常IDCTへ統一（2026-09-09）
+
+ユーザーの採用指示により、統合検証branchの`92b2177`でS1の旧IDCTと`experimental-symmetric-idct` featureを削除した。S1の演算自体と独立f64参照テストは維持し、対称性のテストも常時実行する。S2は変更せず既定OFFである。以前のS1 feature指定はbuildコマンド・依存設定から削除する必要がある。過去の固定build・品質記録とclean bit-exact PR branchは変更しない。
+
+通常設定とS2有効設定の`cargo test --release`は各272件成功、`cargo fmt --all --check`と通常WASM buildも成功した。通常版の全6 fixtureのnative Annex Bは保存済みS1有効binaryと`cmp`で完全一致した。意図的に変わる`altscan`と`hd1080i`の通常goldenは、その保存済み出力のFNV-1aから照合した値を固定した。S2有効時の`hd1080i`は以前の組合せgoldenを別に固定し、テストを除外していない。
+
+音声付き合成TS `/data/ssd/mpeg2-quality-hd-audio-20260909.ts`を`tools/compare-wasm.cjs`で2回交互実行し、保存済みS1有効Node buildと新しい通常buildの完全フラグメントdigestが一致した（607 video samples、50,645,508 bytes）。これは既定化による意図しない出力差の確認であり、新しい性能値や実機の保証ではない。独立差分レビューは依頼本文に差分が渡らず未完了だったため、レビュー済みとは扱わない。`dist`・dogfood branchはこの変更では更新していない。
 
 ### oversample 2→1.5の独立screen（2026-09-09）
 
