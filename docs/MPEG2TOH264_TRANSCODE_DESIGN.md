@@ -415,6 +415,30 @@ source/buildは`/data/ssd/mpeg2toh264-proposal-b-artifacts/build-manifest-s12-{c
 
 証拠の対応は`/data/ssd/mpeg2toh264-proposal-b-artifacts/s12-B-quality-validation.json`（SHA-256 `0ddfd6cadbc7424ba850e13281fc3dcefe392ea07893b89b6b19548f51571001`）、包装・全編PSNR・実行コマンドは`/data/ssd/mpeg2-quality-B-s12-pts-pack-20260909/`に保存した。評価用コードはartifact directoryの`s12-quality-tools-v5-20260909.tar.gz`（SHA-256 `0882645dd719f954c9425bcf278d62f5ac3798b63a7ff06f78004273f333c84e`）。統合branch `834e53b`の素材B raw出力との完全一致は別の抽出確認で証明済みなので、この同一出力には同じ品質結果が対応する。ただしSession途中の追加RAP、他素材、実機・browser、長時間、人間視聴の保証へ広げず、featureの既定値とPR候補は変更しない。
 
+#### S1＋S2の素材E/Fの追試
+
+素材Bと同じ固定B・`198ec85`組合せbuild・oversample=2で、素材E（59.692967秒）とF（60.026633秒）を各8組、nativeで交互比較した。warmup除外・外部負荷の組単位除外・計時範囲を変えず、性能測定とbuild・復号は重ねなかった。
+
+| 素材 | 固定B → 組合せのnative平均時間 | 時間短縮率 | 短縮した組 | 組ごとの短縮時間の95% paired t区間 |
+| --- | ---: | ---: | ---: | ---: |
+| E | 10.478907 → 10.215613秒 | 2.513% | 8/8 | 240.749〜285.841 ms |
+| F | 12.116617 → 11.797307秒 | 2.635% | 8/8 | 283.599〜355.022 ms |
+
+品質も同じv5の固定10.010秒窓・前処理・PTS/NAL対応付けで評価した。実行probeは各測定出力と完全一致し、固定Bと組合せでEは1,789、Fは1,799 pictures変換、いずれも先頭除外2 pictures・追加の`undecodable`なしだった。各素材の固定窓は「視覚的同等を狙う」数値条件を満たし、再集計でも指標と判定が一致した。
+
+| 素材 | 平均追加VMAF低下 | 最悪の連続1秒の平均追加低下 | そのsource PTS | 固定窓PSNR低下 Y / Cb / Cr（dB） |
+| --- | ---: | ---: | --- | --- |
+| E | 0.001295 | 0.004185 | 6.677939〜7.677939秒 | −0.000109 / −0.000093 / 0.000144 |
+| F | 0.000813 | 0.001582 | 8.074333〜9.074333秒 | 0.000163 / 0 / 0 |
+
+全編の整数SSEからのY/Cb/Cr PSNR低下は、Eが0.00005233 / −0.00000599 / −0.00000231 dB、Fが0.00003341 / −0.00002759 / −0.00006525 dBで条件内だった。B/Cの最大絶対画素差はEが4 / 2 / 1、Fが2 / 2 / 2で、差があるframeはそれぞれ1,674 / 1,789、1,689 / 1,799枚。差の持続を含む結果であり、平均値だけで時間方向の視聴品質を保証しない。全編SSE最大frameはEが386（PTS 14.634889秒）、Fが221（PTS 8.874133秒）だった。
+
+人間用のEの[元映像](../.opencode/eval/proposal-b/E-s12-pts-evaluated-v5/E-source-preview-reencoded.mp4)・[固定B](../.opencode/eval/proposal-b/E-s12-pts-evaluated-v5/E-baseline-preview-reencoded.mp4)・[組合せ](../.opencode/eval/proposal-b/E-s12-pts-evaluated-v5/E-candidate-preview-reencoded.mp4)、Fの[元映像](../.opencode/eval/proposal-b/F-s12-pts-evaluated-v5/F-source-preview-reencoded.mp4)・[固定B](../.opencode/eval/proposal-b/F-s12-pts-evaluated-v5/F-baseline-preview-reencoded.mp4)・[組合せ](../.opencode/eval/proposal-b/F-s12-pts-evaluated-v5/F-candidate-preview-reencoded.mp4)を保存した。SSE最大frame前後の各2.002秒も`{E,F}-s12-worst-sse-preview/`にある。再符号化した補助資料で指標入力ではなく、**視聴確認待ち**である。
+
+統合branch `834e53b`の固定buildもE/Fで実行し、native Annex Bを今回の各組合せ出力と`cmp`で照合した。Nodeでは元試作と統合buildの完全フラグメントdigest・bytes・sample数・metadataがそれぞれ一致した。したがって同一raw出力の品質結果を対応付けられるが、これはNodeの速度比較やnative/Node間のSession MP4照合ではない。統合tree固有の性能値へも転用しない。
+
+生の性能記録は`/data/ssd/mpeg2-quality-native-{E,F}-s12-combined-20260909/`、品質・包装・実行コマンドは`/data/ssd/mpeg2-quality-{E,F}-s12-pts-pack-20260909/`。証拠の対応はartifact directoryの`s12-EF-followup-validation.json`（SHA-256 `0c5d50933e775d845da6dc3721d8fe4db13e50b27b3d12a8b2fa6fdea52cbb83`）、実行用コードは`s12-EF-followup-tools-20260909.tar.gz`（SHA-256 `c099ad05a0f01ab3fbe5dd54e3f9408835590f39eff74514c579b64a53fa72b1`）に保存した。B/E/Fは以前からprofileに使った素材で、ジャンルを確認した未使用の評価セットではない。組合せのnative利益は複数素材で観測されたが、S2単独の利益、負荷管理付きbrowser、実機・長時間・人間視聴、Session途中の追加RAPの品質はなお未確定である。次はnative素材の追加よりbrowser評価を優先し、両featureの既定OFFと既存PR候補を維持する。
+
 ### 有力案をまとめた統合検証branch（2026-09-09）
 
 `integration/promising-transcode@834e53bbe40b66e570b2f871ddcd55e3ee112235`は、既存clean PR候補 `perf/bit-exact-transcode-hot-paths@581f2b78f398423d864b10a27040778595c6d289`を基点に作った統合検証用branchである。既存の完全一致最適化5 commitに、インターレース寸法のpadding修正、S1、S2をそれぞれ意味単位で追加した。基点からの追加commitは`0f8a097`、`b4e2d22`、`834e53b`。S1・S2の実装ファイルとpadding修正の実装・テストは実験branch `198ec85`とbyte単位で同一である。
