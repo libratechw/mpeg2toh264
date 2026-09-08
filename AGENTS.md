@@ -8,7 +8,7 @@
 - Before editing, fetch `upstream` and confirm the exact base. Pull `main` from
   its tracking remote with `--ff-only` when it advanced; never carry an old
   measurement across a changed source tree without revalidation.
-- The first implementation experiment is Proposal A stage 1 only: compute the
+- The first bit-exact implementation experiment was Proposal A stage 1 only: compute the
   existing quantisation operation in raster order, then reorder the integer
   levels for the residual coder. Do not combine sparse-coefficient metadata,
   CAVLC API changes, Proposal B, or Proposal C into that comparison.
@@ -16,6 +16,13 @@
   reproducible improvement and every output digest remains identical to the
   baseline. An output difference is a failed equivalence experiment, not an
   acceptable performance result.
+- Intentional numerical or quality changes after the bit-exact experiments use
+  the separate quality/performance contract in
+  `docs/MPEG2TOH264_TRANSCODE_DESIGN.md` (2026-09-09). A changed hash alone does
+  not reject these candidates. Keep the original baseline and golden hashes,
+  evaluate cumulative degradation, retain the old-quality path, and keep
+  unvalidated changes off by default. Codec, timeline, decoder compatibility,
+  malformed-input, licensing, and operational invariants still apply.
 - Keep the branch classified as an experiment until its effect and relevant
   regressions are measured. Do not publish or present it as an adoption or
   provisional candidate without the separate publication review and records.
@@ -49,7 +56,7 @@
 - For web changes, build WASM first with `./tools/build-wasm.sh`, then run `npm run typecheck` and the relevant package/web build. `packages/player/wasm` is generated and ignored.
 - `wasm-bindgen-cli` must match the crate version in `Cargo.lock`; the build script checks it.
 - Page and Worker TypeScript are separate programs. `packages/player/src/mse.ts` is shared, while Worker MSE declarations live in `worker-mse.d.ts`; avoid broadening tsconfig inputs in a way that merges conflicting DOM libraries.
-- A change meant to be faster and not different is two claims. `tools/compare-wasm.cjs` measures both at once: it runs several `--target nodejs` builds over one input, taking turns so a machine that warms over the run favours none of them, and hashes every fragment each produced. Build the other side in a worktree of the commit to measure against. A speedup with a hash that moved is not a speedup.
+- A change meant to be faster and not different is two claims. `tools/compare-wasm.cjs` measures both at once: it runs several `--target nodejs` builds over one input, taking turns so a machine that warms over the run favours none of them, and hashes every fragment each produced. Build the other side in a worktree of the commit to measure against. A changed hash fails this bit-exact claim; intentional quality changes instead require the separate quality/performance evaluation above.
 - `tools/compare-deferred.cjs` drives one build both ways -- pictures converted inside the session, and outside it through `pushDeferred` -- and checks the two agree. Give it a recording with an audio track: the video comes out the same either way whatever happens, so a fault here hides in how many AAC frames each fragment carries, and a video-only input cannot fail.
 - ffmpeg decoding the output cleanly is not the whole story. Safari decodes through VideoToolbox, which has disagreed with ffmpeg about reference picture lists and about how long an IDR stays a reference; `tools/vtdec.swift` and `tools/vtdiff.py` measure that without a browser, and `tools/m2v-pictures.py` finds the sources that reach the awkward paths.
 - VideoToolbox decoding the output cleanly is not the whole story either. Safari reaches it through Media Source Extensions, which parses with AVStreamDataParser, submits one sample at a time, and reuses a cached image format description; `tools/sdpdec.m` is the only harness that reproduces all three, and it is what found the field pair decode error. A fault that appears in the browser but not in `tools/vtdec.swift` belongs here.
