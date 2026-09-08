@@ -244,7 +244,7 @@ native C2の逆アセンブルでも`n_c`内に動的除算が残ることを確
 #### シフト化C3は利益を確認できず不採用
 
 C3はconstructorでmacroblock内block数のlog2を保存し、C2の剰余・除算・乗算をmask/shiftへ置き換えたもの。
-feature有効時282テストとWASM buildは成功し、nativeの素材B全8組はC1/C2の原H.264と一致した。
+feature有効時282テストとWASM buildは成功し、素材Bのnative全8組でC3が生成したAnnex BはC1/C2のAnnex Bと一致した。
 `n_c`の逆アセンブルから除算命令はなくなったが、固定B平均11.790545秒に対しC3は12.738430秒で、
 素材Bの8.039%退行は残った。このnative結果はC2との直接交互比較ではない。
 
@@ -252,10 +252,11 @@ C3単独の効果を分けるため、Node WASMではC2/C3を交互8組、初回
 基準Bを動かさない追加の差分比較であり、manifestにも`incremental C2 versus C3`と明記した。
 C2平均15,415.418 ms → C3平均15,388.424 ms、名目0.175%短縮、短縮6/8組、
 各組の短縮時間の95% paired t区間は−1.616〜55.603 msで、利益をばらつきから分離できなかった。
-全組有効で、1,809 video samples、完全フラグメントdigest、init・fragment metadata・sample timing/flagsが一致した。
+WASMのC2/C3比較は全8組有効で、1,809 video samples、完全フラグメントdigest、init・fragment metadata・sample timing/flagsが一致した。
 完全digestは`e0553557cc3518f53f98f566b8bd2bd2a8dc63334ff524079a4b1167ee48e99d`。
 
-このためC3のコードは取り除き、実装はC2（`ae3e8f7`）までとする。既存goldenは変更していない。
+C3単独の採否では、直接交互比較したWASMで利益を確認できなかったことを根拠にコードを取り除き、実装はC2（`ae3e8f7`）までとする。
+固定Bとのnative比較は、適応MBAFF全体の未達を示す別の結果である。既存goldenは変更していない。
 棄却した差分・source hash・native/WASM binaryはartifact directoryの`build-manifest-c3-shift.json`に対応付け、
 生結果は`/data/ssd/mpeg2-quality-native-B-c3-shift-20260909/results.json`と
 `/data/ssd/mpeg2-quality-wasm-B-c2-v-c3-20260909/results.json`へ保存した。
