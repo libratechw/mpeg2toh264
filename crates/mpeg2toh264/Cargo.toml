@@ -10,6 +10,7 @@ repository.workspace = true
 [features]
 default = []
 experimental-adaptive-mbaff = []
+experimental-symmetric-idct = []
 
 [lints.rust]
 unsafe_code = "forbid"

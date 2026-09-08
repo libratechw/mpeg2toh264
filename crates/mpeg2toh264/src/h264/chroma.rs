@@ -60,6 +60,7 @@ pub fn chroma_qp(luma_qp: i32, offset: i32) -> i32 {
 }
 
 /// Inverse 8x8 DCT, orthonormal, into `out` in raster order.
+#[cfg(not(feature = "experimental-symmetric-idct"))]
 pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
     let c8 = &*C8;
     // Columns first: tmp = C8^T * coeff
@@ -80,6 +81,38 @@ pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
                 s += c8[v * 8 + y] * tmp[v * 8 + x];
             }
             out[y * 8 + x] = s;
+        }
+    }
+}
+
+/// The same basis as the dense IDCT, with mirrored samples sharing their
+/// even/odd frequency sums. Regrouping f32 additions can change rounding;
+/// this experimental path does not promise the dense path's output bytes.
+#[cfg(feature = "experimental-symmetric-idct")]
+pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
+    #[inline]
+    fn transform(input: [f32; 8], c8: &[f32; 64]) -> [f32; 8] {
+        let mut result = [0.0; 8];
+        for x in 0..4 {
+            let even = ((c8[x] * input[0] + c8[16 + x] * input[2]) + c8[32 + x] * input[4])
+                + c8[48 + x] * input[6];
+            let odd = ((c8[8 + x] * input[1] + c8[24 + x] * input[3]) + c8[40 + x] * input[5])
+                + c8[56 + x] * input[7];
+            result[x] = even + odd;
+            result[7 - x] = even - odd;
+        }
+        result
+    }
+
+    let c8 = &*C8;
+    for v in 0..8 {
+        let row = transform(std::array::from_fn(|u| coeff[v * 8 + u]), c8);
+        tmp[v * 8..v * 8 + 8].copy_from_slice(&row);
+    }
+    for x in 0..8 {
+        let column = transform(std::array::from_fn(|v| tmp[v * 8 + x]), c8);
+        for y in 0..8 {
+            out[y * 8 + x] = column[y];
         }
     }
 }
@@ -433,6 +466,97 @@ mod tests {
         idct8(&coeff, &mut out, &mut tmp);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 100.0).abs() < 1e-9, "sample {i} is {v}");
+        }
+    }
+
+    #[cfg(feature = "experimental-symmetric-idct")]
+    #[test]
+    fn the_rounded_basis_preserves_idct_mirror_symmetry() {
+        let c8 = &*C8;
+        for k in 0..8 {
+            for x in 0..4 {
+                let reflected = if k % 2 == 0 {
+                    c8[k * 8 + x]
+                } else {
+                    -c8[k * 8 + x]
+                };
+                assert_eq!(c8[k * 8 + 7 - x].to_bits(), reflected.to_bits());
+            }
+        }
+    }
+
+    fn check_idct_against_f64_matrix(coeff: &[f32; 64]) {
+        let c8 = &*C8;
+        let mut out = [f32::NAN; 64];
+        let mut tmp = [f32::NAN; 64];
+        idct8(coeff, &mut out, &mut tmp);
+        for y in 0..8 {
+            for x in 0..8 {
+                let mut expected = 0.0f64;
+                let mut absolute_sum = 0.0f64;
+                // Direct 2D matrix product in double precision: no shared
+                // intermediate layout or even/odd decomposition with idct8.
+                for v in 0..8 {
+                    for u in 0..8 {
+                        let term =
+                            coeff[v * 8 + u] as f64 * c8[u * 8 + x] as f64 * c8[v * 8 + y] as f64;
+                        expected += term;
+                        absolute_sum += term.abs();
+                    }
+                }
+                // Conservative roundoff allowance scaled to the input, not
+                // a pixel-quality threshold. Cancellation may make expected
+                // zero even for a large block, hence absolute_sum, not |expected|.
+                let tolerance = 32.0 * f32::EPSILON as f64 * (absolute_sum + 1.0);
+                let actual = out[y * 8 + x] as f64;
+                assert!(
+                    actual.is_finite() && (actual - expected).abs() <= tolerance,
+                    "sample ({x},{y}): actual={actual}, expected={expected}, tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idct_matches_the_f64_matrix_for_basis_sparse_and_dense_blocks() {
+        check_idct_against_f64_matrix(&[0.0; 64]);
+        for pos in 0..64 {
+            for level in [-3064.0, 1.0, 2047.0] {
+                let mut coeff = [0.0; 64];
+                coeff[pos] = level;
+                check_idct_against_f64_matrix(&coeff);
+            }
+        }
+        for scale in [1.0, 4096.0, 1.0e12] {
+            for axis in 0..3 {
+                let coeff = std::array::from_fn(|pos| {
+                    let parity = match axis {
+                        0 => pos % 8,
+                        1 => pos / 8,
+                        _ => pos % 8 + pos / 8,
+                    };
+                    if parity % 2 == 0 {
+                        scale
+                    } else {
+                        -scale
+                    }
+                });
+                check_idct_against_f64_matrix(&coeff);
+            }
+        }
+        let mut state = 0x9e37_79b9u32;
+        for block in 0..256 {
+            let coeff = std::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                if block % 2 == 0 && state % 4 != 0 {
+                    0.0
+                } else {
+                    ((state & 8191) as i32 - 4096) as f32
+                }
+            });
+            check_idct_against_f64_matrix(&coeff);
         }
     }
 

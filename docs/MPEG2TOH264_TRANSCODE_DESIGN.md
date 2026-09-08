@@ -262,10 +262,49 @@ C3単独の採否では、直接交互比較したWASMで利益を確認でき�
 `/data/ssd/mpeg2-quality-wasm-B-c2-v-c3-20260909/results.json`へ保存した。
 命令削減だけでは全体の利益を証明できないため、C3を同じ根拠で再試行しない。
 
-次の独立候補は色差`idct8()`の偶数・奇数周波数と鏡映対称性を使う分解で、既存の順変換との融合案とは区別する。
-現在のC8の32組の鏡映要素はf32の絶対値が同一で、周波数の偶奇に応じた符号関係を満たすことを計算で確認した。
-ただし加算順序が変わるため、速度・量子化後の差・R/B/C品質は未検証である。実装する場合も適応MBAFFと組み合わせず、
-既定無効の個別候補として固定Bと比較する。対称性だけを画質の証明にはしない。
+### 独立候補S1: 色差IDCTの鏡映対称性（2026-09-09）
+
+S1は`crates/mpeg2toh264/src/h264/chroma.rs::idct8()`の偶数・奇数周波数の和を共有する試作で、`experimental-symmetric-idct` featureでのみ有効になる。適応MBAFFのC1/C2とは組み合わせず、oversample=2で固定Bと比較する。S1差分は既定値、旧golden hash、順変換、量子化、走査順、参照・timeline処理を変更しない。土台にはB以降の既存geometry修正を含み、以下は固定B対S1 build全体の比較である。既存のIDCTと順変換の融合案とは別の演算削減である。
+
+丸め済みのC8は`C8[k,7-x] = (-1)^k C8[k,x]`を満たす。1次元の逆変換を偶数周波数の和Eと奇数周波数の和Oに分け、鏡映位置へ`E+O`と`E-O`を書く。これを両軸に適用する。ソース上の乗算は8×8 block当たり1,024回から512回になるが、命令数・実行時間が半分になるという主張ではない。固定Bの素材B Node profileではIDCTのself timeは4.52%であり、全体への効果は限られる。
+
+これはf32加算順序の変更であって、基底の削減や係数省略ではない。ただし量子化境界をまたぐ差はあり得る。通常の色差block、frameからfieldへの色差pair変換、random-access intraの色差に共通適用されるため、参照画像を通じた累積差も評価対象となる。鏡映対称性だけを画質の証明にはしない。
+
+#### 数値検証と既定経路
+
+`the_rounded_basis_preserves_idct_mirror_symmetry`はC8の鏡映32組をf32 bit単位で検査する。`idct_matches_the_f64_matrix_for_basis_sparse_and_dense_blocks`はゼロ、64基底の正負入力、縞・市松、疎・密な決定的乱数を、丸め済みC8を使う直接2次元f64行列積と照合する。許容誤差は`32 * f32::EPSILON * (sum(abs(term)) + 1)`で、符号・軸・初期化ミスを検出する数値回帰条件であり、画質閾値ではない。
+
+defaultの`cargo test --release`は270件成功し、元の6素材のgoldenも通った。S1有効時は`tests/fixtures.rs::transcodes_every_fixture_to_the_expected_bitstream`を実行し、6素材中`altscan.m2v`と`hd1080i.m2v`の変化により、このtest caseが失敗した。他の4素材のgoldenは一致した。旧値は更新せず、このtest case 1件だけを`--skip`で除く再実行で270件が成功した。WASM release buildも成功した。独立コードレビューの委任は結果を返さず終了したため、独立レビュー済みとは扱わない。
+
+#### 最初の性能比較
+
+素材B全編（1,790 frames、59.726333秒）のnative交互8組は、固定B平均11.783145秒 → S1平均11.561944秒、1.877%短縮、8/8組で短縮した。各組の短縮時間の95% paired t区間は191.246〜251.156 ms。映像1秒当たりのwall/CPU時間は、Bの0.197286/0.197257秒からS1の0.193582/0.193561秒へ減った。既存runnerの初回除外・外部負荷上限・全組保存条件を維持している。CLI全体の結果であり、GOP p95・browser・実機の改善ではない。
+
+native出力は259,609,856 → 259,609,837 bytesで、S1のSHA-256は`8c415532139dcf4d3b13de729f9a37ddd5330b546424b83afa2bc4a72f8d7579`。全8組で各build内の出力が安定した。19 bytes減というサイズ差から画質の小ささを判断しない。
+
+同じ素材B全編のNode WASMも交互8組で比較し、14,195.735 → 14,131.129 ms、0.455%短縮、8/8組で短縮した。短縮時間の95% paired t区間は53.279〜75.934 ms。初回は14,294.518 / 14,255.655 msで、定常集計から除いた。Node v24.19.0、1 MiB入力chunkでSession構築・変換・fragment受渡しまでを測り、hash・MP4解析・保存は計時外である。全8組が外部負荷条件を満たし、1,809 video samples、init・fragment metadata・sample timing/flagsが一致した。S1の完全フラグメントdigestは`a9ed9a02ae15ef1085c34affd635d4e2ec2e2c715b015bbd663ad6c7d4a2b75c`。生結果は`/data/ssd/mpeg2-quality-wasm-B-s1-idct-20260909/{results,pair-summary}.json`。
+
+native/Nodeの初期利益は確認できたが、とくにNodeの利益は小さい。知覚可能な劣化と交換する根拠にはせず、視覚的同等を狙う候補として以下の品質検証を進める。browser、他素材、長時間、実機の起動・シーク、人間の視聴は未確認であり、既定化・PR候補への昇格はしない。
+
+sourceは`efb0b872d8cdb813ad7cca0d483da10180ea5782`に対する保存済みS1差分で、全coreファイルhash、native/WASM build、コマンド、テストログは`/data/ssd/mpeg2toh264-proposal-b-artifacts/build-manifest-s1-idct.json`に固定した。同manifestの`native`/`wasm`の`build_command`と`binding_command`が正確なbuild手順で、S1だけを`--features mpeg2toh264/experimental-symmetric-idct`で有効にする。native binary SHA-256は`852a3f24bd99a5ff91ffea28a3fd1f4cd71b368710df7508d4d839e700000d0a`。生結果と集約は`/data/ssd/mpeg2-quality-native-B-s1-idct-20260909/{results,pair-summary}.json`。旧品質へ戻すにはS1と適応MBAFFの両featureを付けずにbuildする。これらの測定・評価成果物はこのworkspaceのローカル記録であり、Gitだけを取得しても入力素材や生ログまでは取得できない。
+
+#### 素材BのPTS付き局所品質とcross-target確認
+
+固定したRのdisplay frames `[30,330)`、B/Cの`[31,331)`（10.010秒、600 bob fields）を既存評価器で比較した。RのPTSは2.721089秒から。BT.709 limited、1440×1080、SAR 4:3、TFF、前後1 frameのcontext付きbwdif、`vmaf_v0.6.1`などは素材Eのv4条件を維持した。全編1,790 source picturesと包装MP4の1,791 access unitsを実PES PTS・decode orderで照合し、初期lead-in/cloneの1枚差を確認した。包装前後のNAL payload・順序・数も一致した。
+
+この区間のR/B → R/CのY/Cb/Cr PSNRは、47.072070 / 56.692332 / 55.735306 → 47.072070 / 56.693371 / 55.735306 dB。両者のVMAF平均は96.822479で、各時刻の非負追加低下は平均・最悪連続1秒とも0だった。局所窓では[評価契約](#品質の対応付けと判定)の「視覚的同等を狙う」数値基準を満たすが、全編のVMAFや人間の同等判定ではない。最悪1秒は全窓同率であり、記録された先頭0〜1秒を固有の悪化区間とは呼ばない。
+
+旧runnerはB/C直接比較のMSEがログ上0の場合もエラーにしていた。v5では0を記述用のinfinityとして表示し、NaN・負値などの拒否を維持した。ログのMSEは小数2桁なので、これは画素一致の証明ではない。R/BまたはR/Cがログ上0となる場合のPSNR差判定は、より高精度の証拠を要求して停止する。閾値・前処理・区間は変更していない。selftestは0の成分、平均MSE、異常値の拒否を含めて成功した。
+
+全編の入力復号記録は、小さな評価専用probeで固定BとS1を再実行して取得し、各probeのAnnex Bを対応する測定出力とbyte-for-byteで一致させた。両方とも1,790 pictures変換・先頭2 pictures除外、`undecodable`は実際に空配列だった。推測した空配列ではない。S1のnative Session MP4もNode WASMの完全MP4と`cmp`でbyte-for-byteの一致を確認した。ただしSessionには途中のrecovery pictureがあるため、このcross-target一致を、単一unitを包装した局所品質窓からSession全編の品質を保証する根拠にはしない。
+
+小数丸めのない補助確認として、既に全編のAU/PTS対応を確認したraw出力を再復号し、lead-inのみを除いた1,790 framesの8-bit Y/Cb/Cr画素から整数SSEを集約した。Yは全画素でB/Cが一致し、Cbは4,200 samples、Crは3,406 samplesが異なり、差の絶対値はどちらも最大1だった。差があるframeは516枚で、参照を通じた差の持続も含む。Rに対する全編PSNR低下はY=0、Cb=−0.0000273、Cr=0.00000194 dB。全編のPSNR条件を満たすが、全編VMAFや人間の許容判断を代替しない。
+
+全編のB/C合計SSEが最大のsource frameは522（PTS 19.137489秒、Cb/CrのSSEは113/2）。その前後、source PTS 18.136489〜20.138489秒の2.002秒を、追加の人間用比較動画として`.opencode/eval/proposal-b/B-s1-worst-sse-preview/`に置いた。これはVMAFの最悪区間ではなく、採否用の固定窓も変更していない。全編の生集約は`/data/ssd/mpeg2-quality-B-s1-pts-pack-20260909/exact-full-psnr-v2.json`。最初の実行はJSON保存時に失敗したため、その不完全な出力を結果に使わず、保存処理を直して全編を再実行した。
+
+品質manifestと人間用の[元映像](../.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/B-source-preview-reencoded.mp4)・[固定B](../.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/B-baseline-preview-reencoded.mp4)・[S1](../.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/B-candidate-preview-reencoded.mp4)は`.opencode/eval/proposal-b/B-s1-pts-evaluated-v5/`に保存した。リンク先はローカル評価成果物で、Gitには含めない。動画はCRF18の再符号化で指標の入力ではなく、**視聴確認待ち**。数値だけから文字・肌・色・ちらつきの問題がないとは断定しない。
+
+再集計でも同じ品質差と局所判定を再現した。build・性能・品質・probe・cross-target比較の対応はartifact directoryの`s1-idct-validation.json`、評価用コード一式は`s1-evaluation-tools-v5-20260909.tar.gz`（SHA-256 `a9f6f1adbabb9e292501776ac502251372d75d99437c7451afd76fc8110dd97a`）に保存した。採否は「既定無効の実験候補として検証継続」。利益と画質差の測定は素材Bに限られ、未使用素材、実機、独立コードレビュー、人間の視聴が残る。従来のclean bit-exact PR候補branchは変更しない。
 
 ### 素材EのPTS付き局所品質と評価手順の修正（2026-09-09）
 
