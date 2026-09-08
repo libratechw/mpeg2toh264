@@ -21,10 +21,30 @@ use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
 /// short-term reference list outright. Both only move the slice headers: each
 /// fixture decodes to the same frames as before, checked frame by frame with
 /// `ffmpeg -f framemd5`.
+#[cfg(not(all(
+    feature = "experimental-symmetric-field-basis",
+    feature = "experimental-symmetric-idct"
+)))]
 const GOLDEN: [(&str, usize, usize, u64); 6] = [
     ("altscan.m2v", 8, 224007, 0x4c98_4bed_dc31_53c5),
     ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
     ("hd1080i.m2v", 15, 2106380, 0xa903_55d8_0a1c_4d05),
+    ("i_only.m2v", 3, 79513, 0x31f6_0c7f_fb6b_b97a),
+    ("ibbp.m2v", 15, 164459, 0x183e_7cc0_f7ca_1a86),
+    ("ip.m2v", 10, 132314, 0x7f35_4fc6_a64f_829c),
+];
+
+// KonomiTV の統合検証用 WASM は2つの演算試作を同時に有効化する。
+// 対称性を用いた丸め経路によって altscan と hd1080i の係数表現が意図的に変わるため、
+// 組み合わせ後のビットストリームも固定し、以後の意図しない変化を検出する。
+#[cfg(all(
+    feature = "experimental-symmetric-field-basis",
+    feature = "experimental-symmetric-idct"
+))]
+const GOLDEN: [(&str, usize, usize, u64); 6] = [
+    ("altscan.m2v", 8, 224007, 0xa813_8ed1_4e3d_0261),
+    ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
+    ("hd1080i.m2v", 15, 2106378, 0x2b2f_6483_a0b4_7704),
     ("i_only.m2v", 3, 79513, 0x31f6_0c7f_fb6b_b97a),
     ("ibbp.m2v", 15, 164459, 0x183e_7cc0_f7ca_1a86),
     ("ip.m2v", 10, 132314, 0x7f35_4fc6_a64f_829c),
