@@ -317,7 +317,10 @@ pub fn field_dct_to_frame_targets(
 /// macroblock pair must be field-coded because either source macroblock uses
 /// field motion: frame-DCT neighbours in the same pair then have to be expressed
 /// in the field transform basis as well.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(feature = "experimental-symmetric-field-basis")
+))]
 pub fn frame_dct_to_field_targets(
     upper: &[f32; 64],
     lower: &[f32; 64],
@@ -357,7 +360,72 @@ pub fn frame_dct_to_field_targets(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "experimental-symmetric-field-basis"
+))]
+pub fn frame_dct_to_field_targets(
+    upper: &[f32; 64],
+    lower: &[f32; 64],
+    first_field: &mut [f32; 64],
+    second_field: &mut [f32; 64],
+) {
+    // The rounded basis is unchanged. This reassociates f32 sums, so downstream
+    // quantisation can change levels and no byte-equivalence promise is made.
+    let dct = &*DCT8_BASIS;
+    let mut upper_samples = [0.0f32; 8];
+    let mut lower_samples = [0.0f32; 8];
+
+    for horizontal_frequency in 0..8 {
+        for (input, samples) in [(upper, &mut upper_samples), (lower, &mut lower_samples)] {
+            for y in 0..4 {
+                let mut even = 0.0;
+                let mut odd = 0.0;
+                for vertical_frequency in (0..8).step_by(2) {
+                    even += dct[y * 8 + vertical_frequency]
+                        * input[vertical_frequency * 8 + horizontal_frequency];
+                }
+                for vertical_frequency in (1..8).step_by(2) {
+                    odd += dct[y * 8 + vertical_frequency]
+                        * input[vertical_frequency * 8 + horizontal_frequency];
+                }
+                samples[y] = even + odd;
+                samples[7 - y] = even - odd;
+            }
+        }
+
+        for field in 0..2 {
+            let out: &mut [f32; 64] = if field == 0 {
+                &mut *first_field
+            } else {
+                &mut *second_field
+            };
+            let mut coefficients = [0.0f32; 8];
+            for y in 0..4 {
+                let near = upper_samples[y * 2 + field];
+                let mirrored = lower_samples[6 - y * 2 + field];
+                let sum = near + mirrored;
+                let difference = near - mirrored;
+                for vertical_frequency in (0..8).step_by(2) {
+                    coefficients[vertical_frequency] += dct[y * 8 + vertical_frequency] * sum;
+                }
+                for vertical_frequency in (1..8).step_by(2) {
+                    coefficients[vertical_frequency] +=
+                        dct[y * 8 + vertical_frequency] * difference;
+                }
+            }
+            for vertical_frequency in 0..8 {
+                out[vertical_frequency * 8 + horizontal_frequency] =
+                    coefficients[vertical_frequency];
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "wasm32",
+    not(feature = "experimental-symmetric-field-basis")
+))]
 #[target_feature(enable = "simd128")]
 pub fn frame_dct_to_field_targets(
     upper: &[f32; 64],
@@ -439,12 +507,225 @@ pub fn frame_dct_to_field_targets(
     }
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "experimental-symmetric-field-basis"))]
+#[target_feature(enable = "simd128")]
+pub fn frame_dct_to_field_targets(
+    upper: &[f32; 64],
+    lower: &[f32; 64],
+    first_field: &mut [f32; 64],
+    second_field: &mut [f32; 64],
+) {
+    use core::arch::wasm32::{
+        f32x4, f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_splat, f32x4_sub, v128,
+    };
+
+    #[inline]
+    fn load4(values: &[f32; 64], pos: usize) -> v128 {
+        f32x4(
+            values[pos],
+            values[pos + 1],
+            values[pos + 2],
+            values[pos + 3],
+        )
+    }
+
+    #[inline]
+    fn store4(values: &mut [f32; 64], pos: usize, lanes: v128) {
+        values[pos] = f32x4_extract_lane::<0>(lanes);
+        values[pos + 1] = f32x4_extract_lane::<1>(lanes);
+        values[pos + 2] = f32x4_extract_lane::<2>(lanes);
+        values[pos + 3] = f32x4_extract_lane::<3>(lanes);
+    }
+
+    let dct = &*DCT8_BASIS;
+    let mut upper_samples = [0.0f32; 64];
+    let mut lower_samples = [0.0f32; 64];
+
+    // D[7-y, k] is D[y, k] for even k and -D[y, k] for odd k. Reusing each
+    // mirror pair halves the mathematical product count from 256 to 128 per
+    // horizontal frequency; this does not predict emitted instructions or time.
+    for horizontal_frequency in (0..8).step_by(4) {
+        for y in 0..4 {
+            let mut upper_even = f32x4_splat(0.0);
+            let mut upper_odd = f32x4_splat(0.0);
+            let mut lower_even = f32x4_splat(0.0);
+            let mut lower_odd = f32x4_splat(0.0);
+            for vertical_frequency in (0..8).step_by(2) {
+                let basis = f32x4_splat(dct[y * 8 + vertical_frequency]);
+                let pos = vertical_frequency * 8 + horizontal_frequency;
+                upper_even = f32x4_add(upper_even, f32x4_mul(basis, load4(upper, pos)));
+                lower_even = f32x4_add(lower_even, f32x4_mul(basis, load4(lower, pos)));
+            }
+            for vertical_frequency in (1..8).step_by(2) {
+                let basis = f32x4_splat(dct[y * 8 + vertical_frequency]);
+                let pos = vertical_frequency * 8 + horizontal_frequency;
+                upper_odd = f32x4_add(upper_odd, f32x4_mul(basis, load4(upper, pos)));
+                lower_odd = f32x4_add(lower_odd, f32x4_mul(basis, load4(lower, pos)));
+            }
+            store4(
+                &mut upper_samples,
+                y * 8 + horizontal_frequency,
+                f32x4_add(upper_even, upper_odd),
+            );
+            store4(
+                &mut upper_samples,
+                (7 - y) * 8 + horizontal_frequency,
+                f32x4_sub(upper_even, upper_odd),
+            );
+            store4(
+                &mut lower_samples,
+                y * 8 + horizontal_frequency,
+                f32x4_add(lower_even, lower_odd),
+            );
+            store4(
+                &mut lower_samples,
+                (7 - y) * 8 + horizontal_frequency,
+                f32x4_sub(lower_even, lower_odd),
+            );
+        }
+
+        for field in 0..2 {
+            let out: &mut [f32; 64] = if field == 0 {
+                &mut *first_field
+            } else {
+                &mut *second_field
+            };
+            let mut coefficients = [f32x4_splat(0.0); 8];
+            for y in 0..4 {
+                let near = load4(&upper_samples, (y * 2 + field) * 8 + horizontal_frequency);
+                let mirrored = load4(
+                    &lower_samples,
+                    (6 - y * 2 + field) * 8 + horizontal_frequency,
+                );
+                let sum = f32x4_add(near, mirrored);
+                let difference = f32x4_sub(near, mirrored);
+                for vertical_frequency in (0..8).step_by(2) {
+                    coefficients[vertical_frequency] = f32x4_add(
+                        coefficients[vertical_frequency],
+                        f32x4_mul(f32x4_splat(dct[y * 8 + vertical_frequency]), sum),
+                    );
+                }
+                for vertical_frequency in (1..8).step_by(2) {
+                    coefficients[vertical_frequency] = f32x4_add(
+                        coefficients[vertical_frequency],
+                        f32x4_mul(f32x4_splat(dct[y * 8 + vertical_frequency]), difference),
+                    );
+                }
+            }
+            for vertical_frequency in 0..8 {
+                store4(
+                    out,
+                    vertical_frequency * 8 + horizontal_frequency,
+                    coefficients[vertical_frequency],
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::h264::mb::FIELD_SCAN_8X8;
     use crate::h264::params::ZIGZAG_8X8;
     use crate::mpeg2::constants::{DEFAULT_INTRA_QUANT, DEFAULT_NON_INTRA_QUANT};
+
+    fn direct_frame_dct_to_field_targets(
+        upper: &[f32; 64],
+        lower: &[f32; 64],
+    ) -> ([f64; 64], [f64; 64], [f64; 64], [f64; 64]) {
+        let dct = &*DCT8_BASIS;
+        let mut first_field = [0.0f64; 64];
+        let mut second_field = [0.0f64; 64];
+        let mut first_absolute_sum = [0.0f64; 64];
+        let mut second_absolute_sum = [0.0f64; 64];
+
+        for horizontal_frequency in 0..8 {
+            for (field, out, absolute_sum) in [
+                (0, &mut first_field, &mut first_absolute_sum),
+                (1, &mut second_field, &mut second_absolute_sum),
+            ] {
+                for vertical_frequency in 0..8 {
+                    for y in 0..8 {
+                        let spatial_y = y * 2 + field;
+                        let (input, source_y) = if spatial_y < 8 {
+                            (upper, spatial_y)
+                        } else {
+                            (lower, spatial_y - 8)
+                        };
+                        for source_frequency in 0..8 {
+                            let term = dct[y * 8 + vertical_frequency] as f64
+                                * dct[source_y * 8 + source_frequency] as f64
+                                * input[source_frequency * 8 + horizontal_frequency] as f64;
+                            out[vertical_frequency * 8 + horizontal_frequency] += term;
+                            absolute_sum[vertical_frequency * 8 + horizontal_frequency] +=
+                                term.abs();
+                        }
+                    }
+                }
+            }
+        }
+        (
+            first_field,
+            second_field,
+            first_absolute_sum,
+            second_absolute_sum,
+        )
+    }
+
+    fn fixed_random_block(seed: u32, sparse: bool) -> [f32; 64] {
+        std::array::from_fn(|i| {
+            let word = seed
+                .wrapping_add((i as u32).wrapping_mul(0x9e37_79b9))
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(12_345);
+            if sparse && word & 7 != 0 {
+                0.0
+            } else {
+                ((word >> 16) & 0x0fff) as f32 - 2048.0
+            }
+        })
+    }
+
+    fn assert_frame_dct_to_field_targets_match_reference(
+        upper: &[f32; 64],
+        lower: &[f32; 64],
+        case: &str,
+    ) {
+        let mut first_field = [f32::NAN; 64];
+        let mut second_field = [f32::NAN; 64];
+        frame_dct_to_field_targets(upper, lower, &mut first_field, &mut second_field);
+        let (expected_first, expected_second, first_absolute_sum, second_absolute_sum) =
+            direct_frame_dct_to_field_targets(upper, lower);
+
+        for (field, actual, expected, absolute_sum) in [
+            ("first", &first_field, &expected_first, &first_absolute_sum),
+            (
+                "second",
+                &second_field,
+                &expected_second,
+                &second_absolute_sum,
+            ),
+        ] {
+            for i in 0..64 {
+                let actual = actual[i];
+                let expected = expected[i];
+                // Bound rounding across both transforms by 16 f32 epsilons
+                // times the direct composition's absolute term sum, including
+                // terms which cancel. This covers both implementations and is
+                // a numerical regression bound, not a quality tolerance.
+                let tolerance = 16.0 * f32::EPSILON as f64 * absolute_sum[i];
+                assert!(
+                    actual.is_finite(),
+                    "{case}: {field} field slot {i} was not written"
+                );
+                assert!(
+                    ((actual as f64) - expected).abs() <= tolerance,
+                    "{case}: {field} field slot {i}: actual {actual}, expected {expected}, tolerance {tolerance}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn doubling_the_mpeg2_step_is_exactly_six_h264_qp() {
@@ -544,6 +825,89 @@ mod tests {
     /// of them; a basis that was actually wrong would be out by whole units, so
     /// nothing is given up by checking to a thousandth.
     const ROUND_TRIP_TOLERANCE: f32 = 1e-3;
+
+    #[test]
+    fn dct8_basis_has_the_exact_rounded_mirror_identity() {
+        let dct = &*DCT8_BASIS;
+        for y in 0..4 {
+            for vertical_frequency in 0..8 {
+                let expected = if vertical_frequency & 1 == 0 {
+                    dct[y * 8 + vertical_frequency]
+                } else {
+                    -dct[y * 8 + vertical_frequency]
+                };
+                assert_eq!(
+                    dct[(7 - y) * 8 + vertical_frequency].to_bits(),
+                    expected.to_bits(),
+                    "sample {y}, frequency {vertical_frequency}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frame_dct_to_field_targets_matches_the_f64_direct_reference() {
+        assert_frame_dct_to_field_targets_match_reference(&[0.0; 64], &[0.0; 64], "zero");
+
+        let mut dc_upper = [0.0f32; 64];
+        let mut dc_lower = [0.0f32; 64];
+        dc_upper[0] = 2047.0;
+        dc_lower[0] = -2048.0;
+        assert_frame_dct_to_field_targets_match_reference(&dc_upper, &dc_lower, "DC");
+
+        for value in [-127.25, 127.25] {
+            for basis_vector in 0..128 {
+                let mut upper = [0.0f32; 64];
+                let mut lower = [0.0f32; 64];
+                if basis_vector < 64 {
+                    upper[basis_vector] = value;
+                } else {
+                    lower[basis_vector - 64] = value;
+                }
+                assert_frame_dct_to_field_targets_match_reference(
+                    &upper,
+                    &lower,
+                    &format!("basis vector {basis_vector} value {value}"),
+                );
+            }
+        }
+
+        let mut sparse_upper = [0.0f32; 64];
+        let mut sparse_lower = [0.0f32; 64];
+        for (pos, value) in [(0, 2047.0), (7, -2048.0), (18, 511.5), (63, -255.25)] {
+            sparse_upper[pos] = value;
+        }
+        for (pos, value) in [(1, -2048.0), (14, 2047.0), (41, -1023.75), (56, 255.5)] {
+            sparse_lower[pos] = value;
+        }
+        assert_frame_dct_to_field_targets_match_reference(&sparse_upper, &sparse_lower, "sparse");
+
+        for seed in [0x0c0f_feeeu32, 0x1234_5678, 0xfedc_ba98] {
+            let dense_upper = fixed_random_block(seed, false);
+            let dense_lower = fixed_random_block(!seed, false);
+            assert_frame_dct_to_field_targets_match_reference(
+                &dense_upper,
+                &dense_lower,
+                &format!("dense fixed-random seed {seed:#010x}"),
+            );
+
+            let sparse_upper = fixed_random_block(seed, true);
+            let sparse_lower = fixed_random_block(!seed, true);
+            assert_frame_dct_to_field_targets_match_reference(
+                &sparse_upper,
+                &sparse_lower,
+                &format!("sparse fixed-random seed {seed:#010x}"),
+            );
+        }
+
+        let cancellation_upper = std::array::from_fn(|i| if i & 1 == 0 { 2047.0 } else { -2048.0 });
+        let cancellation_lower = std::array::from_fn(|i| if i & 8 == 0 { -2048.0 } else { 2047.0 });
+        assert_frame_dct_to_field_targets_match_reference(
+            &cancellation_upper,
+            &cancellation_lower,
+            "cancellation at finite input limits",
+        );
+    }
 
     #[test]
     fn raster_levels_are_what_the_scanned_levels_reorder() {

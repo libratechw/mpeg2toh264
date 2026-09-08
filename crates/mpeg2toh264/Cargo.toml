@@ -9,6 +9,7 @@ repository.workspace = true
 
 [features]
 default = []
+experimental-symmetric-field-basis = []
 experimental-symmetric-idct = []
 
 [lints.rust]
