@@ -16,15 +16,17 @@ use mpeg2toh264::{
 use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
 
 /// fixture, converted pictures, output bytes, FNV-1a of the Annex B stream.
-/// Last moved when a frame IDR began taking the long-term slot itself, leaving
-/// the copy behind it short-term, and when every P and B slice began naming its
-/// short-term reference list outright. Both only move the slice headers: each
-/// fixture decodes to the same frames as before, checked frame by frame with
-/// `ffmpeg -f framemd5`.
+/// The symmetric chroma IDCT intentionally changes floating-point rounding in
+/// altscan and hd1080i. These values match the previously opt-in IDCT output.
+/// The optional field-basis transform additionally changes hd1080i; keep its
+/// golden separate so the default and experimental paths are both checked.
 const GOLDEN: [(&str, usize, usize, u64); 6] = [
-    ("altscan.m2v", 8, 224007, 0x4c98_4bed_dc31_53c5),
+    ("altscan.m2v", 8, 224007, 0xa813_8ed1_4e3d_0261),
     ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
-    ("hd1080i.m2v", 15, 2106380, 0xa903_55d8_0a1c_4d05),
+    #[cfg(not(feature = "experimental-symmetric-field-basis"))]
+    ("hd1080i.m2v", 15, 2106380, 0x6e15_ffef_01e0_97bb),
+    #[cfg(feature = "experimental-symmetric-field-basis")]
+    ("hd1080i.m2v", 15, 2106378, 0x2b2f_6483_a0b4_7704),
     ("i_only.m2v", 3, 79513, 0x31f6_0c7f_fb6b_b97a),
     ("ibbp.m2v", 15, 164459, 0x183e_7cc0_f7ca_1a86),
     ("ip.m2v", 10, 132314, 0x7f35_4fc6_a64f_829c),

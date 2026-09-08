@@ -60,35 +60,9 @@ pub fn chroma_qp(luma_qp: i32, offset: i32) -> i32 {
 }
 
 /// Inverse 8x8 DCT, orthonormal, into `out` in raster order.
-#[cfg(not(feature = "experimental-symmetric-idct"))]
-pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
-    let c8 = &*C8;
-    // Columns first: tmp = C8^T * coeff
-    for x in 0..8 {
-        for v in 0..8 {
-            let mut s = 0.0;
-            for u in 0..8 {
-                s += c8[u * 8 + x] * coeff[v * 8 + u];
-            }
-            tmp[v * 8 + x] = s;
-        }
-    }
-    // Then rows: out = tmp^T applied the same way down the other axis.
-    for x in 0..8 {
-        for y in 0..8 {
-            let mut s = 0.0;
-            for v in 0..8 {
-                s += c8[v * 8 + y] * tmp[v * 8 + x];
-            }
-            out[y * 8 + x] = s;
-        }
-    }
-}
-
-/// The same basis as the dense IDCT, with mirrored samples sharing their
-/// even/odd frequency sums. Regrouping f32 additions can change rounding;
-/// this experimental path does not promise the dense path's output bytes.
-#[cfg(feature = "experimental-symmetric-idct")]
+///
+/// Mirrored samples share their even/odd frequency sums. The basis is unchanged,
+/// but regrouping f32 additions can round differently from a dense matrix sum.
 pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
     #[inline]
     fn transform(input: [f32; 8], c8: &[f32; 64]) -> [f32; 8] {
@@ -469,7 +443,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "experimental-symmetric-idct")]
     #[test]
     fn the_rounded_basis_preserves_idct_mirror_symmetry() {
         let c8 = &*C8;
