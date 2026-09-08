@@ -312,7 +312,7 @@ export class Mpeg2TsPlayer extends EventTarget {
   readonly #options: Mpeg2TsPlayerOptions;
   readonly #sinkKind: SinkKind;
   #worker: Worker | null = null;
-  /** Which load messages belong to. Bumped by every load and every stop. */
+  /** Which load messages belong to. Bumped by every stop and failure. */
   #generation = 0;
   #state: PlayerState = "idle";
   /** The sink, when the page owns the MediaSource. */
@@ -1031,6 +1031,9 @@ export class Mpeg2TsPlayer extends EventTarget {
   }
 
   #fail(error: Error): void {
+    const id = this.#generation;
+    this.#generation++;
+    this.#worker?.postMessage({ type: "stop", id } satisfies Command);
     this.#teardown();
     this.#setState("error");
     this.#settle(error);

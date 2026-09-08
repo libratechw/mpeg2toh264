@@ -33,6 +33,7 @@
     "test:frame-callback": "node tools/test-frame-callback-recovery.mjs",
     "test:mse": "node tools/test-mse-reset.mjs",
     "test:range-eof": "node tools/test-range-eof.mjs && node tools/test-range-reading.mjs",
+    "test:player-failure": "node tools/test-player-failure.mjs",
     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
     "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
     "typecheck": "npm run typecheck --workspaces --if-present",
