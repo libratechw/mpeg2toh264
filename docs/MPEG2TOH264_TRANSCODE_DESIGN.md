@@ -238,8 +238,33 @@ native E/F出力は`/data/ssd/mpeg2-quality-c2-native-equality-20260909/`に置�
 C2の`CoeffCountMap::n_c`と`MbaffModes::neighbour_with_size`の自己時間が合計10.830%だった。
 各buildは初回を含む2回を別processで測ったサンプリングであり、定常性能差やnative内訳の証拠にはしない。
 生profileは`/data/ssd/mpeg2-quality-wasm-profile-B-20260909/{baseline,c1,c2}.cpuprofile`。
-native C2の逆アセンブルでも`n_c`内に動的除算が残ることを確認したため、次は既知の2/4 block幅を使う座標計算の削減を個別に試す。
+native C2の逆アセンブルでも`n_c`内に動的除算が残ることを確認したため、既知の2/4 block幅を使う座標計算の削減をC3として個別に試した。
 ネイティブのハードウェア・サンプリングは権限不足で未実施であり、権限設定は変更していない。
+
+#### シフト化C3は利益を確認できず不採用
+
+C3はconstructorでmacroblock内block数のlog2を保存し、C2の剰余・除算・乗算をmask/shiftへ置き換えたもの。
+feature有効時282テストとWASM buildは成功し、nativeの素材B全8組はC1/C2の原H.264と一致した。
+`n_c`の逆アセンブルから除算命令はなくなったが、固定B平均11.790545秒に対しC3は12.738430秒で、
+素材Bの8.039%退行は残った。このnative結果はC2との直接交互比較ではない。
+
+C3単独の効果を分けるため、Node WASMではC2/C3を交互8組、初回を除外して素材B全編で比較した。
+基準Bを動かさない追加の差分比較であり、manifestにも`incremental C2 versus C3`と明記した。
+C2平均15,415.418 ms → C3平均15,388.424 ms、名目0.175%短縮、短縮6/8組、
+各組の短縮時間の95% paired t区間は−1.616〜55.603 msで、利益をばらつきから分離できなかった。
+全組有効で、1,809 video samples、完全フラグメントdigest、init・fragment metadata・sample timing/flagsが一致した。
+完全digestは`e0553557cc3518f53f98f566b8bd2bd2a8dc63334ff524079a4b1167ee48e99d`。
+
+このためC3のコードは取り除き、実装はC2（`ae3e8f7`）までとする。既存goldenは変更していない。
+棄却した差分・source hash・native/WASM binaryはartifact directoryの`build-manifest-c3-shift.json`に対応付け、
+生結果は`/data/ssd/mpeg2-quality-native-B-c3-shift-20260909/results.json`と
+`/data/ssd/mpeg2-quality-wasm-B-c2-v-c3-20260909/results.json`へ保存した。
+命令削減だけでは全体の利益を証明できないため、C3を同じ根拠で再試行しない。
+
+次の独立候補は色差`idct8()`の偶数・奇数周波数と鏡映対称性を使う分解で、既存の順変換との融合案とは区別する。
+現在のC8の32組の鏡映要素はf32の絶対値が同一で、周波数の偶奇に応じた符号関係を満たすことを計算で確認した。
+ただし加算順序が変わるため、速度・量子化後の差・R/B/C品質は未検証である。実装する場合も適応MBAFFと組み合わせず、
+既定無効の個別候補として固定Bと比較する。対称性だけを画質の証明にはしない。
 
 ### 素材EのPTS付き局所品質と評価手順の修正（2026-09-09）
 
