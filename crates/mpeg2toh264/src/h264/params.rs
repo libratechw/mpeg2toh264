@@ -90,7 +90,18 @@ pub struct FrameGeometry {
 
 pub fn frame_geometry(width: u32, height: u32, frame_mbs_only: bool) -> FrameGeometry {
     let mb_width = ((width + 15) >> 4) as usize;
-    let mb_height = ((height + 15) >> 4) as usize;
+    let frame_mb_height = ((height + 15) >> 4) as usize;
+    // An MBAFF map unit always contains two macroblock rows. Keep one padded
+    // row when the coded height would otherwise be odd; the source grid may
+    // still end at the preceding row, and the writer will emit the padding
+    // macroblock with the same empty/constant semantics as any missing source
+    // macroblock. This is required by FrameHeightInMbs = 2 *
+    // PicHeightInMapUnits when frame_mbs_only_flag is zero.
+    let mb_height = if frame_mbs_only {
+        frame_mb_height
+    } else {
+        (frame_mb_height + 1) & !1
+    };
     // With MBAFF or field coding, a map unit is a macroblock pair.
     let map_units = if frame_mbs_only {
         mb_height
@@ -321,5 +332,13 @@ mod tests {
             assert!(!seen[p], "position {p} is scanned twice");
             seen[p] = true;
         }
+    }
+
+    #[test]
+    fn mbaff_geometry_rounds_an_odd_row_count_to_a_complete_pair() {
+        let g = frame_geometry(1280, 720, false);
+        assert_eq!(g.mb_height, 46);
+        assert_eq!(g.map_units, 23);
+        assert_eq!(g.crop_bottom, 4, "16 padded lines at CropUnitY 4");
     }
 }

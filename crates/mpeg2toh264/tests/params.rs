@@ -3,7 +3,8 @@
 
 use mpeg2toh264::h264::params::{write_pps, write_sps, PpsConfig, SpsConfig, ZIGZAG_8X8};
 use mpeg2toh264::mpeg2::constants::DEFAULT_INTRA_QUANT;
-use mpeg2toh264::mpeg2::headers::SampleAspectRatio;
+use mpeg2toh264::mpeg2::headers::{parse_elementary_stream, SampleAspectRatio};
+use mpeg2toh264::{transcode, TranscodeOptions};
 
 /// Strip the Annex B start code, NAL header and emulation prevention bytes.
 fn rbsp_of(nal: &[u8]) -> Vec<u8> {
@@ -244,6 +245,56 @@ fn sps_carries_an_interlaced_source_as_mbaff_with_doubled_crop_units() {
         Some([0, 0, 0, 2]),
         "8 lines to crop, at CropUnitY 4"
     );
+}
+
+#[test]
+fn odd_interlaced_transcode_emits_a_complete_mbaff_pair_and_crop() {
+    // Reuse the checked-in interlaced fixture, changing only the sequence
+    // header's vertical_size from 1080 to 720.  Its coded macroblock data is
+    // deliberately allowed to run past the shortened grid: the MPEG-2
+    // decoder's outside cell absorbs those source rows, while this test
+    // observes the output geometry and the transcoder's no-panic contract.
+    let path = format!("{}/../../testdata/hd1080i.m2v", env!("CARGO_MANIFEST_DIR"));
+    let mut source = std::fs::read(path).expect("interlaced fixture is readable");
+    let header = source
+        .windows(4)
+        .position(|bytes| bytes == [0, 0, 1, 0xb3])
+        .expect("sequence header");
+    let payload = header + 4;
+    let width = ((source[payload] as u16) << 4) | ((source[payload + 1] as u16) >> 4);
+    assert_eq!(width, 1440);
+    let height = 720u16;
+    source[payload + 1] = (source[payload + 1] & 0xf0) | ((height >> 8) as u8);
+    source[payload + 2] = height as u8;
+
+    let pictures = parse_elementary_stream(&source).expect("mutated fixture parses");
+    assert!(!pictures.is_empty());
+    assert!(pictures
+        .iter()
+        .all(|picture| picture.sequence.vertical_size == 720));
+    assert_eq!(pictures[0].sequence.horizontal_size, 1440);
+    assert_eq!((pictures[0].sequence.vertical_size + 15) >> 4, 45);
+    assert!(!pictures[0].slices.is_empty());
+
+    // This is a malformed-input regression: only the sequence header was
+    // changed, not the existing 1440x1080 macroblock payload. Valid 1280x720
+    // runtime evidence is recorded separately in odd720-validation.json.
+    let result = transcode(&source, TranscodeOptions::default()).expect("odd source transcodes");
+    assert!(result.pictures_converted > 0);
+    let start = result
+        .bitstream
+        .windows(5)
+        .position(|bytes| bytes[..4] == [0, 0, 0, 1] && bytes[4] & 0x1f == 7)
+        .expect("transcoded SPS");
+    let end = result.bitstream[start + 4..]
+        .windows(4)
+        .position(|bytes| bytes == [0, 0, 0, 1])
+        .map_or(result.bitstream.len(), |offset| start + 4 + offset);
+    let sps = parse_sps(&result.bitstream[start..end]);
+    assert_eq!(sps.pic_height_in_map_units_minus1, 22, "23 MBAFF map units");
+    assert!(!sps.frame_mbs_only);
+    assert!(sps.mb_adaptive_frame_field);
+    assert_eq!(sps.crop, Some([0, 0, 0, 4]), "16 lines at CropUnitY 4");
 }
 
 #[test]
