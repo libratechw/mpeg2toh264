@@ -101,6 +101,66 @@ core、並列/deferred、異常入力、FFmpeg、VideoToolbox、Safari/MSEの試
 PTS対応・非相殺VMAF・最悪1秒を補って再評価する。既存のnative速度試行は外部負荷と測定手順の問題で無効であり、
 その値から性能改善は主張しない。
 
+### 初期native比較と証拠の訂正（2026-09-09）
+
+固定Bと保存した提案B build（native SHA-256
+`c5b45d873d23fa7c7e506508d8fb039d183dcb015a38959a7c636156a2dde538`）を、
+`hd1080i-x40.m2v`の600 pictures・20.02秒で比較した。入力SHA-256は
+`88b48841b5e9e7644e54f44c66e09b9bcc3b932283467216dfc25c9b9cf4e645`。
+Linux AMD Ryzen AI Max+ 395、既存release設定、1 thread、raw Annex B出力で、CLIの起動・入力処理・出力書込みを含む。
+
+`.opencode/bench/quality-screen.py`で各buildのwarmupを除き、先行順を交互にして有効8組を集めた。
+同時build/復号は禁止し、既知の高負荷processを0.2秒ごとに確認する。
+`/proc/stat`のbusy CPU差から子processと監視処理のCPU時間を引いた外部負荷推定が平均1 coreを超える組は、
+A/B両方を除外する。elapsed値では選別しない。上限は定常24組・warmup4組で、無効試行も保存する。
+提案Bは定常9組中1組を除外、oversample比較は8組すべて有効だった。
+これは予定した処理の競合を避けたscreenであり、一時的なscheduler/I/O noiseの不存在を保証しない。
+
+| 個別候補 | B平均 → C平均 | 時間短縮率 | 各組の短縮時間の95% t区間 | 出力bytes削減率 | 次の判断 |
+| --- | --- | ---: | --- | ---: | --- |
+| 適応MBAFF、oversample=2 | 2.362050 → 2.279193 s | 3.508% | 68.560〜97.155 ms | 12.456% | 8/8組で短縮。画質・WASM検証を優先 |
+| Bのoversampleだけ1.75 | 2.364442 → 2.357848 s | 0.279% | −5.941〜19.130 ms | 3.327% | 利益をばらつきから分離できず、現時点では不採用 |
+
+映像1秒当たりのwall/CPU秒は、提案B比較のBが0.117985 / 0.117965、Cが0.113846 / 0.113828。
+全runのbuild別出力hashは安定したが、B/Cのhashは意図的に異なる。
+生記録は`/data/ssd/mpeg2-quality-screen-pb-paired-20260909/results.json`と
+`/data/ssd/mpeg2-quality-screen-o175-paired-20260909/results.json`で、入力・runner・binary hashと全コマンドを含む。
+これらはnativeの初期screenであり、GOP p95、browser、実機の起動・シークや視聴改善、画質合格の証拠ではない。
+1.5以下のoversample候補は未測定で、1.75の結果から全段階を不採用とは決めない。
+
+検証中、baseline名のtarget directoryへscratch checkoutからbuildした生成物を、基準Bと誤認した。
+この生成物による「基準Bでもgolden不一致」「720iの基準Bと候補が同じ出力」の報告は撤回する。
+真の隔離Bは上記固定binary hashと一致し、6 fixtureの既存goldenを含む267テストが成功した。
+親セッションの再実行ログは`/data/ssd/mpeg2toh264-proposal-b-artifacts/baseline-full-tests-20260909.log`に保存した。
+一方、scratchの既定経路で`split_frame_mb`の処理を落としていた不一致は実在したため、feature無効時の旧経路を復元した。
+復元後は既存goldenと追加したgeometry回帰を含む269テストが成功した。feature有効時は、既存golden比較1件だけを
+除外して281テストが成功した。goldenの値・テスト本体は変更していない。
+ログは同artifact directoryの`candidate-restored-default-tests-v2-20260909.log`と
+`candidate-restored-feature-tests-20260909.log`にある。
+以後のCargo呼出しは絶対workdir・`--manifest-path`・隔離targetを明示し、stdout/stderrを保存する。
+経緯は`/data/ssd/mpeg2toh264-proposal-b-artifacts/provenance-incident.md`に残す。
+
+別の正しさの問題として、真のBは1280×720 interlaced入力（45 source MB rows）でpanicした。
+H.264側を46 MB rowsへpaddingし16 linesをcropする修正は、適応MBAFFとは別の修正単位とする。
+根拠はITU-T H.264 (02/2014) §7.4.2.1.1の式(7-18)、(7-22)である。
+`frame_mbs_only_flag=0`ではframe高はmap unit高の2倍、4:2:0の`CropUnitY`は4になる。
+入力の時間情報・picture受理方針を変えず、既存出力hashの更新で不一致を隠さない。
+
+実装はgeometry修正`2a8a564`と、既定で無効な適応MBAFF `202cdff`に分けてcommitした。
+有効化はCargoの`--features mpeg2toh264/experimental-adaptive-mbaff`を使う。指定しなければ旧量子化・符号化経路へ戻る
+（独立したgeometry修正は残る）。上記の初期性能値は復元前の保存buildであり、最終commitの再測定とは区別する。
+
+Node WASMの20.02秒入力では、`session.rs`の既存`MAX_RECOVERY_BYTES = 32 * 1024 * 1024`により
+B/Cの再開ポイント位置が変わった。小さい候補出力では32 MiBに達する時点が遅くなるためであり、
+当該runはsample timing・再開位置の同一性gateで停止し、速度を採用していない。
+この制約を変更せず、同じTSの先頭から次のGOPの`restartOffset=15187580`までの180 source frames
+（6.006秒、32 MiB上限未到達）で、同じ既定設定の処理を分離した。
+初期buildのNode v24.19.0、wasm-bindgen 0.2.126では8組すべて短縮し、平均908.509 → 864.757 ms、
+4.816%短縮だった。初回実行は除外し、181 output samples、init bytes、fragment metadata、
+MP4のsample durations/composition offsets/flagsの一致とbuild別出力hashの安定を確認した。
+生記録は`/data/ssd/mpeg2-quality-wasm-pb-short-20260909/results.json`。
+これはbrowser再生の証拠ではなく、長区間の再開間隔の変化によるシーク影響も未確認である。
+
 ## 用語
 
 | 語 | 意味 |
