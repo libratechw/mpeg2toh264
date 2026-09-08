@@ -397,11 +397,23 @@ Session全編のS2 native逐次・`-j 2`・Node WASMのMP4は`cmp`で完全一�
 | H0 → S2単独、Node WASM | 14,210.389 → 14,278.073 ms | −0.476% | 1/8 | −133.379〜−1.989 ms |
 | 固定B → S1＋S2、Node WASM | 14,102.881 → 13,954.133 ms | 1.055% | 8/8 | 134.459〜163.036 ms |
 
-組合せの初期利益は確認できたが、S2単独は同一ソース比較で遅くなった。したがって、前節の固定B対S2の小幅な短縮だけではS2自体の利益を確定できない。S1を優先し、S2は組合せの寄与を追加確認する選択式試作に留める。別々に測ったS1・S2の短縮率を足さない。組合せの累積品質・負荷管理付きbrowser・実機・長時間・人間視聴は未検証であり、既定化しない。
+組合せの初期利益は確認できたが、S2単独は同一ソース比較で遅くなった。したがって、前節の固定B対S2の小幅な短縮だけではS2自体の利益を確定できない。S1を優先し、S2は組合せの寄与を追加確認する選択式試作に留める。別々に測ったS1・S2の短縮率を足さない。組合せの素材Bの累積品質は次項で確認する。他素材・負荷管理付きbrowser・実機・長時間・人間視聴は未検証であり、既定化しない。
 
 組合せのnative Annex Bは259,609,951 bytes、SHA-256 `67b81232f7deb9ac91f4225f079fba0d8078c2e0fdb3d6ca58d6851dea01e594`。Nodeの完全フラグメントは261,774,416 bytes、SHA-256 `5c973ecdf3d56244f645191dabc4be62f428080f19814b85e23466ad561a2dcb`。Nodeでは各build内の全runでdigestが安定し、固定Bと1,809 video samples・init・metadata・sample timing/flagsが一致した。これは画質の同等性ではない。
 
 source/buildは`/data/ssd/mpeg2toh264-proposal-b-artifacts/build-manifest-s12-{control,combined,control-v-s2}.json`、生記録と集約は`/data/ssd/mpeg2-quality-native-B-s12-combined-20260909/`、`/data/ssd/mpeg2-quality-wasm-B-s12-control-v-s2-20260909/`、`/data/ssd/mpeg2-quality-wasm-B-s12-combined-20260909/`の`{results,pair-summary}.json`に固定した。組合せbuildのrelease testは272件成功、旧goldenを照合するcase全体1件を除外した。既存hashは変更していない。
+
+#### S1＋S2の素材Bの累積品質
+
+上の固定build・素材Bを使い、Rを元MPEG-2の復号、Bを固定基準、CをS1＋S2の出力として既存v5評価器で比較した。両buildの実行probeは測定時Annex Bと完全一致し、変換1,790 pictures・先頭除外2 pictures・追加の`undecodable`なしだった。全編の実PES PTS・decode順・包装MP4のPTS/DTS、包装前後の各NAL payloadと順序を照合して、初期lead-inの1枚差と参照用cloneの対応を確認した。固定R `[30,330)`、B/C `[31,331)`の300 frames・10.010秒・600 bob fieldsを評価し、色・レンジ・SAR・TFFの時間情報、FFmpeg 8.1.2、VMAF model v0.6.1、前処理・閾値を変更していない。
+
+固定窓の平均VMAFはR/B 96.822479 → R/C 96.822380。各時刻の非負追加低下は平均0.000548、最悪の連続1秒で0.001161、source PTS 11.396422〜12.396422秒だった。Y/Cb/CrのPSNR低下は−0.000113 / −0.001040 / 0 dB。固定窓は「視覚的同等を狙う」暫定数値条件を満たし、保存ログの再集計でも指標と判定が一致した。平均VMAFの差で局所悪化を相殺していない。
+
+全編1,790 framesの原interlaced planeも整数SSEから集約した。Rに対するY/Cb/CrのPSNR低下は−0.00000513 / −0.00002730 / 0.00000193 dBで全編PSNR条件内だった。B/Cで異なるsamplesは164,052 / 4,200 / 3,406、最大絶対差は3 / 1 / 1、少なくとも一成分に差があるframeは1,190枚。差の二乗和が最大のsource frameは1212、PTS 42.160489秒だった。これは全編VMAFや知覚上の最悪場面の証明ではない。
+
+人間用の[元映像](../.opencode/eval/proposal-b/B-s12-pts-evaluated-v5/B-source-preview-reencoded.mp4)・[固定B](../.opencode/eval/proposal-b/B-s12-pts-evaluated-v5/B-baseline-preview-reencoded.mp4)・[組合せ](../.opencode/eval/proposal-b/B-s12-pts-evaluated-v5/B-candidate-preview-reencoded.mp4)を保存した。全編SSE最大frame前後のsource PTS 41.159489〜43.161489秒、2.002秒の比較動画も`B-s12-worst-sse-preview/`にある。いずれもCRF18再符号化の補助資料で指標入力ではなく、**視聴確認待ち**である。文字・肌・色・ちらつきの問題がないとは数値だけで判定しない。
+
+証拠の対応は`/data/ssd/mpeg2toh264-proposal-b-artifacts/s12-B-quality-validation.json`（SHA-256 `0ddfd6cadbc7424ba850e13281fc3dcefe392ea07893b89b6b19548f51571001`）、包装・全編PSNR・実行コマンドは`/data/ssd/mpeg2-quality-B-s12-pts-pack-20260909/`に保存した。評価用コードはartifact directoryの`s12-quality-tools-v5-20260909.tar.gz`（SHA-256 `0882645dd719f954c9425bcf278d62f5ac3798b63a7ff06f78004273f333c84e`）。統合branch `834e53b`の素材B raw出力との完全一致は別の抽出確認で証明済みなので、この同一出力には同じ品質結果が対応する。ただしSession途中の追加RAP、他素材、実機・browser、長時間、人間視聴の保証へ広げず、featureの既定値とPR候補は変更しない。
 
 ### 有力案をまとめた統合検証branch（2026-09-09）
 
