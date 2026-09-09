@@ -1,4 +1,4 @@
-const ce = "" + new URL("assets/worker-ByXQC-IS.js", import.meta.url).href, fe = {
+const ce = "" + new URL("assets/worker-8w4fGbSJ.js", import.meta.url).href, fe = {
   prev: "uPrev",
   cur: "uCur",
   next: "uNext",
@@ -528,7 +528,7 @@ let le = null;
 function ge(a) {
   le = a;
 }
-const we = 0.5, y = 3, q = 5, k = q + 1, te = 1e3, V = 4, X = 200, Ee = 0.25, ve = 1e3 / 60, be = 0.02, ye = 250, De = 1e3 / 30, Te = 27, xe = 22, ie = 36, Me = 0.8, Fe = 250, Se = 6e3, se = 45, Re = 0.8, Ce = 300 * 1e3, ke = 90;
+const we = 0.5, y = 3, q = 5, k = q + 1, te = 1e3, V = 4, X = 200, Ee = 0.25, ve = 1e3 / 60, be = 0.02, ye = 250, De = 1e3 / 30, Te = 27, xe = 22, ie = 36, Me = 0.8, Fe = 250, Se = 3e3, se = 45, Re = 0.8, Ce = 300 * 1e3, ke = 90;
 function Ae(a) {
   if (!Number.isFinite(a) || a < 0)
     throw new RangeError(

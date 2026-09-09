@@ -647,19 +647,26 @@ for (const timeline of [
 }
 
 // 2. Without recovery the bounded trial is removed and cools down; after the
-// cooldown a new stable spell may try again.
+// cooldown a new stable spell may try again. A later natural recovery cannot
+// retroactively make the rejected trial look successful.
 resetHarness();
 {
   const { deinterlacer } = createEligible();
   advanceRaf(SLOW_GAP, 50);
   assert.equal(surfaceElements().length, 1, "trial must have started");
-  advanceRaf(SLOW_GAP, 200);
+  advanceRaf(SLOW_GAP, 100);
   assert.equal(
     surfaceElements().length,
     0,
     "a trial with no 60 Hz recovery must be removed",
   );
   assert.equal(intervals.size, 0, "rejected trial must clear its timer");
+  advanceRaf(FAST_GAP, 60);
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "fast cadence after the deadline must not latch a removed surface",
+  );
   advanceRaf(SLOW_GAP, 50);
   assert.equal(
     surfaceElements().length,

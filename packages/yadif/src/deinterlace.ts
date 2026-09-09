@@ -129,11 +129,12 @@ const SURFACE_OBSERVE_SLOW_FRACTION = 0.8;
 const SURFACE_TOGGLE_MS = 250;
 
 /**
- * Bounded trial length. Several seconds let the surface take effect and the
- * 30-to-60 Hz transition show up as sustained fast gaps, while staying far
- * shorter than the 10-minute phase where the benefit was measured.
+ * Bounded trial length. The POCO composed-surface probe recovered in the first
+ * one-second report, while the observed no-intervention slow run recovered
+ * only around 4.5 seconds. Three seconds leaves time for sustained fast gaps
+ * without crediting that later natural recovery to the surface.
  */
-const SURFACE_TRIAL_MS = 6000;
+const SURFACE_TRIAL_MS = 3000;
 
 /**
  * How many recent page gaps must be fast to prove recovery during a trial.
