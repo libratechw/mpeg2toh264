@@ -344,6 +344,18 @@ export interface VideoState {
   scan?: Scan;
 }
 
+/** Last source state whose start is at or immediately before media time. */
+function videoStateAt(
+  timeline: readonly VideoState[],
+  mediaTime: number,
+): VideoState | undefined {
+  for (let index = timeline.length - 1; index >= 0; index--) {
+    const state = timeline[index]!;
+    if (state.start <= mediaTime + 1e-6) return state;
+  }
+  return undefined;
+}
+
 export interface DeinterlacerEventMap {
   stats: CustomEvent<DeinterlaceStats>;
 }
@@ -1530,14 +1542,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   #selectVideoState(mediaTime: number): void {
-    let selected: VideoState | undefined;
-    for (let index = this.#videoTimeline.length - 1; index >= 0; index--) {
-      const state = this.#videoTimeline[index]!;
-      if (state.start <= mediaTime + 1e-6) {
-        selected = state;
-        break;
-      }
-    }
+    const selected = videoStateAt(this.#videoTimeline, mediaTime);
     // An init reaches the SourceBuffer before its first sample. Applying the
     // size here keeps the texture change on that sample's frame callback.
     if (
@@ -1979,7 +1984,7 @@ export class Deinterlacer extends EventTarget {
     if (!this.#running || this.#destroyed || this.#lost) return false;
     if (this.#workerState !== "active") return false;
     if (!this.#doubleRate) return false;
-    if (this.#scan?.interlaced !== true) return false;
+    if (this.#surfaceScan?.interlaced !== true) return false;
     // Film sections play at 24 Hz cadence with no double-rate field schedule
     // to rescue. While Worker rendering is active the cadence decision lives
     // in the Worker and arrives via stats, so the trial needs a confirmed
@@ -2031,7 +2036,7 @@ export class Deinterlacer extends EventTarget {
           !this.#running ||
           this.#video.paused ||
           this.#video.ended ||
-          this.#scan?.interlaced !== true ||
+          this.#surfaceScan?.interlaced !== true ||
           !this.#doubleRate ||
           this.#workerState !== "active" ||
           this.#mode === "film" ||
@@ -2049,6 +2054,23 @@ export class Deinterlacer extends EventTarget {
         this.#rejectSurfaceTrial(now);
       }
     }
+  }
+
+  /**
+   * Scan state for page-owned surface decisions.
+   *
+   * Worker rendering selects timeline state while processing transferred
+   * frames, so the page-side #scan is normally untouched. Resolve the same
+   * timeline at the media element playhead here. A present timeline owns the
+   * answer: before its first state, or at a state with no scan metadata, the
+   * result is unknown rather than a permissive interlaced default. Standalone
+   * callers without a timeline keep the direct scan-setter contract.
+   */
+  get #surfaceScan(): Scan | null {
+    if (this.#videoTimeline.length === 0) return this.#scan;
+    return (
+      videoStateAt(this.#videoTimeline, this.#video.currentTime)?.scan ?? null
+    );
   }
 
   /** Whether recent page gaps sit stably near the stuck 30 Hz cadence. */

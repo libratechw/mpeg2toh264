@@ -313,7 +313,9 @@ class FakeVideo extends EventTarget {
 
 globalThis.document = new FakeDocument();
 globalThis.Worker = FakeWorker;
-globalThis.VideoFrame = class {};
+globalThis.VideoFrame = class {
+  close() {}
+};
 globalThis.OffscreenCanvas = class {};
 globalThis.HTMLCanvasElement = class {};
 globalThis.HTMLCanvasElement.prototype.transferControlToOffscreen =
@@ -407,6 +409,25 @@ function createEligible(options = {}) {
     // need a different cadence history send their own stats afterwards.
     fakeWorkers.at(-1).onmessage({ data: workerStats("video") });
   }
+  return { video, deinterlacer, host };
+}
+
+/** Normal Player shape: scan metadata arrives only through videoTimeline. */
+function createTimelineEligible(timeline, currentTime = 0) {
+  const video = new FakeVideo();
+  video.currentTime = currentTime;
+  const host = attachVideo(video);
+  const deinterlacer = new Deinterlacer(video, {
+    rendering: "auto",
+    workerUrl: "fake-worker.js",
+    doubleRate: true,
+  });
+  assert.equal(deinterlacer.scan, null, "direct scan must remain unset");
+  deinterlacer.videoTimeline = timeline;
+  deinterlacer.enabled = true;
+  assert.ok(fakeWorkers.length > 0, "timeline playback must create a Worker");
+  fakeWorkers.at(-1).onmessage({ data: { type: "ready" } });
+  fakeWorkers.at(-1).onmessage({ data: workerStats("video") });
   return { video, deinterlacer, host };
 }
 
@@ -550,6 +571,77 @@ resetHarness();
     surfaceElements().length,
     1,
     "confirmed video cadence may start a trial",
+  );
+  deinterlacer.destroy();
+}
+
+// 1d. Normal Player integration supplies scan metadata only through the video
+// timeline. The page-side surface decision must select the same current state
+// as the Worker without requiring the standalone scan setter.
+resetHarness();
+{
+  const { deinterlacer } = createTimelineEligible([
+    { start: 0, scan: { interlaced: true, topFieldFirst: true } },
+  ]);
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "timeline-only interlaced playback must start a trial",
+  );
+  deinterlacer.destroy();
+}
+
+resetHarness();
+{
+  const { deinterlacer } = createTimelineEligible([
+    { start: 0, scan: { interlaced: false, topFieldFirst: true } },
+  ]);
+  advanceRaf(SLOW_GAP, 60);
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "timeline-only progressive playback must not start a trial",
+  );
+  deinterlacer.destroy();
+}
+
+resetHarness();
+{
+  const { video, deinterlacer } = createTimelineEligible(
+    [
+      { start: 0, scan: { interlaced: true, topFieldFirst: true } },
+      { start: 10, scan: { interlaced: false, topFieldFirst: true } },
+    ],
+    9.5,
+  );
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "pre-boundary interlaced state must be eligible",
+  );
+  video.currentTime = 10;
+  advanceRaf(SLOW_GAP, 1);
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "boundary progressive state must stop the trial",
+  );
+  deinterlacer.destroy();
+}
+
+for (const timeline of [
+  [{ start: 10, scan: { interlaced: true, topFieldFirst: true } }],
+  [{ start: 0 }],
+]) {
+  resetHarness();
+  const { deinterlacer } = createTimelineEligible(timeline, 0);
+  advanceRaf(SLOW_GAP, 60);
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "unknown timeline scan must not start a trial",
   );
   deinterlacer.destroy();
 }
