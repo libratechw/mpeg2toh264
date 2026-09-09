@@ -2,7 +2,7 @@
 
 ## 日常利用用dogfood統合版
 
-`dogfood/integration`はKonomiTVで日常利用するための統合branchです。branch全体を上流へ提出するものではなく、PR候補への昇格には別途、利用者への明確な改善と2〜4週間の日常利用確認が必要です。
+`dogfood/integration`はKonomiTVで日常利用するための統合branchです。branch全体を上流へ提出するものではなく、PR候補への昇格は変更の価値と影響に応じた証拠で別途判断します。今回の描画・電力・発熱などの長期影響は、2〜4週間ほどの日常利用を目安に確認します。
 
 基点は`tsukumijima/main@faf1464`です。既存dogfood `cf6cecf`のIVTC索引化、欠落直前の完全picture保持、HTTP Range終端処理を保持し、ビット一致hot-path最適化`581f2b7`とadaptive surface `3f75bd0`を元の履歴を保って統合しています。S1の出力変更と未確認のqueue fallback撤去は含みません。
 
