@@ -1,5 +1,15 @@
 # mpeg2toh264
 
+## 日常利用用dogfood統合版
+
+`dogfood/integration`はKonomiTVで日常利用するための統合branchです。branch全体を上流へ提出するものではなく、PR候補への昇格には別途、利用者への明確な改善と2〜4週間の日常利用確認が必要です。
+
+基点は`tsukumijima/main@faf1464`です。既存dogfood `cf6cecf`のIVTC索引化、欠落直前の完全picture保持、HTTP Range終端処理を保持し、ビット一致hot-path最適化`581f2b7`とadaptive surface `3f75bd0`を元の履歴を保って統合しています。S1の出力変更と未確認のqueue fallback撤去は含みません。
+
+adaptive surfaceは、通常Playerのtimelineからinterlaced状態を判定し、シーク終了後の新しい観測窓で持続的な描画速度低下を検出した場合だけ1×1 CSS pixelを更新します。POCOの正常録画で発動後の約60fps復帰を観測していますが、自然回復との厳密な因果、長期の発熱・消費電力、他端末への影響は日常利用で確認中です。回復済みsurfaceを同じ再生sessionのシーク間で保持する挙動も評価対象です。
+
+統合sourceでRust release tests、WASM build、TypeScript型検査、IVTC・MSE・Range終端・adaptive surfaceテストと両package buildを確認しました。単体最適化の性能値を統合版の速度向上として主張しません。実配備の構成と状態は[KonomiTV dogfood](https://github.com/libratechw/KonomiTV/tree/dogfood/integration)、横断的な評価は[調査一覧](https://github.com/libratechw/konomitv-mpeg2ts-seek-investigation)を参照してください。
+
 [demo](https://otya128.github.io/mpeg2toh264/)
 [日本語版はこちら](#日本語)
 
