@@ -80,6 +80,83 @@ const FRAME_CALLBACK_TIMEOUT_MS = 250;
 /** requestVideoFrameCallback() から周期を実測できるまで使う控えめな入力周期。 */
 const DEFAULT_FALLBACK_PERIOD_MS = 1000 / 30;
 
+/**
+ * Adaptive page-surface trial for a stuck ~30 Hz page cadence.
+ *
+ * Measured evidence (live interlaced playback with the YADIF Worker): the
+ * physical display stays at 60/120 Hz while page and Worker rAF sit near
+ * 33.3 ms and frame callbacks miss ~4,000 frames per 10 minutes. Toggling a
+ * visible 1x1 CSS-pixel surface every 250 ms prevented the state for the whole
+ * 10-minute target phase (missed frames 3979 to 6 at fixed 60 Hz, 4213 to 0 at
+ * fixed 120 Hz); a timer at the same rate with no surface did not help, so the
+ * update must actually reach composition.
+ *
+ * A true 30 Hz display also shows 33.3 ms page rAF, so the trial below never
+ * latches on the initial slow cadence alone: it keeps the surface only after
+ * the page cadence demonstrably recovers toward ~60 Hz, and otherwise removes
+ * it and backs off. No device, vendor, UA, or platform detection is used.
+ */
+
+/**
+ * A page rAF gap at or above this counts as near-30 Hz (33.3 ms).
+ * 27 ms sits between 16.7 ms (60 Hz) and 33.3 ms (30 Hz), requiring gaps
+ * clearly closer to the stuck 30 Hz cadence than to a healthy 60 Hz one.
+ */
+const SURFACE_SLOW_MS = 27;
+
+/**
+ * A page rAF gap at or below this counts as near-60 Hz (16.7 ms).
+ * 22 ms requires gaps clearly closer to the recovered 60 Hz cadence than to
+ * 30 Hz, while allowing ordinary jitter above a perfect 16.7 ms.
+ */
+const SURFACE_FAST_MS = 22;
+
+/**
+ * How many recent page gaps prove a stable slow cadence before any trial.
+ * 36 gaps are ~1.2 s at the stuck 33.3 ms cadence, long enough to rule out a
+ * transient hitch and short enough to react within a playback session.
+ */
+const SURFACE_OBSERVE_GAPS = 36;
+
+/** Fraction of the observe window that must be slow to consider a trial. */
+const SURFACE_OBSERVE_SLOW_FRACTION = 0.8;
+
+/**
+ * How often the 1x1 surface toggles while a trial or latched session runs.
+ * This is the measured 250 ms cadence that prevented the stuck state; a
+ * no-op timer at the same rate is not a substitute.
+ */
+const SURFACE_TOGGLE_MS = 250;
+
+/**
+ * Bounded trial length. The POCO composed-surface probe recovered in the first
+ * one-second report, while the observed no-intervention slow run recovered
+ * only around 4.5 seconds. Three seconds leaves time for sustained fast gaps
+ * without crediting that later natural recovery to the surface.
+ */
+const SURFACE_TRIAL_MS = 3000;
+
+/**
+ * How many recent page gaps must be fast to prove recovery during a trial.
+ * 45 gaps are ~0.75 s at a recovered 60 Hz cadence: sustained improvement,
+ * not a single fast blip.
+ */
+const SURFACE_SUCCESS_GAPS = 45;
+
+/** Fraction of the success window that must be fast to keep the surface. */
+const SURFACE_SUCCESS_FAST_FRACTION = 0.8;
+
+/**
+ * Bounded cooldown after a failed trial. A true 30 Hz display also produces
+ * 33.3 ms page rAF and never recovers, so without a backoff it would pay for
+ * a 6 s trial over and over. Five minutes bounds that cost to ~2% duty cycle
+ * and avoids a retry loop that runs continuously.
+ */
+const SURFACE_COOLDOWN_MS = 5 * 60 * 1000;
+
+/** Cap for stored page gaps; keeps the sliding windows bounded. */
+const SURFACE_MAX_GAPS = 90;
+
 function validateFilmCombThreshold(value: number): number {
   if (!Number.isFinite(value) || value < 0)
     throw new RangeError(
@@ -268,6 +345,18 @@ export interface VideoState {
   scan?: Scan;
 }
 
+/** Last source state whose start is at or immediately before media time. */
+function videoStateAt(
+  timeline: readonly VideoState[],
+  mediaTime: number,
+): VideoState | undefined {
+  for (let index = timeline.length - 1; index >= 0; index--) {
+    const state = timeline[index]!;
+    if (state.start <= mediaTime + 1e-6) return state;
+  }
+  return undefined;
+}
+
 export interface DeinterlacerEventMap {
   stats: CustomEvent<DeinterlaceStats>;
 }
@@ -374,6 +463,38 @@ export class Deinterlacer extends EventTarget {
   #frameWatchdogHandle: number | null = null;
   /** The gap between animation frames: as near as the page gets to the screen. */
   #refreshMs = DEFAULT_REFRESH_MS;
+  /**
+   * Recent page-side rAF gaps from the frame watchdog, oldest first.
+   * This is the observable page cadence the surface trial decides on: stuck
+   * near 33.3 ms in the bad state, near 16.7 ms after a 30-to-60 Hz recovery.
+   */
+  #pageGaps: number[] = [];
+  /** The watchdog timestamp the current gap is measured from; 0 before any. */
+  #lastWatchdogAt = 0;
+  /**
+   * The lazily created 1x1 CSS-pixel surface. Page-owned so it composites even
+   * while Worker rendering is active; null unless a trial or latched session
+   * is running.
+   */
+  #surfaceElement: HTMLElement | null = null;
+  /** The 250 ms toggle driving the surface; null unless trial/latched. */
+  #surfaceTimer: ReturnType<typeof setInterval> | null = null;
+  /** Which side of the visible toggle the surface currently shows. */
+  #surfacePhase = false;
+  /** Whether the surface is proving itself, kept, or absent. */
+  #surfaceMode: "off" | "trial" | "on" = "off";
+  /** When the current bounded trial started, on the rAF clock. */
+  #surfaceTrialStart = 0;
+  /** When a failed trial may be retried, on the rAF clock. */
+  #surfaceCooldownUntil = 0;
+  /**
+   * The Worker's film/video cadence as last reported via stats, unknown until
+   * the first notification. Page-side #mode never moves while Worker rendering
+   * is active (frames are filtered in the Worker), so the trial reads this
+   * copy and requires a confirmed "video": a long film section would otherwise
+   * satisfy the slow page-rAF window before the Worker has reported anything.
+   */
+  #workerCadence: "film" | "video" | "unknown" = "unknown";
   /** The `<div>` this put around the element, so it can be taken away again. */
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver | null;
@@ -538,6 +659,12 @@ export class Deinterlacer extends EventTarget {
     video.addEventListener("seeking", this.#onSeeking);
     video.addEventListener("seeked", this.#onFlush);
     video.addEventListener("ratechange", this.#onFlush);
+    // A hidden page runs no rAF, so the watchdog cannot tear the trial down.
+    // Listen here so the timer and element never survive in the background.
+    // The Worker-side engine (externalHost) owns no DOM and stays out.
+    if (!externalHost && typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.#onSurfaceVisibility);
+    }
   }
 
   get running(): boolean {
@@ -596,6 +723,15 @@ export class Deinterlacer extends EventTarget {
       if (interlacingChanged) this.#periodMs = 0;
       this.#presentedPicture = null;
       this.#setVisible(false);
+      // Progressive content has no double-rate field cadence to rescue, and a
+      // new interlaced section must prove its own slow cadence from scratch.
+      if (scan?.interlaced !== true) {
+        this.#resetSurfaceObservation(true);
+      } else if (interlacingChanged) {
+        this.#pageGaps.length = 0;
+        this.#lastWatchdogAt = 0;
+        this.#workerCadence = "unknown";
+      }
     }
     this.#apply();
     if (changed) {
@@ -648,6 +784,11 @@ export class Deinterlacer extends EventTarget {
     // A rate change gives every queued field a different presentation cadence,
     // so the next decoded frame starts a new schedule on the current timeline.
     this.#queue.length = 0;
+    // Without double-rate output there is no 30-to-60 Hz field cadence to
+    // rescue; a re-enabled rate must prove slow cadence from scratch.
+    if (!doubleRate) {
+      this.#resetSurfaceObservation(false);
+    }
     if (doubleRate) {
       if (this.#width > 0) this.#allocateOutputs();
       if (
@@ -841,6 +982,9 @@ export class Deinterlacer extends EventTarget {
           dropped:
             this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
         };
+        // The Worker filters frames, so its film/video cadence lives there.
+        // Keep a page-side copy so the surface trial stays out of film mode.
+        this.#workerCadence = notification.stats.mode;
         this.dispatchEvent(new CustomEvent("stats", { detail: stats }));
         this.#onStats?.(stats);
         break;
@@ -865,6 +1009,9 @@ export class Deinterlacer extends EventTarget {
 
   /** 一時的な Worker 障害を1回だけ復旧し、再失敗時は media element 自体を表示する。 */
   #workerFailed(message: string): void {
+    // The Worker backend is gone or restarting, so a page-surface trial that
+    // exists only for Worker rendering must not survive it.
+    this.#resetSurfaceObservation(true);
     if (
       this.#workerState === "starting" &&
       this.#rendering === "auto" &&
@@ -889,6 +1036,7 @@ export class Deinterlacer extends EventTarget {
 
   /** Worker を自動選択できなかった場合は元のメインスレッド用 canvas へ戻す。 */
   #fallBackToMain(): void {
+    this.#resetSurfaceObservation(true);
     const mainCanvas = this.#renderCanvas as HTMLCanvasElement;
     mainCanvas.className = this.#displayCanvas.className;
     const style = this.#displayCanvas.getAttribute("style");
@@ -928,6 +1076,7 @@ export class Deinterlacer extends EventTarget {
     this.#running = true;
     this.#resetStats();
     this.#resetFilm();
+    this.#resetSurfaceObservation(true);
     this.#lastVideoFrameCallbackAt = performance.now();
     this.#lastFallbackAt = this.#lastVideoFrameCallbackAt;
     this.#lastIngestedMediaTime = Number.NaN;
@@ -953,6 +1102,7 @@ export class Deinterlacer extends EventTarget {
   stop(): void {
     if (!this.#running) return;
     this.#running = false;
+    this.#resetSurfaceObservation(false);
     if (this.#handle !== null)
       this.#video.cancelVideoFrameCallback(this.#handle);
     this.#handle = null;
@@ -973,6 +1123,13 @@ export class Deinterlacer extends EventTarget {
     this.#destroyed = true;
     this.#enabled = false;
     this.stop();
+    this.#resetSurfaceObservation(false);
+    if (typeof document !== "undefined") {
+      document.removeEventListener(
+        "visibilitychange",
+        this.#onSurfaceVisibility,
+      );
+    }
     this.#worker?.postMessage({ type: "destroy" } satisfies WorkerCommand);
     this.#worker?.terminate();
     this.#worker = null;
@@ -1386,14 +1543,7 @@ export class Deinterlacer extends EventTarget {
   }
 
   #selectVideoState(mediaTime: number): void {
-    let selected: VideoState | undefined;
-    for (let index = this.#videoTimeline.length - 1; index >= 0; index--) {
-      const state = this.#videoTimeline[index]!;
-      if (state.start <= mediaTime + 1e-6) {
-        selected = state;
-        break;
-      }
-    }
+    const selected = videoStateAt(this.#videoTimeline, mediaTime);
     // An init reaches the SourceBuffer before its first sample. Applying the
     // size here keeps the texture change on that sample's frame callback.
     if (
@@ -1417,6 +1567,13 @@ export class Deinterlacer extends EventTarget {
     // Progressive sections provide no cadence measurement, and a discontinuity
     // may change the input rate, so remeasure the next interlaced section
     if (previousInterlaced !== scan.interlaced) this.#periodMs = 0;
+    if (scan.interlaced !== true) {
+      this.#resetSurfaceObservation(true);
+    } else if (previousInterlaced !== true) {
+      this.#pageGaps.length = 0;
+      this.#lastWatchdogAt = 0;
+      this.#workerCadence = "unknown";
+    }
     if (
       scan.interlaced &&
       (this.#externalHost || this.#workerState === "main")
@@ -1806,8 +1963,279 @@ export class Deinterlacer extends EventTarget {
   #onFrameWatchdog = (now: DOMHighResTimeStamp): void => {
     this.#frameWatchdogHandle = null;
     if (!this.#running || this.#lost) return;
+    this.#observePageCadence(now);
     this.#recoverFrameCallback(now);
     this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
+  };
+
+  /**
+   * Whether a surface trial may even be considered on this tick.
+   *
+   * Running, visible, interlaced, double-rate playback with the Worker backend
+   * active is the only eligible shape: the main-thread renderer draws on the
+   * page rAF itself, film cadence has no 60 Hz field schedule to rescue,
+   * progressive content needs no deinterlacing, and paused/ended or hidden
+   * playback produces no meaningful cadence. The cooldown gate keeps true
+   * 30 Hz displays -- which also sit at 33.3 ms -- from paying for repeated
+   * trials. No device, vendor, UA, or platform signal is consulted.
+   */
+  #isSurfaceEligible(now: number): boolean {
+    if (this.#externalHost) return false;
+    if (typeof document === "undefined") return false;
+    if (!this.#running || this.#destroyed || this.#lost) return false;
+    if (this.#workerState !== "active") return false;
+    if (!this.#doubleRate) return false;
+    if (this.#surfaceScan?.interlaced !== true) return false;
+    // Film sections play at 24 Hz cadence with no double-rate field schedule
+    // to rescue. While Worker rendering is active the cadence decision lives
+    // in the Worker and arrives via stats, so the trial needs a confirmed
+    // "video": until the first stats notification the cadence is unknown and
+    // a long film section could otherwise satisfy the slow page-rAF window.
+    // On the main path read #mode.
+    if (this.#workerCadence !== "video" || this.#mode === "film") return false;
+    if (document.hidden) return false;
+    if (this.#video.paused || this.#video.ended || this.#video.seeking)
+      return false;
+    if (now < this.#surfaceCooldownUntil) return false;
+    return true;
+  }
+
+  /**
+   * Track the page-side rAF cadence and drive the bounded surface trial.
+   *
+   * The watchdog's own rAF timestamps are the page cadence signal: stuck near
+   * 33.3 ms in the bad state, near 16.7 ms after a 30-to-60 Hz recovery. Off
+   * collects gaps until a stable slow window justifies a trial, trial toggles
+   * the 1x1 surface while watching for sustained fast gaps, and on keeps the
+   * proven surface for the session. A trial that runs its bounded length
+   * without recovery is removed and enters cooldown.
+   */
+  #observePageCadence(now: DOMHighResTimeStamp): void {
+    if (this.#externalHost || typeof document === "undefined") return;
+    // A seek can make page rAF slow while the media pipeline replaces its
+    // buffered range. That transition is not evidence of the persistent
+    // compositor state this trial targets. An unproven trial is discarded,
+    // while a surface already proven for this playback session keeps toggling
+    // through the seek so it remains available at the new position.
+    if (this.#video.seeking) {
+      if (this.#surfaceMode === "trial") this.#stopSurface();
+      this.#pageGaps.length = 0;
+      this.#lastWatchdogAt = now;
+      return;
+    }
+    if (this.#lastWatchdogAt > 0) {
+      const gap = now - this.#lastWatchdogAt;
+      if (gap >= 1 && gap <= MAX_PERIOD_MS) {
+        this.#pageGaps.push(gap);
+        if (this.#pageGaps.length > SURFACE_MAX_GAPS) this.#pageGaps.shift();
+      }
+    }
+    this.#lastWatchdogAt = now;
+    if (document.hidden) {
+      if (this.#surfaceMode !== "off") this.#stopSurface();
+      this.#pageGaps.length = 0;
+      return;
+    }
+    if (!this.#isSurfaceEligible(now)) {
+      // An aborted trial never completed, so it sets no cooldown: a transient
+      // pause, hide, or scan flip must not penalize the next eligible session.
+      // A latched surface belongs to its session and goes with it.
+      if (this.#surfaceMode !== "off") this.#stopSurface();
+      // While ineligible (including cooldown) the next session must prove slow
+      // cadence from scratch rather than inheriting stale gaps.
+      if (this.#surfaceMode === "off" && this.#pageGaps.length > 0) {
+        const stillCooling = now < this.#surfaceCooldownUntil;
+        const interrupted =
+          !this.#running ||
+          this.#video.paused ||
+          this.#video.ended ||
+          this.#surfaceScan?.interlaced !== true ||
+          !this.#doubleRate ||
+          this.#workerState !== "active" ||
+          this.#mode === "film" ||
+          this.#workerCadence !== "video";
+        if (stillCooling || interrupted) this.#pageGaps.length = 0;
+      }
+      return;
+    }
+    if (this.#surfaceMode === "off") {
+      if (this.#isStablySlow()) this.#startSurfaceTrial(now);
+    } else if (this.#surfaceMode === "trial") {
+      if (this.#isSustainedFast()) {
+        this.#latchSurfaceTrial();
+      } else if (now - this.#surfaceTrialStart >= SURFACE_TRIAL_MS) {
+        this.#rejectSurfaceTrial(now);
+      }
+    }
+  }
+
+  /**
+   * Scan state for page-owned surface decisions.
+   *
+   * Worker rendering selects timeline state while processing transferred
+   * frames, so the page-side #scan is normally untouched. Resolve the same
+   * timeline at the media element playhead here. A present timeline owns the
+   * answer: before its first state, or at a state with no scan metadata, the
+   * result is unknown rather than a permissive interlaced default. Standalone
+   * callers without a timeline keep the direct scan-setter contract.
+   */
+  get #surfaceScan(): Scan | null {
+    if (this.#videoTimeline.length === 0) return this.#scan;
+    return (
+      videoStateAt(this.#videoTimeline, this.#video.currentTime)?.scan ?? null
+    );
+  }
+
+  /** Whether recent page gaps sit stably near the stuck 30 Hz cadence. */
+  #isStablySlow(): boolean {
+    if (this.#pageGaps.length < SURFACE_OBSERVE_GAPS) return false;
+    const window = this.#pageGaps.slice(-SURFACE_OBSERVE_GAPS);
+    let slow = 0;
+    for (const gap of window) if (gap >= SURFACE_SLOW_MS) slow++;
+    return slow / window.length >= SURFACE_OBSERVE_SLOW_FRACTION;
+  }
+
+  /** Whether recent page gaps show sustained recovery toward ~60 Hz. */
+  #isSustainedFast(): boolean {
+    if (this.#pageGaps.length < SURFACE_SUCCESS_GAPS) return false;
+    const window = this.#pageGaps.slice(-SURFACE_SUCCESS_GAPS);
+    let fast = 0;
+    for (const gap of window) if (gap <= SURFACE_FAST_MS) fast++;
+    return fast / window.length >= SURFACE_SUCCESS_FAST_FRACTION;
+  }
+
+  /** Begin the bounded trial: lazily create the surface and toggle it. */
+  #startSurfaceTrial(now: number): void {
+    if (this.#surfaceMode !== "off") return;
+    const element = this.#ensureSurfaceElement();
+    if (!element) return;
+    this.#surfaceMode = "trial";
+    this.#surfaceTrialStart = now;
+    this.#surfacePhase = false;
+    this.#applySurfacePhase();
+    if (this.#surfaceTimer !== null) clearInterval(this.#surfaceTimer);
+    this.#surfaceTimer = setInterval(
+      () => this.#toggleSurface(),
+      SURFACE_TOGGLE_MS,
+    );
+  }
+
+  /** Keep the surface for the session: the trial proved a 60 Hz recovery. */
+  #latchSurfaceTrial(): void {
+    if (this.#surfaceMode !== "trial") return;
+    this.#surfaceMode = "on";
+  }
+
+  /**
+   * End a trial that proved nothing: remove the surface and back off.
+   * True 30 Hz displays never recover, so the bounded cooldown keeps them
+   * from paying for back-to-back trials.
+   */
+  #rejectSurfaceTrial(now: number): void {
+    this.#stopSurface();
+    this.#surfaceCooldownUntil = now + SURFACE_COOLDOWN_MS;
+    this.#pageGaps.length = 0;
+    this.#lastWatchdogAt = now;
+  }
+
+  /** Clear the timer and remove the page-owned element, if any. */
+  #stopSurface(): void {
+    if (this.#surfaceTimer !== null) {
+      clearInterval(this.#surfaceTimer);
+      this.#surfaceTimer = null;
+    }
+    this.#surfaceElement?.remove();
+    this.#surfaceElement = null;
+    this.#surfaceMode = "off";
+    this.#surfacePhase = false;
+  }
+
+  /**
+   * Abort any surface trial and restart page-cadence observation from scratch.
+   * When `forgetCadence` is set, the Worker cadence also returns to unknown so
+   * the next trial needs a fresh video confirmation via stats: a new Worker, a
+   * new scan section, or a new stream. Transient interruptions (pause, ended,
+   * rate toggles, teardown) keep the confirmed cadence and only restart the
+   * gaps, so an eligible session does not wait for stats twice.
+   */
+  #resetSurfaceObservation(forgetCadence: boolean): void {
+    if (this.#surfaceMode !== "off") this.#stopSurface();
+    this.#pageGaps.length = 0;
+    this.#lastWatchdogAt = 0;
+    if (forgetCadence) this.#workerCadence = "unknown";
+  }
+
+  /**
+   * Lazily create the page-owned 1x1 CSS-pixel surface.
+   *
+   * It must actually reach composition: fully opaque, visible, non-zero size,
+   * with background and transform toggled every 250 ms. display:none,
+   * visibility:hidden, zero opacity, or a no-op timer are not substitutes --
+   * the measured prevention required a real composed update. It lives inside
+   * the deinterlacer wrapper (or body before mount) with pointer-events none
+   * and absolute/fixed 1x1 placement, so it intercepts no input, disturbs no
+   * layout, and stays inside the fullscreen container.
+   */
+  #ensureSurfaceElement(): HTMLElement | null {
+    if (typeof document === "undefined") return null;
+    if (this.#surfaceElement) return this.#surfaceElement;
+    const parent = this.#wrapper ?? document.body;
+    if (!parent) return null;
+    const element = document.createElement("div");
+    element.setAttribute("data-mpeg2toh264-surface", "true");
+    element.style.cssText = this.#wrapper
+      ? "position:absolute;left:0;top:0;width:1px;height:1px;margin:0;padding:0;border:0;pointer-events:none;opacity:1;visibility:visible;transform:translateZ(0);background-color:rgb(0,0,0);"
+      : "position:fixed;left:0;top:0;width:1px;height:1px;margin:0;padding:0;border:0;pointer-events:none;opacity:1;visibility:visible;transform:translateZ(0);background-color:rgb(0,0,0);z-index:2147483647;";
+    parent.appendChild(element);
+    this.#surfaceElement = element;
+    return element;
+  }
+
+  /** Flip the visible surface phase; the composition is the workaround. */
+  #toggleSurface(): void {
+    const element = this.#surfaceElement;
+    if (!element || this.#surfaceMode === "off") return;
+    // Intervals can fire while hidden or paused before the next watchdog tick;
+    // never keep toggling in the background, just tear down.
+    if (typeof document !== "undefined" && document.hidden) {
+      this.#stopSurface();
+      this.#pageGaps.length = 0;
+      return;
+    }
+    if (!this.#running || this.#video.paused || this.#video.ended) {
+      this.#stopSurface();
+      this.#pageGaps.length = 0;
+      return;
+    }
+    this.#surfacePhase = !this.#surfacePhase;
+    this.#applySurfacePhase();
+  }
+
+  /** Apply the current toggle phase as a composited style change. */
+  #applySurfacePhase(): void {
+    const element = this.#surfaceElement;
+    if (!element) return;
+    // A 1 LSB red toggle plus a 1 px translate: visually negligible, but both
+    // dirty the layer so every 250 ms tick reaches the compositor.
+    element.style.backgroundColor = this.#surfacePhase
+      ? "rgb(1,0,0)"
+      : "rgb(0,0,0)";
+    element.style.transform = this.#surfacePhase
+      ? "translateZ(0) translateX(1px)"
+      : "translateZ(0)";
+  }
+
+  /** Hidden pages run no rAF: never leave the surface behind in background. */
+  #onSurfaceVisibility = (): void => {
+    if (typeof document === "undefined") return;
+    if (!document.hidden) {
+      this.#pageGaps.length = 0;
+      this.#lastWatchdogAt = 0;
+      return;
+    }
+    if (this.#surfaceMode !== "off") this.#stopSurface();
+    this.#pageGaps.length = 0;
+    this.#lastWatchdogAt = 0;
   };
 
   /** requestVideoFrameCallback() が来ない間も requestAnimationFrame() から復号フレームを取り込む。 */
@@ -2330,6 +2758,7 @@ export class Deinterlacer extends EventTarget {
 
   #onEmptied = (): void => {
     this.#lastIngestedMediaTime = Number.NaN;
+    this.#resetSurfaceObservation(true);
     if (this.#postWorkerEvent("emptied")) {
       this.#closePendingWorkerFrame();
       this.#setVisible(false);
@@ -2384,6 +2813,12 @@ export class Deinterlacer extends EventTarget {
    * A new seek invalidates any destination frame remembered for the last one.
    */
   #onSeeking = (): void => {
+    // Do not let a transient seek delay start or complete a surface trial.
+    // A latched surface has already demonstrated recovery and remains useful
+    // across positions in the same playback session.
+    if (this.#surfaceMode === "trial") this.#stopSurface();
+    this.#pageGaps.length = 0;
+    this.#lastWatchdogAt = 0;
     if (this.#postWorkerEvent("seeking")) {
       this.#closePendingWorkerFrame();
       return;
@@ -2397,6 +2832,9 @@ export class Deinterlacer extends EventTarget {
    * the one the first field was taken at.
    */
   #onFlush = (event: Event): void => {
+    if (event.type === "pause" || event.type === "ended") {
+      this.#resetSurfaceObservation(false);
+    }
     if (
       (event.type === "pause" ||
         event.type === "ended" ||

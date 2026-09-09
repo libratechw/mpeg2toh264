@@ -32,6 +32,8 @@ interface WorkerElementStyle {
   top: string;
   width: string;
   height: string;
+  backgroundColor: string;
+  transform: string;
 }
 
 interface HTMLElement extends EventTarget {
@@ -44,6 +46,7 @@ interface HTMLElement extends EventTarget {
   appendChild<T extends HTMLElement>(node: T): T;
   insertBefore<T extends HTMLElement>(node: T, child: HTMLElement | null): T;
   remove(): void;
+  setAttribute(name: string, value: string): void;
 }
 
 interface HTMLCanvasElement extends HTMLElement, OffscreenCanvas {
@@ -93,8 +96,12 @@ declare var ResizeObserver: {
 };
 
 interface Document {
+  readonly hidden: boolean;
+  readonly body: HTMLElement;
   createElement(tagName: "canvas"): HTMLCanvasElement;
   createElement(tagName: "div"): HTMLElement;
+  addEventListener(type: string, callback: () => void): void;
+  removeEventListener(type: string, callback: () => void): void;
 }
 
 declare var document: Document;
