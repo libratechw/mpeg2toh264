@@ -2061,10 +2061,13 @@ export class Deinterlacer extends EventTarget {
     if (this.#surfaceMode === "off") {
       if (this.#isStablySlow()) this.#startSurfaceTrial(now);
     } else if (this.#surfaceMode === "trial") {
-      if (this.#isSustainedFast()) {
-        this.#latchSurfaceTrial();
-      } else if (now - this.#surfaceTrialStart >= SURFACE_TRIAL_MS) {
+      // The bound owns the decision at and after its deadline. Checking fast
+      // cadence first could credit a recovery first observed after the trial
+      // had already expired.
+      if (now - this.#surfaceTrialStart >= SURFACE_TRIAL_MS) {
         this.#rejectSurfaceTrial(now);
+      } else if (this.#isSustainedFast()) {
+        this.#latchSurfaceTrial();
       }
     }
   }
@@ -2205,6 +2208,25 @@ export class Deinterlacer extends EventTarget {
     if (!this.#running || this.#video.paused || this.#video.ended) {
       this.#stopSurface();
       this.#pageGaps.length = 0;
+      return;
+    }
+    // A visible page can temporarily stop delivering rAF callbacks. Keep the
+    // trial bounded from its interval too, rather than depending on the next
+    // watchdog callback to reject it.
+    const now = performance.now();
+    if (this.#surfaceMode === "trial" && !this.#isSurfaceEligible(now)) {
+      // Cadence, scan, Worker, or seek state can change just before the timer
+      // fires. Match the watchdog's interrupted-trial semantics: this is not a
+      // failed trial and must not impose cooldown on the next eligible state.
+      this.#stopSurface();
+      this.#pageGaps.length = 0;
+      return;
+    }
+    if (
+      this.#surfaceMode === "trial" &&
+      now - this.#surfaceTrialStart >= SURFACE_TRIAL_MS
+    ) {
+      this.#rejectSurfaceTrial(now);
       return;
     }
     this.#surfacePhase = !this.#surfacePhase;

@@ -685,6 +685,78 @@ resetHarness();
 
 // 3. Sustained ~60 Hz during the trial latches the surface past its bound;
 // a brief fast blip followed by slow cadence does not latch.
+// Recovery first proven at or after the deadline must reject the trial, and
+// the interval must enforce the same bound if page rAF stops entirely.
+resetHarness();
+{
+  const { deinterlacer } = createEligible();
+  while (surfaceElements().length === 0) advanceRaf(SLOW_GAP, 1);
+  advanceRaf(33.4, 72);
+  advanceRaf(FAST_GAP, 35);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "the trial must remain active just before the deadline",
+  );
+  advanceRaf(FAST_GAP, 1);
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "recovery first proven after the deadline must not latch",
+  );
+  assert.equal(intervals.size, 0, "deadline rejection must clear its timer");
+  deinterlacer.destroy();
+}
+
+// A cadence change can make a trial ineligible immediately before its timer
+// observes the deadline. That interruption must not create cooldown.
+resetHarness();
+{
+  const { deinterlacer } = createEligible();
+  while (surfaceElements().length === 0) advanceRaf(SLOW_GAP, 1);
+  const trialObservedAt = fakeNow;
+  fakeNow = trialObservedAt + 2999;
+  fakeWorkers.at(-1).onmessage({ data: workerStats("film") });
+  fakeNow = trialObservedAt + 3001;
+  fireIntervals();
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "an ineligible trial must stop without deadline rejection",
+  );
+  assert.equal(intervals.size, 0, "an interrupted trial must clear its timer");
+  advanceRaf(SLOW_GAP, 1);
+  fakeWorkers.at(-1).onmessage({ data: workerStats("video") });
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "an interrupted trial must allow a fresh attempt without cooldown",
+  );
+  deinterlacer.destroy();
+}
+
+resetHarness();
+{
+  const { deinterlacer } = createEligible();
+  while (surfaceElements().length === 0) advanceRaf(SLOW_GAP, 1);
+  fakeNow += 3000 + 1;
+  fireIntervals();
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "the interval must reject an expired trial when page rAF has stopped",
+  );
+  assert.equal(intervals.size, 0, "timer-side rejection must clear its timer");
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "timer-side rejection must enter cooldown",
+  );
+  deinterlacer.destroy();
+}
+
 resetHarness();
 {
   const { deinterlacer } = createEligible();
