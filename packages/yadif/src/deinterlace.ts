@@ -1993,7 +1993,8 @@ export class Deinterlacer extends EventTarget {
     // On the main path read #mode.
     if (this.#workerCadence !== "video" || this.#mode === "film") return false;
     if (document.hidden) return false;
-    if (this.#video.paused || this.#video.ended) return false;
+    if (this.#video.paused || this.#video.ended || this.#video.seeking)
+      return false;
     if (now < this.#surfaceCooldownUntil) return false;
     return true;
   }
@@ -2010,6 +2011,17 @@ export class Deinterlacer extends EventTarget {
    */
   #observePageCadence(now: DOMHighResTimeStamp): void {
     if (this.#externalHost || typeof document === "undefined") return;
+    // A seek can make page rAF slow while the media pipeline replaces its
+    // buffered range. That transition is not evidence of the persistent
+    // compositor state this trial targets. An unproven trial is discarded,
+    // while a surface already proven for this playback session keeps toggling
+    // through the seek so it remains available at the new position.
+    if (this.#video.seeking) {
+      if (this.#surfaceMode === "trial") this.#stopSurface();
+      this.#pageGaps.length = 0;
+      this.#lastWatchdogAt = now;
+      return;
+    }
     if (this.#lastWatchdogAt > 0) {
       const gap = now - this.#lastWatchdogAt;
       if (gap >= 1 && gap <= MAX_PERIOD_MS) {
@@ -2800,6 +2812,12 @@ export class Deinterlacer extends EventTarget {
    * A new seek invalidates any destination frame remembered for the last one.
    */
   #onSeeking = (): void => {
+    // Do not let a transient seek delay start or complete a surface trial.
+    // A latched surface has already demonstrated recovery and remains useful
+    // across positions in the same playback session.
+    if (this.#surfaceMode === "trial") this.#stopSurface();
+    this.#pageGaps.length = 0;
+    this.#lastWatchdogAt = 0;
     if (this.#postWorkerEvent("seeking")) {
       this.#closePendingWorkerFrame();
       return;

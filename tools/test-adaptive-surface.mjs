@@ -712,6 +712,75 @@ resetHarness();
   deinterlacer.destroy();
 }
 
+// 3c. Seeking is a transient pipeline transition, not evidence of a stuck
+// compositor cadence. It must neither start nor complete a trial. A surface
+// already proven in this playback session stays active across the seek.
+resetHarness();
+{
+  const { video, deinterlacer } = createEligible();
+  video.seeking = true;
+  video.dispatchEvent(new Event("seeking"));
+  advanceRaf(SLOW_GAP, 60);
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "slow page cadence during a seek must not start a trial",
+  );
+  video.seeking = false;
+  video.dispatchEvent(new Event("seeked"));
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "post-seek playback must prove a fresh slow window",
+  );
+  deinterlacer.destroy();
+}
+
+resetHarness();
+{
+  const { video, deinterlacer } = createEligible();
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(surfaceElements().length, 1, "trial must have started");
+  video.seeking = true;
+  video.dispatchEvent(new Event("seeking"));
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "seeking must abort an unproven trial immediately",
+  );
+  assert.equal(intervals.size, 0, "aborted trial must clear its timer");
+  video.seeking = false;
+  video.dispatchEvent(new Event("seeked"));
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "an aborted seek trial must not impose a cooldown",
+  );
+  deinterlacer.destroy();
+}
+
+resetHarness();
+{
+  const { video, deinterlacer } = createEligible();
+  advanceRaf(SLOW_GAP, 50);
+  advanceRaf(FAST_GAP, 60);
+  assert.equal(surfaceElements().length, 1, "surface must be latched");
+  video.seeking = true;
+  video.dispatchEvent(new Event("seeking"));
+  advanceRaf(SLOW_GAP, 60);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "a proven surface must remain active across the seek",
+  );
+  assert.equal(intervals.size, 1, "latched surface must keep its timer");
+  video.seeking = false;
+  video.dispatchEvent(new Event("seeked"));
+  deinterlacer.destroy();
+}
+
 // 3b. A film report arriving mid-trial aborts it without a cooldown penalty:
 // surface and timer go away on the next page frame, and a later video report
 // may start a fresh trial.
