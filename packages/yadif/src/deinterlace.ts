@@ -2214,6 +2214,14 @@ export class Deinterlacer extends EventTarget {
     // trial bounded from its interval too, rather than depending on the next
     // watchdog callback to reject it.
     const now = performance.now();
+    if (this.#surfaceMode === "trial" && !this.#isSurfaceEligible(now)) {
+      // Cadence, scan, Worker, or seek state can change just before the timer
+      // fires. Match the watchdog's interrupted-trial semantics: this is not a
+      // failed trial and must not impose cooldown on the next eligible state.
+      this.#stopSurface();
+      this.#pageGaps.length = 0;
+      return;
+    }
     if (
       this.#surfaceMode === "trial" &&
       now - this.#surfaceTrialStart >= SURFACE_TRIAL_MS

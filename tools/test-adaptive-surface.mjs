@@ -708,6 +708,34 @@ resetHarness();
   deinterlacer.destroy();
 }
 
+// A cadence change can make a trial ineligible immediately before its timer
+// observes the deadline. That interruption must not create cooldown.
+resetHarness();
+{
+  const { deinterlacer } = createEligible();
+  while (surfaceElements().length === 0) advanceRaf(SLOW_GAP, 1);
+  const trialObservedAt = fakeNow;
+  fakeNow = trialObservedAt + 2999;
+  fakeWorkers.at(-1).onmessage({ data: workerStats("film") });
+  fakeNow = trialObservedAt + 3001;
+  fireIntervals();
+  assert.equal(
+    surfaceElements().length,
+    0,
+    "an ineligible trial must stop without deadline rejection",
+  );
+  assert.equal(intervals.size, 0, "an interrupted trial must clear its timer");
+  advanceRaf(SLOW_GAP, 1);
+  fakeWorkers.at(-1).onmessage({ data: workerStats("video") });
+  advanceRaf(SLOW_GAP, 50);
+  assert.equal(
+    surfaceElements().length,
+    1,
+    "an interrupted trial must allow a fresh attempt without cooldown",
+  );
+  deinterlacer.destroy();
+}
+
 resetHarness();
 {
   const { deinterlacer } = createEligible();
