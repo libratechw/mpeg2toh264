@@ -135,32 +135,49 @@ impl CoeffCountMap {
     }
 
     pub fn set(&mut self, bx: usize, by: usize, total: usize) {
-        self.counts[by * self.blk_w + bx] = total as i16;
+        self.set_index(by * self.blk_w + bx, total);
+    }
+
+    /// Resolve a block's neighbour count and flat storage index together.
+    /// Writers need both: the index is also where they store the TotalCoeff
+    /// after emitting the block. Keeping the pair from one coordinate
+    /// calculation avoids repeating `by * blk_w + bx` in that hot path.
+    #[inline]
+    pub(crate) fn n_c_and_index(&self, bx: usize, by: usize) -> (i32, usize) {
+        let index = by * self.blk_w + bx;
+        let a = if bx > 0 {
+            self.counts[index - 1] as i32
+        } else {
+            -1
+        };
+        let b = if by > 0 {
+            self.counts[index - self.blk_w] as i32
+        } else {
+            -1
+        };
+        let n_c = if a >= 0 && b >= 0 {
+            (a + b + 1) >> 1
+        } else if a >= 0 {
+            a
+        } else if b >= 0 {
+            b
+        } else {
+            0
+        };
+        (n_c, index)
+    }
+
+    /// Store a TotalCoeff at an index already resolved by
+    /// [`Self::n_c_and_index`].
+    #[inline]
+    pub(crate) fn set_index(&mut self, index: usize, total: usize) {
+        self.counts[index] = total as i16;
     }
 
     /// nC from the left and upper neighbours. A block that was coded but carries
     /// no coefficients counts as 0, which is different from being unavailable.
     pub fn n_c(&self, bx: usize, by: usize) -> i32 {
-        let a = if bx > 0 {
-            self.counts[by * self.blk_w + bx - 1] as i32
-        } else {
-            -1
-        };
-        let b = if by > 0 {
-            self.counts[(by - 1) * self.blk_w + bx] as i32
-        } else {
-            -1
-        };
-        if a >= 0 && b >= 0 {
-            return (a + b + 1) >> 1;
-        }
-        if a >= 0 {
-            return a;
-        }
-        if b >= 0 {
-            return b;
-        }
-        0
+        self.n_c_and_index(bx, by).0
     }
 }
 
@@ -429,8 +446,9 @@ fn write_chroma_residual(
                 map.set(bx, by, 0);
                 continue;
             }
-            let total = write_residual_levels(w, &chroma[c].ac[b], 15, map.n_c(bx, by))?;
-            map.set(bx, by, total);
+            let (n_c, index) = map.n_c_and_index(bx, by);
+            let total = write_residual_levels(w, &chroma[c].ac[b], 15, n_c)?;
+            map.set_index(index, total);
         }
     }
     Ok(())
@@ -505,8 +523,9 @@ fn write_luma_residual_8x8(
             let (x, y) = LUMA_4X4_XY[blk_idx];
             let bx = mb_x * 4 + x;
             let by = mb_y * 4 + y;
-            let total = write_masked_levels(w, &sub[i4x4], masks[i4x4], 16, counts.n_c(bx, by))?;
-            counts.set(bx, by, total);
+            let (n_c, index) = counts.n_c_and_index(bx, by);
+            let total = write_masked_levels(w, &sub[i4x4], masks[i4x4], 16, n_c)?;
+            counts.set_index(index, total);
         }
     }
     Ok(())
