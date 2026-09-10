@@ -437,11 +437,13 @@ fn write_chroma_residual(
 }
 
 pub fn mark_no_chroma_coefficients(counts: &mut ChromaCounts, mb_x: usize, mb_y: usize) {
-    for b in 0..4 {
-        let bx = mb_x * 2 + (b & 1);
-        let by = mb_y * 2 + (b >> 1);
-        counts.cb.set(bx, by, 0);
-        counts.cr.set(bx, by, 0);
+    let bx = mb_x * 2;
+    let by = mb_y * 2;
+    for y in 0..2 {
+        let cb_start = (by + y) * counts.cb.blk_w + bx;
+        counts.cb.counts[cb_start..cb_start + 2].fill(0);
+        let cr_start = (by + y) * counts.cr.blk_w + bx;
+        counts.cr.counts[cr_start..cr_start + 2].fill(0);
     }
 }
 
@@ -452,9 +454,8 @@ pub fn mark_no_coefficients(counts: &mut CoeffCountMap, mb_x: usize, mb_y: usize
     let bx = mb_x * 4;
     let by = mb_y * 4;
     for y in 0..4 {
-        for x in 0..4 {
-            counts.set(bx + x, by + y, 0);
-        }
+        let start = (by + y) * counts.blk_w + bx;
+        counts.counts[start..start + 4].fill(0);
     }
 }
 
