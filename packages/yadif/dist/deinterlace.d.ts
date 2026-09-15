@@ -36,10 +36,7 @@ export interface DeinterlaceStats {
     discontinuities: number;
     /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
     late: number;
-    /**
-     * Times the presentation queue was reset because its scheduled lead exceeded
-     * the useful display window.
-     */
+    /** Reserved for stats compatibility; queue resets are not used for recovery. */
     queueResetted: number;
     /** Frames presented per second over the last report. */
     fps: number;
