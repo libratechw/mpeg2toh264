@@ -153,13 +153,53 @@ impl CoeffCountMap {
         self.counts[found.address * across * across + (found.y / 4) * across + found.x / 4] as i32
     }
 
+    /// The count of one of the current macroblock's own blocks.
+    #[inline]
+    fn own(&self, address: usize, bx: usize, by: usize) -> i32 {
+        let across = self.across;
+        self.counts[address * across * across + by * across + bx] as i32
+    }
+
+    /// What the blocks along the macroblock's left and upper edges see across
+    /// them, worked out once: every other block's neighbours are inside the
+    /// macroblock, where no derivation is needed at all.
+    ///
+    /// The blocks above all lie in one macroblock, on one row of it, so that
+    /// side is a single question; the left side is asked row by row, because
+    /// a field pair beside a frame macroblock answers it differently for even
+    /// and odd lines.
+    pub fn edges(&self, frame: &Frame, address: usize) -> EdgeCounts {
+        let across = self.across;
+        let size = across as i32 * 4;
+        let mut edges = EdgeCounts {
+            left: [-1; 4],
+            above: [-1; 4],
+        };
+        for (by, left) in edges.left.iter_mut().enumerate().take(across) {
+            *left = self.at(frame, address, -1, by as i32 * 4);
+        }
+        if let Some(found) = frame.neighbour(address, 0, -1, size, size) {
+            for (bx, above) in edges.above.iter_mut().enumerate().take(across) {
+                *above = self.own(found.address, bx, found.y / 4);
+            }
+        }
+        edges
+    }
+
     /// nC from the left and upper neighbours. A block that was coded but carries
     /// no coefficients counts as 0, which is different from being unavailable.
-    pub fn n_c(&self, frame: &Frame, address: usize, bx: usize, by: usize) -> i32 {
-        let x = bx as i32 * 4;
-        let y = by as i32 * 4;
-        let a = self.at(frame, address, x - 1, y);
-        let b = self.at(frame, address, x, y - 1);
+    #[inline]
+    pub fn n_c(&self, edges: &EdgeCounts, address: usize, bx: usize, by: usize) -> i32 {
+        let a = if bx > 0 {
+            self.own(address, bx - 1, by)
+        } else {
+            edges.left[by]
+        };
+        let b = if by > 0 {
+            self.own(address, bx, by - 1)
+        } else {
+            edges.above[bx]
+        };
         if a >= 0 && b >= 0 {
             return (a + b + 1) >> 1;
         }
@@ -171,6 +211,13 @@ impl CoeffCountMap {
         }
         0
     }
+}
+
+/// The counts just outside a macroblock, indexed by the row (left) or column
+/// (above) of the edge block asking. -1 where there is no block there.
+pub struct EdgeCounts {
+    left: [i32; 4],
+    above: [i32; 4],
 }
 
 /// Coefficient counts for the chroma 4x4 blocks, one map per component.
@@ -432,14 +479,17 @@ fn write_chroma_residual(
         } else {
             &mut counts.cr
         };
+        if cbp_chroma != 2 {
+            for b in 0..4 {
+                map.set(address, b & 1, b >> 1, 0);
+            }
+            continue;
+        }
+        let edges = map.edges(frame, address);
         for b in 0..4 {
             let (bx, by) = (b & 1, b >> 1);
-            if cbp_chroma != 2 {
-                map.set(address, bx, by, 0);
-                continue;
-            }
             let total =
-                write_residual_levels(w, &chroma[c].ac[b], 15, map.n_c(frame, address, bx, by))?;
+                write_residual_levels(w, &chroma[c].ac[b], 15, map.n_c(&edges, address, bx, by))?;
             map.set(address, bx, by, total);
         }
     }
@@ -486,6 +536,7 @@ fn write_luma_residual_8x8(
     cbp_luma: u32,
 ) -> Result<()> {
     let mut sub = [0i32; 16];
+    let edges = counts.edges(frame, address);
     for i8x8 in 0..4 {
         let block = luma[i8x8];
         for i4x4 in 0..4 {
@@ -503,7 +554,8 @@ fn write_luma_residual_8x8(
                 sub[i] = level;
                 mask |= u32::from(level != 0) << i;
             }
-            let total = write_masked_levels(w, &sub, mask, 16, counts.n_c(frame, address, bx, by))?;
+            let total =
+                write_masked_levels(w, &sub, mask, 16, counts.n_c(&edges, address, bx, by))?;
             counts.set(address, bx, by, total);
         }
     }
@@ -594,20 +646,25 @@ mod tests {
         assert_eq!(b16x8_mb_type(Bi, Bi), 20);
     }
 
+    /// nC as the writer derives it: the edges once, then the block.
+    fn n_c(counts: &CoeffCountMap, frame: &Frame, at: usize, bx: usize, by: usize) -> i32 {
+        counts.n_c(&counts.edges(frame, at), at, bx, by)
+    }
+
     #[test]
     fn neighbouring_counts_average_only_when_both_exist() {
         let frame = Frame::new(4, 4, false);
         let mut counts = make_luma_counts(4, 4);
         let at = frame.address(1, 1);
         assert_eq!(
-            counts.n_c(&frame, frame.address(0, 0), 0, 0),
+            n_c(&counts, &frame, frame.address(0, 0), 0, 0),
             0,
             "no neighbours reads as zero"
         );
         counts.set(frame.address(0, 1), 3, 0, 5);
-        assert_eq!(counts.n_c(&frame, at, 0, 0), 5, "only the left neighbour");
+        assert_eq!(n_c(&counts, &frame, at, 0, 0), 5, "only the left neighbour");
         counts.set(frame.address(1, 0), 0, 3, 2);
-        assert_eq!(counts.n_c(&frame, at, 0, 0), 4, "(5 + 2 + 1) >> 1");
+        assert_eq!(n_c(&counts, &frame, at, 0, 0), 4, "(5 + 2 + 1) >> 1");
     }
 
     #[test]
@@ -616,12 +673,32 @@ mod tests {
         let mut counts = make_luma_counts(4, 4);
         let at = frame.address(1, 0);
         counts.set(frame.address(0, 0), 3, 0, 0);
-        assert_eq!(counts.n_c(&frame, at, 0, 0), 0);
+        assert_eq!(n_c(&counts, &frame, at, 0, 0), 0);
         counts.set(at, 0, 0, 8);
         assert_eq!(
-            counts.n_c(&frame, at, 1, 0),
+            n_c(&counts, &frame, at, 1, 0),
             8,
             "an absent upper neighbour is skipped"
         );
+    }
+
+    #[test]
+    fn edges_read_a_field_pair_beside_a_frame_macroblock_row_by_row() {
+        // The pair to the left is field coded: even lines of the current frame
+        // macroblock come from its top macroblock, odd lines from its bottom,
+        // both at half the row. Block rows 0..4 start at lines 0, 4, 8, 12,
+        // all even, so the left edge reads the top field macroblock at block
+        // rows 0, 0, 1, 1.
+        let mut frame = Frame::new(4, 4, true);
+        frame.set_field_pair(frame.address(0, 0), true);
+        let mut counts = make_luma_counts(4, 4);
+        let top = frame.address(0, 0);
+        for by in 0..4 {
+            counts.set(top, 3, by, 10 + by);
+        }
+        let at = frame.address(1, 0);
+        let edges = counts.edges(&frame, at);
+        assert_eq!(edges.left, [10, 10, 11, 11]);
+        assert_eq!(edges.above, [-1; 4], "nothing above the first row");
     }
 }
