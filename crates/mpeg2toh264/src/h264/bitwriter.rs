@@ -84,7 +84,11 @@ impl BitWriter {
     }
 
     /// `ue(v)`: unsigned Exp-Golomb (clause 9.1).
-    #[inline]
+    ///
+    /// Inlined outright: it is a handful of instructions written several
+    /// times per macroblock, and left to itself the browser build made it a
+    /// call.
+    #[inline(always)]
     pub fn ue(&mut self, value: u32) {
         // codeNum + 1 written as a 1 followed by (bits-1) zeros then the remainder.
         let v = value + 1;
@@ -99,7 +103,7 @@ impl BitWriter {
     }
 
     /// `se(v)`: signed Exp-Golomb (clause 9.1.1).
-    #[inline]
+    #[inline(always)]
     pub fn se(&mut self, value: i32) {
         self.ue(if value <= 0 {
             (-2 * value) as u32
