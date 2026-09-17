@@ -152,16 +152,50 @@ pub fn to_nal_unit(rbsp: &[u8], nal_ref_idc: u8, nal_unit_type: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + rbsp.len() + rbsp.len().div_ceil(2));
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     out.push((nal_ref_idc << 5) | nal_unit_type);
-    let mut zeros = 0;
-    for &b in rbsp {
-        if zeros >= 2 && b <= 0x03 {
-            out.push(0x03);
-            zeros = 0;
+    // Nothing needs escaping until two zero bytes, so the payload is copied in
+    // the runs between zeros, and only a zero is looked at one byte at a time.
+    // A slice payload is mostly non-zero, which makes this a copy with a few
+    // stops rather than a decision per byte.
+    let mut copied = 0;
+    let mut at = 0;
+    while at + 2 < rbsp.len() {
+        let zero = next_zero(rbsp, at);
+        if zero + 2 >= rbsp.len() {
+            break;
         }
-        out.push(b);
-        zeros = if b == 0x00 { zeros + 1 } else { 0 };
+        if rbsp[zero + 1] != 0 {
+            at = zero + 2;
+        } else if rbsp[zero + 2] <= 0x03 {
+            out.extend_from_slice(&rbsp[copied..zero + 2]);
+            out.push(0x03);
+            copied = zero + 2;
+            at = zero + 2;
+        } else {
+            at = zero + 3;
+        }
     }
+    out.extend_from_slice(&rbsp[copied..]);
     out
+}
+
+/// The index of the first zero byte at or after `from`, or the length where
+/// there is none. Eight bytes are tested at a time.
+pub fn next_zero(data: &[u8], mut from: usize) -> usize {
+    while let Some(chunk) = data.get(from..from + 8) {
+        let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+        // Each byte's high bit is set where the byte is zero, and possibly
+        // above the first zero as a borrow spills upward -- so the lowest set
+        // bit is the one to trust, and it is the first zero.
+        let zeros = word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080;
+        if zeros != 0 {
+            return from + (zeros.trailing_zeros() / 8) as usize;
+        }
+        from += 8;
+    }
+    while from < data.len() && data[from] != 0 {
+        from += 1;
+    }
+    from
 }
 
 #[cfg(test)]
@@ -265,5 +299,61 @@ mod tests {
         let rbsp = vec![0u8; 1024];
         let nal = to_nal_unit(&rbsp, 3, nal_type::SLICE_IDR);
         assert_eq!(nal.len(), 5 + 1024 + 511);
+    }
+
+    /// Clause 7.4.1.1 one byte at a time, which is what the run-copying form
+    /// has to agree with.
+    fn escape_byte_by_byte(rbsp: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut zeros = 0;
+        for &b in rbsp {
+            if zeros >= 2 && b <= 0x03 {
+                out.push(0x03);
+                zeros = 0;
+            }
+            out.push(b);
+            zeros = if b == 0x00 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+
+    #[test]
+    fn nal_wrapping_agrees_with_the_byte_by_byte_form_on_zero_heavy_payloads() {
+        // A generator biased towards zeros and the small values that need
+        // escaping after them, over every length up to a few words.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match state % 8 {
+                0..=3 => 0u8,
+                4 => (state >> 8) as u8 & 0x03,
+                _ => (state >> 16) as u8,
+            }
+        };
+        for len in 0..40 {
+            for _ in 0..50 {
+                let rbsp: Vec<u8> = (0..len).map(|_| byte()).collect();
+                let nal = to_nal_unit(&rbsp, 3, nal_type::SLICE_IDR);
+                assert_eq!(&nal[5..], &escape_byte_by_byte(&rbsp)[..], "{rbsp:02x?}");
+            }
+        }
+    }
+
+    #[test]
+    fn next_zero_finds_the_first_zero_in_either_half_of_a_word() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 0, 11, 0];
+        assert_eq!(next_zero(&data, 0), 9);
+        assert_eq!(next_zero(&data, 10), 11);
+        assert_eq!(next_zero(&data, 0), 9);
+        assert_eq!(next_zero(&[1, 1, 1], 0), 3, "none is the length");
+        assert_eq!(next_zero(&[0; 9], 1), 1);
+        let mut data = [0xffu8; 24];
+        for at in 0..24 {
+            data[at] = 0;
+            assert_eq!(next_zero(&data, 0), at, "zero at {at}");
+            data[at] = 0xff;
+        }
     }
 }
