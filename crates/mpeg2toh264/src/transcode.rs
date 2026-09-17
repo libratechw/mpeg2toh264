@@ -30,9 +30,10 @@ use crate::h264::chroma::{
 };
 use crate::h264::intra::{chroma_dc, luma_8x8_dc, CodingOrder, ReconstructedPicture};
 use crate::h264::mb::{
-    b16x8_mb_type, b_mb_type, make_luma_counts, mark_no_chroma_coefficients, mark_no_coefficients,
-    write_inter_macroblock, write_intra_macroblock, ChromaCounts, CoeffCountMap, InterMacroblock,
-    MotionPartition, PredictionMode, FIELD_SCAN_8X8,
+    b16x8_mb_type, b_mb_type, level_mask, make_luma_counts, mark_no_chroma_coefficients,
+    mark_no_coefficients, write_inter_macroblock, write_intra_macroblock, ChromaCounts,
+    CoeffCountMap, InterMacroblock, MotionPartition, PredictionMode, FIELD_SCAN_8X8,
+    INVERSE_FIELD_SCAN_8X8, INVERSE_ZIGZAG_8X8,
 };
 use crate::h264::mbaff::Frame as MbaffFrame;
 use crate::h264::mvmap::{map_vector, native_position, VectorKind};
@@ -42,8 +43,8 @@ use crate::h264::params::{
 };
 use crate::h264::params::{ZIGZAG_4X4, ZIGZAG_8X8};
 use crate::h264::quant::{
-    field_dct_to_frame_targets, frame_dct_to_field_targets, inter_targets, intra_targets,
-    Quantiser8x8, DEFAULT_OVERSAMPLE, FLAT_PREDICTION_DC,
+    column_mask, field_dct_to_frame_targets, frame_dct_to_field_targets, inter_targets,
+    intra_targets, Quantiser8x8, DEFAULT_OVERSAMPLE, FLAT_PREDICTION_DC,
 };
 use crate::h264::reconstruct::{
     chroma_dc_terms, chroma_residual_4x4, residual_8x8, InverseScale8x8,
@@ -2037,6 +2038,8 @@ fn pair_needs_field(top: Option<&Macroblock>, bottom: Option<&Macroblock>) -> bo
 struct FieldTargetSet {
     converted: bool,
     active_mask: u32,
+    /// The positions of each block that may be non-zero.
+    nonzero: [u64; 4],
 }
 
 /// Dequantise one MPEG-2 macroblock of a field-coded pair, converting its
@@ -2048,12 +2051,14 @@ fn source_field_targets(
     converted: &mut [[f32; 64]; 4],
 ) -> FieldTargetSet {
     let mut active_mask = 0u32;
+    let mut nonzero = [0u64; 4];
     // A macroblock the source never coded carries nothing, which is the same
     // as one it coded as skipped.
     let Some(field_source) = field_source.filter(|mb| !mb.skipped) else {
         return FieldTargetSet {
             converted: false,
             active_mask,
+            nonzero,
         };
     };
     let quantiser_scale =
@@ -2065,29 +2070,32 @@ fn source_field_targets(
         &pic.quant.non_intra
     };
     for b in 0..4 {
-        let Some(block) = field_source.block(b) else {
+        let Some((block, mask)) = field_source.coded_block(b) else {
             continue;
         };
         active_mask |= 1 << b;
-        if source_intra {
+        nonzero[b] = if source_intra {
             intra_targets(
                 block,
+                mask,
                 matrix,
                 quantiser_scale,
                 pic.coding.intra_dc_precision,
                 &mut raw[b],
-            );
+            )
         } else {
-            inter_targets(block, matrix, quantiser_scale, &mut raw[b]);
-        }
+            inter_targets(block, mask, matrix, quantiser_scale, &mut raw[b])
+        };
     }
     if field_source.dct_type == 1 {
         return FieldTargetSet {
             converted: false,
             active_mask,
+            nonzero,
         };
     }
     let mut converted_mask = 0u32;
+    let mut converted_nonzero = [0u64; 4];
     if active_mask & 0b0101 != 0 {
         if active_mask & 0b0001 == 0 {
             raw[0].fill(0.0);
@@ -2098,6 +2106,9 @@ fn source_field_targets(
         let (upper, lower) = converted.split_at_mut(2);
         frame_dct_to_field_targets(&raw[0], &raw[2], &mut upper[0], &mut lower[0]);
         converted_mask |= 0b0101;
+        let columns = column_mask(nonzero[0] | nonzero[2]);
+        converted_nonzero[0] = columns;
+        converted_nonzero[2] = columns;
     }
     if active_mask & 0b1010 != 0 {
         if active_mask & 0b0010 == 0 {
@@ -2109,10 +2120,14 @@ fn source_field_targets(
         let (upper, lower) = converted.split_at_mut(2);
         frame_dct_to_field_targets(&raw[1], &raw[3], &mut upper[1], &mut lower[1]);
         converted_mask |= 0b1010;
+        let columns = column_mask(nonzero[1] | nonzero[3]);
+        converted_nonzero[1] = columns;
+        converted_nonzero[3] = columns;
     }
     FieldTargetSet {
         converted: true,
         active_mask: converted_mask,
+        nonzero: converted_nonzero,
     }
 }
 
@@ -2125,7 +2140,7 @@ fn field_chroma_source<'a>(
 ) -> FieldChromaSource<'a> {
     let source_intra = pair_source.is_some_and(Macroblock::is_intra);
     FieldChromaSource {
-        levels: pair_source.and_then(|mb| mb.block(4 + component)),
+        levels: pair_source.and_then(|mb| mb.coded_block(4 + component)),
         weight_scale: if source_intra {
             &pic.quant.chroma_intra
         } else {
@@ -2554,6 +2569,9 @@ fn write_picture(
         let mut intra_luma_coded = false;
 
         let mut luma_active = [false; 4];
+        // Which positions of each block of `luma_scratch`, in scan order, hold
+        // a non-zero level. The rest of a block is not written and not read.
+        let mut luma_masks = [0u64; 4];
         let mut has_chroma = false;
         let mut chroma_from_pair = false;
         let mut qp = prev_qp;
@@ -2575,27 +2593,31 @@ fn write_picture(
                         &source_pic.quant.chroma_non_intra
                     };
 
+                    // Where each dequantised block may be non-zero, which is
+                    // what the quantiser visits.
+                    let mut target_masks = [0u64; 4];
                     for b in 0..4 {
                         let target = if source.dct_type == 1 && !direct_field_pair {
                             &mut field_targets[b]
                         } else {
                             &mut targets[b]
                         };
-                        target.fill(0.0);
-                        let Some(block) = source.block(b) else {
+                        let Some((block, mask)) = source.coded_block(b) else {
+                            target.fill(0.0);
                             continue;
                         };
-                        if intra {
+                        target_masks[b] = if intra {
                             intra_targets(
                                 block,
+                                mask,
                                 matrix,
                                 quantiser_scale,
                                 source_pic.coding.intra_dc_precision,
                                 target,
-                            );
+                            )
                         } else {
-                            inter_targets(block, matrix, quantiser_scale, target);
-                        }
+                            inter_targets(block, mask, matrix, quantiser_scale, target)
+                        };
                     }
                     if source.dct_type == 1 && !direct_field_pair {
                         let (upper, lower) = targets.split_at_mut(2);
@@ -2611,20 +2633,30 @@ fn write_picture(
                             &mut upper[1],
                             &mut lower[1],
                         );
+                        let left = column_mask(target_masks[0] | target_masks[2]);
+                        let right = column_mask(target_masks[1] | target_masks[3]);
+                        target_masks = [left, right, left, right];
                     }
                     let scan: &[usize; 64] = if direct_field_pair {
                         &FIELD_SCAN_8X8
                     } else {
                         &ZIGZAG_8X8
                     };
+                    let inverse_scan: &[u8; 64] = if direct_field_pair {
+                        &INVERSE_FIELD_SCAN_8X8
+                    } else {
+                        &INVERSE_ZIGZAG_8X8
+                    };
                     for b in 0..4 {
                         let Some(state) = intra_state.as_mut().filter(|_| intra) else {
-                            luma_active[b] = quant.scanned_levels_for(
+                            luma_masks[b] = quant.scanned_levels_masked(
                                 &targets[b],
+                                target_masks[b],
                                 qp,
-                                scan,
+                                inverse_scan,
                                 &mut luma_scratch[b],
                             );
+                            luma_active[b] = luma_masks[b] != 0;
                             continue;
                         };
                         // A block predicts from the ones already coded, its own
@@ -2643,6 +2675,7 @@ fn write_picture(
                         targets[b][0] += FLAT_PREDICTION_DC - 8.0 * pred as f32;
                         luma_active[b] =
                             quant.scanned_levels_for(&targets[b], qp, scan, &mut luma_scratch[b]);
+                        luma_masks[b] = level_mask(&luma_scratch[b]);
                         state.store_luma(
                             mb_x,
                             coded_mb_y,
@@ -2660,7 +2693,7 @@ fn write_picture(
                     for c in 0..2 {
                         let prediction =
                             chroma_prediction.as_ref().filter(|_| intra).map(|p| &p[c]);
-                        match (source.block(4 + c), prediction) {
+                        match (source.coded_block(4 + c), prediction) {
                             (Some(block), Some(prediction)) => convert_intra_chroma_block(
                                 block,
                                 chroma_matrix,
@@ -2717,6 +2750,7 @@ fn write_picture(
                     );
                 }
                 luma_active = [false; 4];
+                luma_masks = [0; 4];
             }
             let luma: [Option<&[i32; 64]>; 4] =
                 std::array::from_fn(|i| luma_active[i].then_some(&luma_scratch[i]));
@@ -2745,6 +2779,7 @@ fn write_picture(
                 qp,
                 prev_qp,
                 &luma,
+                &luma_masks,
                 has_chroma.then_some(&chroma_scratch),
             )?;
             prev_qp = written.qp;
@@ -2861,8 +2896,14 @@ fn write_picture(
                 } else {
                     &pair_raw_targets[b / 2][source_index]
                 };
-                luma_active[b] =
-                    quant.scanned_levels_for(selected, qp, &FIELD_SCAN_8X8, &mut luma_scratch[b]);
+                luma_masks[b] = quant.scanned_levels_masked(
+                    selected,
+                    set.nonzero[source_index],
+                    qp,
+                    &INVERSE_FIELD_SCAN_8X8,
+                    &mut luma_scratch[b],
+                );
+                luma_active[b] = luma_masks[b] != 0;
             }
             has_chroma =
                 !pair_field_chroma[field][0].is_empty() || !pair_field_chroma[field][1].is_empty();
@@ -3224,6 +3265,7 @@ fn write_picture(
             },
             &mb,
             &luma,
+            &luma_masks,
             chroma,
         )?;
         if !luma_active.iter().any(|&active| active) {

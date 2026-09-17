@@ -20,11 +20,37 @@ use crate::h264::mbaff::Frame;
 use crate::h264::params::ZIGZAG_8X8;
 
 /// H.264 Table 8-14: 8x8 field scan for field-coded macroblocks.
-pub static FIELD_SCAN_8X8: [usize; 64] = [
+pub const FIELD_SCAN_8X8: [usize; 64] = [
     0, 8, 16, 1, 9, 24, 32, 17, 2, 25, 40, 48, 56, 33, 10, 3, 18, 41, 49, 57, 26, 11, 4, 19, 34,
     42, 50, 58, 27, 12, 5, 20, 35, 43, 51, 59, 28, 13, 6, 21, 36, 44, 52, 60, 29, 14, 22, 37, 45,
     53, 61, 30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
 ];
+
+/// Where each raster position lands in [`FIELD_SCAN_8X8`], for a quantiser
+/// that writes only the positions it has something to put in.
+pub const INVERSE_FIELD_SCAN_8X8: [u8; 64] = inverse_scan(&FIELD_SCAN_8X8);
+
+/// The same for [`ZIGZAG_8X8`].
+pub const INVERSE_ZIGZAG_8X8: [u8; 64] = inverse_scan(&ZIGZAG_8X8);
+
+const fn inverse_scan(scan: &[usize; 64]) -> [u8; 64] {
+    let mut inverse = [0u8; 64];
+    let mut k = 0;
+    while k < 64 {
+        inverse[scan[k]] = k as u8;
+        k += 1;
+    }
+    inverse
+}
+
+/// Bit `k` set where `levels[k]` is non-zero, for levels made the dense way.
+pub fn level_mask(levels: &[i32; 64]) -> u64 {
+    let mut mask = 0u64;
+    for (k, &level) in levels.iter().enumerate() {
+        mask |= u64::from(level != 0) << k;
+    }
+    mask
+}
 
 /// B slice macroblock types for a single 16x16 partition (Table 7-14).
 ///
@@ -277,8 +303,10 @@ pub struct InterMacroblock {
 /// macroblock's own QP only if it actually carried a `mb_qp_delta`.
 ///
 /// `luma` holds the four 8x8 blocks of coefficient levels in 8x8 zig-zag scan
-/// order, or `None` where a block has no coefficients at all; `chroma` is `None`
-/// to leave chroma at the prediction.
+/// order, or `None` where a block has no coefficients at all, and `luma_masks`
+/// says which positions of each are non-zero -- nothing else in a block is
+/// read, so the rest need not have been written; `chroma` is `None` to leave
+/// chroma at the prediction.
 #[allow(clippy::too_many_arguments)]
 pub fn write_inter_macroblock(
     w: &mut BitWriter,
@@ -287,6 +315,7 @@ pub fn write_inter_macroblock(
     frame: &Frame,
     mb: &InterMacroblock,
     luma: &[Option<&[i32; 64]>; 4],
+    luma_masks: &[u64; 4],
     chroma: Option<&[ChromaBlockLevels; 2]>,
 ) -> Result<i32> {
     // P_L0_16x16 is mb_type 0 (Table 7-13). B slices use Table 7-14 below.
@@ -361,7 +390,7 @@ pub fn write_inter_macroblock(
         w.se(wrap_qp_delta(mb.qp - mb.prev_qp));
         qp_after = mb.qp;
         if cbp_luma > 0 {
-            write_luma_residual_8x8(w, counts, frame, mb.address, luma, cbp_luma)?;
+            write_luma_residual_8x8(w, counts, frame, mb.address, luma, luma_masks, cbp_luma)?;
         } else {
             mark_no_coefficients(counts, mb.address);
         }
@@ -393,6 +422,7 @@ pub fn write_intra_macroblock(
     qp: i32,
     prev_qp: i32,
     luma: &[Option<&[i32; 64]>; 4],
+    luma_masks: &[u64; 4],
     chroma: Option<&[ChromaBlockLevels; 2]>,
 ) -> Result<IntraMacroblock> {
     w.ue(0); // mb_type: I_NxN
@@ -426,7 +456,7 @@ pub fn write_intra_macroblock(
         w.se(wrap_qp_delta(qp - prev_qp));
         qp_after = qp;
         if cbp_luma > 0 {
-            write_luma_residual_8x8(w, counts, frame, address, luma, cbp_luma)?;
+            write_luma_residual_8x8(w, counts, frame, address, luma, luma_masks, cbp_luma)?;
         } else {
             mark_no_coefficients(counts, address);
         }
@@ -533,6 +563,7 @@ fn write_luma_residual_8x8(
     frame: &Frame,
     address: usize,
     luma: &[Option<&[i32; 64]>; 4],
+    luma_masks: &[u64; 4],
     cbp_luma: u32,
 ) -> Result<()> {
     let mut sub = [0i32; 16];
@@ -548,11 +579,17 @@ fn write_luma_residual_8x8(
                 continue;
             };
 
+            // The non-zero levels among every fourth position from `i4x4`.
+            // Only those are gathered, and only those are read back: the
+            // writer takes the same mask.
+            let mut rest = luma_masks[i8x8] & (0x1111_1111_1111_1111u64 << i4x4);
             let mut mask = 0u32;
-            for i in 0..16 {
-                let level = block[4 * i + i4x4];
-                sub[i] = level;
-                mask |= u32::from(level != 0) << i;
+            while rest != 0 {
+                let position = rest.trailing_zeros() as usize & 63;
+                rest &= rest - 1;
+                let i = position >> 2;
+                sub[i] = block[position];
+                mask |= 1 << i;
             }
             let total = write_masked_levels(w, &sub, mask, counts.n_c(&edges, address, bx, by))?;
             counts.set(address, bx, by, total);

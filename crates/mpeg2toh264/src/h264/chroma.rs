@@ -17,6 +17,8 @@ use std::sync::LazyLock;
 
 use crate::h264::cos_table::COS_PI_OVER_16;
 use crate::h264::params::ZIGZAG_4X4;
+#[cfg(test)]
+use crate::h264::quant::level_mask;
 use crate::h264::quant::{inter_targets, intra_targets, FLAT_PREDICTION_DC};
 use crate::h264::quant_tables::{CHROMA_AC_GAIN_4X4, CHROMA_DC_GAIN, QPC_FROM_QPI};
 use crate::round_half_up_i32;
@@ -185,33 +187,32 @@ fn spatial_to_chroma_levels(
 }
 
 fn dequant_chroma(
-    levels: Option<&[i16; 64]>,
+    (levels, mask): (&[i16; 64], u64),
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
     intra_dc_precision: u32,
     intra: bool,
     out: &mut [f32; 64],
 ) {
-    let Some(levels) = levels else {
-        out.fill(0.0);
-        return;
-    };
     if intra {
         intra_targets(
             levels,
+            mask,
             weight_scale,
             quantiser_scale,
             intra_dc_precision,
             out,
         );
     } else {
-        inter_targets(levels, weight_scale, quantiser_scale, out);
+        inter_targets(levels, mask, weight_scale, quantiser_scale, out);
     }
 }
 
 /// One MPEG-2 chroma block as the field-pair conversion needs to see it.
 pub struct FieldChromaSource<'a> {
-    pub levels: Option<&'a [i16; 64]>,
+    /// The levels and which of them are non-zero, as the decoder hands them
+    /// out, or `None` where the source coded nothing.
+    pub levels: Option<(&'a [i16; 64], u64)>,
     pub weight_scale: &'a [i32; 64],
     pub quantiser_scale: i32,
     pub intra_dc_precision: u32,
@@ -253,9 +254,9 @@ pub fn convert_field_chroma_pair(
     out_bottom: &mut ChromaBlockLevels,
     scratch: &mut FieldChromaScratch,
 ) {
-    if upper.levels.is_some() {
+    if let Some(levels) = upper.levels {
         dequant_chroma(
-            upper.levels,
+            levels,
             upper.weight_scale,
             upper.quantiser_scale,
             upper.intra_dc_precision,
@@ -270,9 +271,9 @@ pub fn convert_field_chroma_pair(
     } else {
         scratch.upper_spatial.fill(0.0);
     }
-    if lower.levels.is_some() {
+    if let Some(levels) = lower.levels {
         dequant_chroma(
-            lower.levels,
+            levels,
             lower.weight_scale,
             lower.quantiser_scale,
             lower.intra_dc_precision,
@@ -306,7 +307,7 @@ pub fn convert_field_chroma_pair(
 /// DC coefficient alone. A non-intra block is coded against motion compensation
 /// the H.264 side reproduces, so its residual carries across untouched.
 pub fn convert_chroma_block(
-    levels: &[i16; 64],
+    levels: (&[i16; 64], u64),
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
     intra_dc_precision: u32,
@@ -320,7 +321,7 @@ pub fn convert_chroma_block(
     let mut tmp = [0.0f32; 64];
 
     dequant_chroma(
-        Some(levels),
+        levels,
         weight_scale,
         quantiser_scale,
         intra_dc_precision,
@@ -339,7 +340,7 @@ pub fn convert_chroma_block(
 /// already taken the flat constant off every sample, so putting it back and
 /// removing the right one leaves the residual this block actually needs.
 pub fn convert_intra_chroma_block(
-    levels: &[i16; 64],
+    levels: (&[i16; 64], u64),
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
     intra_dc_precision: u32,
@@ -353,7 +354,7 @@ pub fn convert_intra_chroma_block(
     let mut tmp = [0.0f32; 64];
 
     dequant_chroma(
-        Some(levels),
+        levels,
         weight_scale,
         quantiser_scale,
         intra_dc_precision,
@@ -421,7 +422,16 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = 8 * 60; // DC only, at intra_dc_precision 0 this is 60 per sample
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, false, false);
+        convert_chroma_block(
+            (&levels, level_mask(&levels)),
+            &[16; 64],
+            8,
+            0,
+            26,
+            &mut out,
+            false,
+            false,
+        );
         assert!(out.any_dc, "the flat level lands on the DC block");
         assert!(!out.any_ac, "a constant block has no AC content");
         assert_eq!(&out.dc[1..], &[0, 0, 0], "only the Hadamard DC is non-zero");
@@ -434,7 +444,16 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = (FLAT_PREDICTION_DC / 8.0) as i16;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, true, false);
+        convert_chroma_block(
+            (&levels, level_mask(&levels)),
+            &[16; 64],
+            8,
+            0,
+            26,
+            &mut out,
+            true,
+            false,
+        );
         assert!(
             out.is_empty(),
             "the residual against a flat prediction is zero"
@@ -446,7 +465,16 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[5] = 400;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 16, 0, 20, &mut out, false, false);
+        convert_chroma_block(
+            (&levels, level_mask(&levels)),
+            &[16; 64],
+            16,
+            0,
+            20,
+            &mut out,
+            false,
+            false,
+        );
         assert!(!out.is_empty(), "the fixture actually codes something");
         out.clear();
         assert!(out.is_empty());
