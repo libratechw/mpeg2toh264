@@ -90,10 +90,7 @@ static TABLES: LazyLock<Tables> = LazyLock::new(|| {
 /// Returns the codeword's length and bits, with the suffix separately for the
 /// few escape codes wider than the writer takes at once, or nothing for a
 /// level beyond what level_prefix 24 can reach.
-const fn level_codeword(
-    level_code: u32,
-    suffix_length: u32,
-) -> Option<(u32, u32, Option<(u32, u32)>)> {
+const fn level_codeword(level_code: u32, suffix_length: u32) -> Option<LevelCodeword> {
     let prefix;
     let mut suffix = 0u32;
     let mut suffix_bits = 0u32;
@@ -146,6 +143,10 @@ const fn level_codeword(
         Some((prefix + 1, 1, Some((suffix_bits, suffix))))
     }
 }
+
+/// A level's codeword: its length and bits, and for the widest escapes the
+/// suffix's own length and bits, which go out as a second write.
+type LevelCodeword = (u32, u32, Option<(u32, u32)>);
 
 /// Every level below this is written from [`LEVEL_CODES`]; a level that large
 /// is rare enough to work out on the spot.
