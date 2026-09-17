@@ -76,30 +76,23 @@ pub struct Macroblock {
     pub field_select: [u8; 4],
     /// How many of the two vector slots are in use.
     pub mv_count: usize,
-    /// Six 8x8 blocks of quantised levels in raster order.
+    /// Six 8x8 blocks of quantised levels in raster order. Only the positions
+    /// `nonzero` names were written for this picture; the rest hold whatever
+    /// an earlier picture left there, and nothing reads them.
     blocks: [[i16; 64]; 6],
     /// Which positions of each block the stream coded, bit `p` for raster
-    /// position `p`. Every other position is zero, and a block carries five
-    /// non-zero levels in sixty-four on a broadcast, so what reads the block
-    /// walks these bits rather than the whole of it.
+    /// position `p`. A block carries five non-zero levels in sixty-four on a
+    /// broadcast, so what reads the block walks these bits rather than the
+    /// whole of it -- and the decoder need not clear the other fifty-nine.
     nonzero: [u64; 6],
     /// Bit `i` is set when block `i` carries decoded levels.
     coded_blocks: u8,
 }
 
 impl Macroblock {
-    /// Levels of one 8x8 block, or `None` where the source did not code it.
-    #[inline]
-    pub fn block(&self, index: usize) -> Option<&[i16; 64]> {
-        if self.coded_blocks & (1 << index) != 0 {
-            Some(&self.blocks[index])
-        } else {
-            None
-        }
-    }
-
-    /// [`Self::block`] with the positions it coded, for a reader that would
-    /// rather not look at the zeros.
+    /// Levels of one 8x8 block and the positions the source coded, or `None`
+    /// where it did not code the block. Positions outside the mask are not
+    /// zero, they are unwritten; read the mask, not the block.
     #[inline]
     pub fn coded_block(&self, index: usize) -> Option<(&[i16; 64], u64)> {
         if self.coded_blocks & (1 << index) != 0 {
@@ -368,7 +361,8 @@ fn decode_block(
     out: &mut [i16; 64],
     nonzero: &mut u64,
 ) -> Result<()> {
-    out.fill(0);
+    // `out` is not cleared: `nonzero` says which of it was written, and that
+    // is all any reader looks at.
     *nonzero = 0;
     let scan: &[usize; 64] = if pic.coding.alternate_scan {
         &ALTERNATE_SCAN
