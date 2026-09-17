@@ -37,9 +37,43 @@ static V_DC_LUMA: LazyLock<VlcTable> =
 static V_DC_CHROMA: LazyLock<VlcTable> =
     LazyLock::new(|| VlcTable::new("dct_dc_size_chrominance", DCT_DC_SIZE_CHROMA));
 static V_COEFF0: LazyLock<VlcTable> =
-    LazyLock::new(|| VlcTable::new("dct_coefficients_0", DCT_COEFF_TABLE0));
+    LazyLock::new(|| signed_coefficient_table("dct_coefficients_0", DCT_COEFF_TABLE0));
 static V_COEFF1: LazyLock<VlcTable> =
-    LazyLock::new(|| VlcTable::new("dct_coefficients_1", DCT_COEFF_TABLE1));
+    LazyLock::new(|| signed_coefficient_table("dct_coefficients_1", DCT_COEFF_TABLE1));
+
+/// How a coefficient comes out of [`signed_coefficient_table`]: the run in
+/// the high bits and the level, offset so that it is never negative, in the
+/// low twelve.
+const COEFFICIENT_RUN_SHIFT: u32 = 12;
+const COEFFICIENT_LEVEL_BIAS: i32 = 2048;
+
+/// Table B.14 or B.15 with the sign bit that follows every run/level code
+/// folded into the code itself, so a coefficient is one lookup rather than a
+/// lookup and a bit. End of block and escape carry no sign and stay as they
+/// are. The first lookup covers ten bits: the codes a broadcast spends most
+/// of its time in are six to nine bits before their sign.
+fn signed_coefficient_table(name: &'static str, entries: &[(&str, i32)]) -> VlcTable {
+    let mut signed: Vec<(String, i32)> = Vec::with_capacity(entries.len() * 2);
+    for &(code, value) in entries {
+        if value == EOB || value == ESCAPE {
+            signed.push((code.to_string(), value));
+            continue;
+        }
+        let run = value >> 8;
+        let level = value & 0xff;
+        for (sign, level) in [("0", level), ("1", -level)] {
+            signed.push((
+                format!("{code}{sign}"),
+                (run << COEFFICIENT_RUN_SHIFT) | (level + COEFFICIENT_LEVEL_BIAS),
+            ));
+        }
+    }
+    let entries: Vec<(&str, i32)> = signed
+        .iter()
+        .map(|(code, value)| (code.as_str(), *value))
+        .collect();
+    VlcTable::with_primary_bits(name, &entries, 10)
+}
 
 /// `frame_motion_type` / `field_motion_type` values (Tables 6-17, 6-18).
 pub mod motion_type {
@@ -414,12 +448,10 @@ fn decode_block(
             let raw = r.u(12) as i32;
             (run, if raw >= 2048 { raw - 4096 } else { raw })
         } else {
-            let run = (sym >> 8) as usize;
-            let mut level = sym & 0xff;
-            if r.flag() {
-                level = -level;
-            }
-            (run, level)
+            (
+                (sym >> COEFFICIENT_RUN_SHIFT) as usize,
+                (sym & ((1 << COEFFICIENT_RUN_SHIFT) - 1)) - COEFFICIENT_LEVEL_BIAS,
+            )
         };
         n += run;
         if n > 63 {

@@ -25,12 +25,24 @@ impl VlcTable {
     /// codes are a defect in the generated tables, not in any input, so they
     /// panic rather than surfacing as a stream error.
     pub fn new(name: &'static str, entries: &[(&str, i32)]) -> Self {
+        Self::with_primary_bits(name, entries, 8)
+    }
+
+    /// [`Self::new`] with the first lookup covering `primary_bits` bits, or
+    /// the longest code if that is shorter. Eight suits most of the tables;
+    /// a table whose everyday codes run longer is worth a bigger first table
+    /// so that they, too, are one lookup.
+    pub fn with_primary_bits(
+        name: &'static str,
+        entries: &[(&str, i32)],
+        primary_bits: u32,
+    ) -> Self {
         let max_len = entries
             .iter()
             .map(|(code, _)| code.len() as u32)
             .max()
             .unwrap_or(0);
-        let primary_bits = max_len.min(8);
+        let primary_bits = max_len.min(primary_bits);
         let secondary_bits = max_len - primary_bits;
         let mut expanded = vec![0u32; 1usize << primary_bits];
         let mut secondary = Vec::new();
