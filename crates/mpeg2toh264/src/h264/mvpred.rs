@@ -9,7 +9,7 @@
 //! given line is [`crate::h264::mbaff`]'s answer, and what a macroblock of the
 //! other kind makes of the vector it finds there is clause 8.4.1.3.2's.
 
-use crate::h264::mbaff::Frame;
+use crate::h264::mbaff::{self, Frame, Neighbourhood};
 
 /// Motion state of one macroblock, as neighbours need to see it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -101,8 +101,14 @@ impl MotionField {
     /// A field macroblock counts lines half as often as a frame one, so a
     /// vector read across that boundary is scaled and its reference index moved
     /// between the frame list and the field list built from it.
-    fn at(&self, frame: &Frame, address: usize, x: i32, y: i32, list: usize) -> Neighbour {
-        let Some(found) = frame.neighbour(address, x, y, 16, 16) else {
+    fn at(
+        &self,
+        frame: &Frame,
+        address: usize,
+        found: Option<mbaff::Neighbour>,
+        list: usize,
+    ) -> Neighbour {
+        let Some(found) = found else {
             return UNAVAILABLE;
         };
         let block = found.address * 16 + (found.y / 4) * 4 + found.x / 4;
@@ -142,11 +148,24 @@ impl MotionField {
     /// exactly one of them uses the same reference index, its vector is taken
     /// directly; otherwise the component-wise median is used.
     pub fn predict(&self, frame: &Frame, address: usize, list: usize, ref_idx: i32) -> [i32; 2] {
-        let a = self.at(frame, address, -1, 0, list);
-        let b = self.at(frame, address, 0, -1, list);
-        let mut c = self.at(frame, address, 16, -1, list);
+        self.predict_in(frame, address, &frame.neighbourhood(address), list, ref_idx)
+    }
+
+    /// [`Self::predict`] with the neighbours already derived, which a
+    /// macroblock does once and then uses for both lists.
+    pub fn predict_in(
+        &self,
+        frame: &Frame,
+        address: usize,
+        hood: &Neighbourhood,
+        list: usize,
+        ref_idx: i32,
+    ) -> [i32; 2] {
+        let a = self.at(frame, address, hood.a, list);
+        let b = self.at(frame, address, hood.b, list);
+        let mut c = self.at(frame, address, hood.c, list);
         if !c.available {
-            c = self.at(frame, address, -1, -1, list);
+            c = self.at(frame, address, hood.d, list);
         }
         predict_from_neighbours(a, b, c, ref_idx)
     }
@@ -160,9 +179,54 @@ impl MotionField {
         list: usize,
         ref_idx: i32,
     ) -> [i32; 2] {
-        let y = part as i32 * 8;
-        let a = self.at(frame, address, -1, y, list);
-        let b = self.at(frame, address, 0, y - 1, list);
+        self.predict_16x8_in(
+            frame,
+            address,
+            &frame.neighbourhood(address),
+            part,
+            list,
+            ref_idx,
+        )
+    }
+
+    /// [`Self::predict_16x8`] with the corner's neighbours already derived.
+    /// The top partition uses them as they are; the bottom one starts eight
+    /// lines down, where the neighbour above is the macroblock's own top half
+    /// and above-right is never available.
+    pub fn predict_16x8_in(
+        &self,
+        frame: &Frame,
+        address: usize,
+        hood: &Neighbourhood,
+        part: usize,
+        list: usize,
+        ref_idx: i32,
+    ) -> [i32; 2] {
+        let (a, b) = if part == 0 {
+            (
+                self.at(frame, address, hood.a, list),
+                self.at(frame, address, hood.b, list),
+            )
+        } else {
+            (
+                self.at(
+                    frame,
+                    address,
+                    frame.neighbour(address, -1, 8, 16, 16),
+                    list,
+                ),
+                self.at(
+                    frame,
+                    address,
+                    Some(mbaff::Neighbour {
+                        address,
+                        x: 0,
+                        y: 7,
+                    }),
+                    list,
+                ),
+            )
+        };
         let same_ref = |n: &Neighbour| n.available && n.ref_idx == ref_idx;
         // Clause 8.4.1.3: 16x8 top prefers B and bottom prefers A before the
         // general median/reference-match process.
@@ -172,10 +236,21 @@ impl MotionField {
         if part == 1 && same_ref(&a) {
             return vector_of(&a);
         }
-        let mut c = self.at(frame, address, 16, y - 1, list);
-        if !c.available {
-            c = self.at(frame, address, -1, y - 1, list);
-        }
+        let c = if part == 0 {
+            let c = self.at(frame, address, hood.c, list);
+            if c.available {
+                c
+            } else {
+                self.at(frame, address, hood.d, list)
+            }
+        } else {
+            self.at(
+                frame,
+                address,
+                frame.neighbour(address, -1, 7, 16, 16),
+                list,
+            )
+        };
         predict_from_neighbours(a, b, c, ref_idx)
     }
 }

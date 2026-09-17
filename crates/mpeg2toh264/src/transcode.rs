@@ -2943,27 +2943,37 @@ fn write_picture(
 
         let uses_l0 = pred.mb_type != b_mb_type::L1_16X16;
         let uses_l1 = pred.mb_type != b_mb_type::L0_16X16;
+        // Where this macroblock's motion neighbours are, in whichever picture
+        // it is coded in, asked once for everything below.
+        let (motion_frame, motion_address): (&MbaffFrame, usize) = if direct_field_pair {
+            (&field_frames[mb_y & 1], field_address)
+        } else {
+            (frame, address)
+        };
+        let hood = motion_frame.neighbourhood(motion_address);
         let pred_l0 = if direct_field_pair && uses_l0 {
-            field_motion[mb_y & 1].predict(
-                &field_frames[mb_y & 1],
-                field_address,
+            field_motion[mb_y & 1].predict_in(
+                motion_frame,
+                motion_address,
+                &hood,
                 0,
                 pred.ref_idx_l0,
             )
         } else if !field_pair && uses_l0 {
-            motion.predict(frame, address, 0, pred.ref_idx_l0)
+            motion.predict_in(motion_frame, motion_address, &hood, 0, pred.ref_idx_l0)
         } else {
             [0, 0]
         };
         let pred_l1 = if direct_field_pair && uses_l1 {
-            field_motion[mb_y & 1].predict(
-                &field_frames[mb_y & 1],
-                field_address,
+            field_motion[mb_y & 1].predict_in(
+                motion_frame,
+                motion_address,
+                &hood,
                 1,
                 pred.ref_idx_l1,
             )
         } else if !field_pair && uses_l1 {
-            motion.predict(frame, address, 1, pred.ref_idx_l1)
+            motion.predict_in(motion_frame, motion_address, &hood, 1, pred.ref_idx_l1)
         } else {
             [0, 0]
         };
@@ -2998,9 +3008,10 @@ fn write_picture(
                 let uses_part_l0 = part_pred.ref_idx_l0 >= 0;
                 let uses_part_l1 = part_pred.ref_idx_l1 >= 0;
                 let p_l0 = if uses_part_l0 {
-                    field_motion[field].predict_16x8(
-                        &field_frames[field],
-                        field_address,
+                    field_motion[field].predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
                         part,
                         0,
                         part_pred.ref_idx_l0,
@@ -3009,9 +3020,10 @@ fn write_picture(
                     [0, 0]
                 };
                 let p_l1 = if uses_part_l1 {
-                    field_motion[field].predict_16x8(
-                        &field_frames[field],
-                        field_address,
+                    field_motion[field].predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
                         part,
                         1,
                         part_pred.ref_idx_l1,
@@ -3073,12 +3085,26 @@ fn write_picture(
                 let uses_field_l0 = field_pred.ref_idx_l0 >= 0;
                 let uses_field_l1 = field_pred.ref_idx_l1 >= 0;
                 let p_l0 = if uses_field_l0 {
-                    motion.predict_16x8(frame, address, part, 0, field_pred.ref_idx_l0)
+                    motion.predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
+                        part,
+                        0,
+                        field_pred.ref_idx_l0,
+                    )
                 } else {
                     [0, 0]
                 };
                 let p_l1 = if uses_field_l1 {
-                    motion.predict_16x8(frame, address, part, 1, field_pred.ref_idx_l1)
+                    motion.predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
+                        part,
+                        1,
+                        field_pred.ref_idx_l1,
+                    )
                 } else {
                     [0, 0]
                 };

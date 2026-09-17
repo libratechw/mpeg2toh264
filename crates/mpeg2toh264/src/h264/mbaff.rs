@@ -26,6 +26,18 @@ pub struct Neighbour {
     pub y: usize,
 }
 
+/// The four locations motion vector prediction asks about for a 16x16
+/// partition or the top half of a 16x8 one -- left, above, above-right and
+/// above-left of the macroblock's corner -- derived once per macroblock,
+/// since the derivation is the same for both reference lists.
+#[derive(Clone, Copy, Debug)]
+pub struct Neighbourhood {
+    pub a: Option<Neighbour>,
+    pub b: Option<Neighbour>,
+    pub c: Option<Neighbour>,
+    pub d: Option<Neighbour>,
+}
+
 /// The shape of a picture and how each of its pairs is coded.
 ///
 /// Whether a macroblock has been coded yet is not here: the caller's own record
@@ -136,6 +148,17 @@ impl Frame {
             };
             let d = if column == 0 { -1 } else { at - width - 1 };
             [a, b, c, d]
+        }
+    }
+
+    /// The luma neighbours of `address`'s upper-left corner, for motion
+    /// vector prediction.
+    pub fn neighbourhood(&self, address: usize) -> Neighbourhood {
+        Neighbourhood {
+            a: self.neighbour(address, -1, 0, 16, 16),
+            b: self.neighbour(address, 0, -1, 16, 16),
+            c: self.neighbour(address, 16, -1, 16, 16),
+            d: self.neighbour(address, -1, -1, 16, 16),
         }
     }
 
