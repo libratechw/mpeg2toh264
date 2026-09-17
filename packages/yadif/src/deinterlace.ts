@@ -198,7 +198,12 @@ export interface DeinterlaceStats {
   queueResetted: number;
   /** The number of fields queued when doubleRate is true. */
   maxQueuedFields: number;
-  /** GPU processing time, supported only in Chrome. */
+  /**
+   * GPU processing time, supported only in Chrome. On ANGLE's Metal backend
+   * it spans command buffers rather than the work in them, so it overstates
+   * anything split into many small passes; a change is best judged by its
+   * direction here and by a synchronous readback in isolation.
+   */
   gpuMs: number | undefined;
   /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
   film: boolean;

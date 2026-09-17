@@ -13,19 +13,22 @@
  * previous frame's second; phase 1 then repeats the previous film frame and
  * is dropped. The phases are numbered in the order they are told apart in.
  *
- * FIELD_COMPARE measures one field of two frames block by block, REDUCTION
- * folds the blocks into one texel, and DETECT reads the texels and decides
- * the phase. "First" and "second" are the fields in capture order.
+ * Three passes a frame, none of them a copy. FIELD_COMPARE measures both
+ * fields of two frames block by block in one go, REDUCTION folds the blocks
+ * most of the way down, and METRICS finishes the fold, moves the earlier
+ * comparisons along, and decides the phase, writing the whole metrics row of
+ * one frame from the row of the frame before. "First" and "second" are the
+ * fields in capture order.
  */
 
 /**
  * The texels of the field-metrics texture. Each comparison texel is `(max,
- * differing, mean)`: the largest block mean absolute luma difference, how
- * many blocks were over the threshold, and the mean over all blocks. The
- * `phase` texel is `(phase, run)`.
+ * differing, mean, blocks)`: the largest block mean absolute luma difference,
+ * how many blocks were over the threshold, the mean over all blocks, and how
+ * many blocks there were. The `phase` texel is `(phase, run)`.
  *
  * Only the two comparisons against the next frame are measured per frame;
- * the rest are earlier ones moved along by the deinterlacer.
+ * the rest are earlier ones moved along by METRICS.
  */
 export const FIELD_METRICS = {
   /** This frame's first field is the previous frame's first field. */
@@ -63,7 +66,7 @@ export const FIELD_COMPARE_UNIFORMS = {
   a: "uA",
   b: "uB",
   fieldMetrics: "uFieldMetrics",
-  parity: "uParity",
+  first: "uFirst",
   size: "uSize",
 } as const;
 
@@ -72,9 +75,14 @@ export const FIELD_COMPARE_BLOCK_W = 16;
 export const FIELD_COMPARE_BLOCK_H = 8;
 
 /**
- * Compare one field of two frames block by block. The threshold on a
- * block's mean absolute luma difference is tight until a cadence is found
- * and loosens as it holds.
+ * Compare both fields of two frames block by block. A block is BLOCK_W by
+ * BLOCK_H lines of each field, which is BLOCK_H * 2 consecutive frame lines,
+ * so the two fields are measured in one pass over each texel. The second
+ * field goes to the first output and the first field to the second, which
+ * is the order the metrics are numbered in.
+ *
+ * The threshold on a block's mean absolute luma difference is tight until a
+ * cadence is found and loosens as it holds.
  */
 export const FIELD_COMPARE_FRAGMENT_SHADER = `#version 300 es
 
@@ -84,14 +92,22 @@ uniform sampler2D uA;
 uniform sampler2D uB;
 uniform sampler2D uFieldMetrics;
 
-uniform int uParity;
+/** The parity of the field captured first. */
+uniform int uFirst;
 uniform ivec2 uSize;
 
-out vec4 outValue;
+layout(location = 0) out vec4 outSecond;
+layout(location = 1) out vec4 outFirst;
 
 float luma(vec3 c)
 {
   return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec4 measure(float diff, float total, float threshold)
+{
+  diff /= total;
+  return vec4(diff, diff > threshold ? 1.0 : 0.0, diff, 1.0);
 }
 
 void main()
@@ -100,13 +116,13 @@ void main()
   const int BLOCK_H = ${FIELD_COMPARE_BLOCK_H};
 
   ivec2 block = ivec2(gl_FragCoord.xy);
-  ivec2 base = ivec2(
-    block.x * BLOCK_W,
-    block.y * BLOCK_H * 2 + uParity
-  );
+  ivec2 base = ivec2(block.x * BLOCK_W, block.y * BLOCK_H * 2);
 
-  float diff = 0.0;
-  int total = 0;
+  // Even and odd frame lines, summed apart.
+  float diffEven = 0.0;
+  float diffOdd = 0.0;
+  int totalEven = 0;
+  int totalOdd = 0;
 
   for (int y = 0; y < BLOCK_H; ++y) {
     for (int x = 0; x < BLOCK_W; ++x) {
@@ -116,68 +132,87 @@ void main()
         float a = luma(texelFetch(uA, p, 0).rgb);
         float b = luma(texelFetch(uB, p, 0).rgb);
 
-        diff += abs(a - b);
-        total += 1;
+        diffEven += abs(a - b);
+        totalEven += 1;
+      }
+      p.y += 1;
+      if (p.x < uSize.x && p.y < uSize.y) {
+        float a = luma(texelFetch(uA, p, 0).rgb);
+        float b = luma(texelFetch(uB, p, 0).rgb);
+
+        diffOdd += abs(a - b);
+        totalOdd += 1;
       }
     }
   }
 
-  diff /= float(total);
   float run = texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.phase}, 0), 0)[1];
   float threshold = run == 0.0 ? 0.025 : (run <= 10.0 ? 0.11 : 0.15);
 
-  outValue = vec4(diff, diff > threshold ? 1.0 : 0.0, diff, 0.0);
+  vec4 even = measure(diffEven, float(totalEven), threshold);
+  vec4 odd = measure(diffOdd, float(totalOdd), threshold);
+  outFirst = uFirst == 0 ? even : odd;
+  outSecond = uFirst == 0 ? odd : even;
 }
 `;
 
 export const REDUCTION_UNIFORMS = {
-  input: "uInput",
+  second: "uSecond",
+  first: "uFirst",
   size: "uSize",
 } as const;
-export const REDUCTION_FACTOR = 4;
+export const REDUCTION_FACTOR = 8;
 
-/** Fold a square of texels into one, until a comparison is one texel. */
+/** Fold a square of texels of both comparisons into one texel each. */
 export const REDUCTION_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 
-uniform sampler2D uInput;
+uniform sampler2D uSecond;
+uniform sampler2D uFirst;
 
 uniform ivec2 uSize;
-out vec4 outValue;
+
+layout(location = 0) out vec4 outSecond;
+layout(location = 1) out vec4 outFirst;
 
 void main()
 {
   ivec2 dst = ivec2(gl_FragCoord.xy);
   ivec2 base = dst * ${REDUCTION_FACTOR};
 
-  vec4 sum = vec4(0.0);
-  int total = 0;
+  vec4 second = vec4(0.0);
+  vec4 first = vec4(0.0);
 
   for (int y = 0; y < ${REDUCTION_FACTOR}; ++y) {
     for (int x = 0; x < ${REDUCTION_FACTOR}; ++x) {
       ivec2 p = base + ivec2(x, y);
 
       if (p.x < uSize.x && p.y < uSize.y) {
-        vec4 value = texelFetch(uInput, p, 0);
-        sum[0] = max(sum[0], value[0]);
-        sum[1] += value[1];
-        sum[2] += value[2];
-        total += 1;
+        vec4 value = texelFetch(uSecond, p, 0);
+        second[0] = max(second[0], value[0]);
+        second.yzw += value.yzw;
+        value = texelFetch(uFirst, p, 0);
+        first[0] = max(first[0], value[0]);
+        first.yzw += value.yzw;
       }
     }
   }
 
-  sum[2] /= float(total);
-  outValue = sum;
+  outSecond = second;
+  outFirst = first;
 }
 `;
 
-export const DETECT_UNIFORMS = {
-  fieldMetrics: "uFieldMetrics",
+export const METRICS_UNIFORMS = {
+  previous: "uPrevious",
+  second: "uSecond",
+  first: "uFirst",
+  size: "uSize",
 } as const;
 
 /**
- * Decide the pulldown phase of a frame from the comparisons.
+ * Write the metrics row of a frame from the row of the frame before and the
+ * two comparisons just measured, and decide the pulldown phase.
  *
  * Each phase is told by one field that repeats and one that does not. Held
  * film frames (animation) make the latter unreliable, so once a cycle has
@@ -185,43 +220,64 @@ export const DETECT_UNIFORMS = {
  * frame has to show both. A still (both fields the same as a neighbour's)
  * keeps the cycle's place but counts only once the cycle is believed.
  */
-export const DETECT_FRAGMENT_SHADER = `#version 300 es
+export const METRICS_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 
-uniform sampler2D uFieldMetrics;
+uniform sampler2D uPrevious;
+uniform sampler2D uSecond;
+uniform sampler2D uFirst;
+
+/** The size of the reduced comparisons. */
+uniform ivec2 uSize;
+
 out vec4 outValue;
 
-float differing(int metric) {
-  return texelFetch(uFieldMetrics, ivec2(metric, 0), 0)[1];
+vec4 previous(int metric) {
+  return texelFetch(uPrevious, ivec2(metric, 0), 0);
 }
 
-bool same(int metric) {
-  return differing(metric) <= ${SAME_BLOCKS_MAX}.0;
+/** Fold what REDUCTION left into one texel. */
+vec4 fold(sampler2D reduced) {
+  vec4 sum = vec4(0.0);
+  for (int y = 0; y < uSize.y; ++y) {
+    for (int x = 0; x < uSize.x; ++x) {
+      vec4 value = texelFetch(reduced, ivec2(x, y), 0);
+      sum[0] = max(sum[0], value[0]);
+      sum.yzw += value.yzw;
+    }
+  }
+  return vec4(sum[0], sum[1], sum[2] / max(sum[3], 1.0), sum[3]);
 }
 
-bool differs(int metric) {
-  return differing(metric) >= ${DIFFERENT_BLOCKS_MIN}.0;
+bool same(float differing) {
+  return differing <= ${SAME_BLOCKS_MAX}.0;
 }
 
-void main()
+bool differs(float differing) {
+  return differing >= ${DIFFERENT_BLOCKS_MIN}.0;
+}
+
+/** The phase texel, (phase, run), from the six comparisons' differing counts. */
+vec4 decide(vec4 last, float dFirstRepeatsPrevious, float dSecondRepeatsNext,
+            float dSecondRepeatsPrevious, float dPreviousSecondRepeated,
+            float dFirstRepeatsNext, float dPreviousFirstRepeated)
 {
-  bool firstRepeatsPrevious = same(${FIELD_METRICS.firstRepeatsPrevious});
-  bool secondRepeatsNext = same(${FIELD_METRICS.secondRepeatsNext});
-  bool secondRepeatsPrevious = same(${FIELD_METRICS.secondRepeatsPrevious});
-  bool previousSecondRepeated = same(${FIELD_METRICS.previousSecondRepeated});
-  bool firstRepeatsNext = same(${FIELD_METRICS.firstRepeatsNext});
-  bool previousFirstRepeated = same(${FIELD_METRICS.previousFirstRepeated});
+  bool firstRepeatsPrevious = same(dFirstRepeatsPrevious);
+  bool secondRepeatsNext = same(dSecondRepeatsNext);
+  bool secondRepeatsPrevious = same(dSecondRepeatsPrevious);
+  bool previousSecondRepeated = same(dPreviousSecondRepeated);
+  bool firstRepeatsNext = same(dFirstRepeatsNext);
+  bool previousFirstRepeated = same(dPreviousFirstRepeated);
   bool still = (firstRepeatsPrevious && secondRepeatsPrevious) || (secondRepeatsNext && firstRepeatsNext);
 
-  vec4 last = texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.phase}, 0), 0);
   int previous = int(last[0]);
   float run = last[1];
   // What each phase looks like: one field repeats, the other plainly does not.
-  bool looks1 = firstRepeatsPrevious && differs(${FIELD_METRICS.secondRepeatsPrevious});
-  bool looks2 = secondRepeatsNext && differs(${FIELD_METRICS.firstRepeatsNext});
-  bool looks3 = secondRepeatsPrevious && differs(${FIELD_METRICS.firstRepeatsPrevious});
-  bool looks4 = previousSecondRepeated && differs(${FIELD_METRICS.previousFirstRepeated});
-  bool looks5 = firstRepeatsNext && differs(${FIELD_METRICS.secondRepeatsNext});
+  bool looks1 = firstRepeatsPrevious && differs(dSecondRepeatsPrevious);
+  bool looks2 = secondRepeatsNext && differs(dFirstRepeatsNext);
+  bool looks3 = secondRepeatsPrevious && differs(dFirstRepeatsPrevious);
+  bool looks4 = previousSecondRepeated && differs(dPreviousFirstRepeated);
+  bool looks5 = firstRepeatsNext && differs(dSecondRepeatsNext);
 
   int expected = previous == 0 ? 0 : (previous == 5 ? 1 : previous + 1);
   bool expectedRepeat =
@@ -259,6 +315,36 @@ void main()
     phase = 5;
   }
   if (phase != expected) run = phase != 0 ? 1.0 : 0.0;
-  outValue = vec4(float(phase), run, 0.0, 0.0);
+  return vec4(float(phase), run, 0.0, 0.0);
+}
+
+void main()
+{
+  int metric = int(gl_FragCoord.x);
+  // The comparisons against the next frame become, a frame later, the ones
+  // against the previous frame, and those the ones before.
+  if (metric == ${FIELD_METRICS.firstRepeatsPrevious}) {
+    outValue = previous(${FIELD_METRICS.firstRepeatsNext});
+  } else if (metric == ${FIELD_METRICS.secondRepeatsNext}) {
+    outValue = fold(uSecond);
+  } else if (metric == ${FIELD_METRICS.secondRepeatsPrevious}) {
+    outValue = previous(${FIELD_METRICS.secondRepeatsNext});
+  } else if (metric == ${FIELD_METRICS.previousSecondRepeated}) {
+    outValue = previous(${FIELD_METRICS.secondRepeatsPrevious});
+  } else if (metric == ${FIELD_METRICS.firstRepeatsNext}) {
+    outValue = fold(uFirst);
+  } else if (metric == ${FIELD_METRICS.previousFirstRepeated}) {
+    outValue = previous(${FIELD_METRICS.firstRepeatsPrevious});
+  } else {
+    outValue = decide(
+      previous(${FIELD_METRICS.phase}),
+      previous(${FIELD_METRICS.firstRepeatsNext})[1],
+      fold(uSecond)[1],
+      previous(${FIELD_METRICS.secondRepeatsNext})[1],
+      previous(${FIELD_METRICS.secondRepeatsPrevious})[1],
+      fold(uFirst)[1],
+      previous(${FIELD_METRICS.firstRepeatsPrevious})[1]
+    );
+  }
 }
 `;

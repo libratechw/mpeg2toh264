@@ -5,14 +5,14 @@
  * and what the measurements mean.
  */
 import {
-  DETECT_FRAGMENT_SHADER,
-  DETECT_UNIFORMS,
   FIELD_COMPARE_BLOCK_H,
   FIELD_COMPARE_BLOCK_W,
   FIELD_COMPARE_FRAGMENT_SHADER,
   FIELD_COMPARE_UNIFORMS,
   FIELD_METRICS,
   FIELD_METRICS_SIZE,
+  METRICS_FRAGMENT_SHADER,
+  METRICS_UNIFORMS,
   REDUCTION_FACTOR,
   REDUCTION_FRAGMENT_SHADER,
   REDUCTION_UNIFORMS,
@@ -29,10 +29,13 @@ export interface Phase {
 
 export const NO_PHASE: Phase = { phase: 0, run: 0 };
 
-type RenderTarget = {
-  texture: WebGLTexture;
+/** RGBA32F textures of one size, drawn together as one framebuffer. */
+interface RenderTarget {
   framebuffer: WebGLFramebuffer;
-};
+  textures: WebGLTexture[];
+  width: number;
+  height: number;
+}
 
 type Locations<T extends Record<string, string>> = Record<
   keyof T,
@@ -60,19 +63,26 @@ function locate<T extends Record<string, string>>(
  * result back; `poll` collects it once it has arrived, a frame or so later.
  * `texture` is the newest measurements, for the filter to read the phase
  * from without waiting for the page.
+ *
+ * The measurements of one frame are written from those of the frame before
+ * in a single pass, so they live in two textures taken in turns; nothing is
+ * copied between passes, and the frame costs three draws and a readback.
  */
 export class FilmDetector {
   readonly #gl: WebGL2RenderingContext;
-  readonly #fieldCompareProgram: WebGLProgram;
-  readonly #fieldCompareLocation: Locations<typeof FIELD_COMPARE_UNIFORMS>;
+  readonly #compareProgram: WebGLProgram;
+  readonly #compareLocation: Locations<typeof FIELD_COMPARE_UNIFORMS>;
   readonly #reductionProgram: WebGLProgram;
   readonly #reductionLocation: Locations<typeof REDUCTION_UNIFORMS>;
-  readonly #detectProgram: WebGLProgram;
-  readonly #detectLocation: Locations<typeof DETECT_UNIFORMS>;
-  #reductionTargets: [RenderTarget, RenderTarget] | null = null;
-  #detectResult: RenderTarget | null = null;
-  /** The field metrics (see FIELD_METRICS) and a copy from the frame before. */
-  #fieldMetrics: [RenderTarget, RenderTarget] | null = null;
+  readonly #metricsProgram: WebGLProgram;
+  readonly #metricsLocation: Locations<typeof METRICS_UNIFORMS>;
+  /** The block comparisons of both fields, and the same folded most of the way. */
+  #blocks: RenderTarget | null = null;
+  #reduced: RenderTarget | null = null;
+  /** The field metrics (see FIELD_METRICS) of this frame and the one before. */
+  #metrics: [RenderTarget, RenderTarget] | null = null;
+  /** Which of the two holds the newest metrics. */
+  #head = 0;
   /** The metrics being read back asynchronously. */
   #pixelBuffer: WebGLBuffer | null = null;
   #fence: WebGLSync | null = null;
@@ -83,6 +93,16 @@ export class FilmDetector {
 
   constructor(gl: WebGL2RenderingContext) {
     this.#gl = gl;
+    this.#compareProgram = createProgram(
+      gl,
+      FIELD_COMPARE_FRAGMENT_SHADER,
+      VERTEX_SHADER,
+    );
+    this.#compareLocation = locate(
+      gl,
+      this.#compareProgram,
+      FIELD_COMPARE_UNIFORMS,
+    );
     this.#reductionProgram = createProgram(
       gl,
       REDUCTION_FRAGMENT_SHADER,
@@ -93,27 +113,17 @@ export class FilmDetector {
       this.#reductionProgram,
       REDUCTION_UNIFORMS,
     );
-    this.#fieldCompareProgram = createProgram(
+    this.#metricsProgram = createProgram(
       gl,
-      FIELD_COMPARE_FRAGMENT_SHADER,
+      METRICS_FRAGMENT_SHADER,
       VERTEX_SHADER,
     );
-    this.#fieldCompareLocation = locate(
-      gl,
-      this.#fieldCompareProgram,
-      FIELD_COMPARE_UNIFORMS,
-    );
-    this.#detectProgram = createProgram(
-      gl,
-      DETECT_FRAGMENT_SHADER,
-      VERTEX_SHADER,
-    );
-    this.#detectLocation = locate(gl, this.#detectProgram, DETECT_UNIFORMS);
+    this.#metricsLocation = locate(gl, this.#metricsProgram, METRICS_UNIFORMS);
   }
 
   /** The newest measurements, or null before any frame has been measured. */
   get texture(): WebGLTexture | null {
-    return this.#fieldMetrics?.[0].texture ?? null;
+    return this.#metrics?.[this.#head]?.textures[0] ?? null;
   }
 
   /** The size of the frames to be measured, which sizes the block grid. */
@@ -121,7 +131,7 @@ export class FilmDetector {
     if (width === this.#width && height === this.#height) return;
     this.#width = width;
     this.#height = height;
-    this.#freeReductionTargets();
+    this.#freeBlocks();
   }
 
   /** Forget every measurement: the next frame starts a cycle from nothing. */
@@ -129,18 +139,19 @@ export class FilmDetector {
     const gl = this.#gl;
     gl.deleteSync(this.#fence);
     this.#fence = null;
-    if (this.#fieldMetrics === null) return;
+    const newest = this.#metrics?.[this.#head];
+    if (!newest) return;
     const metrics = new Float32Array(FIELD_METRICS_SIZE * 4);
     for (let index = 0; index < FIELD_METRICS.phase; index++)
       metrics[index * 4 + 1] = 1;
-    gl.bindTexture(gl.TEXTURE_2D, this.#fieldMetrics[0].texture);
-    gl.texImage2D(
+    gl.bindTexture(gl.TEXTURE_2D, newest.textures[0] ?? null);
+    gl.texSubImage2D(
       gl.TEXTURE_2D,
       0,
-      gl.RGBA32F,
+      0,
+      0,
       FIELD_METRICS_SIZE,
       1,
-      0,
       gl.RGBA,
       gl.FLOAT,
       metrics,
@@ -156,67 +167,47 @@ export class FilmDetector {
   detect(cur: WebGLTexture, next: WebGLTexture, first: number): void {
     const gl = this.#gl;
     if (this.#width === 0 || this.#height === 0) return;
-    this.#allocateFieldMetrics();
-    this.#allocateReductionTargets();
-    const metrics = this.#fieldMetrics;
-    const targets = this.#reductionTargets;
-    if (metrics === null || targets === null) return;
-    const [current, previous] = metrics;
+    this.#allocate();
+    const blocks = this.#blocks;
+    const reduced = this.#reduced;
+    const metrics = this.#metrics;
+    if (blocks === null || reduced === null || metrics === null) return;
+    const previous = metrics[this.#head]!;
+    const current = metrics[1 - this.#head]!;
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, current.framebuffer);
-    gl.bindTexture(gl.TEXTURE_2D, previous.texture);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, FIELD_METRICS.phase, 1);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, previous.framebuffer);
-    gl.bindTexture(gl.TEXTURE_2D, current.texture);
-    const carry: [from: number, to: number][] = [
-      [
-        FIELD_METRICS.secondRepeatsPrevious,
-        FIELD_METRICS.previousSecondRepeated,
-      ],
-      [FIELD_METRICS.firstRepeatsPrevious, FIELD_METRICS.previousFirstRepeated],
-      [FIELD_METRICS.secondRepeatsNext, FIELD_METRICS.secondRepeatsPrevious],
-      [FIELD_METRICS.firstRepeatsNext, FIELD_METRICS.firstRepeatsPrevious],
-    ];
-    for (const [from, to] of carry)
-      gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, to, 0, from, 0, 1, 1);
-
-    this.#compareField(
-      targets,
-      cur,
-      next,
-      current.texture,
-      FIELD_METRICS.secondRepeatsNext,
-      1 - first,
-    );
-    this.#compareField(
-      targets,
-      cur,
-      next,
-      current.texture,
-      FIELD_METRICS.firstRepeatsNext,
-      first,
-    );
-
-    this.#detectResult ??= allocateRenderTarget(gl, 1, 1);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.#detectResult.framebuffer);
-    gl.useProgram(this.#detectProgram);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, current.texture);
-    gl.uniform1i(this.#detectLocation.fieldMetrics, 0);
-    gl.viewport(0, 0, 1, 1);
+    // Both fields of the two frames, block by block.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, blocks.framebuffer);
+    gl.useProgram(this.#compareProgram);
+    this.#bind(0, cur, this.#compareLocation.a);
+    this.#bind(1, next, this.#compareLocation.b);
+    this.#bind(2, previous.textures[0], this.#compareLocation.fieldMetrics);
+    gl.uniform1i(this.#compareLocation.first, first);
+    gl.uniform2i(this.#compareLocation.size, this.#width, this.#height);
+    gl.viewport(0, 0, blocks.width, blocks.height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindTexture(gl.TEXTURE_2D, current.texture);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, FIELD_METRICS.phase, 0, 0, 0, 1, 1);
 
-    this.#pixelBuffer ??= gl.createBuffer();
+    // The blocks folded most of the way down.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, reduced.framebuffer);
+    gl.useProgram(this.#reductionProgram);
+    this.#bind(0, blocks.textures[0], this.#reductionLocation.second);
+    this.#bind(1, blocks.textures[1], this.#reductionLocation.first);
+    gl.uniform2i(this.#reductionLocation.size, blocks.width, blocks.height);
+    gl.viewport(0, 0, reduced.width, reduced.height);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // The rest of the way, the earlier comparisons moved along, and the phase.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, current.framebuffer);
+    gl.useProgram(this.#metricsProgram);
+    this.#bind(0, previous.textures[0], this.#metricsLocation.previous);
+    this.#bind(1, reduced.textures[0], this.#metricsLocation.second);
+    this.#bind(2, reduced.textures[1], this.#metricsLocation.first);
+    gl.uniform2i(this.#metricsLocation.size, reduced.width, reduced.height);
+    gl.viewport(0, 0, FIELD_METRICS_SIZE, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.#head = 1 - this.#head;
+
     gl.deleteSync(this.#fence);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#pixelBuffer);
-    gl.bufferData(
-      gl.PIXEL_PACK_BUFFER,
-      this.metrics.byteLength,
-      gl.STREAM_READ,
-    );
-    gl.bindFramebuffer(gl.FRAMEBUFFER, current.framebuffer);
     gl.readPixels(0, 0, FIELD_METRICS_SIZE, 1, gl.RGBA, gl.FLOAT, 0);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -251,100 +242,72 @@ export class FilmDetector {
 
   destroy(): void {
     const gl = this.#gl;
-    this.#freeReductionTargets();
-    this.#freeFieldMetrics();
+    this.#freeBlocks();
+    if (this.#metrics !== null) {
+      for (const target of this.#metrics) freeRenderTarget(gl, target);
+      this.#metrics = null;
+    }
     gl.deleteSync(this.#fence);
     this.#fence = null;
     gl.deleteBuffer(this.#pixelBuffer);
     this.#pixelBuffer = null;
-    if (this.#detectResult !== null) {
-      freeRenderTarget(gl, this.#detectResult);
-      this.#detectResult = null;
-    }
+    gl.deleteProgram(this.#compareProgram);
     gl.deleteProgram(this.#reductionProgram);
-    gl.deleteProgram(this.#fieldCompareProgram);
-    gl.deleteProgram(this.#detectProgram);
+    gl.deleteProgram(this.#metricsProgram);
   }
 
-  #freeReductionTargets(): void {
-    if (this.#reductionTargets === null) return;
-    for (const target of this.#reductionTargets)
-      freeRenderTarget(this.#gl, target);
-    this.#reductionTargets = null;
-  }
-
-  #allocateReductionTargets(): void {
-    if (this.#reductionTargets !== null) return;
-    const width = Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W);
-    const height = Math.ceil(this.#height / FIELD_COMPARE_BLOCK_H);
-    this.#reductionTargets = [
-      allocateRenderTarget(this.#gl, width, height),
-      allocateRenderTarget(this.#gl, width, height),
-    ];
-  }
-
-  #freeFieldMetrics(): void {
-    if (this.#fieldMetrics === null) return;
-    for (const target of this.#fieldMetrics) freeRenderTarget(this.#gl, target);
-    this.#fieldMetrics = null;
-  }
-
-  #allocateFieldMetrics(): void {
-    if (this.#fieldMetrics !== null) return;
-    this.#fieldMetrics = [
-      allocateRenderTarget(this.#gl, FIELD_METRICS_SIZE, 1),
-      allocateRenderTarget(this.#gl, FIELD_METRICS_SIZE, 1),
-    ];
-    this.reset();
-  }
-
-  /** Compare one field of two frames block by block, reduce to one texel, and store it in the metrics. */
-  #compareField(
-    reductionTargets: [RenderTarget, RenderTarget],
-    frameA: WebGLTexture,
-    frameB: WebGLTexture,
-    metrics: WebGLTexture,
-    metric: number,
-    parity: number,
+  #bind(
+    unit: number,
+    texture: WebGLTexture | undefined,
+    location: WebGLUniformLocation | null,
   ): void {
     const gl = this.#gl;
-    let target: 0 | 1 = 0;
-    let width = Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W);
-    let height = Math.ceil(this.#height / 2 / FIELD_COMPARE_BLOCK_H);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, reductionTargets[target].framebuffer);
-    gl.useProgram(this.#fieldCompareProgram);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, frameA);
-    gl.uniform1i(this.#fieldCompareLocation.a, 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, frameB);
-    gl.uniform1i(this.#fieldCompareLocation.b, 1);
-    gl.uniform1i(this.#fieldCompareLocation.parity, parity);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, metrics);
-    gl.uniform1i(this.#fieldCompareLocation.fieldMetrics, 2);
-    gl.uniform2i(this.#fieldCompareLocation.size, this.#width, this.#height);
-    gl.viewport(0, 0, width, height);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    while (width > 1 || height > 1) {
-      const source = target;
-      target = target === 0 ? 1 : 0;
-      const reducedWidth = Math.ceil(width / REDUCTION_FACTOR);
-      const reducedHeight = Math.ceil(height / REDUCTION_FACTOR);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, reductionTargets[target].framebuffer);
-      gl.useProgram(this.#reductionProgram);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, reductionTargets[source].texture);
-      gl.uniform1i(this.#reductionLocation.input, 0);
-      gl.uniform2i(this.#reductionLocation.size, width, height);
-      gl.viewport(0, 0, reducedWidth, reducedHeight);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-      width = reducedWidth;
-      height = reducedHeight;
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, texture ?? null);
+    gl.uniform1i(location, unit);
+  }
+
+  #freeBlocks(): void {
+    const gl = this.#gl;
+    if (this.#blocks !== null) freeRenderTarget(gl, this.#blocks);
+    if (this.#reduced !== null) freeRenderTarget(gl, this.#reduced);
+    this.#blocks = null;
+    this.#reduced = null;
+  }
+
+  /** Everything detect needs that is not there yet. */
+  #allocate(): void {
+    const gl = this.#gl;
+    if (this.#blocks === null || this.#reduced === null) {
+      this.#freeBlocks();
+      const width = Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W);
+      const height = Math.ceil(this.#height / (FIELD_COMPARE_BLOCK_H * 2));
+      this.#blocks = allocateRenderTarget(gl, width, height, 2);
+      this.#reduced = allocateRenderTarget(
+        gl,
+        Math.ceil(width / REDUCTION_FACTOR),
+        Math.ceil(height / REDUCTION_FACTOR),
+        2,
+      );
     }
-    gl.bindTexture(gl.TEXTURE_2D, metrics);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, metric, 0, 0, 0, 1, 1);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (this.#metrics === null) {
+      this.#metrics = [
+        allocateRenderTarget(gl, FIELD_METRICS_SIZE, 1, 1),
+        allocateRenderTarget(gl, FIELD_METRICS_SIZE, 1, 1),
+      ];
+      this.#head = 0;
+      this.reset();
+    }
+    if (this.#pixelBuffer === null) {
+      this.#pixelBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#pixelBuffer);
+      gl.bufferData(
+        gl.PIXEL_PACK_BUFFER,
+        this.metrics.byteLength,
+        gl.STREAM_READ,
+      );
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    }
   }
 }
 
@@ -352,46 +315,52 @@ function allocateRenderTarget(
   gl: WebGL2RenderingContext,
   width: number,
   height: number,
+  count: number,
 ): RenderTarget {
-  const texture = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texImage2D(
-    gl.TEXTURE_2D,
-    0,
-    gl.RGBA32F,
-    width,
-    height,
-    0,
-    gl.RGBA,
-    gl.FLOAT,
-    null,
-  );
   const framebuffer = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-  gl.framebufferTexture2D(
-    gl.FRAMEBUFFER,
-    gl.COLOR_ATTACHMENT0,
-    gl.TEXTURE_2D,
-    texture,
-    0,
-  );
+  const textures: WebGLTexture[] = [];
+  for (let index = 0; index < count; index++) {
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      width,
+      height,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      null,
+    );
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0 + index,
+      gl.TEXTURE_2D,
+      texture,
+      0,
+    );
+    textures.push(texture);
+  }
+  gl.drawBuffers(textures.map((_, index) => gl.COLOR_ATTACHMENT0 + index));
   const complete =
     gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  const target = { framebuffer, textures, width, height };
   if (!complete) {
-    gl.deleteFramebuffer(framebuffer);
-    gl.deleteTexture(texture);
+    freeRenderTarget(gl, target);
     throw new Error("failed to allocate framebuffer");
   }
-  return { texture, framebuffer };
+  return target;
 }
 
 function freeRenderTarget(
   gl: WebGL2RenderingContext,
-  { texture, framebuffer }: RenderTarget,
+  { framebuffer, textures }: RenderTarget,
 ): void {
   gl.deleteFramebuffer(framebuffer);
-  gl.deleteTexture(texture);
+  for (const texture of textures) gl.deleteTexture(texture);
 }
