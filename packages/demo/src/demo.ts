@@ -56,6 +56,9 @@ const audioSelectLabel = document.querySelector<HTMLElement>("#audio-label")!;
 const passthrough = document.querySelector<HTMLInputElement>("#passthrough")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
+const film = document.querySelector<HTMLInputElement>("#film")!;
+const deinterlaceDebug =
+  document.querySelector<HTMLInputElement>("#deinterlace-debug")!;
 const splitFieldSamples = document.querySelector<HTMLInputElement>(
   "#split-field-samples",
 )!;
@@ -433,6 +436,8 @@ function createPlayer(): Mpeg2TsPlayer {
       yadif = new Deinterlacer(element, {
         doubleRate: doubleRate.checked,
         onStats: showDeinterlaceStats,
+        debug: deinterlaceDebug.checked,
+        film: film.checked,
       });
       return yadif;
     },
@@ -601,11 +606,11 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): {
 
 function showDeinterlaceStats(stats: DeinterlaceStats): void {
   const { filtered, missed, dropped, degraded, discontinuities, late } = stats;
-  const { fps: presentedFps, frameMs } = stats;
+  const { fps: presentedFps, frameMs, gpuMs, resynced, film } = stats;
   deinterlaceStats.textContent =
-    `${presentedFps.toFixed(2)} FPS ${frameMs.toFixed(3)} ms/フレーム` +
+    `${presentedFps.toFixed(2)} FPS${film ? " (24p)" : ""} ${frameMs.toFixed(3)} ms/フレーム (CPU) ${gpuMs?.toFixed(3) ?? "不明"} ms/フレーム (GPU)` +
     ` 適用: ${filtered} 取りこぼし: ${missed} 端: ${degraded}` +
-    ` 未表示: ${late}` +
+    ` 未表示: ${late} 再同期: ${resynced}` +
     ` 不連続: ${discontinuities} ドロップ: ${dropped} キューリセット数: ${stats.queueResetted} キュー長: ${stats.maxQueuedFields}`;
 }
 
@@ -1040,7 +1045,11 @@ document.addEventListener("keydown", (event) => {
 function applyDeinterlace() {
   if (!player) return;
   player.deinterlace = deinterlace.checked;
-  if (yadif) yadif.doubleRate = doubleRate.checked;
+  if (yadif) {
+    yadif.doubleRate = doubleRate.checked;
+    yadif.film = film.checked;
+    yadif.debug = deinterlaceDebug.checked;
+  }
   syncControls();
 }
 
@@ -1081,6 +1090,8 @@ service.addEventListener("change", () => {
 
 deinterlace.addEventListener("change", applyDeinterlace);
 doubleRate.addEventListener("change", applyDeinterlace);
+deinterlaceDebug.addEventListener("change", applyDeinterlace);
+film.addEventListener("change", applyDeinterlace);
 
 if (!canPassthrough) {
   passthrough.checked = false;

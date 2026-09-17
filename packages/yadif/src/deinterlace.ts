@@ -18,14 +18,41 @@
  * to wait for it, so the canvas is one frame -- around 33 ms -- behind the
  * audio. That is well inside what a viewer can tell, and the alternative is a
  * filter with half its motion measurements missing.
+ *
+ * With `film` on, 2:3 pulldown is detected on the GPU (see film-shader.ts):
+ * each frame is put back together into the film frame it came from, the
+ * repeated one in every five is dropped, and the rest are shown at 24 a
+ * second, evenly spaced.
  */
+import {
+  destroyDebugRenderState,
+  drawText,
+  initDebugRenderState,
+  type DebugRenderState,
+} from "./debug.js";
 import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
+import {
+  DETECT_FRAGMENT_SHADER,
+  DETECT_UNIFORMS,
+  FIELD_COMPARE_BLOCK_H,
+  FIELD_COMPARE_BLOCK_W,
+  FIELD_COMPARE_FRAGMENT_SHADER,
+  FIELD_COMPARE_UNIFORMS,
+  FIELD_METRICS,
+  FIELD_METRICS_SIZE,
+  FILM_DUPLICATE_PHASE,
+  FILM_LOCK_FRAMES,
+  REDUCTION_FACTOR,
+  REDUCTION_FRAGMENT_SHADER,
+  REDUCTION_UNIFORMS,
+} from "./film-shader.js";
+import { createProgram } from "./utils.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
 
-/** prev, cur and next: everything the filter reads. */
-const HISTORY = 3;
+/** pprev, prev, cur and next: the filter reads three, the detection four. */
+const HISTORY = 4;
 
 const FIELD_QUEUE_LENGTH = 5;
 
@@ -38,6 +65,53 @@ const MAX_PERIOD_MS = 200;
 
 /** How much of each measurement the smoothed frame period takes. */
 const PERIOD_SMOOTHING = 0.25;
+
+/** A measurement under this fraction of the period replaces it outright. */
+const PERIOD_SHORTER = 0.75;
+
+/**
+ * How much of the gap between the schedule and the clock each picture makes
+ * up, and the most one picture is moved by, in milliseconds. See #schedule.
+ */
+const DRIFT_GAIN = 0.1;
+const DRIFT_STEP_MS = 1;
+
+/** What to take a refresh to be until the loop has measured one. */
+const DEFAULT_REFRESH_MS = 1000 / 60;
+
+/** How much of each animation frame's error the refresh grid takes. */
+const GRID_PERIOD_GAIN = 0.02;
+const GRID_PHASE_GAIN = 0.1;
+
+/** Hysteresis around the half-refresh boundary, in milliseconds. */
+const PRESENT_HYSTERESIS_MS = 1;
+
+/** Broadcast frames in a pulldown cycle, and the film frames they hold. */
+const PULLDOWN_FRAMES = 5;
+const FILM_FRAMES = 4;
+
+/**
+ * How long after its frame arrives a film frame of each phase is shown, in
+ * frame periods, so that the film frames come out 1.25 periods apart. Phase
+ * 2 is whole only once the frame after it has arrived, so it goes up at
+ * once and the others are held back to match. Phase 1 is the repeat.
+ */
+const FILM_LEAD: Record<number, number> = {
+  2: 0,
+  3: 0.25,
+  4: 0.5,
+  5: 0.75,
+};
+
+/** What the pulldown detection said about a frame. */
+interface Phase {
+  /** Which frame of the cycle it is, 1 to 5, or 0 for none. */
+  phase: number;
+  /** How many frames in a row have had a phase. See film-shader.ts. */
+  run: number;
+}
+
+const NO_PHASE: Phase = { phase: 0, run: 0 };
 
 const VERTEX_SHADER = `#version 300 es
 void main() {
@@ -74,7 +148,14 @@ interface Ready {
   /** When it belongs on the screen, on `performance.now()`'s clock. */
   at: number;
   duration: number;
+  cadence: Cadence;
+  /** The pulldown phase of a film frame, or 1 or 2 of a field. Debug only. */
+  phase: number;
+  /** Repeats dropped since the picture before. Debug only. */
+  droppedBefore: number;
 }
+
+type Cadence = "frame" | "field" | "film";
 
 /**
  * How the filter is getting on, and where it is being let down.
@@ -135,10 +216,20 @@ export interface DeinterlaceStats {
    * deinterlacer takes away from everything else.
    */
   frameMs: number;
+  /**
+   * Times the schedule was restarted from the clock instead of following on
+   * from the last picture: a seek, a stall, a cadence change, or a missed
+   * frame. Climbing during steady playback means the cadence is not holding.
+   */
+  resynced: number;
   /** The number of times the field queue was reset when doubleRate is true. */
   queueResetted: number;
   /** The number of fields queued when doubleRate is true. */
   maxQueuedFields: number;
+  /** GPU processing time, supported only in Chrome. */
+  gpuMs: number | undefined;
+  /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
+  film: boolean;
 }
 
 export interface DeinterlacerOptions {
@@ -172,6 +263,17 @@ export interface DeinterlacerOptions {
    * being asked for anything.
    */
   onStats?(stats: DeinterlaceStats): void;
+  /**
+   * Whether to detect 2:3 pulldown and show film at 24 frames a second.
+   * Frames that are not film are filtered as usual. Needs
+   * `EXT_color_buffer_float`.
+   */
+  film?: boolean;
+  /**
+   * Whether to draw the pulldown detection over the picture and log every
+   * picture shown to the console.
+   */
+  debug?: boolean;
 }
 
 /** Field information supplied by a player or another video source. */
@@ -195,6 +297,20 @@ export function supportsDeinterlace(): boolean {
   );
 }
 
+type RenderTarget = {
+  texture: WebGLTexture;
+  framebuffer: WebGLFramebuffer;
+};
+
+interface EXT_disjoint_timer_query_webgl2 {
+  readonly QUERY_COUNTER_BITS_EXT: 0x8864;
+  readonly TIME_ELAPSED_EXT: 0x88bf;
+  readonly TIMESTAMP_EXT: 0x8e28;
+  readonly GPU_DISJOINT_EXT: 0x8fbb;
+
+  queryCounterEXT(query: WebGLQuery, target: GLenum): void;
+}
+
 /**
  * Puts a deinterlaced copy of a `<video>` over the top of it.
  *
@@ -214,6 +330,29 @@ export class Deinterlacer {
 
   readonly #video: HTMLVideoElement;
   readonly #gl: WebGL2RenderingContext;
+  readonly #fieldCompareProgram: WebGLProgram;
+  readonly #fieldCompareLocation: Record<
+    keyof typeof FIELD_COMPARE_UNIFORMS,
+    WebGLUniformLocation | null
+  >;
+  readonly #reductionProgram: WebGLProgram;
+  readonly #reductionLocation: Record<
+    keyof typeof REDUCTION_UNIFORMS,
+    WebGLUniformLocation | null
+  >;
+  readonly #detectProgram: WebGLProgram;
+  readonly #detectLocation: Record<
+    keyof typeof DETECT_UNIFORMS,
+    WebGLUniformLocation | null
+  >;
+  #reductionTargets: [RenderTarget, RenderTarget] | null = null;
+  #detectResult: RenderTarget | null = null;
+  /** The field metrics (see FIELD_METRICS) and a copy from the frame before. */
+  #fieldMetrics: [RenderTarget, RenderTarget] | null = null;
+  /** The metrics being read back asynchronously, and the last ones read. */
+  #metricsPixelBuffer: WebGLBuffer | null = null;
+  #metricsFence: WebGLSync | null = null;
+  readonly #metricsBuffer = new Float32Array(FIELD_METRICS_SIZE * 4);
   readonly #program: WebGLProgram;
   readonly #location: Record<
     keyof typeof YADIF_UNIFORMS,
@@ -225,18 +364,31 @@ export class Deinterlacer {
   readonly #blitFlip: WebGLUniformLocation | null;
   #textures: WebGLTexture[] = [];
   /** Somewhere to filter a field into, and to read it back out of. */
-  #outputs: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
+  #outputs: RenderTarget[] = [];
   /** Which output slot was written last; the next one follows round the ring. */
   #outputHead = FIELD_QUEUE_LENGTH - 1;
   /** Filtered fields waiting for their moment, oldest first. */
   #queue: Ready[] = [];
+  /** The last picture scheduled, shown or not; the next follows on from it. */
+  #lastScheduled: Ready | null = null;
   /** The rAF loop that puts them up, which is all that draws on the canvas. */
   #loopHandle: number | null = null;
+  /** When the loop last ran, and the refresh grid fitted to it. See #measureRefresh. */
+  #loopAt = 0;
+  #refreshMs = DEFAULT_REFRESH_MS;
+  #gridAt = 0;
+  /** How far ahead of its moment the last picture was shown. See #present. */
+  #shownAhead = 0;
+  /** Debug only: the rAF the last picture was drawn in, and repeats dropped since. */
+  #shownAt = 0;
+  #droppedBefore = 0;
   /** The `<div>` this put around the element, so it can be taken away again. */
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver;
   #doubleRate: boolean;
   #spatialCheck: boolean;
+  #debug: boolean;
+  #film: boolean;
   /** How long a frame lasts in wall time, from what the frames themselves say. */
   #periodMs = 0;
   /** The size of a frame as it is coded, which is what a texture holds. */
@@ -261,6 +413,7 @@ export class Deinterlacer {
     degraded: 0,
     discontinuities: 0,
     late: 0,
+    resynced: 0,
     queueResetted: 0,
   };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
@@ -273,11 +426,31 @@ export class Deinterlacer {
   #showFramesSinceReport = 0;
   #showMsSinceReport = 0;
   #reportMaxQueuedFields = 0;
+  readonly #timerQueryExtension: EXT_disjoint_timer_query_webgl2 | null;
+  #freeQueries: WebGLQuery[] = [];
+  #timerUsingQueries: { q: WebGLQuery; isField: boolean }[] = [];
+  #gpuFrameNanosecondsSinceReport = 0;
+  #gpuFrameCountSinceReport = 0;
+  #gpuFieldNanosecondsSinceReport = 0;
+  #gpuFieldCountSinceReport = 0;
+  /** The last phase read back from the GPU, and how many frames ago it was for. */
+  #known: Phase = NO_PHASE;
+  #knownAge = 0;
+  /** The phase of the frame being filtered: #known advanced by #knownAge. */
+  #phase: Phase = NO_PHASE;
+  #filmLocked = false;
+  #debugRenderState: DebugRenderState | null = null;
+  #debugText = "";
+  /** Debug only: frames given each phase (0 for none), and repeats dropped. */
+  #phaseCounts = [0, 0, 0, 0, 0, 0];
+  #filmDropped = 0;
 
   constructor(video: HTMLVideoElement, options: DeinterlacerOptions = {}) {
     this.#video = video;
     this.#doubleRate = options.doubleRate ?? false;
     this.#spatialCheck = options.spatialCheck ?? true;
+    this.#debug = options.debug ?? false;
+    this.#film = options.film ?? false;
     this.#onStats = options.onStats;
     this.canvas = document.createElement("canvas");
     // Where it goes is worked out in #layout; the element underneath keeps
@@ -294,7 +467,48 @@ export class Deinterlacer {
     });
     if (!gl) throw new Error("this browser has no WebGL2");
     this.#gl = gl;
-    this.#program = createProgram(gl, YADIF_FRAGMENT_SHADER);
+    const reductionProgram = createProgram(
+      gl,
+      REDUCTION_FRAGMENT_SHADER,
+      VERTEX_SHADER,
+    );
+    this.#reductionProgram = reductionProgram;
+    this.#reductionLocation = Object.fromEntries(
+      Object.entries(REDUCTION_UNIFORMS).map(([key, name]) => [
+        key,
+        gl.getUniformLocation(reductionProgram, name),
+      ]),
+    ) as Record<keyof typeof REDUCTION_UNIFORMS, WebGLUniformLocation | null>;
+
+    const fieldCompareProgram = createProgram(
+      gl,
+      FIELD_COMPARE_FRAGMENT_SHADER,
+      VERTEX_SHADER,
+    );
+    this.#fieldCompareProgram = fieldCompareProgram;
+    this.#fieldCompareLocation = Object.fromEntries(
+      Object.entries(FIELD_COMPARE_UNIFORMS).map(([key, name]) => [
+        key,
+        gl.getUniformLocation(fieldCompareProgram, name),
+      ]),
+    ) as Record<
+      keyof typeof FIELD_COMPARE_UNIFORMS,
+      WebGLUniformLocation | null
+    >;
+
+    const detectProgram = createProgram(
+      gl,
+      DETECT_FRAGMENT_SHADER,
+      VERTEX_SHADER,
+    );
+    this.#detectProgram = detectProgram;
+    this.#detectLocation = Object.fromEntries(
+      Object.entries(DETECT_UNIFORMS).map(([key, name]) => [
+        key,
+        gl.getUniformLocation(detectProgram, name),
+      ]),
+    ) as Record<keyof typeof DETECT_UNIFORMS, WebGLUniformLocation | null>;
+    this.#program = createProgram(gl, YADIF_FRAGMENT_SHADER, VERTEX_SHADER);
     const program = this.#program;
     this.#location = Object.fromEntries(
       Object.entries(YADIF_UNIFORMS).map(([key, name]) => [
@@ -302,9 +516,13 @@ export class Deinterlacer {
         gl.getUniformLocation(program, name),
       ]),
     ) as Record<keyof typeof YADIF_UNIFORMS, WebGLUniformLocation | null>;
-    this.#blit = createProgram(gl, BLIT_FRAGMENT_SHADER);
+    this.#blit = createProgram(gl, BLIT_FRAGMENT_SHADER, VERTEX_SHADER);
     this.#blitField = gl.getUniformLocation(this.#blit, "uField");
     this.#blitFlip = gl.getUniformLocation(this.#blit, "uFlip");
+    if (this.#film) this.#requireFloatBuffers();
+    this.#timerQueryExtension = gl.getExtension(
+      "EXT_disjoint_timer_query_webgl2",
+    );
     this.canvas.addEventListener("webglcontextlost", this.#onContextLost);
     // The canvas is placed in pixels rather than in percentages, because where
     // the picture sits inside the element is arithmetic the browser does not
@@ -376,7 +594,40 @@ export class Deinterlacer {
   set doubleRate(doubleRate: boolean) {
     if (doubleRate === this.#doubleRate) return;
     this.#doubleRate = doubleRate;
-    if (doubleRate) {
+    this.#applyScheduling();
+  }
+
+  get film(): boolean {
+    return this.#film;
+  }
+
+  set film(film: boolean) {
+    if (film === this.#film) return;
+    if (film) this.#requireFloatBuffers();
+    this.#film = film;
+    if (!film) {
+      this.#filmLocked = false;
+      this.#phase = NO_PHASE;
+      this.#resetFieldMetrics();
+    }
+    this.#applyScheduling();
+  }
+
+  get debug(): boolean {
+    return this.#debug;
+  }
+
+  set debug(debug: boolean) {
+    this.#debug = debug;
+  }
+
+  /** Whether pictures are queued and put up by the loop rather than drawn on arrival. */
+  get #scheduled(): boolean {
+    return this.#doubleRate || this.#film;
+  }
+
+  #applyScheduling(): void {
+    if (this.#scheduled) {
       if (this.#width > 0) this.#allocateOutputs();
       this.#startLoop();
     } else {
@@ -385,6 +636,11 @@ export class Deinterlacer {
       this.#stopLoop();
       this.#freeOutputs();
     }
+  }
+
+  #requireFloatBuffers(): void {
+    if (this.#gl.getExtension("EXT_color_buffer_float") === null)
+      throw new Error("film needs EXT_color_buffer_float");
   }
 
   #apply(): void {
@@ -430,6 +686,32 @@ export class Deinterlacer {
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
     this.#freeOutputs();
+    for (const q of [
+      ...this.#freeQueries,
+      ...this.#timerUsingQueries.map(({ q }) => q),
+    ]) {
+      this.#gl.deleteQuery(q);
+    }
+    this.#freeQueries.length = 0;
+    this.#timerUsingQueries.length = 0;
+    this.#freeReductionTargets();
+    this.#freeFieldMetrics();
+    this.#gl.deleteSync(this.#metricsFence);
+    this.#metricsFence = null;
+    this.#gl.deleteBuffer(this.#metricsPixelBuffer);
+    this.#metricsPixelBuffer = null;
+    if (this.#detectResult !== null) {
+      this.#gl.deleteFramebuffer(this.#detectResult.framebuffer);
+      this.#gl.deleteTexture(this.#detectResult.texture);
+      this.#detectResult = null;
+    }
+    if (this.#debugRenderState !== null) {
+      destroyDebugRenderState(this.#debugRenderState);
+      this.#debugRenderState = null;
+    }
+    this.#gl.deleteProgram(this.#reductionProgram);
+    this.#gl.deleteProgram(this.#fieldCompareProgram);
+    this.#gl.deleteProgram(this.#detectProgram);
     this.#gl.deleteProgram(this.#program);
     this.#gl.deleteProgram(this.#blit);
     this.#gl.getExtension("WEBGL_lose_context")?.loseContext();
@@ -438,6 +720,216 @@ export class Deinterlacer {
   #request(): void {
     if (!this.#running || this.#handle !== null) return;
     this.#handle = this.#video.requestVideoFrameCallback(this.#onFrame);
+  }
+
+  #drawText(text: string, x: number, y: number): void {
+    if (this.#debugRenderState == null) {
+      this.#debugRenderState = initDebugRenderState(this.#gl, "20px monospace");
+    }
+    drawText(this.#debugRenderState, text, x, y, this.#width, this.#height, 20);
+  }
+
+  #beginGpuTimer(isField: boolean): WebGLQuery | undefined {
+    if (this.#timerQueryExtension == null) {
+      return undefined;
+    }
+    if (this.#timerUsingQueries.length > 30) {
+      return undefined;
+    }
+    const q = this.#freeQueries.pop() ?? this.#gl.createQuery();
+    this.#gl.beginQuery(this.#timerQueryExtension.TIME_ELAPSED_EXT, q);
+    this.#timerUsingQueries.push({ q, isField });
+    return q;
+  }
+
+  #endGpuTimer(q: WebGLQuery | undefined): void {
+    if (this.#timerQueryExtension == null) {
+      return;
+    }
+    if (q != null) {
+      this.#gl.endQuery(this.#timerQueryExtension.TIME_ELAPSED_EXT);
+    }
+    this.#timerUsingQueries = this.#timerUsingQueries.filter(
+      ({ q, isField }) => {
+        if (this.#gl.getQueryParameter(q, this.#gl.QUERY_RESULT_AVAILABLE)) {
+          const result = this.#gl.getQueryParameter(q, this.#gl.QUERY_RESULT);
+          if (isField) {
+            this.#gpuFieldNanosecondsSinceReport += result;
+            this.#gpuFieldCountSinceReport++;
+          } else {
+            this.#gpuFrameNanosecondsSinceReport += result;
+            this.#gpuFrameCountSinceReport++;
+          }
+          this.#freeQueries.push(q);
+          return false;
+        }
+        return true;
+      },
+    );
+  }
+
+  #resetFieldMetrics(): void {
+    this.#phase = NO_PHASE;
+    this.#known = NO_PHASE;
+    this.#knownAge = 0;
+    this.#filmLocked = false;
+    this.#gl.deleteSync(this.#metricsFence);
+    this.#metricsFence = null;
+    if (this.#fieldMetrics === null) return;
+    const gl = this.#gl;
+    const metrics = new Float32Array(FIELD_METRICS_SIZE * 4);
+    for (let index = 0; index < FIELD_METRICS.phase; index++)
+      metrics[index * 4 + 1] = 1;
+    gl.bindTexture(gl.TEXTURE_2D, this.#fieldMetrics[0].texture);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      FIELD_METRICS_SIZE,
+      1,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      metrics,
+    );
+  }
+
+  /**
+   * Detect the pulldown phase of the frame being filtered on the GPU, and
+   * start reading it back. Only the two comparisons against the next frame
+   * are measured; the rest are earlier ones moved along a frame.
+   */
+  #detect(): void {
+    const gl = this.#gl;
+    this.#allocateFieldMetrics();
+    this.#allocateReductionTargets();
+    const metrics = this.#fieldMetrics;
+    const targets = this.#reductionTargets;
+    if (metrics === null || targets === null) return;
+    const { cur, next } = this.#neighbours(false);
+    const curTexture = this.#textures[cur];
+    const nextTexture = this.#textures[next];
+    if (!curTexture || !nextTexture) return;
+    const [current, previous] = metrics;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, current.framebuffer);
+    gl.bindTexture(gl.TEXTURE_2D, previous.texture);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, FIELD_METRICS.phase, 1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, previous.framebuffer);
+    gl.bindTexture(gl.TEXTURE_2D, current.texture);
+    const carry: [from: number, to: number][] = [
+      [
+        FIELD_METRICS.secondRepeatsPrevious,
+        FIELD_METRICS.previousSecondRepeated,
+      ],
+      [FIELD_METRICS.firstRepeatsPrevious, FIELD_METRICS.previousFirstRepeated],
+      [FIELD_METRICS.secondRepeatsNext, FIELD_METRICS.secondRepeatsPrevious],
+      [FIELD_METRICS.firstRepeatsNext, FIELD_METRICS.firstRepeatsPrevious],
+    ];
+    for (const [from, to] of carry)
+      gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, to, 0, from, 0, 1, 1);
+
+    const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
+    this.#compareField(
+      targets,
+      curTexture,
+      nextTexture,
+      current.texture,
+      FIELD_METRICS.secondRepeatsNext,
+      1 - first,
+    );
+    this.#compareField(
+      targets,
+      curTexture,
+      nextTexture,
+      current.texture,
+      FIELD_METRICS.firstRepeatsNext,
+      first,
+    );
+
+    this.#detectResult ??= allocateRenderTarget(gl, 1, 1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.#detectResult.framebuffer);
+    gl.useProgram(this.#detectProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, current.texture);
+    gl.uniform1i(this.#detectLocation.fieldMetrics, 0);
+    gl.viewport(0, 0, 1, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindTexture(gl.TEXTURE_2D, current.texture);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, FIELD_METRICS.phase, 0, 0, 0, 1, 1);
+
+    this.#metricsPixelBuffer ??= gl.createBuffer();
+    gl.deleteSync(this.#metricsFence);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#metricsPixelBuffer);
+    gl.bufferData(
+      gl.PIXEL_PACK_BUFFER,
+      this.#metricsBuffer.byteLength,
+      gl.STREAM_READ,
+    );
+    gl.bindFramebuffer(gl.FRAMEBUFFER, current.framebuffer);
+    gl.readPixels(0, 0, FIELD_METRICS_SIZE, 1, gl.RGBA, gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.#metricsFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+  }
+
+  /**
+   * Read back the previous frame's phase if it has arrived, and advance it
+   * to the frame being filtered. The run is not advanced: only the GPU
+   * counts observed frames.
+   */
+  #collectPhase(): void {
+    const gl = this.#gl;
+    const fence = this.#metricsFence;
+    if (fence !== null && this.#metricsPixelBuffer !== null) {
+      switch (gl.clientWaitSync(fence, 0, 0)) {
+        case gl.ALREADY_SIGNALED:
+        case gl.CONDITION_SATISFIED:
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#metricsPixelBuffer);
+          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, this.#metricsBuffer);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+          gl.deleteSync(fence);
+          this.#metricsFence = null;
+          this.#known = {
+            phase: this.#metricsBuffer[FIELD_METRICS.phase * 4] ?? 0,
+            run: this.#metricsBuffer[FIELD_METRICS.phase * 4 + 1] ?? 0,
+          };
+          this.#knownAge = 0;
+          break;
+      }
+    }
+    this.#knownAge++;
+    const { phase, run } = this.#known;
+    if (phase === 0 || this.#knownAge > PULLDOWN_FRAMES) {
+      this.#phase = NO_PHASE;
+    } else {
+      this.#phase = {
+        phase: ((phase - 1 + this.#knownAge) % PULLDOWN_FRAMES) + 1,
+        run,
+      };
+    }
+  }
+
+  #describePhase(frame: number): string {
+    const columns: string[] = [];
+    for (let index = 0; index < FIELD_METRICS.phase; index++) {
+      const max = this.#metricsBuffer[index * 4] ?? 0;
+      const differing = this.#metricsBuffer[index * 4 + 1] ?? 0;
+      const mean = this.#metricsBuffer[index * 4 + 2] ?? 0;
+      columns.push(
+        `${max.toFixed(3)},${differing.toString().padStart(4)},${mean.toFixed(3)}`,
+      );
+    }
+    const counts = this.#phaseCounts
+      .map((count, phase) => `${phase === 0 ? "-" : phase}:${count}`)
+      .join(" ");
+    return (
+      `frame=${frame} phase=${this.#phase.phase} run=${this.#phase.run}` +
+      ` known=${this.#known.phase}/${this.#known.run} age=${this.#knownAge}` +
+      ` ${this.#filmLocked ? "film" : "video"} period=${this.#periodMs.toFixed(3)}\n` +
+      `${columns.join(" ")}\n${counts} dropped:${this.#filmDropped}`
+    );
   }
 
   #onFrame = (
@@ -471,8 +963,10 @@ export class Deinterlacer {
         // behind, and the clock they were timed by is pinned to the same
         // place. Both start again from where playback actually is.
         this.#queue.length = 0;
+        this.#lastScheduled = null;
+        this.#resetFieldMetrics();
       }
-      this.#count(metadata.presentedFrames, stale);
+      const missed = this.#count(metadata.presentedFrames, stale);
       // The same picture presented again, which the compositor does whenever
       // nothing new has been decoded: paused, stalled, or stopped at the end
       // of a stream, and at the display's rate rather than the video's.
@@ -496,27 +990,74 @@ export class Deinterlacer {
         this.#showFramesSinceReport = 0;
         this.#showMsSinceReport = 0;
         this.#reportMaxQueuedFields = 0;
+        this.#gpuFrameNanosecondsSinceReport = 0;
+        this.#gpuFrameCountSinceReport = 0;
+        this.#gpuFieldNanosecondsSinceReport = 0;
+        this.#gpuFieldCountSinceReport = 0;
       }
       this.#lastFrameAt = at;
       const begin = performance.now();
+      const q = this.#beginGpuTimer(false);
       this.#push();
       this.#reportMaxQueuedFields = Math.max(
         this.#reportMaxQueuedFields,
         this.#queue.length,
       );
+      if (this.#film) {
+        // A missed frame leaves a gap in the held frames, so the comparisons
+        // carried over would be between frames that were never neighbours.
+        if (this.#frames === HISTORY && missed === 0) {
+          this.#collectPhase();
+          this.#detect();
+        } else {
+          this.#resetFieldMetrics();
+        }
+        this.#phaseCounts[this.#phase.phase] =
+          (this.#phaseCounts[this.#phase.phase] ?? 0) + 1;
+        this.#filmLocked =
+          this.#phase.phase !== 0 && this.#phase.run >= FILM_LOCK_FRAMES;
+        if (this.#debug)
+          this.#debugText = this.#describePhase(metadata.presentedFrames);
+      }
       if (this.#scheduling()) {
-        const duration = this.#periodMs / 2;
         if (this.#queue.length >= FIELD_QUEUE_LENGTH) {
           this.#queue.length = 0;
-          this.#stats.queueResetted += 1;
+          this.#lastScheduled = null;
+          this.#stats.queueResetted++;
         }
-        const last = this.#queue.at(-1);
-        const at = last != null ? last.at + last.duration : now;
-        this.#filter(false, at, duration);
-        this.#filter(true, at + duration, duration);
+        // Timed from when the frame reaches the screen, which unlike `now`
+        // does not move when the callback runs late; a refresh of margin
+        // covers a late callback.
+        const shown = (metadata.expectedDisplayTime || now) + this.#refreshMs;
+        if (this.#filmLocked) {
+          const phase = this.#phase.phase;
+          if (phase === FILM_DUPLICATE_PHASE) {
+            this.#filmDropped++;
+            this.#droppedBefore++;
+          } else {
+            const duration = (this.#periodMs * PULLDOWN_FRAMES) / FILM_FRAMES;
+            const lead = FILM_LEAD[phase] ?? 0;
+            const at = this.#schedule(
+              "film",
+              shown + lead * this.#periodMs,
+              duration,
+            );
+            this.#filter("film", phase, false, at, duration);
+          }
+        } else if (this.#doubleRate) {
+          const duration = this.#periodMs / 2;
+          const at = this.#schedule("field", shown, duration);
+          this.#filter("field", 1, false, at, duration);
+          this.#filter("field", 2, true, at + duration, duration);
+        } else {
+          const duration = this.#periodMs;
+          const at = this.#schedule("frame", shown, duration);
+          this.#filter("frame", 0, false, at, duration);
+        }
       } else {
         this.#render(false, false, null);
       }
+      this.#endGpuTimer(q);
       this.#renderMsSinceReport += performance.now() - begin;
       this.#renderFramesSinceReport++;
       this.#report(at);
@@ -551,15 +1092,17 @@ export class Deinterlacer {
     this.#scan = scan;
     this.#frames = 0;
     this.#queue.length = 0;
+    this.#lastScheduled = null;
+    this.#resetFieldMetrics();
     if (scan.interlaced) {
-      if (this.#doubleRate) this.#startLoop();
+      if (this.#scheduled) this.#startLoop();
     } else {
       this.#stopLoop();
     }
   }
 
   /**
-   * Whether fields are being filtered ahead of time and queued, rather than
+   * Whether pictures are being filtered ahead of time and queued, rather than
    * drawn as their frame arrives.
    *
    * A picture for every frame has nothing to schedule -- there is one of them
@@ -568,10 +1111,40 @@ export class Deinterlacer {
    */
   #scheduling(): boolean {
     return (
-      this.#doubleRate &&
+      this.#scheduled &&
       this.#periodMs > 0 &&
       this.#outputs.length === FIELD_QUEUE_LENGTH
     );
+  }
+
+  /**
+   * When a picture goes up: one duration after the last one of its cadence,
+   * nudged towards `ideal` by a fraction of the gap so that the schedule
+   * follows the clock without a picture ever moving across a refresh. It
+   * restarts from `ideal` when the gap has grown to a whole picture or the
+   * cadence has changed.
+   */
+  #schedule(cadence: Cadence, ideal: number, duration: number): number {
+    const last = this.#lastScheduled;
+    if (last !== null && last.cadence === cadence) {
+      const chain = last.at + last.duration;
+      const error = ideal - chain;
+      if (Math.abs(error) < duration) {
+        const step = Math.max(
+          -DRIFT_STEP_MS,
+          Math.min(DRIFT_STEP_MS, error * DRIFT_GAIN),
+        );
+        return chain + step;
+      }
+    }
+    if (last !== null) this.#stats.resynced++;
+    // Pictures queued after the new moment would never be shown in order.
+    for (let tail = this.#queue.at(-1); tail && tail.at >= ideal;) {
+      this.#queue.pop();
+      this.#stats.late++;
+      tail = this.#queue.at(-1);
+    }
+    return ideal;
   }
 
   /**
@@ -591,8 +1164,9 @@ export class Deinterlacer {
       this.#periodMs > 0 ? Math.max(1, Math.round(step / this.#periodMs)) : 1;
     const period = step / frames;
     if (period < MIN_PERIOD_MS || period > MAX_PERIOD_MS) return;
+    // A much shorter period means the estimate was a multiple of it.
     this.#periodMs =
-      this.#periodMs > 0
+      this.#periodMs > 0 && period > this.#periodMs * PERIOD_SHORTER
         ? this.#periodMs + (period - this.#periodMs) * PERIOD_SMOOTHING
         : period;
   }
@@ -605,7 +1179,13 @@ export class Deinterlacer {
    * held as pictures. What is queued after that is a copy waiting for a
    * moment, which no later frame can take away.
    */
-  #filter(second: boolean, at: number, duration: number): void {
+  #filter(
+    cadence: Cadence,
+    phase: number,
+    second: boolean,
+    at: number,
+    duration: number,
+  ): void {
     const slot = (this.#outputHead + 1) % FIELD_QUEUE_LENGTH;
     const output = this.#outputs[slot];
     if (!output) return;
@@ -618,13 +1198,23 @@ export class Deinterlacer {
       this.#stats.late++;
     }
     this.#render(false, second, output.framebuffer);
-    this.#queue.push({ slot, at, duration });
+    const ready = {
+      slot,
+      at,
+      duration,
+      cadence,
+      phase,
+      droppedBefore: this.#droppedBefore,
+    };
+    this.#droppedBefore = 0;
+    this.#queue.push(ready);
+    this.#lastScheduled = ready;
   }
 
   /** The loop that puts filtered fields up, and the only thing that draws. */
   #startLoop(): void {
     if (this.#loopHandle !== null) return;
-    if (!this.#running || this.#lost || !this.#doubleRate) return;
+    if (!this.#running || this.#lost || !this.#scheduled) return;
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   }
 
@@ -632,14 +1222,42 @@ export class Deinterlacer {
     if (this.#loopHandle !== null) cancelAnimationFrame(this.#loopHandle);
     this.#loopHandle = null;
     this.#queue.length = 0;
+    this.#lastScheduled = null;
   }
 
   #onLoop = (now: DOMHighResTimeStamp): void => {
     this.#loopHandle = null;
-    if (!this.#running || this.#lost || !this.#doubleRate) return;
-    this.#present(now);
+    if (!this.#running || this.#lost || !this.#scheduled) return;
+    this.#measureRefresh(now);
+    this.#present(this.#gridAt, now);
     this.#loopHandle = requestAnimationFrame(this.#onLoop);
   };
+
+  /**
+   * Fit a grid of refreshes (period and phase) to the animation frames. rAF
+   * timestamps wander by a millisecond or so, which is more than the
+   * nearest-refresh decision in #present can take; the grid is what it
+   * compares against. A frame far off the grid restarts it.
+   */
+  #measureRefresh(now: number): void {
+    const step = now - this.#loopAt;
+    this.#loopAt = now;
+    const refreshes = Math.max(1, Math.round(step / this.#refreshMs));
+    const predicted = this.#gridAt + refreshes * this.#refreshMs;
+    const error = now - predicted;
+    if (
+      this.#gridAt === 0 ||
+      step <= 0 ||
+      step > MAX_PERIOD_MS ||
+      Math.abs(error) > this.#refreshMs / 4
+    ) {
+      if (step > 0 && step <= MAX_PERIOD_MS) this.#refreshMs = step;
+      this.#gridAt = now;
+      return;
+    }
+    this.#refreshMs += (error / refreshes) * GRID_PERIOD_GAIN;
+    this.#gridAt = predicted + error * GRID_PHASE_GAIN;
+  }
 
   /**
    * Put up whichever filtered field belongs on the screen next.
@@ -650,25 +1268,54 @@ export class Deinterlacer {
    * refresh either side of it. Where two of them have come due since the last
    * one, only the newer is shown: a screen has one picture per refresh, and
    * the older of the two is a moment the viewer should already be past.
+   *
+   * Near the half-refresh boundary a picture goes the way the last one went,
+   * so that the slip a cadence the refresh does not divide into must make
+   * every so often happens once rather than flapping.
    */
-  #present(now: number): void {
-    const tolerance = 3;
-    while (this.#queue[1] && this.#queue[1].at - now <= tolerance) {
+  #present(now: number, frameAt: number): void {
+    const half = this.#refreshMs / 2;
+    const due = (ready: Ready) => {
+      const ahead = ready.at - now;
+      if (ahead <= half - PRESENT_HYSTERESIS_MS) return true;
+      if (ahead > half + PRESENT_HYSTERESIS_MS) return false;
+      return this.#shownAhead > 0;
+    };
+    while (this.#queue[1] && due(this.#queue[1])) {
       this.#stats.late++;
       this.#queue.shift();
     }
-    let ready = this.#queue[0];
-    if (!ready) {
-      return;
-    }
-    if (ready.at - now > tolerance) {
-      return;
-    }
+    const ready = this.#queue[0];
+    if (!ready || !due(ready)) return;
     this.#queue.shift();
+    this.#shownAhead = ready.at - now;
     const begin = performance.now();
+    const q = this.#beginGpuTimer(true);
     this.#show(ready.slot);
+    this.#endGpuTimer(q);
     this.#showMsSinceReport += performance.now() - begin;
     this.#showFramesSinceReport++;
+    if (this.#debug) this.#logShown(ready, frameAt);
+    this.#shownAt = frameAt;
+  }
+
+  #logShown(ready: Ready, frameAt: number): void {
+    const step = this.#shownAt === 0 ? 0 : frameAt - this.#shownAt;
+    const refreshes = step / this.#refreshMs;
+    const which =
+      ready.cadence === "film"
+        ? `phase ${ready.phase}`
+        : ready.cadence === "field"
+          ? `field ${ready.phase}`
+          : "frame";
+    const dropped =
+      ready.droppedBefore > 0
+        ? `, phase ${FILM_DUPLICATE_PHASE} dropped before it` +
+          (ready.droppedBefore > 1 ? ` (${ready.droppedBefore})` : "")
+        : "";
+    console.log(
+      `yadif: +${step.toFixed(2)} ms (${refreshes.toFixed(2)} refreshes) ${ready.cadence} ${which}, due ${(ready.at - frameAt).toFixed(2)} ms${dropped}`,
+    );
   }
 
   /** Copy one of the filtered pictures onto the canvas. */
@@ -708,12 +1355,17 @@ export class Deinterlacer {
    * more than one. Frames thrown away either side of a discontinuity are not
    * counted: the held frames were being dropped anyway, and a seek presents
    * what it passes over.
+   *
+   * Returns how many frames were missed between the last one and this one.
    */
-  #count(presented: number, stale: boolean): void {
+  #count(presented: number, stale: boolean): number {
+    let missed = 0;
     if (this.#lastPresented !== 0 && !stale) {
-      this.#stats.missed += Math.max(0, presented - this.#lastPresented - 1);
+      missed = Math.max(0, presented - this.#lastPresented - 1);
+      this.#stats.missed += missed;
     }
     this.#lastPresented = presented;
+    return missed;
   }
 
   #report(at: number): void {
@@ -723,18 +1375,42 @@ export class Deinterlacer {
     const frames = this.#scheduling()
       ? this.#showFramesSinceReport
       : this.#renderFramesSinceReport;
+    let frameMs = 0;
+    if (this.#renderFramesSinceReport !== 0) {
+      frameMs += this.#renderMsSinceReport / this.#renderFramesSinceReport;
+    }
+    if (this.#showFramesSinceReport !== 0) {
+      frameMs += this.#showMsSinceReport / this.#showFramesSinceReport / 2;
+    }
+
+    let gpuMs: number | undefined;
+    if (this.#timerQueryExtension != null) {
+      gpuMs = 0;
+      if (this.#gpuFrameCountSinceReport !== 0) {
+        gpuMs +=
+          this.#gpuFrameNanosecondsSinceReport /
+          1_000_000 /
+          this.#gpuFrameCountSinceReport;
+      }
+      if (this.#gpuFieldCountSinceReport !== 0) {
+        gpuMs +=
+          this.#gpuFieldNanosecondsSinceReport /
+          1_000_000 /
+          this.#gpuFieldCountSinceReport /
+          2;
+      }
+    }
+
     this.#onStats({
       ...this.#stats,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
       dropped: this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
       fps: (frames * 1000) / elapsed,
-      frameMs:
-        this.#renderFramesSinceReport === 0
-          ? 0
-          : (this.#renderMsSinceReport + this.#showMsSinceReport) /
-            this.#renderFramesSinceReport,
+      frameMs,
       maxQueuedFields: this.#reportMaxQueuedFields,
+      gpuMs,
+      film: this.#filmLocked,
     });
     this.#reportedAt = at;
     this.#renderFramesSinceReport = 0;
@@ -742,6 +1418,10 @@ export class Deinterlacer {
     this.#showFramesSinceReport = 0;
     this.#showMsSinceReport = 0;
     this.#reportMaxQueuedFields = 0;
+    this.#gpuFrameNanosecondsSinceReport = 0;
+    this.#gpuFrameCountSinceReport = 0;
+    this.#gpuFieldNanosecondsSinceReport = 0;
+    this.#gpuFieldCountSinceReport = 0;
   }
 
   /** Take the newest frame into the ring. */
@@ -768,17 +1448,13 @@ export class Deinterlacer {
    * there is one per frame and nothing to schedule. An output framebuffer is a
    * field being kept for its moment.
    *
-   * Which of the held frames is the one being filtered depends on how many
-   * there are. In flight it is the middle one, with the newest waiting its
-   * turn; where there is nothing on one side -- the start of a stream, or a
-   * `flush` because the last frame has been presented and no more are coming
-   * -- that side is the frame itself, which is what the reference filter does
-   * at the ends of its input.
-   *
    * `second` asks for the frame's other field: the same three frames filtered
    * the other way round, keeping the field that came second and rebuilding
    * the first. The shader takes the pair of frames the missing line sits
    * between from the parity, so this is the whole of it.
+   *
+   * With `film` on, the shader is also given the field metrics, and puts a
+   * film frame back together rather than filtering it.
    */
   #render(
     flush: boolean,
@@ -789,33 +1465,7 @@ export class Deinterlacer {
     if (this.#frames === HISTORY && !flush) this.#stats.filtered++;
     else this.#stats.degraded++;
     const gl = this.#gl;
-    const newest = this.#head;
-    const older = (this.#head + HISTORY - 1) % HISTORY;
-    const oldest = (this.#head + 1) % HISTORY;
-    let prev: number;
-    let cur: number;
-    let next: number;
-    if (this.#frames === 1) {
-      // One frame, standing in for its own neighbours, which is what the
-      // reference does where its input ends. Nothing moved as far as the
-      // filter can tell, so what comes back is very nearly the frame itself.
-      prev = cur = next = newest;
-    } else if (flush) {
-      // The newest frame is the last there will be, so it stands in for the
-      // one that would have come after it.
-      prev = older;
-      cur = next = newest;
-    } else if (this.#frames === 2) {
-      // The start of a stream: the older of the two is being filtered, and it
-      // stands in for the frame before itself.
-      prev = cur = older;
-      next = newest;
-    } else {
-      prev = oldest;
-      cur = older;
-      next = newest;
-    }
-
+    const { prev, cur, next } = this.#neighbours(flush);
     gl.bindFramebuffer(gl.FRAMEBUFFER, target);
     gl.useProgram(this.#program);
     for (const [unit, texture] of [prev, cur, next].entries()) {
@@ -825,22 +1475,147 @@ export class Deinterlacer {
     gl.uniform1i(this.#location.prev, 0);
     gl.uniform1i(this.#location.cur, 1);
     gl.uniform1i(this.#location.next, 2);
+    const metrics = this.#film ? this.#fieldMetrics : null;
+    const film = metrics !== null;
+    if (metrics !== null) {
+      gl.activeTexture(gl.TEXTURE0 + 3);
+      gl.bindTexture(gl.TEXTURE_2D, metrics[0].texture);
+      gl.uniform1i(this.#location.fieldMetrics, 3);
+    }
     gl.uniform2i(this.#location.size, this.#width, this.#height);
     // The lines that survive are the ones of the field being shown: the first
     // field is the top one when the top field leads, and the second is the
     // other. A frame at a time is always the first.
     const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
     gl.uniform1i(this.#location.parity, second ? 1 - first : first);
+    gl.uniform1i(this.#location.second, second ? 1 : 0);
     gl.uniform1i(
       this.#location.tff,
       this.#scan?.topFieldFirst !== false ? 1 : 0,
     );
     gl.uniform1i(this.#location.spatialCheck, this.#spatialCheck ? 1 : 0);
+    gl.uniform1i(this.#location.debug, this.#debug ? 1 : 0);
+    gl.uniform1i(this.#location.film, film ? 1 : 0);
+    gl.uniform1i(this.#location.phase, this.#phase.phase);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (this.#debug && film) this.#drawText(this.#debugText, 0, 90);
     // A picture filtered into a texture is not on the screen yet, and showing
     // the canvas for it would put up whatever was drawn on it last.
     if (target === null) this.canvas.style.visibility = "visible";
+  }
+
+  #neighbours(flush: boolean): { prev: number; cur: number; next: number } {
+    const back = (frames: number) => (this.#head + HISTORY - frames) % HISTORY;
+    if (this.#frames === 1) {
+      return { prev: this.#head, cur: this.#head, next: this.#head };
+    } else if (flush) {
+      return { prev: back(1), cur: this.#head, next: this.#head };
+    } else if (this.#frames === 2) {
+      return { prev: back(1), cur: back(1), next: this.#head };
+    } else {
+      return { prev: back(2), cur: back(1), next: this.#head };
+    }
+  }
+
+  #freeReductionTargets(): void {
+    if (this.#reductionTargets == null) {
+      return;
+    }
+    for (const { texture, framebuffer } of this.#reductionTargets) {
+      this.#gl.deleteFramebuffer(framebuffer);
+      this.#gl.deleteTexture(texture);
+    }
+    this.#reductionTargets = null;
+  }
+
+  #allocateReductionTargets(): void {
+    if (this.#width === 0 || this.#height === 0) {
+      return;
+    }
+    if (this.#reductionTargets != null) return;
+    this.#freeReductionTargets();
+    this.#reductionTargets = [
+      allocateRenderTarget(
+        this.#gl,
+        Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W),
+        Math.ceil(this.#height / FIELD_COMPARE_BLOCK_H),
+      ),
+      allocateRenderTarget(
+        this.#gl,
+        Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W),
+        Math.ceil(this.#height / FIELD_COMPARE_BLOCK_H),
+      ),
+    ];
+  }
+
+  #freeFieldMetrics(): void {
+    if (this.#fieldMetrics == null) {
+      return;
+    }
+    for (const { texture, framebuffer } of this.#fieldMetrics) {
+      this.#gl.deleteFramebuffer(framebuffer);
+      this.#gl.deleteTexture(texture);
+    }
+    this.#fieldMetrics = null;
+  }
+
+  #allocateFieldMetrics(): void {
+    if (this.#fieldMetrics !== null) return;
+    this.#fieldMetrics = [
+      allocateRenderTarget(this.#gl, FIELD_METRICS_SIZE, 1),
+      allocateRenderTarget(this.#gl, FIELD_METRICS_SIZE, 1),
+    ];
+    this.#resetFieldMetrics();
+  }
+
+  /** Compare one field of two frames block by block, reduce to one texel, and store it in the metrics. */
+  #compareField(
+    reductionTargets: [RenderTarget, RenderTarget],
+    frameA: WebGLTexture,
+    frameB: WebGLTexture,
+    metrics: WebGLTexture,
+    metric: number,
+    parity: number,
+  ): void {
+    const gl = this.#gl;
+    let target: 0 | 1 = 0;
+    let width = Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W);
+    let height = Math.ceil(this.#height / 2 / FIELD_COMPARE_BLOCK_H);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, reductionTargets[target].framebuffer);
+    gl.useProgram(this.#fieldCompareProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, frameA);
+    gl.uniform1i(this.#fieldCompareLocation.a, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, frameB);
+    gl.uniform1i(this.#fieldCompareLocation.b, 1);
+    gl.uniform1i(this.#fieldCompareLocation.parity, parity);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, metrics);
+    gl.uniform1i(this.#fieldCompareLocation.fieldMetrics, 2);
+    gl.uniform2i(this.#fieldCompareLocation.size, this.#width, this.#height);
+    gl.viewport(0, 0, width, height);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    while (width > 1 || height > 1) {
+      const source = target;
+      target = target === 0 ? 1 : 0;
+      const reducedWidth = Math.ceil(width / REDUCTION_FACTOR);
+      const reducedHeight = Math.ceil(height / REDUCTION_FACTOR);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, reductionTargets[target].framebuffer);
+      gl.useProgram(this.#reductionProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, reductionTargets[source].texture);
+      gl.uniform1i(this.#reductionLocation.input, 0);
+      gl.uniform2i(this.#reductionLocation.size, width, height);
+      gl.viewport(0, 0, reducedWidth, reducedHeight);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      width = reducedWidth;
+      height = reducedHeight;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, metrics);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, metric, 0, 0, 0, 1, 1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   /**
@@ -908,7 +1683,8 @@ export class Deinterlacer {
       this.#textures.push(texture);
     }
     this.#freeOutputs();
-    if (this.#doubleRate) this.#allocateOutputs();
+    this.#freeReductionTargets();
+    if (this.#scheduled) this.#allocateOutputs();
   }
 
   /**
@@ -974,6 +1750,7 @@ export class Deinterlacer {
     }
     this.#outputs = [];
     this.#queue.length = 0;
+    this.#lastScheduled = null;
   }
 
   /**
@@ -1013,6 +1790,8 @@ export class Deinterlacer {
     this.#frames = 0;
     this.#lastMediaTime = 0;
     this.#queue.length = 0;
+    this.#lastScheduled = null;
+    this.#resetFieldMetrics();
     this.#periodMs = 0;
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
@@ -1027,8 +1806,11 @@ export class Deinterlacer {
       degraded: 0,
       discontinuities: 0,
       late: 0,
+      resynced: 0,
       queueResetted: 0,
     };
+    this.#phaseCounts.fill(0);
+    this.#filmDropped = 0;
     this.#lastPresented = 0;
     this.#reportedAt = 0;
     this.#lastFrameAt = 0;
@@ -1037,6 +1819,10 @@ export class Deinterlacer {
     this.#showFramesSinceReport = 0;
     this.#showMsSinceReport = 0;
     this.#reportMaxQueuedFields = 0;
+    this.#gpuFrameNanosecondsSinceReport = 0;
+    this.#gpuFrameCountSinceReport = 0;
+    this.#gpuFieldNanosecondsSinceReport = 0;
+    this.#gpuFieldCountSinceReport = 0;
   }
 
   /**
@@ -1049,6 +1835,8 @@ export class Deinterlacer {
     // coming to make sense of them, so the picture goes straight to the canvas
     // rather than through a schedule that has nothing left to keep to.
     this.#queue.length = 0;
+    this.#lastScheduled = null;
+    this.#resetFieldMetrics();
     if (this.#running) this.#render(true, false, null);
   };
 
@@ -1064,45 +1852,42 @@ export class Deinterlacer {
   };
 }
 
-function createProgram(
+function allocateRenderTarget(
   gl: WebGL2RenderingContext,
-  source: string,
-): WebGLProgram {
-  const program = gl.createProgram();
-  const vertex = compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER);
-  const fragment = compile(gl, gl.FRAGMENT_SHADER, source);
-  gl.attachShader(program, vertex);
-  gl.attachShader(program, fragment);
-  gl.linkProgram(program);
-  // Attached shaders live as long as the program needs them, and it is the
-  // program that holds them now.
-  gl.deleteShader(vertex);
-  gl.deleteShader(fragment);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    const log = gl.getProgramInfoLog(program);
-    gl.deleteProgram(program);
-    throw new Error(
-      `the deinterlacer failed to link: ${log ?? "no reason given"}`,
-    );
+  width: number,
+  height: number,
+): RenderTarget {
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    gl.RGBA32F,
+    width,
+    height,
+    0,
+    gl.RGBA,
+    gl.FLOAT,
+    null,
+  );
+  const framebuffer = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+  gl.framebufferTexture2D(
+    gl.FRAMEBUFFER,
+    gl.COLOR_ATTACHMENT0,
+    gl.TEXTURE_2D,
+    texture,
+    0,
+  );
+  const complete =
+    gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  if (!complete) {
+    gl.deleteFramebuffer(framebuffer);
+    gl.deleteTexture(texture);
+    throw new Error("failed to allocate framebuffer");
   }
-  return program;
-}
-
-function compile(
-  gl: WebGL2RenderingContext,
-  kind: GLenum,
-  source: string,
-): WebGLShader {
-  const shader = gl.createShader(kind);
-  if (!shader) throw new Error("the deinterlacer could not create a shader");
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(shader);
-    gl.deleteShader(shader);
-    throw new Error(
-      `the deinterlacer failed to compile: ${log ?? "no reason given"}`,
-    );
-  }
-  return shader;
+  return { texture, framebuffer };
 }
