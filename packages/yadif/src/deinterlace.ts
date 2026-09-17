@@ -32,21 +32,12 @@ import {
 } from "./debug.js";
 import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 import {
-  DETECT_FRAGMENT_SHADER,
-  DETECT_UNIFORMS,
-  FIELD_COMPARE_BLOCK_H,
-  FIELD_COMPARE_BLOCK_W,
-  FIELD_COMPARE_FRAGMENT_SHADER,
-  FIELD_COMPARE_UNIFORMS,
   FIELD_METRICS,
-  FIELD_METRICS_SIZE,
   FILM_DUPLICATE_PHASE,
   FILM_LOCK_FRAMES,
-  REDUCTION_FACTOR,
-  REDUCTION_FRAGMENT_SHADER,
-  REDUCTION_UNIFORMS,
 } from "./film-shader.js";
-import { createProgram } from "./utils.js";
+import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
+import { createProgram, VERTEX_SHADER } from "./utils.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
@@ -102,25 +93,6 @@ const FILM_LEAD: Record<number, number> = {
   4: 0.5,
   5: 0.75,
 };
-
-/** What the pulldown detection said about a frame. */
-interface Phase {
-  /** Which frame of the cycle it is, 1 to 5, or 0 for none. */
-  phase: number;
-  /** How many frames in a row have had a phase. See film-shader.ts. */
-  run: number;
-}
-
-const NO_PHASE: Phase = { phase: 0, run: 0 };
-
-const VERTEX_SHADER = `#version 300 es
-void main() {
-  // One triangle over the whole viewport, from the vertex index alone. There
-  // is no geometry here worth a buffer: every pixel is the fragment shader's.
-  vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
-  gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
-}
-`;
 
 /**
  * Putting a picture that has already been filtered onto the canvas.
@@ -330,29 +302,8 @@ export class Deinterlacer {
 
   readonly #video: HTMLVideoElement;
   readonly #gl: WebGL2RenderingContext;
-  readonly #fieldCompareProgram: WebGLProgram;
-  readonly #fieldCompareLocation: Record<
-    keyof typeof FIELD_COMPARE_UNIFORMS,
-    WebGLUniformLocation | null
-  >;
-  readonly #reductionProgram: WebGLProgram;
-  readonly #reductionLocation: Record<
-    keyof typeof REDUCTION_UNIFORMS,
-    WebGLUniformLocation | null
-  >;
-  readonly #detectProgram: WebGLProgram;
-  readonly #detectLocation: Record<
-    keyof typeof DETECT_UNIFORMS,
-    WebGLUniformLocation | null
-  >;
-  #reductionTargets: [RenderTarget, RenderTarget] | null = null;
-  #detectResult: RenderTarget | null = null;
-  /** The field metrics (see FIELD_METRICS) and a copy from the frame before. */
-  #fieldMetrics: [RenderTarget, RenderTarget] | null = null;
-  /** The metrics being read back asynchronously, and the last ones read. */
-  #metricsPixelBuffer: WebGLBuffer | null = null;
-  #metricsFence: WebGLSync | null = null;
-  readonly #metricsBuffer = new Float32Array(FIELD_METRICS_SIZE * 4);
+  /** The pulldown detection, which keeps its measurements on the GPU. */
+  readonly #detector: FilmDetector;
   readonly #program: WebGLProgram;
   readonly #location: Record<
     keyof typeof YADIF_UNIFORMS,
@@ -467,47 +418,7 @@ export class Deinterlacer {
     });
     if (!gl) throw new Error("this browser has no WebGL2");
     this.#gl = gl;
-    const reductionProgram = createProgram(
-      gl,
-      REDUCTION_FRAGMENT_SHADER,
-      VERTEX_SHADER,
-    );
-    this.#reductionProgram = reductionProgram;
-    this.#reductionLocation = Object.fromEntries(
-      Object.entries(REDUCTION_UNIFORMS).map(([key, name]) => [
-        key,
-        gl.getUniformLocation(reductionProgram, name),
-      ]),
-    ) as Record<keyof typeof REDUCTION_UNIFORMS, WebGLUniformLocation | null>;
-
-    const fieldCompareProgram = createProgram(
-      gl,
-      FIELD_COMPARE_FRAGMENT_SHADER,
-      VERTEX_SHADER,
-    );
-    this.#fieldCompareProgram = fieldCompareProgram;
-    this.#fieldCompareLocation = Object.fromEntries(
-      Object.entries(FIELD_COMPARE_UNIFORMS).map(([key, name]) => [
-        key,
-        gl.getUniformLocation(fieldCompareProgram, name),
-      ]),
-    ) as Record<
-      keyof typeof FIELD_COMPARE_UNIFORMS,
-      WebGLUniformLocation | null
-    >;
-
-    const detectProgram = createProgram(
-      gl,
-      DETECT_FRAGMENT_SHADER,
-      VERTEX_SHADER,
-    );
-    this.#detectProgram = detectProgram;
-    this.#detectLocation = Object.fromEntries(
-      Object.entries(DETECT_UNIFORMS).map(([key, name]) => [
-        key,
-        gl.getUniformLocation(detectProgram, name),
-      ]),
-    ) as Record<keyof typeof DETECT_UNIFORMS, WebGLUniformLocation | null>;
+    this.#detector = new FilmDetector(gl);
     this.#program = createProgram(gl, YADIF_FRAGMENT_SHADER, VERTEX_SHADER);
     const program = this.#program;
     this.#location = Object.fromEntries(
@@ -694,24 +605,11 @@ export class Deinterlacer {
     }
     this.#freeQueries.length = 0;
     this.#timerUsingQueries.length = 0;
-    this.#freeReductionTargets();
-    this.#freeFieldMetrics();
-    this.#gl.deleteSync(this.#metricsFence);
-    this.#metricsFence = null;
-    this.#gl.deleteBuffer(this.#metricsPixelBuffer);
-    this.#metricsPixelBuffer = null;
-    if (this.#detectResult !== null) {
-      this.#gl.deleteFramebuffer(this.#detectResult.framebuffer);
-      this.#gl.deleteTexture(this.#detectResult.texture);
-      this.#detectResult = null;
-    }
+    this.#detector.destroy();
     if (this.#debugRenderState !== null) {
       destroyDebugRenderState(this.#debugRenderState);
       this.#debugRenderState = null;
     }
-    this.#gl.deleteProgram(this.#reductionProgram);
-    this.#gl.deleteProgram(this.#fieldCompareProgram);
-    this.#gl.deleteProgram(this.#detectProgram);
     this.#gl.deleteProgram(this.#program);
     this.#gl.deleteProgram(this.#blit);
     this.#gl.getExtension("WEBGL_lose_context")?.loseContext();
@@ -773,105 +671,17 @@ export class Deinterlacer {
     this.#known = NO_PHASE;
     this.#knownAge = 0;
     this.#filmLocked = false;
-    this.#gl.deleteSync(this.#metricsFence);
-    this.#metricsFence = null;
-    if (this.#fieldMetrics === null) return;
-    const gl = this.#gl;
-    const metrics = new Float32Array(FIELD_METRICS_SIZE * 4);
-    for (let index = 0; index < FIELD_METRICS.phase; index++)
-      metrics[index * 4 + 1] = 1;
-    gl.bindTexture(gl.TEXTURE_2D, this.#fieldMetrics[0].texture);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA32F,
-      FIELD_METRICS_SIZE,
-      1,
-      0,
-      gl.RGBA,
-      gl.FLOAT,
-      metrics,
-    );
+    this.#detector.reset();
   }
 
-  /**
-   * Detect the pulldown phase of the frame being filtered on the GPU, and
-   * start reading it back. Only the two comparisons against the next frame
-   * are measured; the rest are earlier ones moved along a frame.
-   */
+  /** Detect the pulldown phase of the frame being filtered on the GPU. */
   #detect(): void {
-    const gl = this.#gl;
-    this.#allocateFieldMetrics();
-    this.#allocateReductionTargets();
-    const metrics = this.#fieldMetrics;
-    const targets = this.#reductionTargets;
-    if (metrics === null || targets === null) return;
     const { cur, next } = this.#neighbours(false);
     const curTexture = this.#textures[cur];
     const nextTexture = this.#textures[next];
     if (!curTexture || !nextTexture) return;
-    const [current, previous] = metrics;
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, current.framebuffer);
-    gl.bindTexture(gl.TEXTURE_2D, previous.texture);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, FIELD_METRICS.phase, 1);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, previous.framebuffer);
-    gl.bindTexture(gl.TEXTURE_2D, current.texture);
-    const carry: [from: number, to: number][] = [
-      [
-        FIELD_METRICS.secondRepeatsPrevious,
-        FIELD_METRICS.previousSecondRepeated,
-      ],
-      [FIELD_METRICS.firstRepeatsPrevious, FIELD_METRICS.previousFirstRepeated],
-      [FIELD_METRICS.secondRepeatsNext, FIELD_METRICS.secondRepeatsPrevious],
-      [FIELD_METRICS.firstRepeatsNext, FIELD_METRICS.firstRepeatsPrevious],
-    ];
-    for (const [from, to] of carry)
-      gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, to, 0, from, 0, 1, 1);
-
     const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
-    this.#compareField(
-      targets,
-      curTexture,
-      nextTexture,
-      current.texture,
-      FIELD_METRICS.secondRepeatsNext,
-      1 - first,
-    );
-    this.#compareField(
-      targets,
-      curTexture,
-      nextTexture,
-      current.texture,
-      FIELD_METRICS.firstRepeatsNext,
-      first,
-    );
-
-    this.#detectResult ??= allocateRenderTarget(gl, 1, 1);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.#detectResult.framebuffer);
-    gl.useProgram(this.#detectProgram);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, current.texture);
-    gl.uniform1i(this.#detectLocation.fieldMetrics, 0);
-    gl.viewport(0, 0, 1, 1);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindTexture(gl.TEXTURE_2D, current.texture);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, FIELD_METRICS.phase, 0, 0, 0, 1, 1);
-
-    this.#metricsPixelBuffer ??= gl.createBuffer();
-    gl.deleteSync(this.#metricsFence);
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#metricsPixelBuffer);
-    gl.bufferData(
-      gl.PIXEL_PACK_BUFFER,
-      this.#metricsBuffer.byteLength,
-      gl.STREAM_READ,
-    );
-    gl.bindFramebuffer(gl.FRAMEBUFFER, current.framebuffer);
-    gl.readPixels(0, 0, FIELD_METRICS_SIZE, 1, gl.RGBA, gl.FLOAT, 0);
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.#metricsFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-    gl.flush();
+    this.#detector.detect(curTexture, nextTexture, first);
   }
 
   /**
@@ -880,24 +690,10 @@ export class Deinterlacer {
    * counts observed frames.
    */
   #collectPhase(): void {
-    const gl = this.#gl;
-    const fence = this.#metricsFence;
-    if (fence !== null && this.#metricsPixelBuffer !== null) {
-      switch (gl.clientWaitSync(fence, 0, 0)) {
-        case gl.ALREADY_SIGNALED:
-        case gl.CONDITION_SATISFIED:
-          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#metricsPixelBuffer);
-          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, this.#metricsBuffer);
-          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-          gl.deleteSync(fence);
-          this.#metricsFence = null;
-          this.#known = {
-            phase: this.#metricsBuffer[FIELD_METRICS.phase * 4] ?? 0,
-            run: this.#metricsBuffer[FIELD_METRICS.phase * 4 + 1] ?? 0,
-          };
-          this.#knownAge = 0;
-          break;
-      }
+    const known = this.#detector.poll();
+    if (known !== null) {
+      this.#known = known;
+      this.#knownAge = 0;
     }
     this.#knownAge++;
     const { phase, run } = this.#known;
@@ -913,10 +709,11 @@ export class Deinterlacer {
 
   #describePhase(frame: number): string {
     const columns: string[] = [];
+    const metrics = this.#detector.metrics;
     for (let index = 0; index < FIELD_METRICS.phase; index++) {
-      const max = this.#metricsBuffer[index * 4] ?? 0;
-      const differing = this.#metricsBuffer[index * 4 + 1] ?? 0;
-      const mean = this.#metricsBuffer[index * 4 + 2] ?? 0;
+      const max = metrics[index * 4] ?? 0;
+      const differing = metrics[index * 4 + 1] ?? 0;
+      const mean = metrics[index * 4 + 2] ?? 0;
       columns.push(
         `${max.toFixed(3)},${differing.toString().padStart(4)},${mean.toFixed(3)}`,
       );
@@ -1475,11 +1272,11 @@ export class Deinterlacer {
     gl.uniform1i(this.#location.prev, 0);
     gl.uniform1i(this.#location.cur, 1);
     gl.uniform1i(this.#location.next, 2);
-    const metrics = this.#film ? this.#fieldMetrics : null;
+    const metrics = this.#film ? this.#detector.texture : null;
     const film = metrics !== null;
     if (metrics !== null) {
       gl.activeTexture(gl.TEXTURE0 + 3);
-      gl.bindTexture(gl.TEXTURE_2D, metrics[0].texture);
+      gl.bindTexture(gl.TEXTURE_2D, metrics);
       gl.uniform1i(this.#location.fieldMetrics, 3);
     }
     gl.uniform2i(this.#location.size, this.#width, this.#height);
@@ -1516,106 +1313,6 @@ export class Deinterlacer {
     } else {
       return { prev: back(2), cur: back(1), next: this.#head };
     }
-  }
-
-  #freeReductionTargets(): void {
-    if (this.#reductionTargets == null) {
-      return;
-    }
-    for (const { texture, framebuffer } of this.#reductionTargets) {
-      this.#gl.deleteFramebuffer(framebuffer);
-      this.#gl.deleteTexture(texture);
-    }
-    this.#reductionTargets = null;
-  }
-
-  #allocateReductionTargets(): void {
-    if (this.#width === 0 || this.#height === 0) {
-      return;
-    }
-    if (this.#reductionTargets != null) return;
-    this.#freeReductionTargets();
-    this.#reductionTargets = [
-      allocateRenderTarget(
-        this.#gl,
-        Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W),
-        Math.ceil(this.#height / FIELD_COMPARE_BLOCK_H),
-      ),
-      allocateRenderTarget(
-        this.#gl,
-        Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W),
-        Math.ceil(this.#height / FIELD_COMPARE_BLOCK_H),
-      ),
-    ];
-  }
-
-  #freeFieldMetrics(): void {
-    if (this.#fieldMetrics == null) {
-      return;
-    }
-    for (const { texture, framebuffer } of this.#fieldMetrics) {
-      this.#gl.deleteFramebuffer(framebuffer);
-      this.#gl.deleteTexture(texture);
-    }
-    this.#fieldMetrics = null;
-  }
-
-  #allocateFieldMetrics(): void {
-    if (this.#fieldMetrics !== null) return;
-    this.#fieldMetrics = [
-      allocateRenderTarget(this.#gl, FIELD_METRICS_SIZE, 1),
-      allocateRenderTarget(this.#gl, FIELD_METRICS_SIZE, 1),
-    ];
-    this.#resetFieldMetrics();
-  }
-
-  /** Compare one field of two frames block by block, reduce to one texel, and store it in the metrics. */
-  #compareField(
-    reductionTargets: [RenderTarget, RenderTarget],
-    frameA: WebGLTexture,
-    frameB: WebGLTexture,
-    metrics: WebGLTexture,
-    metric: number,
-    parity: number,
-  ): void {
-    const gl = this.#gl;
-    let target: 0 | 1 = 0;
-    let width = Math.ceil(this.#width / FIELD_COMPARE_BLOCK_W);
-    let height = Math.ceil(this.#height / 2 / FIELD_COMPARE_BLOCK_H);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, reductionTargets[target].framebuffer);
-    gl.useProgram(this.#fieldCompareProgram);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, frameA);
-    gl.uniform1i(this.#fieldCompareLocation.a, 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, frameB);
-    gl.uniform1i(this.#fieldCompareLocation.b, 1);
-    gl.uniform1i(this.#fieldCompareLocation.parity, parity);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, metrics);
-    gl.uniform1i(this.#fieldCompareLocation.fieldMetrics, 2);
-    gl.uniform2i(this.#fieldCompareLocation.size, this.#width, this.#height);
-    gl.viewport(0, 0, width, height);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    while (width > 1 || height > 1) {
-      const source = target;
-      target = target === 0 ? 1 : 0;
-      const reducedWidth = Math.ceil(width / REDUCTION_FACTOR);
-      const reducedHeight = Math.ceil(height / REDUCTION_FACTOR);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, reductionTargets[target].framebuffer);
-      gl.useProgram(this.#reductionProgram);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, reductionTargets[source].texture);
-      gl.uniform1i(this.#reductionLocation.input, 0);
-      gl.uniform2i(this.#reductionLocation.size, width, height);
-      gl.viewport(0, 0, reducedWidth, reducedHeight);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-      width = reducedWidth;
-      height = reducedHeight;
-    }
-    gl.bindTexture(gl.TEXTURE_2D, metrics);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, metric, 0, 0, 0, 1, 1);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   /**
@@ -1683,7 +1380,7 @@ export class Deinterlacer {
       this.#textures.push(texture);
     }
     this.#freeOutputs();
-    this.#freeReductionTargets();
+    this.#detector.resize(width, height);
     if (this.#scheduled) this.#allocateOutputs();
   }
 
@@ -1850,44 +1547,4 @@ export class Deinterlacer {
     this.#lost = true;
     this.stop();
   };
-}
-
-function allocateRenderTarget(
-  gl: WebGL2RenderingContext,
-  width: number,
-  height: number,
-): RenderTarget {
-  const texture = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texImage2D(
-    gl.TEXTURE_2D,
-    0,
-    gl.RGBA32F,
-    width,
-    height,
-    0,
-    gl.RGBA,
-    gl.FLOAT,
-    null,
-  );
-  const framebuffer = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-  gl.framebufferTexture2D(
-    gl.FRAMEBUFFER,
-    gl.COLOR_ATTACHMENT0,
-    gl.TEXTURE_2D,
-    texture,
-    0,
-  );
-  const complete =
-    gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  if (!complete) {
-    gl.deleteFramebuffer(framebuffer);
-    gl.deleteTexture(texture);
-    throw new Error("failed to allocate framebuffer");
-  }
-  return { texture, framebuffer };
 }
