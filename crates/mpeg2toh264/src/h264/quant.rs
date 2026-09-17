@@ -240,6 +240,7 @@ static DCT8_BASIS: LazyLock<[f32; 64]> = LazyLock::new(|| {
 /// frequencies are unchanged and each column of eight vertical coefficients is
 /// multiplied by the orthonormal DCT basis. `first_field` supplies lines
 /// 0,2,...,14 and `second_field` lines 1,3,...,15.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn field_dct_to_frame_targets(
     first_field: &[f32; 64],
     second_field: &[f32; 64],
@@ -271,6 +272,96 @@ pub fn field_dct_to_frame_targets(
                     coefficient += samples[half * 8 + y] * dct[y * 8 + vertical_frequency];
                 }
                 out[vertical_frequency * 8 + horizontal_frequency] = coefficient;
+            }
+        }
+    }
+}
+
+/// Four consecutive horizontal frequencies of one coefficient row as a vector,
+/// and back. Rows are contiguous in raster order, so the basis change can work
+/// on four columns at once without gathering anything.
+#[cfg(target_arch = "wasm32")]
+mod lanes {
+    use core::arch::wasm32::{f32x4, f32x4_extract_lane, v128};
+
+    #[inline]
+    pub fn load4(values: &[f32; 64], pos: usize) -> v128 {
+        f32x4(
+            values[pos],
+            values[pos + 1],
+            values[pos + 2],
+            values[pos + 3],
+        )
+    }
+
+    #[inline]
+    pub fn store4(values: &mut [f32; 64], pos: usize, lanes: v128) {
+        values[pos] = f32x4_extract_lane::<0>(lanes);
+        values[pos + 1] = f32x4_extract_lane::<1>(lanes);
+        values[pos + 2] = f32x4_extract_lane::<2>(lanes);
+        values[pos + 3] = f32x4_extract_lane::<3>(lanes);
+    }
+}
+
+/// [`field_dct_to_frame_targets`] four horizontal frequencies at a time. Each
+/// lane adds the same products in the same order as the scalar version, so the
+/// two agree to the bit.
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub fn field_dct_to_frame_targets(
+    first_field: &[f32; 64],
+    second_field: &[f32; 64],
+    upper: &mut [f32; 64],
+    lower: &mut [f32; 64],
+) {
+    use core::arch::wasm32::{f32x4_add, f32x4_mul, f32x4_splat};
+    use lanes::{load4, store4};
+
+    let dct = &*DCT8_BASIS;
+    // Lines of each field in raster order, before they are interleaved.
+    let mut first_samples = [0.0f32; 64];
+    let mut second_samples = [0.0f32; 64];
+
+    for horizontal_frequency in (0..8).step_by(4) {
+        for y in 0..8 {
+            let mut even = f32x4_splat(0.0);
+            let mut odd = f32x4_splat(0.0);
+            for vertical_frequency in 0..8 {
+                let basis = f32x4_splat(dct[y * 8 + vertical_frequency]);
+                let pos = vertical_frequency * 8 + horizontal_frequency;
+                even = f32x4_add(even, f32x4_mul(basis, load4(first_field, pos)));
+                odd = f32x4_add(odd, f32x4_mul(basis, load4(second_field, pos)));
+            }
+            store4(&mut first_samples, y * 8 + horizontal_frequency, even);
+            store4(&mut second_samples, y * 8 + horizontal_frequency, odd);
+        }
+
+        for half in 0..2 {
+            let out = if half == 0 { &mut *upper } else { &mut *lower };
+            for vertical_frequency in 0..8 {
+                let mut coefficient = f32x4_splat(0.0);
+                for y in 0..8 {
+                    // Frame line `half * 8 + y` is line `(half * 8 + y) / 2` of
+                    // the field its parity names.
+                    let line = half * 8 + y;
+                    let samples = if line & 1 == 0 {
+                        &first_samples
+                    } else {
+                        &second_samples
+                    };
+                    coefficient = f32x4_add(
+                        coefficient,
+                        f32x4_mul(
+                            f32x4_splat(dct[y * 8 + vertical_frequency]),
+                            load4(samples, (line >> 1) * 8 + horizontal_frequency),
+                        ),
+                    );
+                }
+                store4(
+                    out,
+                    vertical_frequency * 8 + horizontal_frequency,
+                    coefficient,
+                );
             }
         }
     }
@@ -328,25 +419,8 @@ pub fn frame_dct_to_field_targets(
     first_field: &mut [f32; 64],
     second_field: &mut [f32; 64],
 ) {
-    use core::arch::wasm32::{f32x4, f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_splat, v128};
-
-    #[inline]
-    fn load4(values: &[f32; 64], pos: usize) -> v128 {
-        f32x4(
-            values[pos],
-            values[pos + 1],
-            values[pos + 2],
-            values[pos + 3],
-        )
-    }
-
-    #[inline]
-    fn store4(values: &mut [f32; 64], pos: usize, lanes: v128) {
-        values[pos] = f32x4_extract_lane::<0>(lanes);
-        values[pos + 1] = f32x4_extract_lane::<1>(lanes);
-        values[pos + 2] = f32x4_extract_lane::<2>(lanes);
-        values[pos + 3] = f32x4_extract_lane::<3>(lanes);
-    }
+    use core::arch::wasm32::{f32x4_add, f32x4_mul, f32x4_splat};
+    use lanes::{load4, store4};
 
     let dct = &*DCT8_BASIS;
     let mut upper_samples = [0.0f32; 64];
