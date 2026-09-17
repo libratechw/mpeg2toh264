@@ -11,6 +11,12 @@ import type {
   WorkerRenderingOptions,
   WorkerVideoState,
 } from "./worker-protocol.js";
+import type {
+  DiagnosticPictureMeta,
+  PresentedPictureMeta,
+  PresentationQueueMeta,
+  QueuedPictureMeta,
+} from "./deinterlace.js";
 
 const workerScope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -81,6 +87,49 @@ class WorkerVideo extends EventTarget {
 let video: WorkerVideo | null = null;
 let deinterlacer: Deinterlacer | null = null;
 let destroying = false;
+let queuedFrameWriter: WritableStreamDefaultWriter<VideoFrame> | null = null;
+let sinkChain: Promise<void> = Promise.resolve();
+let sinkAnchorPerf: number | null = null;
+let sinkAnchorMediaUs: number | null = null;
+let sinkGeneration: number | null = null;
+
+/** Worker 側で media-timeline pacing してから sink へ書込む。main-thread を介さない。 */
+function sinkWrite(frame: VideoFrame, meta: QueuedPictureMeta, reportMeta: boolean): void {
+  sinkChain = sinkChain
+    .then(async () => {
+      const writer = queuedFrameWriter;
+      if (!writer) {
+        frame.close();
+        return;
+      }
+      const timestamp = Number.isFinite(frame.timestamp)
+        ? Number(frame.timestamp)
+        : Number(meta.mediaTimestampUs);
+      if (sinkGeneration !== meta.generation) {
+        sinkGeneration = meta.generation;
+        sinkAnchorPerf = null;
+        sinkAnchorMediaUs = null;
+      }
+      if (sinkAnchorPerf === null || sinkAnchorMediaUs === null) {
+        sinkAnchorPerf = performance.now();
+        sinkAnchorMediaUs = timestamp;
+      }
+      const due = sinkAnchorPerf + (timestamp - sinkAnchorMediaUs) / 1000;
+      const wait = Math.max(0, due - performance.now());
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+      try {
+        await writer.write(frame);
+      } catch {
+        try {
+          frame.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      if (reportMeta) post({ type: "queuedMeta", meta });
+    })
+    .catch(() => {});
+}
 
 /** Worker が所有する requestAnimationFrame() へ共通描画エンジンの表示ループを接続する。 */
 function requestWorkerAnimationFrame(callback: FrameRequestCallback): number {
@@ -105,6 +154,7 @@ function applySettings(
   renderer: Deinterlacer,
   options: WorkerRenderingOptions,
 ): void {
+  // diagnostic 要求は initialize 時の静的指定で、途中で切り替えない。
   renderer.doubleRate = options.doubleRate;
   renderer.autoFilm = options.autoFilm;
   renderer.filmCombThreshold = options.filmCombThreshold;
@@ -116,12 +166,76 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
     if (command.type === "initialize") {
       if (typeof workerScope.requestAnimationFrame !== "function")
         throw new Error("requestAnimationFrame is unavailable in this Worker");
+      queuedFrameWriter = command.queuedFrameSink
+        ? command.queuedFrameSink.getWriter()
+        : null;
       video = new WorkerVideo();
       video.update(command.video);
+      // 診断要求がある場合だけ gate を作る。表示点または queue 前の要求では
+      // 加工済み VideoFrame を transfer し、filter-only 要求では meta のみを送る。
+      const diagnosticSink =
+        command.options.diagnostic ||
+        command.options.capturePresentedFrames ||
+        command.options.captureQueuedFrames ||
+        command.options.captureQueuedFrameFullSize ||
+        command.options.capturePresentationQueue
+          ? {
+              onFilteredPicture: command.options.diagnostic
+                ? (meta: DiagnosticPictureMeta) => {
+                    if (!destroying) post({ type: "diagnostic", meta });
+                  }
+                : undefined,
+              onPresentedFrame: command.options.capturePresentedFrames
+                ? (frame: VideoFrame, meta: PresentedPictureMeta) => {
+                    if (destroying) {
+                      frame.close();
+                      return;
+                    }
+                    try {
+                      post({ type: "presented", frame, meta }, [frame]);
+                    } catch {
+                      frame.close();
+                    }
+                  }
+                : undefined,
+              onQueuedFrame: command.options.captureQueuedFrames || queuedFrameWriter
+                ? (frame: VideoFrame, meta: QueuedPictureMeta) => {
+                    if (destroying) {
+                      frame.close();
+                      return;
+                    }
+                    if (queuedFrameWriter) {
+                      // Pace on the worker's own clock and write straight to the
+                      // sink: no main-thread timer or frame transfer.
+                      sinkWrite(frame, meta, command.options.captureQueuedMeta);
+                      return;
+                    }
+                    try {
+                      post({ type: "queued", frame, meta }, [frame]);
+                    } catch {
+                      frame.close();
+                    }
+                  }
+                : undefined,
+              onPresentationQueue: command.options.capturePresentationQueue
+                ? (meta: PresentationQueueMeta) => {
+                    if (!destroying) post({ type: "presentationQueue", meta });
+                  }
+                : undefined,
+            }
+          : undefined;
       deinterlacer = createWorkerDeinterlacer(
         video as unknown as HTMLVideoElement,
         command.canvas,
-        command.options,
+        {
+          ...command.options,
+          diagnostic: {
+            ...diagnosticSink,
+            bypassDisplayQueue: command.options.bypassDisplayQueue,
+            captureQueuedFrameFullSize:
+              command.options.captureQueuedFrameFullSize,
+          },
+        },
         (message) => {
           if (!destroying) post({ type: "failed", message });
         },

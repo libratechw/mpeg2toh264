@@ -3,11 +3,21 @@ import { setBundledWorkerURL } from "./deinterlace.js";
 
 setBundledWorkerURL(bundledWorkerURL);
 
-export { Deinterlacer, supportsDeinterlace } from "./deinterlace.js";
+export {
+  Deinterlacer,
+  DiagnosticPictureGate,
+  supportsDeinterlace,
+  toDiagnosticTimestampUs,
+} from "./deinterlace.js";
 export type {
   DeinterlaceStats,
+  DeinterlacerDiagnosticOptions,
   DeinterlacerEventMap,
   DeinterlacerOptions,
+  DiagnosticPictureMeta,
+  DiagnosticPictureSource,
+  PresentedPictureMeta,
+  QueuedPictureMeta,
   Scan,
 } from "./deinterlace.js";
 export {
