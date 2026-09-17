@@ -470,7 +470,7 @@ fn write_chroma_residual(
     };
 
     for component in chroma {
-        write_residual_levels(w, &component.dc, 4, -1)?;
+        write_residual_levels(w, &component.dc, -1)?;
     }
 
     for c in 0..2 {
@@ -489,7 +489,7 @@ fn write_chroma_residual(
         for b in 0..4 {
             let (bx, by) = (b & 1, b >> 1);
             let total =
-                write_residual_levels(w, &chroma[c].ac[b], 15, map.n_c(&edges, address, bx, by))?;
+                write_residual_levels(w, &chroma[c].ac[b], map.n_c(&edges, address, bx, by))?;
             map.set(address, bx, by, total);
         }
     }
@@ -554,8 +554,7 @@ fn write_luma_residual_8x8(
                 sub[i] = level;
                 mask |= u32::from(level != 0) << i;
             }
-            let total =
-                write_masked_levels(w, &sub, mask, 16, counts.n_c(&edges, address, bx, by))?;
+            let total = write_masked_levels(w, &sub, mask, counts.n_c(&edges, address, bx, by))?;
             counts.set(address, bx, by, total);
         }
     }
