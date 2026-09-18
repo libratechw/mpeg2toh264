@@ -16,15 +16,13 @@ use mpeg2toh264::{
 use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
 
 /// fixture, converted pictures, output bytes, FNV-1a of the Annex B stream.
-/// Last moved when a frame IDR began taking the long-term slot itself, leaving
-/// the copy behind it short-term, and when every P and B slice began naming its
-/// short-term reference list outright. Both only move the slice headers: each
-/// fixture decodes to the same frames as before, checked frame by frame with
-/// `ffmpeg -f framemd5`.
+/// `altscan.m2v` and `hd1080i.m2v` are the interlaced ones, so they are the two
+/// that carry macroblock pairs at all, and `hd1080i.m2v` is the one whose pairs
+/// are of both kinds. See the note on `field_pair` in `transcode.rs`.
 const GOLDEN: [(&str, usize, usize, u64); 6] = [
-    ("altscan.m2v", 8, 224007, 0x4c98_4bed_dc31_53c5),
+    ("altscan.m2v", 8, 202057, 0x18ef_cbc6_c960_3696),
     ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
-    ("hd1080i.m2v", 15, 2106380, 0xa903_55d8_0a1c_4d05),
+    ("hd1080i.m2v", 15, 1830692, 0xdf5e_1a06_c65b_fda3),
     ("i_only.m2v", 3, 79513, 0x31f6_0c7f_fb6b_b97a),
     ("ibbp.m2v", 15, 164459, 0x183e_7cc0_f7ca_1a86),
     ("ip.m2v", 10, 132314, 0x7f35_4fc6_a64f_829c),

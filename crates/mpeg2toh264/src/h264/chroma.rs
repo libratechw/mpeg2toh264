@@ -12,11 +12,17 @@
 //! projecting onto them yields exactly the coefficients the decoder
 //! reconstructs from, and the basis-shape mismatch that puts a floor under the
 //! luma path does not arise here.
+//!
+//! The two transforms together are one linear map, and a broadcast block
+//! carries a handful of non-zero coefficients, so the map is worked out once
+//! per coefficient position and a block is the sum of the rows it needs.
 
 use std::sync::LazyLock;
 
 use crate::h264::cos_table::COS_PI_OVER_16;
 use crate::h264::params::ZIGZAG_4X4;
+#[cfg(test)]
+use crate::h264::quant::level_mask;
 use crate::h264::quant::{inter_targets, intra_targets, FLAT_PREDICTION_DC};
 use crate::h264::quant_tables::{CHROMA_AC_GAIN_4X4, CHROMA_DC_GAIN, QPC_FROM_QPI};
 use crate::round_half_up_i32;
@@ -141,8 +147,86 @@ impl ChromaBlockLevels {
     }
 }
 
-fn spatial_to_chroma_levels(
-    samples: &[f32; 64],
+/// The four 4x4 transforms of an 8x8 sample block, block by block in raster
+/// order of the blocks and raster order within each.
+type Transformed = [f32; 64];
+
+/// [`forward4x4`] over the four blocks of a sample block.
+fn forward_blocks(samples: &[f32; 64], out: &mut Transformed) {
+    for b in 0..4 {
+        let block: &mut [f32; 16] = (&mut out[b * 16..b * 16 + 16])
+            .try_into()
+            .expect("sixteen coefficients");
+        forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, block);
+    }
+}
+
+/// What a unit at each MPEG-2 coefficient position becomes as H.264 transform
+/// coefficients. Row `p` is the result for position `p`; a block is the sum
+/// of the rows its non-zero coefficients name, each scaled by the
+/// coefficient.
+type ChromaMap = [Transformed; 64];
+
+struct ChromaMaps {
+    /// A block that stays a block: a frame-coded macroblock's, or one in a
+    /// picture coded as two field pictures.
+    frame: ChromaMap,
+    /// The two field blocks made of a vertically adjacent pair, indexed
+    /// `[field][source]`: field 0 is the even lines and 1 the odd, source 0
+    /// the upper macroblock's block and 1 the lower's. Each field block takes
+    /// four lines from each source, so it is the sum of two rows per
+    /// coefficient.
+    field: [[ChromaMap; 2]; 2],
+}
+
+static CHROMA_MAPS: LazyLock<ChromaMaps> = LazyLock::new(|| {
+    let mut maps = ChromaMaps {
+        frame: [[0.0; 64]; 64],
+        field: [[[[0.0; 64]; 64]; 2]; 2],
+    };
+    let mut coeff = [0.0f32; 64];
+    let mut spatial = [0.0f32; 64];
+    let mut tmp = [0.0f32; 64];
+    for p in 0..64 {
+        coeff[p] = 1.0;
+        idct8(&coeff, &mut spatial, &mut tmp);
+        coeff[p] = 0.0;
+        forward_blocks(&spatial, &mut maps.frame[p]);
+        for source in 0..2 {
+            for field in 0..2 {
+                // Lines of this parity, in the half of the field block this
+                // source supplies; the other half is the other source's.
+                let mut field_spatial = [0.0f32; 64];
+                for y in 0..4 {
+                    for x in 0..8 {
+                        field_spatial[(y + source * 4) * 8 + x] = spatial[(y * 2 + field) * 8 + x];
+                    }
+                }
+                forward_blocks(&field_spatial, &mut maps.field[field][source][p]);
+            }
+        }
+    }
+    maps
+});
+
+/// Add `coeff[p] * map[p]` for every position `mask` names.
+#[inline]
+fn accumulate(map: &ChromaMap, coeff: &[f32; 64], mask: u64, acc: &mut Transformed) {
+    let mut rest = mask;
+    while rest != 0 {
+        let p = rest.trailing_zeros() as usize & 63;
+        rest &= rest - 1;
+        let scale = coeff[p];
+        let row = &map[p];
+        for (sum, &term) in acc.iter_mut().zip(row.iter()) {
+            *sum += scale * term;
+        }
+    }
+}
+
+/// Quantise the transformed block into levels, in the scan order named.
+fn transformed_to_chroma_levels(
+    coefficients: &Transformed,
     qp_c: i32,
     out: &mut ChromaBlockLevels,
     field_scan: bool,
@@ -156,11 +240,12 @@ fn spatial_to_chroma_levels(
         &ZIGZAG_4X4
     };
 
-    let mut coeff4 = [0.0f32; 16];
     let mut dc_target = [0.0f32; 4];
     out.any_ac = false;
     for b in 0..4 {
-        forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, &mut coeff4);
+        let coeff4: &[f32; 16] = coefficients[b * 16..b * 16 + 16]
+            .try_into()
+            .expect("sixteen coefficients");
         dc_target[b] = coeff4[0];
         let ac_out = &mut out.ac[b];
         for k in 1..16 {
@@ -184,34 +269,35 @@ fn spatial_to_chroma_levels(
     out.any_dc = out.dc.iter().any(|&v| v != 0);
 }
 
+/// Dequantise one chroma block, returning which positions of `out` may be
+/// non-zero.
 fn dequant_chroma(
-    levels: Option<&[i16; 64]>,
+    (levels, mask): (&[i16; 64], u64),
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
     intra_dc_precision: u32,
     intra: bool,
     out: &mut [f32; 64],
-) {
-    let Some(levels) = levels else {
-        out.fill(0.0);
-        return;
-    };
+) -> u64 {
     if intra {
         intra_targets(
             levels,
+            mask,
             weight_scale,
             quantiser_scale,
             intra_dc_precision,
             out,
-        );
+        )
     } else {
-        inter_targets(levels, weight_scale, quantiser_scale, out);
+        inter_targets(levels, mask, weight_scale, quantiser_scale, out)
     }
 }
 
 /// One MPEG-2 chroma block as the field-pair conversion needs to see it.
 pub struct FieldChromaSource<'a> {
-    pub levels: Option<&'a [i16; 64]>,
+    /// The levels and which of them are non-zero, as the decoder hands them
+    /// out, or `None` where the source coded nothing.
+    pub levels: Option<(&'a [i16; 64], u64)>,
     pub weight_scale: &'a [i32; 64],
     pub quantiser_scale: i32,
     pub intra_dc_precision: u32,
@@ -219,14 +305,10 @@ pub struct FieldChromaSource<'a> {
 }
 
 /// Reusable buffers for the field-pair conversion, which runs per macroblock
-/// pair and would otherwise allocate six 8x8 blocks each time.
+/// pair and would otherwise allocate two 8x8 blocks each time.
 pub struct FieldChromaScratch {
     upper_coeff: [f32; 64],
     lower_coeff: [f32; 64],
-    upper_spatial: [f32; 64],
-    lower_spatial: [f32; 64],
-    field_spatial: [f32; 64],
-    idct_temp: [f32; 64],
 }
 
 impl Default for FieldChromaScratch {
@@ -234,17 +316,13 @@ impl Default for FieldChromaScratch {
         Self {
             upper_coeff: [0.0; 64],
             lower_coeff: [0.0; 64],
-            upper_spatial: [0.0; 64],
-            lower_spatial: [0.0; 64],
-            field_spatial: [0.0; 64],
-            idct_temp: [0.0; 64],
         }
     }
 }
 
 /// Convert both field macroblocks of a pair while sharing the source
-/// dequantisation and IDCT. `out_top` receives the field made of the even lines
-/// and `out_bottom` the odd ones.
+/// dequantisation. `out_top` receives the field made of the even lines and
+/// `out_bottom` the odd ones.
 pub fn convert_field_chroma_pair(
     upper: &FieldChromaSource<'_>,
     lower: &FieldChromaSource<'_>,
@@ -253,49 +331,42 @@ pub fn convert_field_chroma_pair(
     out_bottom: &mut ChromaBlockLevels,
     scratch: &mut FieldChromaScratch,
 ) {
-    if upper.levels.is_some() {
+    let upper_nonzero = upper.levels.map_or(0, |levels| {
         dequant_chroma(
-            upper.levels,
+            levels,
             upper.weight_scale,
             upper.quantiser_scale,
             upper.intra_dc_precision,
             upper.intra,
             &mut scratch.upper_coeff,
-        );
-        idct8(
-            &scratch.upper_coeff,
-            &mut scratch.upper_spatial,
-            &mut scratch.idct_temp,
-        );
-    } else {
-        scratch.upper_spatial.fill(0.0);
-    }
-    if lower.levels.is_some() {
+        )
+    });
+    let lower_nonzero = lower.levels.map_or(0, |levels| {
         dequant_chroma(
-            lower.levels,
+            levels,
             lower.weight_scale,
             lower.quantiser_scale,
             lower.intra_dc_precision,
             lower.intra,
             &mut scratch.lower_coeff,
-        );
-        idct8(
-            &scratch.lower_coeff,
-            &mut scratch.lower_spatial,
-            &mut scratch.idct_temp,
-        );
-    } else {
-        scratch.lower_spatial.fill(0.0);
-    }
+        )
+    });
+    let maps = &*CHROMA_MAPS;
     for (field, out) in [out_top, out_bottom].into_iter().enumerate() {
-        for y in 0..4 {
-            for x in 0..8 {
-                scratch.field_spatial[y * 8 + x] = scratch.upper_spatial[(y * 2 + field) * 8 + x];
-                scratch.field_spatial[(y + 4) * 8 + x] =
-                    scratch.lower_spatial[(y * 2 + field) * 8 + x];
-            }
-        }
-        spatial_to_chroma_levels(&scratch.field_spatial, qp_c, out, true);
+        let mut transformed = [0.0f32; 64];
+        accumulate(
+            &maps.field[field][0],
+            &scratch.upper_coeff,
+            upper_nonzero,
+            &mut transformed,
+        );
+        accumulate(
+            &maps.field[field][1],
+            &scratch.lower_coeff,
+            lower_nonzero,
+            &mut transformed,
+        );
+        transformed_to_chroma_levels(&transformed, qp_c, out, true);
     }
 }
 
@@ -306,7 +377,7 @@ pub fn convert_field_chroma_pair(
 /// DC coefficient alone. A non-intra block is coded against motion compensation
 /// the H.264 side reproduces, so its residual carries across untouched.
 pub fn convert_chroma_block(
-    levels: &[i16; 64],
+    levels: (&[i16; 64], u64),
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
     intra_dc_precision: u32,
@@ -316,19 +387,17 @@ pub fn convert_chroma_block(
     field_scan: bool,
 ) {
     let mut dequant = [0.0f32; 64];
-    let mut spatial = [0.0f32; 64];
-    let mut tmp = [0.0f32; 64];
-
-    dequant_chroma(
-        Some(levels),
+    let nonzero = dequant_chroma(
+        levels,
         weight_scale,
         quantiser_scale,
         intra_dc_precision,
         intra,
         &mut dequant,
     );
-    idct8(&dequant, &mut spatial, &mut tmp);
-    spatial_to_chroma_levels(&spatial, qp_c, out, field_scan);
+    let mut transformed = [0.0f32; 64];
+    accumulate(&CHROMA_MAPS.frame, &dequant, nonzero, &mut transformed);
+    transformed_to_chroma_levels(&transformed, qp_c, out, field_scan);
 }
 
 /// As [`convert_chroma_block`], but for a block predicted the way H.264 itself
@@ -339,7 +408,7 @@ pub fn convert_chroma_block(
 /// already taken the flat constant off every sample, so putting it back and
 /// removing the right one leaves the residual this block actually needs.
 pub fn convert_intra_chroma_block(
-    levels: &[i16; 64],
+    levels: (&[i16; 64], u64),
     weight_scale: &[i32; 64],
     quantiser_scale: i32,
     intra_dc_precision: u32,
@@ -349,23 +418,23 @@ pub fn convert_intra_chroma_block(
     field_scan: bool,
 ) {
     let mut dequant = [0.0f32; 64];
-    let mut spatial = [0.0f32; 64];
-    let mut tmp = [0.0f32; 64];
-
-    dequant_chroma(
-        Some(levels),
+    let nonzero = dequant_chroma(
+        levels,
         weight_scale,
         quantiser_scale,
         intra_dc_precision,
         true,
         &mut dequant,
     );
-    idct8(&dequant, &mut spatial, &mut tmp);
-    for (i, sample) in spatial.iter_mut().enumerate() {
-        let blk = ((i / 8) / 4) * 2 + (i % 8) / 4;
-        *sample += FLAT_PREDICTION_DC / 8.0 - prediction[blk] as f32;
+    let mut transformed = [0.0f32; 64];
+    accumulate(&CHROMA_MAPS.frame, &dequant, nonzero, &mut transformed);
+    // A constant over a 4x4 block is sixteen times itself in the block's DC
+    // coefficient and nothing in any other: the core transform's first row
+    // is all ones and every other row sums to zero.
+    for (b, &predicted) in prediction.iter().enumerate() {
+        transformed[b * 16] += 16.0 * (FLAT_PREDICTION_DC / 8.0 - predicted as f32);
     }
-    spatial_to_chroma_levels(&spatial, qp_c, out, field_scan);
+    transformed_to_chroma_levels(&transformed, qp_c, out, field_scan);
 }
 
 #[cfg(test)]
@@ -421,7 +490,16 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = 8 * 60; // DC only, at intra_dc_precision 0 this is 60 per sample
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, false, false);
+        convert_chroma_block(
+            (&levels, level_mask(&levels)),
+            &[16; 64],
+            8,
+            0,
+            26,
+            &mut out,
+            false,
+            false,
+        );
         assert!(out.any_dc, "the flat level lands on the DC block");
         assert!(!out.any_ac, "a constant block has no AC content");
         assert_eq!(&out.dc[1..], &[0, 0, 0], "only the Hadamard DC is non-zero");
@@ -434,7 +512,16 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = (FLAT_PREDICTION_DC / 8.0) as i16;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, true, false);
+        convert_chroma_block(
+            (&levels, level_mask(&levels)),
+            &[16; 64],
+            8,
+            0,
+            26,
+            &mut out,
+            true,
+            false,
+        );
         assert!(
             out.is_empty(),
             "the residual against a flat prediction is zero"
@@ -446,7 +533,16 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[5] = 400;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 16, 0, 20, &mut out, false, false);
+        convert_chroma_block(
+            (&levels, level_mask(&levels)),
+            &[16; 64],
+            16,
+            0,
+            20,
+            &mut out,
+            false,
+            false,
+        );
         assert!(!out.is_empty(), "the fixture actually codes something");
         out.clear();
         assert!(out.is_empty());
