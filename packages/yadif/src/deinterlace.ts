@@ -2708,13 +2708,15 @@ export class Deinterlacer extends EventTarget {
   }
 
   /**
-   * presenter に表示を任せている間か。scan 未確定の間は任せる (初期 canvas を隠す)。
-   * Worker 内では presenter callback が渡らないため、presenter 指定時に必ず立つ
-   * bypassDisplayQueue を併せて見る。
+   * presenter に表示を任せている間か。presenter へ frame が渡るのは先読み queue を
+   * 使う経路だけなので、queue が動いている間だけ任せる。動いていない間は内蔵 canvas が
+   * 実表示であり、隠すと何も見えなくなる。scan 未確定の間は queue も動かないため、
+   * ここは false 側に倒れる。Worker 内では presenter callback が渡らないため、
+   * presenter 指定時に必ず立つ bypassDisplayQueue を併せて見る。
    */
   get #presenterOwnsDisplay(): boolean {
     const externalSink = this.#presenter !== null || this.#bypassDisplayQueue;
-    return externalSink && this.#scan?.interlaced !== false;
+    return externalSink && this.#scan?.interlaced !== false && this.#scheduling();
   }
 
   #showTexture(
