@@ -1521,9 +1521,9 @@ export class Deinterlacer extends EventTarget {
         break;
       }
       case "visibility":
-        this.#displayCanvas.style.visibility = notification.visible
-          ? "visible"
-          : "hidden";
+        // presenter が表示を所有するときは内蔵 canvas を見せない (P1-1)。
+        this.#displayCanvas.style.visibility =
+          this.#presenter === null && notification.visible ? "visible" : "hidden";
         break;
       case "diagnostic": {
         // Worker 描画エンジンの選択/queue 出力記録を Worker 側通番のまま渡す。
@@ -2694,11 +2694,16 @@ export class Deinterlacer extends EventTarget {
 
   /** DOM の visibility 変更はページ側に残し、Worker からは状態だけを通知する。 */
   #setVisible(visible: boolean): void {
+    // presenter が表示を所有するときは内蔵 canvas を決して見せない。startup の
+    // 1 枚や pause/seek の flush が内蔵 canvas を visible にすると、presenter の
+    // 映像を古い still が覆う (2026-09-18 critical review P1-1)。presenter が
+    // 実際の表示を担うため、ここは常に hidden でよい。
+    const effective = this.#presenter !== null ? false : visible;
     if (this.#externalHost) {
-      this.#externalHost.onVisibility(visible);
+      this.#externalHost.onVisibility(effective);
       return;
     }
-    this.#displayCanvas.style.visibility = visible ? "visible" : "hidden";
+    this.#displayCanvas.style.visibility = effective ? "visible" : "hidden";
   }
 
   #showTexture(
