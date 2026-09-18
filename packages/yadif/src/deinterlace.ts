@@ -2764,6 +2764,9 @@ export class Deinterlacer extends EventTarget {
    */
   #hideForPresenter(): void {
     if (this.#presenter === null && !this.#bypassDisplayQueue) return;
+    // 配送が起きた時点で表示所有を確定し、ページ側へ伝える。初回配送の前に所有へ
+    // 変わっても、この経路が必ず通るため通知が漏れない。
+    this.#reportPresenterOwnsDisplay();
     if (this.#externalHost) {
       this.#externalHost.onVisibility(false);
       return;
