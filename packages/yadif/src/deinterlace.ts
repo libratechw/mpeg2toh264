@@ -74,13 +74,6 @@ const DEFAULT_REFRESH_MS = 1000 / 60;
 /** How fast the refresh estimate is allowed to climb back towards a long gap. */
 const REFRESH_DECAY = 0.02;
 
-/**
- * How long a presenter frame delivery keeps the built-in display canvas hidden.
- * Long enough to cover the pause/seek flush and the startup picture, short enough
- * that progressive pictures (which the presenter never receives) reappear.
- */
-const PRESENTER_CANVAS_HOLD_MS = 500;
-
 /** 復号済み映像の進行を requestVideoFrameCallback() なしで待つ時間。 */
 const FRAME_CALLBACK_TIMEOUT_MS = 250;
 
@@ -680,13 +673,6 @@ export class Deinterlacer extends EventTarget {
   readonly #presenter:
     ((frame: VideoFrame, meta: PresenterFrameMeta) => void) | null;
   #presenterFailures = 0;
-  /**
-   * A presenter frame delivery is recent: the presenter owns the picture and the
-   * built-in canvas must stay hidden so a stale still cannot cover it. The window
-   * expires so progressive pictures, which the presenter never receives, are
-   * still shown through the fork's own canvas.
-   */
-  #presenterActiveMs = 0;
   readonly #onQueuedMeta:
     ((meta: QueuedPictureMeta) => void) | undefined;
   readonly #queuedFrameSink: WritableStream<VideoFrame> | null;
@@ -1203,7 +1189,6 @@ export class Deinterlacer extends EventTarget {
       if (this.#presenter) this.#presenterFailures += 1;
       return;
     }
-    this.#notePresenterFrame();
 
     const queuedAtMs = performance.now();
     if (this.#captureQueuedFrameFullSize) {
@@ -1536,14 +1521,10 @@ export class Deinterlacer extends EventTarget {
         break;
       }
       case "visibility":
-        // presenter が直近に提示している間は内蔵 canvas を見せない (P1-1)。
-        this.#displayCanvas.style.visibility =
-          this.#presenter !== null &&
-          performance.now() - this.#presenterActiveMs < PRESENTER_CANVAS_HOLD_MS
-            ? "hidden"
-            : notification.visible
-              ? "visible"
-              : "hidden";
+        // worker 側で scan 種別と presenter 有無から決めた値をそのまま適用する。
+        this.#displayCanvas.style.visibility = notification.visible
+          ? "visible"
+          : "hidden";
         break;
       case "diagnostic": {
         // Worker 描画エンジンの選択/queue 出力記録を Worker 側通番のまま渡す。
@@ -1589,7 +1570,6 @@ export class Deinterlacer extends EventTarget {
           notification.frame.close();
           break;
         }
-        this.#notePresenterFrame();
         try {
           callback(notification.frame, notification.meta);
         } catch {
@@ -2715,14 +2695,11 @@ export class Deinterlacer extends EventTarget {
 
   /** DOM の visibility 変更はページ側に残し、Worker からは状態だけを通知する。 */
   #setVisible(visible: boolean): void {
-    // presenter が直近に提示している間は内蔵 canvas を隠す。startup の 1 枚や
-    // pause/seek の flush が presenter の映像を古い still で覆うのを防ぐ
-    // (2026-09-18 critical review P1-1)。presenter が受け取らない progressive 映像は
-    // 配送が途切れるため、窓が切れたら canvas を通常どおり見せて表示を保つ。
-    const presenterOwns =
-      this.#presenter !== null &&
-      performance.now() - this.#presenterActiveMs < PRESENTER_CANVAS_HOLD_MS;
-    const effective = presenterOwns ? false : visible;
+    // presenter が表示を所有するのはインターレース映像のときだけ。その間は内蔵
+    // canvas を見せない。startup の 1 枚や pause/seek の flush が presenter の映像を
+    // 古い still で覆うのを防ぐ (2026-09-18 critical review P1-1)。進行性映像は
+    // presenter へ配送されないため、従来どおり内蔵 canvas で表示する。
+    const effective = this.#presenterOwnsDisplay ? false : visible;
     if (this.#externalHost) {
       this.#externalHost.onVisibility(effective);
       return;
@@ -2730,15 +2707,9 @@ export class Deinterlacer extends EventTarget {
     this.#displayCanvas.style.visibility = effective ? "visible" : "hidden";
   }
 
-  /** presenter が 1 枚提示したことを記録し、内蔵 canvas を隠す。 */
-  #notePresenterFrame(): void {
-    if (this.#presenter === null) return;
-    this.#presenterActiveMs = performance.now();
-    if (this.#externalHost) {
-      this.#externalHost.onVisibility(false);
-      return;
-    }
-    this.#displayCanvas.style.visibility = "hidden";
+  /** presenter に表示を任せている間か。scan 未確定の間は任せる (初期 canvas を隠す)。 */
+  get #presenterOwnsDisplay(): boolean {
+    return this.#presenter !== null && this.#scan?.interlaced !== false;
   }
 
   #showTexture(
