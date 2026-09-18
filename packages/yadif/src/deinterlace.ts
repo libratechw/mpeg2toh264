@@ -1189,6 +1189,7 @@ export class Deinterlacer extends EventTarget {
       if (this.#presenter) this.#presenterFailures += 1;
       return;
     }
+    this.#hideForPresenter();
 
     const queuedAtMs = performance.now();
     if (this.#captureQueuedFrameFullSize) {
@@ -1570,6 +1571,7 @@ export class Deinterlacer extends EventTarget {
           notification.frame.close();
           break;
         }
+        this.#hideForPresenter();
         try {
           callback(notification.frame, notification.meta);
         } catch {
@@ -2717,6 +2719,20 @@ export class Deinterlacer extends EventTarget {
   get #presenterOwnsDisplay(): boolean {
     const externalSink = this.#presenter !== null || this.#bypassDisplayQueue;
     return externalSink && this.#scan?.interlaced !== false && this.#scheduling();
+  }
+
+  /**
+   * presenter へ 1 枚渡した時点で内蔵 canvas を隠す。pause/seek の flush が canvas を
+   * 見せたままでも、再生が再開して queue が presenter を供給し始めたら必ず隠す
+   * (P1-1)。presenter が表示を所有しない構成では何もしない。
+   */
+  #hideForPresenter(): void {
+    if (this.#presenter === null && !this.#bypassDisplayQueue) return;
+    if (this.#externalHost) {
+      this.#externalHost.onVisibility(false);
+      return;
+    }
+    this.#displayCanvas.style.visibility = "hidden";
   }
 
   #showTexture(

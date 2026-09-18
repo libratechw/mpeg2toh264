@@ -1,4 +1,4 @@
-const le = "" + new URL("assets/worker-foOnRHTu.js", import.meta.url).href, ce = {
+const le = "" + new URL("assets/worker-CdngiRsH.js", import.meta.url).href, ce = {
   prev: "uPrev",
   cur: "uCur",
   next: "uNext",
@@ -295,7 +295,7 @@ class b {
   #e;
   #i = 0;
   #v = null;
-  #h = [];
+  #o = [];
   #b = null;
   #B = 1 / 0;
   #U = 1 / 0;
@@ -341,7 +341,7 @@ class b {
       maxBlockDifference: 1 / 0,
       totalDifference: 1 / 0
     };
-    this.#h.push(i);
+    this.#o.push(i);
     const A = this.#v === t, r = A && i.maxBlockDifference < this.#e;
     A && !r && (this.#v = null);
     const s = this.#v;
@@ -349,9 +349,9 @@ class b {
     let n = this.#v;
     if (this.#i === b.CYCLE) {
       let a = 0, f = null;
-      for (let o = 1; o < this.#h.length; o++)
-        (this.#h[o]?.maxBlockDifference ?? 1 / 0) < (this.#h[a]?.maxBlockDifference ?? 1 / 0) ? (f = a, a = o) : (f === null || (this.#h[o]?.maxBlockDifference ?? 1 / 0) < (this.#h[f]?.maxBlockDifference ?? 1 / 0)) && (f = o);
-      this.#B = this.#h[a]?.maxBlockDifference ?? 1 / 0, this.#U = f === null ? 1 / 0 : this.#h[f]?.maxBlockDifference ?? 1 / 0, n = (this.#h[a]?.maxBlockDifference ?? 1 / 0) < this.#e ? a : null, this.#v = n, this.#h = [], this.#i = 0;
+      for (let o = 1; o < this.#o.length; o++)
+        (this.#o[o]?.maxBlockDifference ?? 1 / 0) < (this.#o[a]?.maxBlockDifference ?? 1 / 0) ? (f = a, a = o) : (f === null || (this.#o[o]?.maxBlockDifference ?? 1 / 0) < (this.#o[f]?.maxBlockDifference ?? 1 / 0)) && (f = o);
+      this.#B = this.#o[a]?.maxBlockDifference ?? 1 / 0, this.#U = f === null ? 1 / 0 : this.#o[f]?.maxBlockDifference ?? 1 / 0, n = (this.#o[a]?.maxBlockDifference ?? 1 / 0) < this.#e ? a : null, this.#v = n, this.#o = [], this.#i = 0;
     }
     return {
       cycleIndex: t,
@@ -377,7 +377,7 @@ class b {
   }
   /** Return all cycle state to the beginning of an FFmpeg decimate window. */
   reset() {
-    this.#i = 0, this.#v = null, this.#h = [], this.#b = null, this.#B = 1 / 0, this.#U = 1 / 0;
+    this.#i = 0, this.#v = null, this.#o = [], this.#b = null, this.#B = 1 / 0, this.#U = 1 / 0;
   }
   /** Compare two candidates with vf_fieldmatch.c's motion masks and weights. */
   #_(e, t, i, A) {
@@ -392,14 +392,14 @@ class b {
     for (let C = 2; C < s - 2; C += 2) {
       const y = (C - 2) / 2, Y = n - 1 + y * 2, Z = n + 1 + y * 2, j = n + 3 + y * 2, O = n + y * 2, X = O + 2, B = a + y * 2, S = B + 2, ee = n + y * 2;
       for (let D = 8; D < r - 8; D++) {
-        const L = (u[ee * r + D] ?? 0) | (u[(ee + 2) * r + D] ?? 0);
-        if (L === 0) continue;
+        const P = (u[ee * r + D] ?? 0) | (u[(ee + 2) * r + D] ?? 0);
+        if (P === 0) continue;
         const te = (A.c[Y * r + D] ?? 0) + ((A.c[Z * r + D] ?? 0) << 2) + (A.c[j * r + D] ?? 0), U = Math.abs(
           3 * ((f[O * r + D] ?? 0) + (f[X * r + D] ?? 0)) - te
         ), _ = Math.abs(
           3 * ((o[B * r + D] ?? 0) + (o[S * r + D] ?? 0)) - te
         );
-        U > 23 && (L & 1) !== 0 && (l += U), _ > 23 && (L & 1) !== 0 && (m += _), U > 42 && (L & 2) !== 0 && (h += U), _ > 42 && (L & 2) !== 0 && (w += _), U > 42 && (L & 4) !== 0 && (d += U), _ > 42 && (L & 4) !== 0 && (E += _);
+        U > 23 && (P & 1) !== 0 && (l += U), _ > 23 && (P & 1) !== 0 && (m += _), U > 42 && (P & 2) !== 0 && (h += U), _ > 42 && (P & 2) !== 0 && (w += _), U > 42 && (P & 4) !== 0 && (d += U), _ > 42 && (P & 4) !== 0 && (E += _);
       }
     }
     h < 500 && w < 500 && (d >= 500 || E >= 500) && Math.max(d, E) > 3 * Math.min(d, E) && (h = d, w = E);
@@ -539,7 +539,7 @@ let he = null;
 function pe(c) {
   he = c;
 }
-const Ee = 0.5, T = 3, oe = 5, P = oe + 1, ie = 1e3, q = 4, J = 200, we = 0.25, ge = 1e3 / 60, ve = 0.02, be = 250, Te = 1e3 / 30, R = 160, x = 90;
+const Ee = 0.5, T = 3, oe = 5, L = oe + 1, ie = 1e3, q = 4, J = 200, we = 0.25, ge = 1e3 / 60, ve = 0.02, be = 250, Te = 1e3 / 30, R = 160, x = 90;
 function se(c) {
   if (!Number.isFinite(c) || c < 0)
     throw new RangeError(
@@ -632,7 +632,7 @@ class _e extends EventTarget {
   #e;
   #i;
   #v;
-  #h;
+  #o;
   /** The program that copies a filtered picture onto the canvas. */
   #b;
   #B;
@@ -651,7 +651,7 @@ class _e extends EventTarget {
   /** Somewhere to filter a field into, and to read it back out of. */
   #T = [];
   /** Which output slot was written last; the next one follows round the ring. */
-  #re = P - 1;
+  #re = L - 1;
   /** The draw path currently shown on the canvas, retained for snapshots. */
   #d = null;
   /** Filtered fields waiting for their moment, oldest first. */
@@ -664,11 +664,11 @@ class _e extends EventTarget {
   /** The gap between animation frames: as near as the page gets to the screen. */
   #ne = ge;
   /** The `<div>` this put around the element, so it can be taken away again. */
-  #z = null;
+  #Y = null;
   #Ge;
   #D;
   #p;
-  #Q;
+  #Z;
   #We;
   #S = "video";
   #ae = "c";
@@ -679,7 +679,7 @@ class _e extends EventTarget {
   #Qe = 1 / 0;
   #X = 0;
   /** How long a frame lasts in wall time, from what the frames themselves say. */
-  #n = 0;
+  #a = 0;
   /** The size of a frame as it is coded, which is what a texture holds. */
   #u = 0;
   #m = 0;
@@ -691,51 +691,51 @@ class _e extends EventTarget {
   #Fe = Number.NaN;
   /** A destination frame that arrived before the browser finished seeking. */
   #oe = !1;
-  #Y = null;
+  #j = null;
   /** requestVideoFrameCallback() の停止を検出するために保持する最終通知時刻。 */
   #Me = 0;
   /** どちらの取得経路からも参照するブラウザの復号フレーム数。 */
-  #Z = 0;
+  #V = 0;
   /** animation loop の代替経路が最後にフレームを取り込んだ時刻。 */
   #Ye = 0;
   #f = !1;
   #Re = !1;
   #ke = !1;
-  #o = null;
-  #j = [];
+  #l = null;
+  #q = [];
   #x = !1;
   #Ze;
   #Se;
-  #V;
+  #J;
   #M;
-  #q;
+  #H;
   #le = 0;
   #ce;
   #Ce;
   #je = !1;
   #C;
   /** Diagnostic-only; the normal Canvas queue remains unchanged by default. */
-  #J;
+  #O;
   /** Diagnostic-only full-size queued-frame transport. */
   #K;
   /** Optional 160x90 framebuffer/canvas used by the bounded transport. */
   #ue = null;
   /** 診断 hook の世代管理。option 未指定時は null で一切動かない。 */
   #$;
-  #l;
-  #Le;
+  #n;
+  #Pe;
   #R;
   #Ve;
-  #a = null;
+  #h = null;
   #s;
   #fe = !1;
   #qe = 0;
   #Je = !1;
-  #_t = 0;
-  #de = !1;
-  #Pe = !1;
-  #ee = null;
   #It = 0;
+  #de = !1;
+  #Le = !1;
+  #ee = null;
+  #Nt = 0;
   #me = /* @__PURE__ */ new Map();
   /** Everything the next report is counted from. See DeinterlaceStats. */
   #k = {
@@ -747,19 +747,19 @@ class _e extends EventTarget {
     queueResetted: 0
   };
   /** `presentedFrames` of the last frame the callback saw; 0 before any. */
-  #H = 0;
+  #z = 0;
   /** When the last frame the filter took arrived, to see the gaps between. */
   #Ke = 0;
   #Be = 0;
-  #O = 0;
+  #Q = 0;
   #pe = 0;
   #Ee = 0;
   #we = 0;
   #te = 0;
   constructor(e, t = {}, i = null) {
-    if (super(), this.#e = e, this.#D = t.doubleRate ?? !1, this.#p = t.autoFilm ?? !1, this.#Q = se(
+    if (super(), this.#e = e, this.#D = t.doubleRate ?? !1, this.#p = t.autoFilm ?? !1, this.#Z = se(
       t.filmCombThreshold ?? b.COMBED_PIXEL_LIMIT
-    ), this.#We = t.spatialCheck ?? !0, this.#Ze = t.onStats, this.#Se = t.diagnostic?.onFilteredPicture, this.#V = t.diagnostic?.onPresentedFrame, t.presenter !== void 0) {
+    ), this.#We = t.spatialCheck ?? !0, this.#Ze = t.onStats, this.#Se = t.diagnostic?.onFilteredPicture, this.#J = t.diagnostic?.onPresentedFrame, t.presenter !== void 0) {
       if (t.diagnostic?.onQueuedFrame !== void 0 || t.diagnostic?.onQueuedMeta !== void 0 || t.queuedFrameSink !== void 0)
         throw new TypeError(
           "presenter cannot be combined with diagnostic frame transport"
@@ -767,21 +767,21 @@ class _e extends EventTarget {
       if (typeof VideoFrame > "u")
         throw new TypeError("presenter requires VideoFrame");
     }
-    if (this.#q = t.presenter ?? null, this.#M = t.presenter ? (s, n) => t.presenter(s, {
+    if (this.#H = t.presenter ?? null, this.#M = t.presenter ? (s, n) => t.presenter(s, {
       mediaTimestampUs: n.mediaTimestampUs,
       durationUs: n.durationUs
-    }) : t.diagnostic?.onQueuedFrame, this.#ce = t.diagnostic?.onQueuedMeta, this.#Ce = t.queuedFrameSink ?? null, this.#C = t.diagnostic?.onPresentationQueue, this.#J = (this.#M !== void 0 || this.#ce !== void 0) && (t.presenter !== void 0 || t.diagnostic?.bypassDisplayQueue === !0), this.#K = t.presenter !== void 0 || t.diagnostic?.captureQueuedFrameFullSize === !0, this.#K && this.#M === void 0 && this.#ce === void 0)
+    }) : t.diagnostic?.onQueuedFrame, this.#ce = t.diagnostic?.onQueuedMeta, this.#Ce = t.queuedFrameSink ?? null, this.#C = t.diagnostic?.onPresentationQueue, this.#O = (this.#M !== void 0 || this.#ce !== void 0) && (t.presenter !== void 0 || t.diagnostic?.bypassDisplayQueue === !0), this.#K = t.presenter !== void 0 || t.diagnostic?.captureQueuedFrameFullSize === !0, this.#K && this.#M === void 0 && this.#ce === void 0)
       throw new TypeError(
         "captureQueuedFrameFullSize requires onQueuedFrame or onQueuedMeta"
       );
-    if (this.#K && !this.#J)
+    if (this.#K && !this.#O)
       throw new TypeError(
         "captureQueuedFrameFullSize requires bypassDisplayQueue"
       );
-    this.#$ = this.#Se || this.#V || this.#M || this.#C ? new Fe(
+    this.#$ = this.#Se || this.#J || this.#M || this.#C ? new Fe(
       this.#Se,
-      this.#V !== void 0 || this.#M !== void 0 || this.#C !== void 0
-    ) : null, this.#l = i, this.#R = i ? "main" : t.rendering ?? "auto", this.#Ve = t.workerUrl ?? he, this.#s = this.#R === "main" ? "main" : "idle", this.#t = i ? i.canvas : document.createElement("canvas"), this.#r = i?.canvas ?? (this.#R === "main" ? this.#t : document.createElement("canvas")), this.#Le = e, i || (this.#t.style.cssText = "position:absolute;pointer-events:none;visibility:hidden");
+      this.#J !== void 0 || this.#M !== void 0 || this.#C !== void 0
+    ) : null, this.#n = i, this.#R = i ? "main" : t.rendering ?? "auto", this.#Ve = t.workerUrl ?? he, this.#s = this.#R === "main" ? "main" : "idle", this.#t = i ? i.canvas : document.createElement("canvas"), this.#r = i?.canvas ?? (this.#R === "main" ? this.#t : document.createElement("canvas")), this.#Pe = e, i || (this.#t.style.cssText = "position:absolute;pointer-events:none;visibility:hidden");
     const A = this.#r.getContext("webgl2", {
       alpha: !1,
       antialias: !1,
@@ -793,18 +793,18 @@ class _e extends EventTarget {
     if (!A) throw new Error("this browser has no WebGL2");
     this.#i = A, this.#v = H(A, ue);
     const r = this.#v;
-    this.#h = Object.fromEntries(
+    this.#o = Object.fromEntries(
       Object.entries(ce).map(([s, n]) => [
         s,
         A.getUniformLocation(r, n)
       ])
-    ), this.#b = H(A, De), this.#B = A.getUniformLocation(this.#b, "uField"), this.#U = A.getUniformLocation(this.#b, "uFlip"), this.#Nt(), this.#p && this.#bt(), this.#r.addEventListener(
+    ), this.#b = H(A, De), this.#B = A.getUniformLocation(this.#b, "uField"), this.#U = A.getUniformLocation(this.#b, "uFlip"), this.#Gt(), this.#p && this.#bt(), this.#r.addEventListener(
       "webglcontextlost",
-      this.#Ut
-    ), this.#Ge = i ? null : new ResizeObserver(() => this.#Ne()), e.addEventListener("emptied", this.#Lt), e.addEventListener("resize", this.#Ct), e.addEventListener("pause", this.#P), e.addEventListener("ended", this.#P), e.addEventListener("seeking", this.#Bt), e.addEventListener("seeked", this.#P), e.addEventListener("ratechange", this.#P);
+      this.#_t
+    ), this.#Ge = i ? null : new ResizeObserver(() => this.#Ne()), e.addEventListener("emptied", this.#Lt), e.addEventListener("resize", this.#Pt), e.addEventListener("pause", this.#L), e.addEventListener("ended", this.#L), e.addEventListener("seeking", this.#Ut), e.addEventListener("seeked", this.#L), e.addEventListener("ratechange", this.#L);
   }
   get running() {
-    return this.#f && (this.#o?.interlaced ?? !0);
+    return this.#f && (this.#l?.interlaced ?? !0);
   }
   /**
    * @internal Diagnostic: the effective render path of THIS (main-side)
@@ -816,7 +816,7 @@ class _e extends EventTarget {
     return {
       rendering: this.#R,
       workerState: this.#s,
-      externalHost: this.#l !== null,
+      externalHost: this.#n !== null,
       // presenter 指定時に frame を配送できなかった回数。0 以外は表示欠落を
       // 意味するため、無言で握りつぶさず観測できるようにする。
       presenterFailures: this.#le
@@ -828,21 +828,21 @@ class _e extends EventTarget {
   }
   /** Field order for the current scan state, defaulting to top-field-first. */
   get #Ue() {
-    return this.#o?.topFieldFirst !== !1;
+    return this.#l?.topFieldFirst !== !1;
   }
   /** どの描画先にも同じ公開オプションを渡す。 */
   #ft() {
     return {
       doubleRate: this.#D,
       autoFilm: this.#p,
-      filmCombThreshold: this.#Q,
+      filmCombThreshold: this.#Z,
       spatialCheck: this.#We,
       diagnostic: this.#Se !== void 0,
-      capturePresentedFrames: this.#V !== void 0,
+      capturePresentedFrames: this.#J !== void 0,
       captureQueuedFrames: this.#M !== void 0,
       captureQueuedFrameFullSize: this.#K,
       capturePresentationQueue: this.#C !== void 0,
-      bypassDisplayQueue: this.#J,
+      bypassDisplayQueue: this.#O,
       captureQueuedMeta: this.#ce !== void 0
     };
   }
@@ -851,27 +851,27 @@ class _e extends EventTarget {
     return this.#Re;
   }
   set enabled(e) {
-    this.#Re = e, this.#it(), this.#a?.postMessage({
+    this.#Re = e, this.#it(), this.#h?.postMessage({
       type: "enabled",
       enabled: e
     });
   }
   /** Update whether the source needs filtering and which field comes first. */
   set scan(e) {
-    const t = this.#o?.interlaced !== e?.interlaced, i = t || this.#o?.topFieldFirst !== e?.topFieldFirst;
-    this.#o = e, this.#a?.postMessage({ type: "scan", scan: e }), i && (this.#c = 0, this.#g(), this.#w(), t && (this.#n = 0), this.#d = null, this.#F(!1)), this.#it(), i && ((e?.interlaced ?? !0) && (this.#l || this.#s === "main") ? this.#ie() : this.#nt());
+    const t = this.#l?.interlaced !== e?.interlaced, i = t || this.#l?.topFieldFirst !== e?.topFieldFirst;
+    this.#l = e, this.#h?.postMessage({ type: "scan", scan: e }), i && (this.#c = 0, this.#g(), this.#w(), t && (this.#a = 0), this.#d = null, this.#F(!1)), this.#it(), i && ((e?.interlaced ?? !0) && (this.#n || this.#s === "main") ? this.#ie() : this.#nt());
   }
   get scan() {
-    return this.#o;
+    return this.#l;
   }
   set videoTimeline(e) {
-    this.#j = e, this.#a?.postMessage({
+    this.#q = e, this.#h?.postMessage({
       type: "timeline",
       videoTimeline: e
-    }), e.length === 0 && (this.#o = null), this.#it();
+    }), e.length === 0 && (this.#l = null), this.#it();
   }
   get videoTimeline() {
-    return this.#j;
+    return this.#q;
   }
   /**
    * What to put on the screen for fullscreen: the `<div>` holding both the
@@ -880,29 +880,29 @@ class _e extends EventTarget {
    * the page, and with it the only deinterlaced picture there is.
    */
   get container() {
-    return this.#z ?? this.#e;
+    return this.#Y ?? this.#e;
   }
   /** Whether a picture goes up for every field rather than every frame. */
   get doubleRate() {
     return this.#D;
   }
   set doubleRate(e) {
-    e !== this.#D && (this.#D = e, this.#tt(), this.#A.length = 0, this.#w(), e ? (this.#u > 0 && this.#lt(), (this.#o?.interlaced ?? !0) && (this.#l || this.#s === "main") && this.#ie()) : this.#p || (this.#d = null, this.#F(!1), this.#se()));
+    e !== this.#D && (this.#D = e, this.#tt(), this.#A.length = 0, this.#w(), e ? (this.#u > 0 && this.#lt(), (this.#l?.interlaced ?? !0) && (this.#n || this.#s === "main") && this.#ie()) : this.#p || (this.#d = null, this.#F(!1), this.#se()));
   }
   /** Whether hard-telecined material is reconstructed at film cadence. */
   get autoFilm() {
     return this.#p;
   }
   set autoFilm(e) {
-    e !== this.#p && (this.#p = e, this.#tt(), this.#g(), this.#w(), e ? (this.#bt(), this.#u > 0 && (this.#St(), this.#lt()), (this.#o?.interlaced ?? !0) && (this.#l || this.#s === "main") && this.#ie()) : (this.#ot(), this.#D || (this.#d = null, this.#F(!1), this.#se())));
+    e !== this.#p && (this.#p = e, this.#tt(), this.#g(), this.#w(), e ? (this.#bt(), this.#u > 0 && (this.#Ct(), this.#lt()), (this.#l?.interlaced ?? !0) && (this.#n || this.#s === "main") && this.#ie()) : (this.#ot(), this.#D || (this.#d = null, this.#F(!1), this.#se())));
   }
   /** The combed-pixel limit used by automatic film detection. */
   get filmCombThreshold() {
-    return this.#Q;
+    return this.#Z;
   }
   set filmCombThreshold(e) {
     const t = se(e);
-    t !== this.#Q && (this.#Q = t, this.#tt(), this.#p && this.#g());
+    t !== this.#Z && (this.#Z = t, this.#tt(), this.#p && this.#g());
   }
   /** 診断 hook の現在世代。未指定時は 0。 */
   get diagnosticGeneration() {
@@ -941,7 +941,7 @@ class _e extends EventTarget {
    * callbackへ移す。表示点より前のproducer通知やcapture()再描画では呼ばない。
    */
   #et(e, t) {
-    const i = this.#V;
+    const i = this.#J;
     if (!i || !e || typeof VideoFrame > "u") return;
     const A = this.#$e(e.mediaTimestampUs, t), r = A.duration ?? null;
     let s;
@@ -978,15 +978,16 @@ class _e extends EventTarget {
   #pt(e, t, i) {
     const A = this.#M;
     if (!A || !t || typeof VideoFrame > "u") {
-      this.#q && (this.#le += 1);
+      this.#H && (this.#le += 1);
       return;
     }
+    this.#Rt();
     const r = performance.now();
     if (this.#K) {
       try {
         this.#mt(e);
       } catch {
-        this.#q && (this.#le += 1);
+        this.#H && (this.#le += 1);
         return;
       }
       const u = this.#$e(t.mediaTimestampUs, i), l = u.duration ?? null;
@@ -994,7 +995,7 @@ class _e extends EventTarget {
       try {
         h = new VideoFrame(this.#r, u);
       } catch {
-        this.#q && (this.#le += 1);
+        this.#H && (this.#le += 1);
         return;
       }
       try {
@@ -1006,7 +1007,7 @@ class _e extends EventTarget {
           captureHeight: this.#m
         });
       } catch {
-        this.#q && (this.#le += 1), h.close();
+        this.#H && (this.#le += 1), h.close();
       }
       return;
     }
@@ -1061,7 +1062,7 @@ class _e extends EventTarget {
     }
   }
   /** Allocate the fixed diagnostic copy only when the pre-queue hook is used. */
-  #Nt() {
+  #Gt() {
     if (!this.#M || this.#K || this.#ue)
       return;
     let e = null;
@@ -1122,7 +1123,7 @@ class _e extends EventTarget {
       )
     };
   }
-  #Gt() {
+  #Wt() {
     const e = this.#ue;
     e && (this.#i.deleteFramebuffer(e.framebuffer), this.#i.deleteTexture(e.texture), this.#ue = null);
   }
@@ -1132,21 +1133,21 @@ class _e extends EventTarget {
   }
   /** Worker と canvas を再構築せずに変更可能なフィルター設定を反映する。 */
   #tt() {
-    this.#a?.postMessage({
+    this.#h?.postMessage({
       type: "settings",
       options: this.#ft()
     });
   }
   #it() {
-    this.#Re && (this.#j.length > 0 || (this.#o?.interlaced ?? !0)) ? this.start() : this.stop();
+    this.#Re && (this.#q.length > 0 || (this.#l?.interlaced ?? !0)) ? this.start() : this.stop();
   }
   /** 転送に必要な API がそろっている場合だけ同梱 Worker を起動する。 */
-  #Wt() {
-    return this.#l || this.#R === "main" ? !1 : this.#s === "starting" || this.#s === "active" ? !0 : typeof Worker < "u" && typeof VideoFrame < "u" && typeof OffscreenCanvas < "u" && this.#Ve !== null && "transferControlToOffscreen" in HTMLCanvasElement.prototype ? (this.#Et(), !0) : this.#R === "auto" ? (this.#_e(), !1) : (this.#s = "failed", this.#f = !1, !0);
+  #Xt() {
+    return this.#n || this.#R === "main" ? !1 : this.#s === "starting" || this.#s === "active" ? !0 : typeof Worker < "u" && typeof VideoFrame < "u" && typeof OffscreenCanvas < "u" && this.#Ve !== null && "transferControlToOffscreen" in HTMLCanvasElement.prototype ? (this.#Et(), !0) : this.#R === "auto" ? (this.#_e(), !1) : (this.#s = "failed", this.#f = !1, !0);
   }
   /** 表示中の canvas を置き換えてから、新しい canvas の制御を Worker へ移す。 */
   #Et() {
-    this.#L(), this.#a?.terminate(), this.#a = null, this.#de = !1, this.#Pe = !1;
+    this.#P(), this.#h?.terminate(), this.#h = null, this.#de = !1, this.#Le = !1;
     let e = this.#t;
     if (this.#Je) {
       e = document.createElement("canvas"), e.className = this.#t.className;
@@ -1164,8 +1165,8 @@ class _e extends EventTarget {
       );
       return;
     }
-    this.#a = i, i.onmessage = (s) => {
-      t === this.#qe && !this.#ke ? this.#Xt(s.data) : (s.data.type === "presented" || s.data.type === "queued") && s.data.frame.close();
+    this.#h = i, i.onmessage = (s) => {
+      t === this.#qe && !this.#ke ? this.#Ht(s.data) : (s.data.type === "presented" || s.data.type === "queued") && s.data.frame.close();
     }, i.onerror = (s) => {
       t === this.#qe && (s.preventDefault(), this.#ge(s.message || "the deinterlacer worker failed"));
     };
@@ -1176,8 +1177,8 @@ class _e extends EventTarget {
         canvas: A,
         options: this.#ft(),
         queuedFrameSink: this.#je ? this.#Ce : null,
-        scan: this.#o,
-        videoTimeline: this.#j,
+        scan: this.#l,
+        videoTimeline: this.#q,
         enabled: this.#f,
         video: this.#st()
       },
@@ -1185,7 +1186,7 @@ class _e extends EventTarget {
     );
   }
   /** Worker の通知を反映し、入力を1枚ずつ送るための待機を解除する。 */
-  #Xt(e) {
+  #Ht(e) {
     switch (e.type) {
       case "ready":
         this.#s = "active", this.#f && (this.#ve(), this.#at());
@@ -1194,7 +1195,7 @@ class _e extends EventTarget {
         this.#ge(e.message);
         break;
       case "consumed": {
-        this.#de = !1, this.#Pe = !0;
+        this.#de = !1, this.#Le = !0;
         const t = this.#ee;
         this.#ee = null, t && this.#gt(t);
         break;
@@ -1220,7 +1221,7 @@ class _e extends EventTarget {
           e.frame.close();
           break;
         }
-        const t = this.#V;
+        const t = this.#J;
         if (!t) {
           e.frame.close();
           break;
@@ -1242,6 +1243,7 @@ class _e extends EventTarget {
           e.frame.close();
           break;
         }
+        this.#Rt();
         try {
           t(e.frame, e.meta);
         } catch {
@@ -1284,17 +1286,17 @@ class _e extends EventTarget {
       this.#fe = !0, this.#Et();
       return;
     }
-    console.error(`Deinterlacer Worker stopped: ${e}`), this.#s = "failed", this.#a?.terminate(), this.#a = null, this.#L(), this.stop();
+    console.error(`Deinterlacer Worker stopped: ${e}`), this.#s = "failed", this.#h?.terminate(), this.#h = null, this.#P(), this.stop();
   }
   /** Worker を自動選択できなかった場合は元のメインスレッド用 canvas へ戻す。 */
   #_e() {
     const e = this.#r;
     e.className = this.#t.className;
     const t = this.#t.getAttribute("style");
-    t === null ? e.removeAttribute("style") : e.setAttribute("style", t), e.style.visibility = "hidden", this.#t.parentElement && this.#t.replaceWith(e), this.#t = e, this.#Je = !1, this.#a?.terminate(), this.#a = null, this.#s = "main", this.#w(), this.#L(), this.#f && (this.#ve(), this.#at(), (this.#o?.interlaced ?? !0) && this.#ie());
+    t === null ? e.removeAttribute("style") : e.setAttribute("style", t), e.style.visibility = "hidden", this.#t.parentElement && this.#t.replaceWith(e), this.#t = e, this.#Je = !1, this.#h?.terminate(), this.#h = null, this.#s = "main", this.#w(), this.#P(), this.#f && (this.#ve(), this.#at(), (this.#l?.interlaced ?? !0) && this.#ie());
   }
   /** 描画先を切り替えるとき、ページ側がまだ所有する待機フレームを閉じる。 */
-  #L() {
+  #P() {
     this.#ee?.frame.close(), this.#ee = null;
   }
   /** Worker の再構築後には応答できない capture を失敗として完了する。 */
@@ -1305,31 +1307,31 @@ class _e extends EventTarget {
   }
   start() {
     if (!(this.#f || this.#ke || this.#x)) {
-      if (this.#f = !0, this.#Pt(), this.#g(), this.#Me = performance.now(), this.#Ye = this.#Me, this.#Fe = Number.NaN, this.#Z = this.#e.getVideoPlaybackQuality?.().totalVideoFrames ?? 0, this.#ii(), this.#at(), this.#Wt()) {
-        this.#a?.postMessage({
+      if (this.#f = !0, this.#Bt(), this.#g(), this.#Me = performance.now(), this.#Ye = this.#Me, this.#Fe = Number.NaN, this.#V = this.#e.getVideoPlaybackQuality?.().totalVideoFrames ?? 0, this.#si(), this.#at(), this.#Xt()) {
+        this.#h?.postMessage({
           type: "enabled",
           enabled: !0
         }), this.#s === "active" && this.#ve();
         return;
       }
-      this.#ve(), (this.#o?.interlaced ?? !0) && this.#ie();
+      this.#ve(), (this.#l?.interlaced ?? !0) && this.#ie();
     }
   }
   /** Take the deinterlaced picture away, leaving the element's own showing. */
   stop() {
-    this.#f && (this.#f = !1, this.#Y !== null && this.#e.cancelVideoFrameCallback(this.#Y), this.#Y = null, this.#Vt(), this.#nt(), this.#c = 0, this.#d = null, this.#F(!1), this.#w(), this.#L(), this.#a?.postMessage({
+    this.#f && (this.#f = !1, this.#j !== null && this.#e.cancelVideoFrameCallback(this.#j), this.#j = null, this.#qt(), this.#nt(), this.#c = 0, this.#d = null, this.#F(!1), this.#w(), this.#P(), this.#h?.postMessage({
       type: "enabled",
       enabled: !1
     }));
   }
   destroy() {
     if (!this.#ke) {
-      this.#ke = !0, this.#Re = !1, this.stop(), this.#a?.postMessage({ type: "destroy" }), this.#a?.terminate(), this.#a = null, this.#w(), this.#$?.destroy(), this.#L(), this.#wt("the deinterlacer was destroyed"), this.#r.removeEventListener(
+      this.#ke = !0, this.#Re = !1, this.stop(), this.#h?.postMessage({ type: "destroy" }), this.#h?.terminate(), this.#h = null, this.#w(), this.#$?.destroy(), this.#P(), this.#wt("the deinterlacer was destroyed"), this.#r.removeEventListener(
         "webglcontextlost",
-        this.#Ut
-      ), this.#e.removeEventListener("emptied", this.#Lt), this.#e.removeEventListener("resize", this.#Ct), this.#e.removeEventListener("pause", this.#P), this.#e.removeEventListener("ended", this.#P), this.#e.removeEventListener("seeking", this.#Bt), this.#e.removeEventListener("seeked", this.#P), this.#e.removeEventListener("ratechange", this.#P), this.#si();
+        this.#_t
+      ), this.#e.removeEventListener("emptied", this.#Lt), this.#e.removeEventListener("resize", this.#Pt), this.#e.removeEventListener("pause", this.#L), this.#e.removeEventListener("ended", this.#L), this.#e.removeEventListener("seeking", this.#Ut), this.#e.removeEventListener("seeked", this.#L), this.#e.removeEventListener("ratechange", this.#L), this.#Ai();
       for (const e of this.#y) this.#i.deleteTexture(e);
-      this.#y = [], this.#Gt(), this.#se(), this.#ot(), this.#i.deleteProgram(this.#v), this.#i.deleteProgram(this.#b), this.#_ && this.#i.deleteProgram(this.#_), this.#I && this.#i.deleteProgram(this.#I), this.#Ae && this.#i.deleteProgram(this.#Ae), this.#i.getExtension("WEBGL_lose_context")?.loseContext();
+      this.#y = [], this.#Wt(), this.#se(), this.#ot(), this.#i.deleteProgram(this.#v), this.#i.deleteProgram(this.#b), this.#_ && this.#i.deleteProgram(this.#_), this.#I && this.#i.deleteProgram(this.#I), this.#Ae && this.#i.deleteProgram(this.#Ae), this.#i.getExtension("WEBGL_lose_context")?.loseContext();
     }
   }
   /**
@@ -1341,11 +1343,11 @@ class _e extends EventTarget {
    * permanent cost of `preserveDrawingBuffer` on ordinary playback.
    */
   capture() {
-    if (this.#s === "active" && this.#t.style.visibility === "visible" && this.#a) {
-      const A = ++this.#It, r = new Promise((s, n) => {
+    if (this.#s === "active" && this.#t.style.visibility === "visible" && this.#h) {
+      const A = ++this.#Nt, r = new Promise((s, n) => {
         this.#me.set(A, { resolve: s, reject: n });
       });
-      return this.#a.postMessage({
+      return this.#h.postMessage({
         type: "capture",
         id: A,
         width: this.#e.videoWidth,
@@ -1355,7 +1357,7 @@ class _e extends EventTarget {
     if (this.#s === "starting" || this.#s === "failed")
       return createImageBitmap(this.#e);
     const e = this.#d;
-    if (this.#l && (!this.#f || this.#x || !e))
+    if (this.#n && (!this.#f || this.#x || !e))
       return Promise.reject(new Error("no rendered picture is available"));
     if (!this.#f || this.#x || !e)
       return createImageBitmap(this.#e);
@@ -1374,7 +1376,7 @@ class _e extends EventTarget {
     super.removeEventListener(e, t, i);
   }
   #ve() {
-    this.#l || !this.#f || this.#Y !== null || (this.#Y = this.#e.requestVideoFrameCallback(this.#Ot));
+    this.#n || !this.#f || this.#j !== null || (this.#j = this.#e.requestVideoFrameCallback(this.#zt));
   }
   /** seek と表示周期の判断に必要な DOM 側の再生状態を複製する。 */
   #st() {
@@ -1397,7 +1399,7 @@ class _e extends EventTarget {
     };
   }
   /** 転送中1枚と最新の待機1枚だけを保持し、音声時計からの遅延蓄積を防ぐ。 */
-  #Ht(e, t) {
+  #Ot(e, t) {
     let i;
     try {
       i = new VideoFrame(this.#e, {
@@ -1405,11 +1407,11 @@ class _e extends EventTarget {
       });
     } catch (r) {
       const s = r instanceof Error ? r.message : String(r);
-      this.#R === "auto" && !this.#Pe && !this.#fe ? (this.#_e(), this.#Ie(e, t)) : this.#ge(s);
+      this.#R === "auto" && !this.#Le && !this.#fe ? (this.#_e(), this.#Ie(e, t)) : this.#ge(s);
       return;
     }
     const A = {
-      id: ++this.#_t,
+      id: ++this.#It,
       frame: i,
       now: e,
       metadata: t,
@@ -1423,7 +1425,7 @@ class _e extends EventTarget {
   }
   /** 直前の入力を Worker が解放した後に、選択済みフレームを転送する。 */
   #gt(e) {
-    const t = this.#a;
+    const t = this.#h;
     if (!t || this.#s !== "active") {
       e.frame.close();
       return;
@@ -1435,69 +1437,69 @@ class _e extends EventTarget {
     } catch (A) {
       this.#de = !1, e.frame.close();
       const r = A instanceof Error ? A.message : String(A);
-      this.#R === "auto" && !this.#Pe && !this.#fe ? (this.#_e(), this.#Ie(e.now, e.metadata)) : this.#ge(r);
+      this.#R === "auto" && !this.#Le && !this.#fe ? (this.#_e(), this.#Ie(e.now, e.metadata)) : this.#ge(r);
     }
   }
-  #Ot = (e, t) => {
-    this.#Y = null, !(!this.#f || this.#x) && (this.#Me = e, this.#Z = Math.max(
-      this.#Z,
+  #zt = (e, t) => {
+    this.#j = null, !(!this.#f || this.#x) && (this.#Me = e, this.#V = Math.max(
+      this.#V,
       this.#e.getVideoPlaybackQuality?.().totalVideoFrames ?? 0
     ), this.#vt(e, t), this.#ve());
   };
   /** どちらの通知経路で見つけたフレームも選択中の描画先へ取り込む。 */
   #vt(e, t) {
     if (this.#Fe = t.mediaTime, this.#s === "active") {
-      this.#Ht(e, t);
+      this.#Ot(e, t);
       return;
     }
     this.#s !== "starting" && this.#Ie(e, t);
   }
   /** @internal Worker でもメインスレッドと同じ履歴と描画判断を使うための入口。 */
   ingestExternalFrame(e, t, i) {
-    this.#Le = i;
+    this.#Pe = i;
     try {
       this.#Ie(e, t);
     } finally {
-      this.#Le = this.#e;
+      this.#Pe = this.#e;
     }
   }
   /** 1枚の入力を共通の履歴へ取り込み、YADIF と IVTC の表示判断を完了する。 */
   #Ie(e, t) {
-    if (this.#zt(t.mediaTime), t.width > 0 && t.height > 0) {
+    if (this.#Qt(t.mediaTime), t.width > 0 && t.height > 0) {
       let i = !1;
       if (!this.#oe && this.#e.seeking) {
-        const h = this.#e.buffered, d = this.#n >= q ? this.#n / 1e3 : J / 1e3;
+        const h = this.#e.buffered, d = this.#a >= q ? this.#a / 1e3 : J / 1e3;
         for (let m = 0; m < h.length; m++)
           if (t.mediaTime >= h.start(m) && t.mediaTime < h.end(m) && Math.abs(t.mediaTime - this.#e.currentTime) <= d) {
             i = !0;
             break;
           }
       }
-      if (i && (this.#oe = !0), (this.#u === 0 || this.#m === 0) && this.#kt(t.width, t.height), this.#o && !this.#o.interlaced) {
-        this.#Kt();
+      if (i && (this.#oe = !0), (this.#u === 0 || this.#m === 0) && this.#St(t.width, t.height), this.#l && !this.#l.interlaced) {
+        this.#$t();
         return;
       }
       const A = t.mediaTime - this.#he, r = i || A < 0 || A > Ee;
-      r && (this.#c = 0, this.#n = 0, this.#k.discontinuities++, this.#w(), this.#A.length = 0, this.#g());
-      const s = this.#p && this.#H !== 0 && t.presentedFrames - this.#H > 1;
-      if (this.#ei(t.presentedFrames, r), !r && s && (this.#c = 0, this.#g()), this.#c > 0 && t.mediaTime === this.#he)
+      r && (this.#c = 0, this.#a = 0, this.#k.discontinuities++, this.#w(), this.#A.length = 0, this.#g());
+      const s = this.#p && this.#z !== 0 && t.presentedFrames - this.#z > 1;
+      if (this.#ti(t.presentedFrames, r), !r && s && (this.#c = 0, this.#g()), this.#c > 0 && t.mediaTime === this.#he)
         return;
-      !r && A > 0 && this.#Qt(A), this.#he = t.mediaTime;
+      !r && A > 0 && this.#Yt(A), this.#he = t.mediaTime;
       const n = performance.now();
-      n - this.#Ke > ie && (this.#Be = n, this.#O = 0, this.#pe = 0, this.#Ee = 0, this.#we = 0, this.#te = 0, this.#X = 0), this.#Ke = n;
+      n - this.#Ke > ie && (this.#Be = n, this.#Q = 0, this.#pe = 0, this.#Ee = 0, this.#we = 0, this.#te = 0, this.#X = 0), this.#Ke = n;
       const a = performance.now();
-      this.#Rt();
-      const f = this.#S, o = this.#p && this.#c === T && this.#Yt();
+      this.#kt();
+      const f = this.#S, o = this.#p && this.#c === T && this.#Zt();
       if (f !== this.#S && (this.#A.length = 0), !(o && this.#be())) if (this.#p && !this.#He && this.#S === "film")
         if (this.#be()) {
-          const h = this.#n * 5 / 4;
+          const h = this.#a * 5 / 4;
           this.#yt(1);
           const d = this.#A.at(-1), m = d == null ? e + h : d.at + d.duration;
-          this.#Zt(m, h, t.mediaTime);
+          this.#jt(m, h, t.mediaTime);
         } else
           this.#At(null, !0, t.mediaTime);
       else if (this.#D && this.#be()) {
-        const h = this.#n / 2;
+        const h = this.#a / 2;
         this.#yt(2);
         const d = this.#A.at(-1), m = d == null ? e + h * 2 : d.at + d.duration;
         this.#Tt(!1, m, h, t.mediaTime), this.#Tt(
@@ -1511,24 +1513,24 @@ class _e extends EventTarget {
       this.#te = Math.max(
         this.#te,
         this.#A.length
-      ), this.#pe += performance.now() - a, this.#O++, this.#ti(n);
+      ), this.#pe += performance.now() - a, this.#Q++, this.#ii(n);
     }
   }
-  #zt(e) {
+  #Qt(e) {
     let t;
-    for (let r = this.#j.length - 1; r >= 0; r--) {
-      const s = this.#j[r];
+    for (let r = this.#q.length - 1; r >= 0; r--) {
+      const s = this.#q[r];
       if (s.start <= e + 1e-6) {
         t = s;
         break;
       }
     }
-    t?.codedSize && (t.codedSize.width !== this.#u || t.codedSize.height !== this.#m) && this.#kt(t.codedSize.width, t.codedSize.height);
+    t?.codedSize && (t.codedSize.width !== this.#u || t.codedSize.height !== this.#m) && this.#St(t.codedSize.width, t.codedSize.height);
     const i = t?.scan;
-    if (!i || this.#o?.interlaced === i.interlaced && this.#o.topFieldFirst === i.topFieldFirst)
+    if (!i || this.#l?.interlaced === i.interlaced && this.#l.topFieldFirst === i.topFieldFirst)
       return;
-    const A = this.#o?.interlaced;
-    this.#o = i, this.#c = 0, this.#A.length = 0, this.#g(), this.#w(), A !== i.interlaced && (this.#n = 0), i.interlaced && (this.#l || this.#s === "main") ? this.#ie() : this.#nt();
+    const A = this.#l?.interlaced;
+    this.#l = i, this.#c = 0, this.#A.length = 0, this.#g(), this.#w(), A !== i.interlaced && (this.#a = 0), i.interlaced && (this.#n || this.#s === "main") ? this.#ie() : this.#nt();
   }
   /**
    * Whether fields are being filtered ahead of time and queued, rather than
@@ -1539,7 +1541,7 @@ class _e extends EventTarget {
    * frames go by, since until then there is no idea how long a frame lasts.
    */
   #be() {
-    return (this.#D || this.#p) && this.#n > 0 && this.#T.length === P;
+    return (this.#D || this.#p) && this.#a > 0 && this.#T.length === L;
   }
   /**
    * How long a frame lasts in wall time, kept as a smoothed estimate.
@@ -1552,9 +1554,9 @@ class _e extends EventTarget {
    * half a frame late and hold the picture through a refresh it should have
    * moved in.
    */
-  #Qt(e) {
-    const t = e * 1e3 / (this.#e.playbackRate || 1), i = this.#n > 0 ? Math.max(1, Math.round(t / this.#n)) : 1, A = t / i;
-    A < q || A > J || (this.#n = this.#n > 0 ? this.#n + (A - this.#n) * we : A);
+  #Yt(e) {
+    const t = e * 1e3 / (this.#e.playbackRate || 1), i = this.#a > 0 ? Math.max(1, Math.round(t / this.#a)) : 1, A = t / i;
+    A < q || A > J || (this.#a = this.#a > 0 ? this.#a + (A - this.#a) * we : A);
   }
   /** Build the optional film passes only for callers that enable them. */
   #bt() {
@@ -1580,7 +1582,7 @@ class _e extends EventTarget {
    * the previous, current and next luma proxies into RGB. A second readback
    * supplies the selected RGB weave to its chroma-sensitive decimate metric.
    */
-  #Yt() {
+  #Zt() {
     const e = this.#N, t = this.#_, i = this.#ye, A = this.#Ae, r = this.#ut;
     if (!e || !t || !i || !A || !r)
       return !1;
@@ -1607,7 +1609,7 @@ class _e extends EventTarget {
       l,
       h,
       o,
-      this.#Q
+      this.#Z
     );
     s.useProgram(A), s.uniform1i(r.prev, 0), s.uniform1i(r.cur, 1), s.uniform1i(r.next, 2), s.uniform2i(r.size, this.#u, this.#m), s.uniform1i(r.topFieldFirst, o ? 1 : 0), s.uniform1i(
       r.match,
@@ -1627,7 +1629,7 @@ class _e extends EventTarget {
     return (w ? "film" : "video") !== this.#S && (this.#S = w ? "film" : "video"), m.shouldDrop && !d.isCombed;
   }
   /** Weave the selected film fields into an output texture and queue it. */
-  #Zt(e, t, i) {
+  #jt(e, t, i) {
     const A = this.#rt();
     if (A === null) return;
     const r = this.#T[A];
@@ -1638,7 +1640,7 @@ class _e extends EventTarget {
       !0,
       i
     );
-    this.#pt(r.texture, s, t), this.#J || this.#A.push({
+    this.#pt(r.texture, s, t), this.#O || this.#A.push({
       slot: A,
       at: e,
       enqueuedAtMs: this.#C ? performance.now() : null,
@@ -1659,7 +1661,7 @@ class _e extends EventTarget {
       this.#ae === "p" ? 0 : this.#ae === "c" ? 1 : 2
     ), s.viewport(0, 0, this.#u, this.#m), s.drawArrays(s.TRIANGLES, 0, 3);
     const u = t ? this.#dt("film", i, !1) : null;
-    return e === null && (this.#d = { kind: "film" }, this.#F(!0), t && (this.#X++, this.#et(u, this.#n))), u;
+    return e === null && (this.#d = { kind: "film" }, this.#F(!0), t && (this.#X++, this.#et(u, this.#a))), u;
   }
   /**
    * Filter one field into an output texture and put it in the queue.
@@ -1682,7 +1684,7 @@ class _e extends EventTarget {
       !0,
       A
     );
-    this.#pt(s.texture, n, i), this.#J || this.#A.push({
+    this.#pt(s.texture, n, i), this.#O || this.#A.push({
       slot: r,
       at: t,
       enqueuedAtMs: this.#C ? performance.now() : null,
@@ -1708,8 +1710,8 @@ class _e extends EventTarget {
   /** Select an output whose pixels are not still represented by the canvas or queue. */
   #rt() {
     const e = this.#d?.kind === "texture" ? this.#d.texture : null, t = new Set(this.#A.map(({ slot: i }) => i));
-    for (let i = 1; i <= P; i++) {
-      const A = (this.#re + i) % P, r = this.#T[A];
+    for (let i = 1; i <= L; i++) {
+      const A = (this.#re + i) % L, r = this.#T[A];
       if (r && r.texture !== e && !t.has(A))
         return A;
     }
@@ -1720,7 +1722,7 @@ class _e extends EventTarget {
     this.#G === null && (!this.#f || this.#x || (this.#xe = 0, this.#G = this.#xt(this.#Dt)));
   }
   #nt() {
-    this.#G !== null && this.#jt(this.#G), this.#G = null, this.#A.length = 0;
+    this.#G !== null && this.#Vt(this.#G), this.#G = null, this.#A.length = 0;
   }
   #Dt = (e) => {
     if (this.#G = null, !(!this.#f || this.#x)) {
@@ -1728,40 +1730,40 @@ class _e extends EventTarget {
         const t = e - this.#xe;
         t >= 1 && t <= J && (this.#ne = t < this.#ne ? t : this.#ne + (t - this.#ne) * ve);
       }
-      this.#xe = e, this.#s === "main" && this.#Jt(e), this.#G = this.#xt(this.#Dt);
+      this.#xe = e, this.#s === "main" && this.#Kt(e), this.#G = this.#xt(this.#Dt);
     }
   };
   /** ページと Worker のそれぞれが所有する requestAnimationFrame() へ表示ループを委ねる。 */
   #xt(e) {
-    return this.#l ? this.#l.requestAnimationFrame(e) : requestAnimationFrame(e);
+    return this.#n ? this.#n.requestAnimationFrame(e) : requestAnimationFrame(e);
   }
   /** 選択中の描画先で予約した表示機会を取り消す。 */
-  #jt(e) {
-    this.#l ? this.#l.cancelAnimationFrame(e) : cancelAnimationFrame(e);
+  #Vt(e) {
+    this.#n ? this.#n.cancelAnimationFrame(e) : cancelAnimationFrame(e);
   }
   /** ページ側の監視を開始し、描画ループの停止中も復号フレームの到着を検査する。 */
   #at() {
-    this.#l || this.#W !== null || !this.#f || this.#x || (this.#W = requestAnimationFrame(this.#Ft));
+    this.#n || this.#W !== null || !this.#f || this.#x || (this.#W = requestAnimationFrame(this.#Ft));
   }
   /** ページ側で予約済みのフレーム監視を取り消す。 */
-  #Vt() {
+  #qt() {
     this.#W !== null && cancelAnimationFrame(this.#W), this.#W = null;
   }
   /** requestAnimationFrame() ごとにフレーム通知の停止を検査し、次の監視を予約する。 */
   #Ft = (e) => {
-    this.#W = null, !(!this.#f || this.#x) && (this.#qt(e), this.#W = requestAnimationFrame(this.#Ft));
+    this.#W = null, !(!this.#f || this.#x) && (this.#Jt(e), this.#W = requestAnimationFrame(this.#Ft));
   };
   /** requestVideoFrameCallback() が来ない間も requestAnimationFrame() から復号フレームを取り込む。 */
-  #qt(e) {
-    if (this.#l || e - this.#Me < be || this.#e.paused || this.#e.ended || this.#e.readyState < 2)
+  #Jt(e) {
+    if (this.#n || e - this.#Me < be || this.#e.paused || this.#e.ended || this.#e.readyState < 2)
       return;
-    const t = this.#e.currentTime, i = this.#e.getVideoPlaybackQuality?.().totalVideoFrames ?? 0, A = this.#n >= q ? this.#n : Te, r = i > this.#Z, s = t !== this.#Fe && e - this.#Ye >= A * 0.75;
-    !r && !s || (this.#Z = Math.max(
-      this.#Z,
+    const t = this.#e.currentTime, i = this.#e.getVideoPlaybackQuality?.().totalVideoFrames ?? 0, A = this.#a >= q ? this.#a : Te, r = i > this.#V, s = t !== this.#Fe && e - this.#Ye >= A * 0.75;
+    !r && !s || (this.#V = Math.max(
+      this.#V,
       i
     ), this.#Ye = e, this.#vt(e, {
       mediaTime: t,
-      presentedFrames: Math.max(this.#H + 1, i),
+      presentedFrames: Math.max(this.#z + 1, i),
       width: this.#e.videoWidth,
       height: this.#e.videoHeight
     }));
@@ -1776,7 +1778,7 @@ class _e extends EventTarget {
    * one, only the newer is shown: a screen has one picture per refresh, and
    * the older of the two is a moment the viewer should already be past.
    */
-  #Jt(e) {
+  #Kt(e) {
     const t = e + this.#ne * 1.5, i = this.#A.length;
     let A = 0;
     const r = [];
@@ -1815,16 +1817,16 @@ class _e extends EventTarget {
     A && this.#ht(A.texture, !1, !0, t, i);
   }
   /** Put a progressive frame through unchanged, keeping one display surface. */
-  #Kt() {
-    this.#Rt();
+  #$t() {
+    this.#kt();
     const e = this.#y[this.#E];
     e && this.#ht(e, !0), this.#c = 0;
   }
   /** DOM の visibility 変更はページ側に残し、Worker からは状態だけを通知する。 */
   #F(e) {
-    const t = this.#$t ? !1 : e;
-    if (this.#l) {
-      this.#l.onVisibility(t);
+    const t = this.#ei ? !1 : e;
+    if (this.#n) {
+      this.#n.onVisibility(t);
       return;
     }
     this.#t.style.visibility = t ? "visible" : "hidden";
@@ -1836,8 +1838,22 @@ class _e extends EventTarget {
    * ここは false 側に倒れる。Worker 内では presenter callback が渡らないため、
    * presenter 指定時に必ず立つ bypassDisplayQueue を併せて見る。
    */
-  get #$t() {
-    return (this.#q !== null || this.#J) && this.#o?.interlaced !== !1 && this.#be();
+  get #ei() {
+    return (this.#H !== null || this.#O) && this.#l?.interlaced !== !1 && this.#be();
+  }
+  /**
+   * presenter へ 1 枚渡した時点で内蔵 canvas を隠す。pause/seek の flush が canvas を
+   * 見せたままでも、再生が再開して queue が presenter を供給し始めたら必ず隠す
+   * (P1-1)。presenter が表示を所有しない構成では何もしない。
+   */
+  #Rt() {
+    if (!(this.#H === null && !this.#O)) {
+      if (this.#n) {
+        this.#n.onVisibility(!1);
+        return;
+      }
+      this.#t.style.visibility = "hidden";
+    }
   }
   #ht(e, t = !1, i = !0, A = null, r = 0) {
     this.#mt(e, t), this.#d = { kind: "texture", texture: e, flip: t }, this.#F(!0), i && (this.#X++, this.#et(A, r));
@@ -1851,19 +1867,19 @@ class _e extends EventTarget {
    * counted: the held frames were being dropped anyway, and a seek presents
    * what it passes over.
    */
-  #ei(e, t) {
-    this.#H !== 0 && !t && (this.#k.missed += Math.max(0, e - this.#H - 1)), this.#H = e;
+  #ti(e, t) {
+    this.#z !== 0 && !t && (this.#k.missed += Math.max(0, e - this.#z - 1)), this.#z = e;
   }
-  #ti(e) {
+  #ii(e) {
     const t = e - this.#Be;
     if (t < ie) return;
-    const i = this.#be() && (this.#D || this.#S === "film") ? this.#Ee : this.#O, A = {
+    const i = this.#be() && (this.#D || this.#S === "film") ? this.#Ee : this.#Q, A = {
       ...this.#k,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
       dropped: this.#e.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
       fps: i * 1e3 / t,
-      frameMs: this.#O === 0 ? 0 : (this.#pe + this.#we) / this.#O,
+      frameMs: this.#Q === 0 ? 0 : (this.#pe + this.#we) / this.#Q,
       maxQueuedFields: this.#te,
       mode: this.#S,
       match: this.#ae,
@@ -1872,10 +1888,10 @@ class _e extends EventTarget {
       duplicateScore: this.#ze,
       duplicateRunnerUp: this.#Qe
     };
-    this.dispatchEvent(new CustomEvent("stats", { detail: A })), this.#Ze?.(A), this.#Be = e, this.#O = 0, this.#pe = 0, this.#Ee = 0, this.#we = 0, this.#te = 0, this.#X = 0;
+    this.dispatchEvent(new CustomEvent("stats", { detail: A })), this.#Ze?.(A), this.#Be = e, this.#Q = 0, this.#pe = 0, this.#Ee = 0, this.#we = 0, this.#te = 0, this.#X = 0;
   }
   /** Take the newest frame into the ring. */
-  #Rt() {
+  #kt() {
     const e = this.#i;
     this.#E = (this.#E + 1) % T, e.bindTexture(e.TEXTURE_2D, this.#y[this.#E] ?? null), e.texImage2D(
       e.TEXTURE_2D,
@@ -1883,7 +1899,7 @@ class _e extends EventTarget {
       e.RGBA,
       e.RGBA,
       e.UNSIGNED_BYTE,
-      this.#Le
+      this.#Pe
     ), this.#c = Math.min(this.#c + 1, T);
   }
   /**
@@ -1918,9 +1934,9 @@ class _e extends EventTarget {
     this.#c === 1 ? u = l = h = a : e ? (u = f, l = h = a) : this.#c === 2 ? (u = l = f, h = a) : (u = o, l = f, h = a), n.bindFramebuffer(n.FRAMEBUFFER, i), n.useProgram(this.#v);
     for (const [m, w] of [u, l, h].entries())
       n.activeTexture(n.TEXTURE0 + m), n.bindTexture(n.TEXTURE_2D, this.#y[w] ?? null);
-    n.uniform1i(this.#h.prev, 0), n.uniform1i(this.#h.cur, 1), n.uniform1i(this.#h.next, 2), n.uniform2i(this.#h.size, this.#u, this.#m);
+    n.uniform1i(this.#o.prev, 0), n.uniform1i(this.#o.cur, 1), n.uniform1i(this.#o.next, 2), n.uniform2i(this.#o.size, this.#u, this.#m);
     const d = this.#Ue ? 0 : 1;
-    return n.uniform1i(this.#h.parity, t ? 1 - d : d), n.uniform1i(this.#h.tff, this.#Ue ? 1 : 0), n.uniform1i(this.#h.spatialCheck, this.#We ? 1 : 0), n.viewport(0, 0, this.#u, this.#m), n.drawArrays(n.TRIANGLES, 0, 3), i === null && (this.#d = { kind: "yadif", flush: e, second: t }, this.#F(!0), A && (this.#X++, this.#et(s, this.#n))), s;
+    return n.uniform1i(this.#o.parity, t ? 1 - d : d), n.uniform1i(this.#o.tff, this.#Ue ? 1 : 0), n.uniform1i(this.#o.spatialCheck, this.#We ? 1 : 0), n.viewport(0, 0, this.#u, this.#m), n.drawArrays(n.TRIANGLES, 0, 3), i === null && (this.#d = { kind: "yadif", flush: e, second: t }, this.#F(!0), A && (this.#X++, this.#et(s, this.#a))), s;
   }
   /**
    * Put the canvas exactly where the element's picture is.
@@ -1934,7 +1950,7 @@ class _e extends EventTarget {
    * `contain` it is by default.
    */
   #Ne() {
-    if (!this.#z) return;
+    if (!this.#Y) return;
     const e = this.#e, t = e.videoWidth, i = e.videoHeight;
     if (t === 0 || i === 0) return;
     const A = Math.min(
@@ -1943,7 +1959,7 @@ class _e extends EventTarget {
     ), r = t * A, s = i * A;
     this.#t.style.left = `${e.offsetLeft + (e.offsetWidth - r) / 2}px`, this.#t.style.top = `${e.offsetTop + (e.offsetHeight - s) / 2}px`, this.#t.style.width = `${r}px`, this.#t.style.height = `${s}px`;
   }
-  #kt(e, t) {
+  #St(e, t) {
     const i = this.#i;
     this.#r.width = e, this.#r.height = t, this.#u = e, this.#m = t, this.#c = 0, this.#d = null, this.#g(), this.#w(), this.#Ne();
     for (const A of this.#y) i.deleteTexture(A);
@@ -1962,10 +1978,10 @@ class _e extends EventTarget {
         null
       ), this.#y.push(r);
     }
-    this.#se(), this.#ot(), this.#p && this.#St(), (this.#D || this.#p) && this.#lt();
+    this.#se(), this.#ot(), this.#p && this.#Ct(), (this.#D || this.#p) && this.#lt();
   }
   /** Allocate the fixed-size framebuffer used by both cadence passes. */
-  #St() {
+  #Ct() {
     if (this.#N) return;
     const e = this.#i, t = e.createTexture();
     e.bindTexture(e.TEXTURE_2D, t), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), e.texImage2D(
@@ -2015,9 +2031,9 @@ class _e extends EventTarget {
    */
   #lt() {
     const e = this.#i;
-    if (!(this.#T.length === P || this.#u === 0)) {
+    if (!(this.#T.length === L || this.#u === 0)) {
       this.#se();
-      for (let t = 0; t < P; t++) {
+      for (let t = 0; t < L; t++) {
         const i = e.createTexture();
         e.bindTexture(e.TEXTURE_2D, i), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), e.texImage2D(
           e.TEXTURE_2D,
@@ -2045,7 +2061,7 @@ class _e extends EventTarget {
         }
         this.#T.push({ texture: i, framebuffer: A });
       }
-      this.#re = P - 1;
+      this.#re = L - 1;
     }
   }
   #se() {
@@ -2061,22 +2077,22 @@ class _e extends EventTarget {
    * element out of the tree and back within the one task leaves playback
    * alone, which is what makes turning this on mid-stream free.
    */
-  #ii() {
-    if (this.#z) return;
+  #si() {
+    if (this.#Y) return;
     const e = this.#e.parentElement;
     if (!e) return;
     const t = document.createElement("div");
-    t.style.cssText = "position:relative;display:inline-block;line-height:0;max-width:100%", e.insertBefore(t, this.#e), t.appendChild(this.#e), t.appendChild(this.#t), this.#z = t, this.#Ge?.observe(this.#e), this.#Ne();
+    t.style.cssText = "position:relative;display:inline-block;line-height:0;max-width:100%", e.insertBefore(t, this.#e), t.appendChild(this.#e), t.appendChild(this.#t), this.#Y = t, this.#Ge?.observe(this.#e), this.#Ne();
   }
-  #si() {
-    if (this.#l) return;
-    const e = this.#z;
-    this.#z = null, this.#Ge?.disconnect(), this.#t.remove(), e?.parentElement && (e.parentElement.insertBefore(this.#e, e), e.remove());
+  #Ai() {
+    if (this.#n) return;
+    const e = this.#Y;
+    this.#Y = null, this.#Ge?.disconnect(), this.#t.remove(), e?.parentElement && (e.parentElement.insertBefore(this.#e, e), e.remove());
   }
-  #Ct = () => this.#Ne();
+  #Pt = () => this.#Ne();
   /** media event と、その意味を決めたページ側の再生状態を Worker へ転送する。 */
   #ct(e) {
-    return !this.#a || this.#s === "main" ? !1 : (this.#a.postMessage({
+    return !this.#h || this.#s === "main" ? !1 : (this.#h.postMessage({
       type: "event",
       name: e,
       video: this.#st()
@@ -2084,12 +2100,12 @@ class _e extends EventTarget {
   }
   #Lt = () => {
     if (this.#w(), this.#Fe = Number.NaN, this.#ct("emptied")) {
-      this.#L(), this.#F(!1);
+      this.#P(), this.#F(!1);
       return;
     }
-    this.#c = 0, this.#he = 0, this.#A.length = 0, this.#n = 0, this.#Pt(), this.#g(), this.#d = null, this.#F(!1);
+    this.#c = 0, this.#he = 0, this.#A.length = 0, this.#a = 0, this.#Bt(), this.#g(), this.#d = null, this.#F(!1);
   };
-  #Pt() {
+  #Bt() {
     this.#k = {
       filtered: 0,
       missed: 0,
@@ -2097,7 +2113,7 @@ class _e extends EventTarget {
       discontinuities: 0,
       late: 0,
       queueResetted: 0
-    }, this.#H = 0, this.#Be = 0, this.#Ke = 0, this.#O = 0, this.#pe = 0, this.#Ee = 0, this.#we = 0, this.#te = 0, this.#X = 0, this.#g();
+    }, this.#z = 0, this.#Be = 0, this.#Ke = 0, this.#Q = 0, this.#pe = 0, this.#Ee = 0, this.#we = 0, this.#te = 0, this.#X = 0, this.#g();
   }
   /** Return FFmpeg's fieldmatch and decimate windows to their initial state. */
   #g() {
@@ -2106,9 +2122,9 @@ class _e extends EventTarget {
   /**
    * A new seek invalidates any destination frame remembered for the last one.
    */
-  #Bt = () => {
+  #Ut = () => {
     if (this.#w(), this.#ct("seeking")) {
-      this.#L();
+      this.#P();
       return;
     }
     this.#oe = !1;
@@ -2118,9 +2134,9 @@ class _e extends EventTarget {
    * whatever the rate: a still frame stands for a moment, and the moment is
    * the one the first field was taken at.
    */
-  #P = (e) => {
+  #L = (e) => {
     if (this.#w(), (e.type === "pause" || e.type === "ended" || e.type === "seeked" || e.type === "ratechange") && this.#ct(e.type)) {
-      this.#L();
+      this.#P();
       return;
     }
     if (e.type === "seeked") {
@@ -2130,7 +2146,7 @@ class _e extends EventTarget {
       return;
     }
     const t = e.type === "ratechange";
-    if (t && (this.#n = 0, this.#he = this.#e.currentTime), this.#A.length = 0, this.#f && this.#c > 0) {
+    if (t && (this.#a = 0, this.#he = this.#e.currentTime), this.#A.length = 0, this.#f && this.#c > 0) {
       const i = this.#rt(), A = i === null ? void 0 : this.#T[i];
       if (i !== null && A) {
         this.#re = i;
@@ -2141,7 +2157,7 @@ class _e extends EventTarget {
           !0,
           this.#e.currentTime
         );
-        this.#Mt(i, r, this.#n);
+        this.#Mt(i, r, this.#a);
       } else
         this.#Te(!0, !1, null, !0, this.#e.currentTime);
     }
@@ -2152,9 +2168,9 @@ class _e extends EventTarget {
    * them is possible, but a page that has lost its context has bigger
    * problems; getting out of the way leaves the element's own picture showing.
    */
-  #Ut = (e) => {
-    if (e.preventDefault(), this.#l) {
-      this.#l.onFailure("the deinterlacer WebGL context was lost");
+  #_t = (e) => {
+    if (e.preventDefault(), this.#n) {
+      this.#n.onFailure("the deinterlacer WebGL context was lost");
       return;
     }
     this.#s !== "active" && (this.#x = !0, this.stop());
@@ -2205,12 +2221,12 @@ async function Se(c) {
   r.muted = !0, r.defaultMuted = !0, r.playsInline = !0, r.preload = "auto";
   let s = null;
   try {
-    s = Le(r, t);
+    s = Pe(r, t);
     const n = Q(z(r, "loadeddata"), t), a = r.play().then(
       () => !0,
       () => !1
     );
-    if (await s.ready, await n, await Pe(r, t, await a), r.videoWidth === 0 || r.videoHeight === 0)
+    if (await s.ready, await n, await Le(r, t, await a), r.videoWidth === 0 || r.videoHeight === 0)
       return A(new Error("the probe clip decoded to nothing"));
     const f = Be(r);
     return {
@@ -2225,7 +2241,7 @@ async function Se(c) {
   }
 }
 const K = typeof MediaSource > "u" ? globalThis.ManagedMediaSource : MediaSource, Ce = typeof MediaSource > "u";
-function Le(c, e) {
+function Pe(c, e) {
   if (!K || !K.isTypeSupported(ae))
     throw new Error("the probe clip needs Media Source Extensions");
   const t = re.indexOf(","), i = atob(re.slice(t + 1)), A = new Uint8Array(i.length);
@@ -2244,7 +2260,7 @@ function Le(c, e) {
   })();
   return { url: s, ready: n };
 }
-async function Pe(c, e, t) {
+async function Le(c, e, t) {
   if (t) {
     const i = performance.now();
     for (; c.currentTime < ne && performance.now() - i < e; )
