@@ -2707,9 +2707,14 @@ export class Deinterlacer extends EventTarget {
     this.#displayCanvas.style.visibility = effective ? "visible" : "hidden";
   }
 
-  /** presenter に表示を任せている間か。scan 未確定の間は任せる (初期 canvas を隠す)。 */
+  /**
+   * presenter に表示を任せている間か。scan 未確定の間は任せる (初期 canvas を隠す)。
+   * Worker 内では presenter callback が渡らないため、presenter 指定時に必ず立つ
+   * bypassDisplayQueue を併せて見る。
+   */
   get #presenterOwnsDisplay(): boolean {
-    return this.#presenter !== null && this.#scan?.interlaced !== false;
+    const externalSink = this.#presenter !== null || this.#bypassDisplayQueue;
+    return externalSink && this.#scan?.interlaced !== false;
   }
 
   #showTexture(
