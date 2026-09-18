@@ -11,7 +11,8 @@
  * The filter is supplied by the separate @mpeg2toh264/yadif package because it
  * is derived from FFmpeg and licensed differently. Everything here
  * is the machinery around it: three frames' worth of textures, a program, and
- * `requestVideoFrameCallback` to say when a frame is worth uploading.
+ * frame callbacks (Firefox's moz counters, native rVFC elsewhere) to say when
+ * a frame is worth uploading.
  *
  * Frames are filtered one behind the element. yadif wants the frame either
  * side of the one it is working on, and the only way to hold the next one is
@@ -38,6 +39,11 @@ import {
 } from "./film-shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
 import { createProgram, VERTEX_SHADER } from "./utils.js";
+import {
+  VideoFrames,
+  supportsVideoFrames,
+  type FrameMetadata,
+} from "./video-frame.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
@@ -144,9 +150,10 @@ export interface DeinterlaceStats {
   filtered: number;
   /**
    * Frames the element presented that the filter never saw, counted from the
-   * gaps in `presentedFrames`. The neighbours of the frames either side of a
-   * gap are further apart in time than the filter believes, so its idea of
-   * what moved is wrong. A page that sees this climbing is asking the filter
+   * gaps in `presentedFrames` (`mozPaintedFrames` on Firefox). The neighbours
+   * of the frames either side of a gap are further apart in time than the
+   * filter believes, so its idea of what moved is wrong. A page that sees
+   * this climbing is asking the filter
    * to keep up with more than it can.
    */
   missed: number;
@@ -267,11 +274,7 @@ export interface VideoState {
 
 /** Whether this browser has the two things the deinterlacer is built on. */
 export function supportsDeinterlace(): boolean {
-  return (
-    typeof HTMLVideoElement !== "undefined" &&
-    "requestVideoFrameCallback" in HTMLVideoElement.prototype &&
-    typeof WebGL2RenderingContext !== "undefined"
-  );
+  return supportsVideoFrames() && typeof WebGL2RenderingContext !== "undefined";
 }
 
 type RenderTarget = {
@@ -306,6 +309,7 @@ export class Deinterlacer {
   readonly canvas: HTMLCanvasElement;
 
   readonly #video: HTMLVideoElement;
+  readonly #videoFrames: VideoFrames;
   readonly #gl: WebGL2RenderingContext;
   /** The pulldown detection, which keeps its measurements on the GPU. */
   readonly #detector: FilmDetector;
@@ -355,7 +359,6 @@ export class Deinterlacer {
   /** How many of the held frames are consecutive, up to HISTORY. */
   #frames = 0;
   #lastMediaTime = 0;
-  #handle: number | null = null;
   #running = false;
   #enabled = false;
   #scan: Scan | null = null;
@@ -444,6 +447,7 @@ export class Deinterlacer {
     // the picture sits inside the element is arithmetic the browser does not
     // hand out. Anything that moves the element has to move it too.
     this.#resizes = new ResizeObserver(() => this.#layout());
+    this.#videoFrames = new VideoFrames(video);
     // A frame the filter has not seen the neighbours of is not worth holding:
     // whatever is next will have been somewhere else entirely.
     video.addEventListener("emptied", this.#onEmptied);
@@ -581,9 +585,7 @@ export class Deinterlacer {
   stop(): void {
     if (!this.#running) return;
     this.#running = false;
-    if (this.#handle !== null)
-      this.#video.cancelVideoFrameCallback(this.#handle);
-    this.#handle = null;
+    this.#videoFrames.cancel();
     this.#stopLoop();
     this.#frames = 0;
     this.canvas.style.visibility = "hidden";
@@ -591,6 +593,7 @@ export class Deinterlacer {
 
   destroy(): void {
     this.stop();
+    this.#videoFrames.destroy();
     this.canvas.removeEventListener("webglcontextlost", this.#onContextLost);
     this.#video.removeEventListener("emptied", this.#onEmptied);
     this.#video.removeEventListener("resize", this.#onResize);
@@ -621,8 +624,8 @@ export class Deinterlacer {
   }
 
   #request(): void {
-    if (!this.#running || this.#handle !== null) return;
-    this.#handle = this.#video.requestVideoFrameCallback(this.#onFrame);
+    if (!this.#running) return;
+    this.#videoFrames.request(this.#onFrame);
   }
 
   #drawText(text: string, x: number, y: number): void {
@@ -734,11 +737,7 @@ export class Deinterlacer {
     );
   }
 
-  #onFrame = (
-    now: DOMHighResTimeStamp,
-    metadata: VideoFrameCallbackMetadata,
-  ): void => {
-    this.#handle = null;
+  #onFrame = (now: DOMHighResTimeStamp, metadata: FrameMetadata): void => {
     if (!this.#running || this.#lost) return;
     this.#selectVideoState(metadata.mediaTime);
     if (metadata.width > 0 && metadata.height > 0) {
@@ -757,7 +756,9 @@ export class Deinterlacer {
       // the neighbours are then further apart than they should be, which is
       // worth less than filtering nothing at all.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
-      const stale = elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
+      const stale = metadata.mozTiming
+        ? metadata.mozTiming.discontinuity
+        : elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
       if (stale) {
         this.#frames = 0;
         this.#stats.discontinuities++;
@@ -775,11 +776,16 @@ export class Deinterlacer {
       // Filtering it again would spend a frame's work on a canvas that
       // already holds the answer, and taking it into the ring would leave the
       // filter holding one moment twice over and calling it motion.
-      if (this.#frames > 0 && metadata.mediaTime === this.#lastMediaTime) {
+      if (
+        !metadata.mozTiming &&
+        this.#frames > 0 &&
+        metadata.mediaTime === this.#lastMediaTime
+      ) {
         this.#request();
         return;
       }
-      if (!stale && elapsed > 0) this.#measure(elapsed);
+      if (metadata.mozTiming) this.#periodMs = metadata.mozTiming.periodMs;
+      else if (!stale && elapsed > 0) this.#measure(elapsed);
       this.#lastMediaTime = metadata.mediaTime;
       const at = performance.now();
       // Frames stopped arriving for a while -- a pause, a stall, a tab in the
@@ -821,7 +827,7 @@ export class Deinterlacer {
         if (this.#debug)
           this.#debugText = this.#describePhase(metadata.presentedFrames);
       }
-      if (this.#scheduling()) {
+      if (this.#scheduling() && !this.#video.paused && !this.#video.ended) {
         if (this.#queue.length >= FIELD_QUEUE_LENGTH) {
           this.#queue.length = 0;
           this.#lastScheduled = null;
@@ -857,7 +863,7 @@ export class Deinterlacer {
           this.#filter("frame", 0, false, at, duration);
         }
       } else {
-        this.#render(false, false, null);
+        this.#render(this.#video.paused || this.#video.ended, false, null);
       }
       this.#endGpuTimer(q);
       this.#renderMsSinceReport += performance.now() - begin;
