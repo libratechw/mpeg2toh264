@@ -97,6 +97,11 @@ export type WorkerNotification = {
 } | {
     type: "visibility";
     visible: boolean;
+}
+/** presenter が現在の映像の表示を所有しているかの変化。 */
+ | {
+    type: "presenterOwnsDisplay";
+    owns: boolean;
 } | {
     type: "stats";
     stats: Omit<DeinterlaceStats, "dropped">;

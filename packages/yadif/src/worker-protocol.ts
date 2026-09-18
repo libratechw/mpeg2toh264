@@ -91,6 +91,8 @@ export type WorkerNotification =
   | { type: "failed"; message: string }
   | { type: "consumed"; id: number }
   | { type: "visibility"; visible: boolean }
+  /** presenter が現在の映像の表示を所有しているかの変化。 */
+  | { type: "presenterOwnsDisplay"; owns: boolean }
   | { type: "stats"; stats: Omit<DeinterlaceStats, "dropped"> }
   | { type: "capture"; id: number; image: ImageBitmap | null }
   /**

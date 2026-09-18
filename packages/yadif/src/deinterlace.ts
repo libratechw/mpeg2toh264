@@ -534,6 +534,11 @@ interface ExternalRenderingHost {
   canvas: OffscreenCanvas;
   onFailure(message: string): void;
   onVisibility(visible: boolean): void;
+  /**
+   * presenter が現在の映像の表示を所有しているかをページ側へ伝える。Worker エンジン
+   * から一意に決まり、ページ側の監視・capture・crop が同じ判断を共有する。
+   */
+  onPresenterOwnsDisplay?(owns: boolean): void;
   requestAnimationFrame(callback: FrameRequestCallback): number;
   cancelAnimationFrame(handle: number): void;
 }
@@ -673,6 +678,9 @@ export class Deinterlacer extends EventTarget {
   readonly #presenter:
     ((frame: VideoFrame, meta: PresenterFrameMeta) => void) | null;
   #presenterFailures = 0;
+  /** Worker から通知された表示所有のミラー。ページ側 getter が参照する。 */
+  #presenterOwnsDisplayMirror = false;
+  #lastReportedPresenterOwns = false;
   readonly #onQueuedMeta:
     ((meta: QueuedPictureMeta) => void) | undefined;
   readonly #queuedFrameSink: WritableStream<VideoFrame> | null;
@@ -1445,6 +1453,9 @@ export class Deinterlacer extends EventTarget {
     }
 
     const generation = ++this.#workerGeneration;
+    // Worker 交代では前世代の表示所有を持ち越さない。
+    this.#presenterOwnsDisplayMirror = false;
+    this.#lastReportedPresenterOwns = false;
     // Worker 交代で古い世代の診断画素を捨てる。
     this.#invalidateDiagnostic();
     this.#workerState = "starting";
@@ -1527,6 +1538,10 @@ export class Deinterlacer extends EventTarget {
           ? "visible"
           : "hidden";
         break;
+      case "presenterOwnsDisplay":
+        // presenter が現在の映像を表示しているか。ページ側の getter が参照する。
+        this.#presenterOwnsDisplayMirror = notification.owns;
+        break;
       case "diagnostic": {
         // Worker 描画エンジンの選択/queue 出力記録を Worker 側通番のまま渡す。
         // 交代・失敗後に届いた迷子は捨てる（onmessage の世代 guard と二重化）。
@@ -1571,7 +1586,8 @@ export class Deinterlacer extends EventTarget {
           notification.frame.close();
           break;
         }
-        this.#hideForPresenter();
+    this.#hideForPresenter();
+    this.#reportPresenterOwnsDisplay();
         try {
           callback(notification.frame, notification.meta);
         } catch {
@@ -2704,9 +2720,11 @@ export class Deinterlacer extends EventTarget {
     const effective = this.#presenterOwnsDisplay ? false : visible;
     if (this.#externalHost) {
       this.#externalHost.onVisibility(effective);
+      this.#reportPresenterOwnsDisplay();
       return;
     }
     this.#displayCanvas.style.visibility = effective ? "visible" : "hidden";
+    this.#reportPresenterOwnsDisplay();
   }
 
   /**
@@ -2717,8 +2735,26 @@ export class Deinterlacer extends EventTarget {
    * presenter 指定時に必ず立つ bypassDisplayQueue を併せて見る。
    */
   get #presenterOwnsDisplay(): boolean {
+    return this.#computePresenterOwnsDisplay();
+  }
+
+  /** presenter が現在の映像の表示を所有しているか。Worker では通知値をそのまま返す。 */
+  get presenterOwnsDisplay(): boolean {
+    if (this.#worker !== null) return this.#presenterOwnsDisplayMirror;
+    return this.#computePresenterOwnsDisplay();
+  }
+
+  #computePresenterOwnsDisplay(): boolean {
     const externalSink = this.#presenter !== null || this.#bypassDisplayQueue;
     return externalSink && this.#scan?.interlaced !== false && this.#scheduling();
+  }
+
+  /** 表示所有の変化をページ側へ通知する。変化が無ければ何もしない。 */
+  #reportPresenterOwnsDisplay(): void {
+    const owns = this.#computePresenterOwnsDisplay();
+    if (owns === this.#lastReportedPresenterOwns) return;
+    this.#lastReportedPresenterOwns = owns;
+    this.#externalHost?.onPresenterOwnsDisplay?.(owns);
   }
 
   /**
@@ -3329,6 +3365,7 @@ export function createWorkerDeinterlacer(
   options: DeinterlacerOptions,
   onFailure: (message: string) => void,
   onVisibility: (visible: boolean) => void,
+  onPresenterOwnsDisplay: (owns: boolean) => void,
   requestAnimationFrame: (callback: FrameRequestCallback) => number,
   cancelAnimationFrame: (handle: number) => void,
 ): Deinterlacer {
@@ -3336,6 +3373,7 @@ export function createWorkerDeinterlacer(
     canvas,
     onFailure,
     onVisibility,
+    onPresenterOwnsDisplay,
     requestAnimationFrame,
     cancelAnimationFrame,
   });

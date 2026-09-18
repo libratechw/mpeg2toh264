@@ -240,6 +240,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
           if (!destroying) post({ type: "failed", message });
         },
         (visible) => post({ type: "visibility", visible }),
+        (owns) => post({ type: "presenterOwnsDisplay", owns }),
         requestWorkerAnimationFrame,
         cancelWorkerAnimationFrame,
       );

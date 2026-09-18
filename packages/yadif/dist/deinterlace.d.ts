@@ -368,5 +368,7 @@ export declare class Deinterlacer extends EventTarget {
     addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void;
     removeEventListener<K extends keyof DeinterlacerEventMap>(type: K, listener: (event: DeinterlacerEventMap[K]) => void, options?: boolean | EventListenerOptions): void;
     removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions): void;
+    /** presenter が現在の映像の表示を所有しているか。Worker では通知値をそのまま返す。 */
+    get presenterOwnsDisplay(): boolean;
 }
 //# sourceMappingURL=deinterlace.d.ts.map
