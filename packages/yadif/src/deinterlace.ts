@@ -37,6 +37,7 @@ import {
   FILM_LOCK_FRAMES,
 } from "./film-shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
+import { loopWindowFor } from "./runtime.js";
 import { createProgram, VERTEX_SHADER } from "./utils.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
@@ -329,6 +330,12 @@ export class Deinterlacer {
   #lastScheduled: Ready | null = null;
   /** The rAF loop that puts them up, which is all that draws on the canvas. */
   #loopHandle: number | null = null;
+  /**
+   * The window the loop is registered with. The rAF grid and the frame
+   * callback moments are only comparable within one window, so the loop
+   * follows the canvas when it moves to another document. See loopWindowFor.
+   */
+  #loopWindow: Window = window;
   /** When the loop last ran, and the refresh grid fitted to it. See #measureRefresh. */
   #loopAt = 0;
   #refreshMs = DEFAULT_REFRESH_MS;
@@ -1017,12 +1024,15 @@ export class Deinterlacer {
   #startLoop(): void {
     if (this.#loopHandle !== null) return;
     if (!this.#running || this.#lost || !this.#scheduled) return;
-    this.#loopHandle = requestAnimationFrame(this.#onLoop);
+    this.#loopWindow = loopWindowFor(this.canvas);
+    this.#loopHandle = this.#loopWindow.requestAnimationFrame(this.#onLoop);
   }
 
   #stopLoop(): void {
-    if (this.#loopHandle !== null) cancelAnimationFrame(this.#loopHandle);
+    if (this.#loopHandle !== null)
+      this.#loopWindow.cancelAnimationFrame(this.#loopHandle);
     this.#loopHandle = null;
+    this.#loopWindow = window;
     this.#queue.length = 0;
     this.#lastScheduled = null;
   }
@@ -1030,9 +1040,12 @@ export class Deinterlacer {
   #onLoop = (now: DOMHighResTimeStamp): void => {
     this.#loopHandle = null;
     if (!this.#running || this.#lost || !this.#scheduled) return;
+    // Follow the canvas if it moved to another document, so the rAF grid, the
+    // scheduled moments and the picture all stay on one window's clock.
+    this.#loopWindow = loopWindowFor(this.canvas);
     this.#measureRefresh(now);
     this.#present(this.#gridAt, now);
-    this.#loopHandle = requestAnimationFrame(this.#onLoop);
+    this.#loopHandle = this.#loopWindow.requestAnimationFrame(this.#onLoop);
   };
 
   /**
