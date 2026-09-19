@@ -11,7 +11,8 @@
  * The filter is supplied by the separate @mpeg2toh264/yadif package because it
  * is derived from FFmpeg and licensed differently. Everything here
  * is the machinery around it: three frames' worth of textures, a program, and
- * `requestVideoFrameCallback()` to say when a frame is worth uploading.
+ * frame callbacks (Firefox's moz counters, native rVFC elsewhere) to say when
+ * a frame is worth uploading.
  *
  * Frames are filtered one behind the element. yadif wants the frame either
  * side of the one it is working on, and the only way to hold the next one is
@@ -30,6 +31,11 @@ import {
   YADIF_UNIFORMS,
 } from "./shader.js";
 import { FFmpegIVTC } from "./ivtc.js";
+import {
+  VideoFrames,
+  supportsVideoFrames,
+  type FrameMetadata,
+} from "./video-frame.js";
 import type {
   WorkerCommand,
   WorkerNotification,
@@ -275,9 +281,7 @@ export interface DeinterlacerEventMap {
 /** Whether this browser has the two things the deinterlacer is built on. */
 export function supportsDeinterlace(): boolean {
   return (
-    typeof HTMLVideoElement !== "undefined" &&
-    "requestVideoFrameCallback" in HTMLVideoElement.prototype &&
-    typeof WebGL2RenderingContext !== "undefined"
+    supportsVideoFrames() && typeof WebGL2RenderingContext !== "undefined"
   );
 }
 
@@ -402,8 +406,8 @@ export class Deinterlacer extends EventTarget {
   #lastIngestedMediaTime = Number.NaN;
   /** A destination frame that arrived before the browser finished seeking. */
   #seekFrameReady = false;
-  #handle: number | null = null;
-  /** requestVideoFrameCallback() の停止を検出するために保持する最終通知時刻。 */
+  readonly #videoFrames: VideoFrames;
+  /** 最終通知時刻。rVFC と Firefox カウンターのどちらの取得経路でも更新する。 */
   #lastVideoFrameCallbackAt = 0;
   /** どちらの取得経路からも参照するブラウザの復号フレーム数。 */
   #lastObservedVideoFrames = 0;
@@ -525,6 +529,7 @@ export class Deinterlacer extends EventTarget {
     this.#resizes = externalHost
       ? null
       : new ResizeObserver(() => this.#layout());
+    this.#videoFrames = new VideoFrames(video);
     // A frame the filter has not seen the neighbours of is not worth holding:
     // whatever is next will have been somewhere else entirely.
     video.addEventListener("emptied", this.#onEmptied);
@@ -953,9 +958,7 @@ export class Deinterlacer extends EventTarget {
   stop(): void {
     if (!this.#running) return;
     this.#running = false;
-    if (this.#handle !== null)
-      this.#video.cancelVideoFrameCallback(this.#handle);
-    this.#handle = null;
+    this.#videoFrames.cancel();
     this.#stopFrameWatchdog();
     this.#stopLoop();
     this.#frames = 0;
@@ -973,6 +976,7 @@ export class Deinterlacer extends EventTarget {
     this.#destroyed = true;
     this.#enabled = false;
     this.stop();
+    this.#videoFrames.destroy();
     this.#worker?.postMessage({ type: "destroy" } satisfies WorkerCommand);
     this.#worker?.terminate();
     this.#worker = null;
@@ -1093,8 +1097,8 @@ export class Deinterlacer extends EventTarget {
   }
 
   #request(): void {
-    if (this.#externalHost || !this.#running || this.#handle !== null) return;
-    this.#handle = this.#video.requestVideoFrameCallback(this.#onFrame);
+    if (this.#externalHost || !this.#running) return;
+    this.#videoFrames.request(this.#onFrame);
   }
 
   /** seek と表示周期の判断に必要な DOM 側の再生状態を複製する。 */
@@ -1189,9 +1193,8 @@ export class Deinterlacer extends EventTarget {
 
   #onFrame = (
     now: DOMHighResTimeStamp,
-    metadata: VideoFrameCallbackMetadata,
+    metadata: FrameMetadata,
   ): void => {
-    this.#handle = null;
     if (!this.#running || this.#lost) return;
     this.#lastVideoFrameCallbackAt = now;
     this.#lastObservedVideoFrames = Math.max(

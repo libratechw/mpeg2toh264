@@ -1040,7 +1040,9 @@ document.addEventListener("keydown", (event) => {
 function applyDeinterlace() {
   if (!player) return;
   player.deinterlace = deinterlace.checked;
-  if (yadif) yadif.doubleRate = doubleRate.checked;
+  if (yadif) {
+    yadif.doubleRate = doubleRate.checked;
+  }
   syncControls();
 }
 

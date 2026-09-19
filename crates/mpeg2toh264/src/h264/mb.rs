@@ -16,14 +16,41 @@ use crate::h264::bitwriter::BitWriter;
 use crate::h264::cavlc::{write_masked_levels, write_residual_levels};
 use crate::h264::cavlc_tables::{CBP_TO_CODE_NUM_INTER, CBP_TO_CODE_NUM_INTRA};
 use crate::h264::chroma::ChromaBlockLevels;
+use crate::h264::mbaff::Frame;
 use crate::h264::params::ZIGZAG_8X8;
 
 /// H.264 Table 8-14: 8x8 field scan for field-coded macroblocks.
-pub static FIELD_SCAN_8X8: [usize; 64] = [
+pub const FIELD_SCAN_8X8: [usize; 64] = [
     0, 8, 16, 1, 9, 24, 32, 17, 2, 25, 40, 48, 56, 33, 10, 3, 18, 41, 49, 57, 26, 11, 4, 19, 34,
     42, 50, 58, 27, 12, 5, 20, 35, 43, 51, 59, 28, 13, 6, 21, 36, 44, 52, 60, 29, 14, 22, 37, 45,
     53, 61, 30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
 ];
+
+/// Where each raster position lands in [`FIELD_SCAN_8X8`], for a quantiser
+/// that writes only the positions it has something to put in.
+pub const INVERSE_FIELD_SCAN_8X8: [u8; 64] = inverse_scan(&FIELD_SCAN_8X8);
+
+/// The same for [`ZIGZAG_8X8`].
+pub const INVERSE_ZIGZAG_8X8: [u8; 64] = inverse_scan(&ZIGZAG_8X8);
+
+const fn inverse_scan(scan: &[usize; 64]) -> [u8; 64] {
+    let mut inverse = [0u8; 64];
+    let mut k = 0;
+    while k < 64 {
+        inverse[scan[k]] = k as u8;
+        k += 1;
+    }
+    inverse
+}
+
+/// Bit `k` set where `levels[k]` is non-zero, for levels made the dense way.
+pub fn level_mask(levels: &[i32; 64]) -> u64 {
+    let mut mask = 0u64;
+    for (k, &level) in levels.iter().enumerate() {
+        mask |= u64::from(level != 0) << k;
+    }
+    mask
+}
 
 /// B slice macroblock types for a single 16x16 partition (Table 7-14).
 ///
@@ -112,21 +139,23 @@ static LUMA_4X4_XY: [(usize, usize); 16] = [
     (3, 3),
 ];
 
-/// TotalCoeff of every 4x4 luma block in the picture, which neighbouring blocks
-/// need to derive their nC (clause 9.2.1). -1 marks a block outside the picture.
+/// TotalCoeff of every 4x4 block of one component, which neighbouring blocks
+/// need to derive their nC (clause 9.2.1). -1 marks a block that is not there.
+///
+/// Blocks are held per macroblock rather than by position, because which
+/// macroblock holds the block above another is [`Frame`]'s answer once a
+/// picture mixes frame and field pairs.
 pub struct CoeffCountMap {
     counts: Vec<i16>,
-    pub blk_w: usize,
-    pub blk_h: usize,
+    /// 4x4 blocks across a macroblock: four for luma, two for chroma.
+    across: usize,
 }
 
 impl CoeffCountMap {
-    /// Dimensions are in 4x4 blocks, which differ between luma and chroma.
-    pub fn new(blk_w: usize, blk_h: usize) -> Self {
+    pub fn new(macroblocks: usize, across: usize) -> Self {
         Self {
-            counts: vec![-1; blk_w * blk_h],
-            blk_w,
-            blk_h,
+            counts: vec![-1; macroblocks * across * across],
+            across,
         }
     }
 
@@ -134,22 +163,68 @@ impl CoeffCountMap {
         self.counts.fill(-1);
     }
 
-    pub fn set(&mut self, bx: usize, by: usize, total: usize) {
-        self.counts[by * self.blk_w + bx] = total as i16;
+    pub fn set(&mut self, address: usize, bx: usize, by: usize, total: usize) {
+        let across = self.across;
+        self.counts[address * across * across + by * across + bx] = total as i16;
+    }
+
+    /// The count of the block holding a sample location, or -1 where there is
+    /// no such block.
+    fn at(&self, frame: &Frame, address: usize, x: i32, y: i32) -> i32 {
+        let size = self.across as i32 * 4;
+        let Some(found) = frame.neighbour(address, x, y, size, size) else {
+            return -1;
+        };
+        let across = self.across;
+        self.counts[found.address * across * across + (found.y / 4) * across + found.x / 4] as i32
+    }
+
+    /// The count of one of the current macroblock's own blocks.
+    #[inline]
+    fn own(&self, address: usize, bx: usize, by: usize) -> i32 {
+        let across = self.across;
+        self.counts[address * across * across + by * across + bx] as i32
+    }
+
+    /// What the blocks along the macroblock's left and upper edges see across
+    /// them, worked out once: every other block's neighbours are inside the
+    /// macroblock, where no derivation is needed at all.
+    ///
+    /// The blocks above all lie in one macroblock, on one row of it, so that
+    /// side is a single question; the left side is asked row by row, because
+    /// a field pair beside a frame macroblock answers it differently for even
+    /// and odd lines.
+    pub fn edges(&self, frame: &Frame, address: usize) -> EdgeCounts {
+        let across = self.across;
+        let size = across as i32 * 4;
+        let mut edges = EdgeCounts {
+            left: [-1; 4],
+            above: [-1; 4],
+        };
+        for (by, left) in edges.left.iter_mut().enumerate().take(across) {
+            *left = self.at(frame, address, -1, by as i32 * 4);
+        }
+        if let Some(found) = frame.neighbour(address, 0, -1, size, size) {
+            for (bx, above) in edges.above.iter_mut().enumerate().take(across) {
+                *above = self.own(found.address, bx, found.y / 4);
+            }
+        }
+        edges
     }
 
     /// nC from the left and upper neighbours. A block that was coded but carries
     /// no coefficients counts as 0, which is different from being unavailable.
-    pub fn n_c(&self, bx: usize, by: usize) -> i32 {
+    #[inline]
+    pub fn n_c(&self, edges: &EdgeCounts, address: usize, bx: usize, by: usize) -> i32 {
         let a = if bx > 0 {
-            self.counts[by * self.blk_w + bx - 1] as i32
+            self.own(address, bx - 1, by)
         } else {
-            -1
+            edges.left[by]
         };
         let b = if by > 0 {
-            self.counts[(by - 1) * self.blk_w + bx] as i32
+            self.own(address, bx, by - 1)
         } else {
-            -1
+            edges.above[bx]
         };
         if a >= 0 && b >= 0 {
             return (a + b + 1) >> 1;
@@ -164,6 +239,13 @@ impl CoeffCountMap {
     }
 }
 
+/// The counts just outside a macroblock, indexed by the row (left) or column
+/// (above) of the edge block asking. -1 where there is no block there.
+pub struct EdgeCounts {
+    left: [i32; 4],
+    above: [i32; 4],
+}
+
 /// Coefficient counts for the chroma 4x4 blocks, one map per component.
 pub struct ChromaCounts {
     pub cb: CoeffCountMap,
@@ -174,8 +256,8 @@ impl ChromaCounts {
     /// 4:2:0 chroma is a 2x2 grid of 4x4 blocks per macroblock.
     pub fn new(mb_width: usize, mb_height: usize) -> Self {
         Self {
-            cb: CoeffCountMap::new(mb_width * 2, mb_height * 2),
-            cr: CoeffCountMap::new(mb_width * 2, mb_height * 2),
+            cb: CoeffCountMap::new(mb_width * mb_height, 2),
+            cr: CoeffCountMap::new(mb_width * mb_height, 2),
         }
     }
 
@@ -187,14 +269,13 @@ impl ChromaCounts {
 
 /// Luma is a 4x4 grid of 4x4 blocks per macroblock.
 pub fn make_luma_counts(mb_width: usize, mb_height: usize) -> CoeffCountMap {
-    CoeffCountMap::new(mb_width * 4, mb_height * 4)
+    CoeffCountMap::new(mb_width * mb_height, 4)
 }
 
 #[derive(Clone, Debug)]
 pub struct InterMacroblock {
-    /// Macroblock position in the picture.
-    pub mb_x: usize,
-    pub mb_y: usize,
+    /// Where the macroblock is, in decoding order.
+    pub address: usize,
     /// `P_L0_16x16` syntax instead of a B-slice macroblock type.
     pub p_slice: bool,
     /// One of [`b_mb_type`], or a 16x8 type from [`b16x8_mb_type`].
@@ -222,14 +303,19 @@ pub struct InterMacroblock {
 /// macroblock's own QP only if it actually carried a `mb_qp_delta`.
 ///
 /// `luma` holds the four 8x8 blocks of coefficient levels in 8x8 zig-zag scan
-/// order, or `None` where a block has no coefficients at all; `chroma` is `None`
-/// to leave chroma at the prediction.
+/// order, or `None` where a block has no coefficients at all, and `luma_masks`
+/// says which positions of each are non-zero -- nothing else in a block is
+/// read, so the rest need not have been written; `chroma` is `None` to leave
+/// chroma at the prediction.
+#[allow(clippy::too_many_arguments)]
 pub fn write_inter_macroblock(
     w: &mut BitWriter,
     counts: &mut CoeffCountMap,
     chroma_counts: &mut ChromaCounts,
+    frame: &Frame,
     mb: &InterMacroblock,
     luma: &[Option<&[i32; 64]>; 4],
+    luma_masks: &[u64; 4],
     chroma: Option<&[ChromaBlockLevels; 2]>,
 ) -> Result<i32> {
     // P_L0_16x16 is mb_type 0 (Table 7-13). B slices use Table 7-14 below.
@@ -304,14 +390,14 @@ pub fn write_inter_macroblock(
         w.se(wrap_qp_delta(mb.qp - mb.prev_qp));
         qp_after = mb.qp;
         if cbp_luma > 0 {
-            write_luma_residual_8x8(w, counts, mb.mb_x, mb.mb_y, luma, cbp_luma)?;
+            write_luma_residual_8x8(w, counts, frame, mb.address, luma, luma_masks, cbp_luma)?;
         } else {
-            mark_no_coefficients(counts, mb.mb_x, mb.mb_y);
+            mark_no_coefficients(counts, mb.address);
         }
-        write_chroma_residual(w, chroma_counts, mb.mb_x, mb.mb_y, chroma, cbp_chroma)?;
+        write_chroma_residual(w, chroma_counts, frame, mb.address, chroma, cbp_chroma)?;
     } else {
-        mark_no_coefficients(counts, mb.mb_x, mb.mb_y);
-        mark_no_chroma_coefficients(chroma_counts, mb.mb_x, mb.mb_y);
+        mark_no_coefficients(counts, mb.address);
+        mark_no_chroma_coefficients(chroma_counts, mb.address);
     }
     Ok(qp_after)
 }
@@ -331,11 +417,12 @@ pub fn write_intra_macroblock(
     w: &mut BitWriter,
     counts: &mut CoeffCountMap,
     chroma_counts: &mut ChromaCounts,
-    mb_x: usize,
-    mb_y: usize,
+    frame: &Frame,
+    address: usize,
     qp: i32,
     prev_qp: i32,
     luma: &[Option<&[i32; 64]>; 4],
+    luma_masks: &[u64; 4],
     chroma: Option<&[ChromaBlockLevels; 2]>,
 ) -> Result<IntraMacroblock> {
     w.ue(0); // mb_type: I_NxN
@@ -369,14 +456,14 @@ pub fn write_intra_macroblock(
         w.se(wrap_qp_delta(qp - prev_qp));
         qp_after = qp;
         if cbp_luma > 0 {
-            write_luma_residual_8x8(w, counts, mb_x, mb_y, luma, cbp_luma)?;
+            write_luma_residual_8x8(w, counts, frame, address, luma, luma_masks, cbp_luma)?;
         } else {
-            mark_no_coefficients(counts, mb_x, mb_y);
+            mark_no_coefficients(counts, address);
         }
-        write_chroma_residual(w, chroma_counts, mb_x, mb_y, chroma, cbp_chroma)?;
+        write_chroma_residual(w, chroma_counts, frame, address, chroma, cbp_chroma)?;
     } else {
-        mark_no_coefficients(counts, mb_x, mb_y);
-        mark_no_chroma_coefficients(chroma_counts, mb_x, mb_y);
+        mark_no_coefficients(counts, address);
+        mark_no_chroma_coefficients(chroma_counts, address);
     }
     Ok(IntraMacroblock {
         qp: qp_after,
@@ -402,18 +489,18 @@ pub struct IntraMacroblock {
 fn write_chroma_residual(
     w: &mut BitWriter,
     counts: &mut ChromaCounts,
-    mb_x: usize,
-    mb_y: usize,
+    frame: &Frame,
+    address: usize,
     chroma: Option<&[ChromaBlockLevels; 2]>,
     cbp_chroma: u32,
 ) -> Result<()> {
     let (Some(chroma), true) = (chroma, cbp_chroma != 0) else {
-        mark_no_chroma_coefficients(counts, mb_x, mb_y);
+        mark_no_chroma_coefficients(counts, address);
         return Ok(());
     };
 
     for component in chroma {
-        write_residual_levels(w, &component.dc, 4, -1)?;
+        write_residual_levels(w, &component.dc, -1)?;
     }
 
     for c in 0..2 {
@@ -422,38 +509,38 @@ fn write_chroma_residual(
         } else {
             &mut counts.cr
         };
-        for b in 0..4 {
-            let bx = mb_x * 2 + (b & 1);
-            let by = mb_y * 2 + (b >> 1);
-            if cbp_chroma != 2 {
-                map.set(bx, by, 0);
-                continue;
+        if cbp_chroma != 2 {
+            for b in 0..4 {
+                map.set(address, b & 1, b >> 1, 0);
             }
-            let total = write_residual_levels(w, &chroma[c].ac[b], 15, map.n_c(bx, by))?;
-            map.set(bx, by, total);
+            continue;
+        }
+        let edges = map.edges(frame, address);
+        for b in 0..4 {
+            let (bx, by) = (b & 1, b >> 1);
+            let total =
+                write_residual_levels(w, &chroma[c].ac[b], map.n_c(&edges, address, bx, by))?;
+            map.set(address, bx, by, total);
         }
     }
     Ok(())
 }
 
-pub fn mark_no_chroma_coefficients(counts: &mut ChromaCounts, mb_x: usize, mb_y: usize) {
+pub fn mark_no_chroma_coefficients(counts: &mut ChromaCounts, address: usize) {
     for b in 0..4 {
-        let bx = mb_x * 2 + (b & 1);
-        let by = mb_y * 2 + (b >> 1);
-        counts.cb.set(bx, by, 0);
-        counts.cr.set(bx, by, 0);
+        let (bx, by) = (b & 1, b >> 1);
+        counts.cb.set(address, bx, by, 0);
+        counts.cr.set(address, bx, by, 0);
     }
 }
 
 /// Record that a macroblock carries no coefficients, so its blocks contribute
 /// nC 0 to their neighbours. Applies to skipped macroblocks and to coded ones
 /// whose `coded_block_pattern` is zero.
-pub fn mark_no_coefficients(counts: &mut CoeffCountMap, mb_x: usize, mb_y: usize) {
-    let bx = mb_x * 4;
-    let by = mb_y * 4;
+pub fn mark_no_coefficients(counts: &mut CoeffCountMap, address: usize) {
     for y in 0..4 {
         for x in 0..4 {
-            counts.set(bx + x, by + y, 0);
+            counts.set(address, x, y, 0);
         }
     }
 }
@@ -473,33 +560,39 @@ pub fn wrap_qp_delta(delta: i32) -> i32 {
 fn write_luma_residual_8x8(
     w: &mut BitWriter,
     counts: &mut CoeffCountMap,
-    mb_x: usize,
-    mb_y: usize,
+    frame: &Frame,
+    address: usize,
     luma: &[Option<&[i32; 64]>; 4],
+    luma_masks: &[u64; 4],
     cbp_luma: u32,
 ) -> Result<()> {
     let mut sub = [0i32; 16];
+    let edges = counts.edges(frame, address);
     for i8x8 in 0..4 {
         let block = luma[i8x8];
         for i4x4 in 0..4 {
             let blk_idx = i8x8 * 4 + i4x4;
-            let (x, y) = LUMA_4X4_XY[blk_idx];
-            let bx = mb_x * 4 + x;
-            let by = mb_y * 4 + y;
+            let (bx, by) = LUMA_4X4_XY[blk_idx];
 
             let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, block) else {
-                counts.set(bx, by, 0);
+                counts.set(address, bx, by, 0);
                 continue;
             };
 
+            // The non-zero levels among every fourth position from `i4x4`.
+            // Only those are gathered, and only those are read back: the
+            // writer takes the same mask.
+            let mut rest = luma_masks[i8x8] & (0x1111_1111_1111_1111u64 << i4x4);
             let mut mask = 0u32;
-            for i in 0..16 {
-                let level = block[4 * i + i4x4];
-                sub[i] = level;
-                mask |= u32::from(level != 0) << i;
+            while rest != 0 {
+                let position = rest.trailing_zeros() as usize & 63;
+                rest &= rest - 1;
+                let i = position >> 2;
+                sub[i] = block[position];
+                mask |= 1 << i;
             }
-            let total = write_masked_levels(w, &sub, mask, 16, counts.n_c(bx, by))?;
-            counts.set(bx, by, total);
+            let total = write_masked_levels(w, &sub, mask, counts.n_c(&edges, address, bx, by))?;
+            counts.set(address, bx, by, total);
         }
     }
     Ok(())
@@ -589,22 +682,59 @@ mod tests {
         assert_eq!(b16x8_mb_type(Bi, Bi), 20);
     }
 
+    /// nC as the writer derives it: the edges once, then the block.
+    fn n_c(counts: &CoeffCountMap, frame: &Frame, at: usize, bx: usize, by: usize) -> i32 {
+        counts.n_c(&counts.edges(frame, at), at, bx, by)
+    }
+
     #[test]
     fn neighbouring_counts_average_only_when_both_exist() {
-        let mut counts = CoeffCountMap::new(4, 4);
-        assert_eq!(counts.n_c(0, 0), 0, "no neighbours reads as zero");
-        counts.set(0, 1, 5);
-        assert_eq!(counts.n_c(1, 1), 5, "only the left neighbour");
-        counts.set(1, 0, 2);
-        assert_eq!(counts.n_c(1, 1), 4, "(5 + 2 + 1) >> 1");
+        let frame = Frame::new(4, 4, false);
+        let mut counts = make_luma_counts(4, 4);
+        let at = frame.address(1, 1);
+        assert_eq!(
+            n_c(&counts, &frame, frame.address(0, 0), 0, 0),
+            0,
+            "no neighbours reads as zero"
+        );
+        counts.set(frame.address(0, 1), 3, 0, 5);
+        assert_eq!(n_c(&counts, &frame, at, 0, 0), 5, "only the left neighbour");
+        counts.set(frame.address(1, 0), 0, 3, 2);
+        assert_eq!(n_c(&counts, &frame, at, 0, 0), 4, "(5 + 2 + 1) >> 1");
     }
 
     #[test]
     fn a_coded_but_empty_block_is_not_the_same_as_an_absent_one() {
-        let mut counts = CoeffCountMap::new(4, 4);
-        counts.set(0, 0, 0);
-        assert_eq!(counts.n_c(1, 0), 0);
-        counts.set(1, 0, 8);
-        assert_eq!(counts.n_c(2, 0), 8, "an absent upper neighbour is skipped");
+        let frame = Frame::new(4, 4, false);
+        let mut counts = make_luma_counts(4, 4);
+        let at = frame.address(1, 0);
+        counts.set(frame.address(0, 0), 3, 0, 0);
+        assert_eq!(n_c(&counts, &frame, at, 0, 0), 0);
+        counts.set(at, 0, 0, 8);
+        assert_eq!(
+            n_c(&counts, &frame, at, 1, 0),
+            8,
+            "an absent upper neighbour is skipped"
+        );
+    }
+
+    #[test]
+    fn edges_read_a_field_pair_beside_a_frame_macroblock_row_by_row() {
+        // The pair to the left is field coded: even lines of the current frame
+        // macroblock come from its top macroblock, odd lines from its bottom,
+        // both at half the row. Block rows 0..4 start at lines 0, 4, 8, 12,
+        // all even, so the left edge reads the top field macroblock at block
+        // rows 0, 0, 1, 1.
+        let mut frame = Frame::new(4, 4, true);
+        frame.set_field_pair(frame.address(0, 0), true);
+        let mut counts = make_luma_counts(4, 4);
+        let top = frame.address(0, 0);
+        for by in 0..4 {
+            counts.set(top, 3, by, 10 + by);
+        }
+        let at = frame.address(1, 0);
+        let edges = counts.edges(&frame, at);
+        assert_eq!(edges.left, [10, 10, 11, 11]);
+        assert_eq!(edges.above, [-1; 4], "nothing above the first row");
     }
 }

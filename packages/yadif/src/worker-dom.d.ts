@@ -73,7 +73,7 @@ interface HTMLVideoElement extends HTMLElement, VideoFrame {
   requestVideoFrameCallback(
     callback: (
       now: DOMHighResTimeStamp,
-      metadata: VideoFrameCallbackMetadata,
+      metadata: import("./video-frame.js").FrameMetadata,
     ) => void,
   ): number;
   cancelVideoFrameCallback(handle: number): void;

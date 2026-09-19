@@ -2,6 +2,7 @@
 
 use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
+use crate::h264::bitwriter::next_zero;
 use crate::mpeg2::constants::{start_code, PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
     parse_elementary_stream, picture_sequence_description, sequence_sample_aspect_ratio,
@@ -94,19 +95,23 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
 fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
     let mut starts: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
+    // A start code begins with two zeros, so everything up to the next zero
+    // byte is skipped a word at a time and only a zero is looked at closely.
     while i + 3 < data.len() {
-        if data[i] != 0 || data[i + 1] != 0 {
-            i += 1;
-            continue;
+        let zero = next_zero(data, i);
+        if zero + 3 >= data.len() {
+            break;
         }
-        if data[i + 2] == 1 {
-            starts.push((i, 3));
-            i += 3;
-        } else if data[i + 2] == 0 && data[i + 3] == 1 {
-            starts.push((i, 4));
-            i += 4;
+        if data[zero + 1] != 0 {
+            i = zero + 2;
+        } else if data[zero + 2] == 1 {
+            starts.push((zero, 3));
+            i = zero + 3;
+        } else if data[zero + 2] == 0 && data[zero + 3] == 1 {
+            starts.push((zero, 4));
+            i = zero + 4;
         } else {
-            i += 1;
+            i = zero + 1;
         }
     }
     let mut nals = Vec::with_capacity(starts.len());
@@ -1758,6 +1763,62 @@ fn make_fragment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The splitter as it read before it skipped to zeros a word at a time,
+    /// one byte per step, which the faster form has to agree with.
+    fn split_annex_b_byte_by_byte(data: &[u8]) -> Vec<&[u8]> {
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i + 3 < data.len() {
+            if data[i] != 0 || data[i + 1] != 0 {
+                i += 1;
+                continue;
+            }
+            if data[i + 2] == 1 {
+                starts.push((i, 3));
+                i += 3;
+            } else if data[i + 2] == 0 && data[i + 3] == 1 {
+                starts.push((i, 4));
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        let mut nals = Vec::new();
+        for (index, &(at, length)) in starts.iter().enumerate() {
+            let start = at + length;
+            let end = starts.get(index + 1).map_or(data.len(), |next| next.0);
+            if end > start {
+                nals.push(&data[start..end]);
+            }
+        }
+        nals
+    }
+
+    #[test]
+    fn splitting_agrees_with_the_byte_by_byte_form_on_zero_heavy_streams() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match state % 8 {
+                0..=3 => 0u8,
+                4 => 1,
+                _ => (state >> 16) as u8,
+            }
+        };
+        for len in 0..48 {
+            for _ in 0..40 {
+                let data: Vec<u8> = (0..len).map(|_| byte()).collect();
+                assert_eq!(
+                    split_annex_b(&data),
+                    split_annex_b_byte_by_byte(&data),
+                    "{data:02x?}"
+                );
+            }
+        }
+    }
 
     /// 29.97 fps, and deliberately odd so a halved field duration cannot be
     /// exact: the two halves still have to add up to the frame.
