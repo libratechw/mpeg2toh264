@@ -9,6 +9,7 @@
     "src/shader.ts",
     "src/film-shader.ts",
     "src/film-detect.ts",
-    "src/runtime.ts"
+    "src/runtime.ts",
+    "src/film-cadence.ts"
   ]
 }

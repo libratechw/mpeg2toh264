@@ -36,6 +36,13 @@ import {
   FILM_DUPLICATE_PHASE,
   FILM_LOCK_FRAMES,
 } from "./film-shader.js";
+import {
+  advancePulldownPhase,
+  filmFrameTiming,
+  isRepeatedFilmPhase,
+  schedulingCadence,
+  type Cadence,
+} from "./film-cadence.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
 import {
   captureSize,
@@ -82,23 +89,6 @@ const GRID_PHASE_GAIN = 0.1;
 /** Hysteresis around the half-refresh boundary, in milliseconds. */
 const PRESENT_HYSTERESIS_MS = 1;
 
-/** Broadcast frames in a pulldown cycle, and the film frames they hold. */
-const PULLDOWN_FRAMES = 5;
-const FILM_FRAMES = 4;
-
-/**
- * How long after its frame arrives a film frame of each phase is shown, in
- * frame periods, so that the film frames come out 1.25 periods apart. Phase
- * 2 is whole only once the frame after it has arrived, so it goes up at
- * once and the others are held back to match. Phase 1 is the repeat.
- */
-const FILM_LEAD: Record<number, number> = {
-  2: 0,
-  3: 0.25,
-  4: 0.5,
-  5: 0.75,
-};
-
 /**
  * Putting a picture that has already been filtered onto the canvas.
  *
@@ -131,8 +121,6 @@ interface Ready {
   /** Repeats dropped since the picture before. Debug only. */
   droppedBefore: number;
 }
-
-type Cadence = "frame" | "field" | "film";
 
 /**
  * How the filter is getting on, and where it is being let down.
@@ -718,15 +706,8 @@ export class Deinterlacer {
       this.#knownAge = 0;
     }
     this.#knownAge++;
-    const { phase, run } = this.#known;
-    if (phase === 0 || this.#knownAge > PULLDOWN_FRAMES) {
-      this.#phase = NO_PHASE;
-    } else {
-      this.#phase = {
-        phase: ((phase - 1 + this.#knownAge) % PULLDOWN_FRAMES) + 1,
-        run,
-      };
-    }
+    const advanced = advancePulldownPhase(this.#known, this.#knownAge);
+    this.#phase = advanced ?? NO_PHASE;
   }
 
   #describePhase(frame: number): string {
@@ -851,30 +832,35 @@ export class Deinterlacer {
         const shown =
           usableExpectedDisplayTime(metadata.expectedDisplayTime, now) +
           this.#refreshMs;
-        if (this.#filmLocked) {
-          const phase = this.#phase.phase;
-          if (phase === FILM_DUPLICATE_PHASE) {
-            this.#filmDropped++;
-            this.#droppedBefore++;
-          } else {
-            const duration = (this.#periodMs * PULLDOWN_FRAMES) / FILM_FRAMES;
-            const lead = FILM_LEAD[phase] ?? 0;
-            const at = this.#schedule(
-              "film",
-              shown + lead * this.#periodMs,
-              duration,
-            );
-            this.#filter("film", phase, false, at, duration);
+        switch (schedulingCadence(this.#filmLocked, this.#doubleRate)) {
+          case "film": {
+            const phase = this.#phase.phase;
+            if (isRepeatedFilmPhase(phase)) {
+              this.#filmDropped++;
+              this.#droppedBefore++;
+            } else {
+              const { at: timing, duration } = filmFrameTiming(
+                phase,
+                shown,
+                this.#periodMs,
+              );
+              const at = this.#schedule("film", timing, duration);
+              this.#filter("film", phase, false, at, duration);
+            }
+            break;
           }
-        } else if (this.#doubleRate) {
-          const duration = this.#periodMs / 2;
-          const at = this.#schedule("field", shown, duration);
-          this.#filter("field", 1, false, at, duration);
-          this.#filter("field", 2, true, at + duration, duration);
-        } else {
-          const duration = this.#periodMs;
-          const at = this.#schedule("frame", shown, duration);
-          this.#filter("frame", 0, false, at, duration);
+          case "field": {
+            const duration = this.#periodMs / 2;
+            const at = this.#schedule("field", shown, duration);
+            this.#filter("field", 1, false, at, duration);
+            this.#filter("field", 2, true, at + duration, duration);
+            break;
+          }
+          default: {
+            const duration = this.#periodMs;
+            const at = this.#schedule("frame", shown, duration);
+            this.#filter("frame", 0, false, at, duration);
+          }
         }
       } else {
         this.#render(false, false, null);
