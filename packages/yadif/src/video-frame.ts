@@ -57,6 +57,7 @@ export class VideoFrames {
   #callback: FrameCallback | null = null;
   #counters: number[] | null = null;
   #painted: number | null = null;
+  #delivered = false;
   #discontinuity = true;
   #lastAt: number | null = null;
   #sample: { at: number; frames: number } | null = null;
@@ -76,6 +77,11 @@ export class VideoFrames {
   /** Whether acquisition runs off the Firefox counters. */
   get mozDriven(): boolean {
     return this.#moz !== null;
+  }
+
+  /** Whether any frame has been delivered yet (counters proven live). */
+  get hasDelivered(): boolean {
+    return this.#delivered;
   }
 
   request(callback: FrameCallback): void {
@@ -121,6 +127,7 @@ export class VideoFrames {
     const callback = this.#callback;
     this.#handle = null;
     this.#callback = null;
+    this.#delivered = true;
     callback?.(now, metadata);
   };
 
@@ -154,11 +161,13 @@ export class VideoFrames {
         const sample = this.#sample;
         if (sample && now - sample.at >= MEASURE_MS) {
           const frames = painted - sample.frames;
-          const period = (now - sample.at) / frames;
-          if (frames > 0 && period >= 4 && period <= 200) {
-            this.#periodMs = this.#periodMs
-              ? this.#periodMs + (period - this.#periodMs) * 0.25
-              : period;
+          if (frames > 0) {
+            const period = (now - sample.at) / frames;
+            if (period >= 4 && period <= 200) {
+              this.#periodMs = this.#periodMs
+                ? this.#periodMs + (period - this.#periodMs) * 0.25
+                : period;
+            }
           }
           this.#sample = null;
         }

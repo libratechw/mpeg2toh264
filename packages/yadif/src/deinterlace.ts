@@ -1281,12 +1281,16 @@ export class Deinterlacer extends EventTarget {
       // worth less than filtering nothing at all.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
       // Firefox counters carry their own discontinuity signal and wall-clock
-      // cadence; the coarse media clock is not consulted on that path.
+      // cadence. The coarse media clock still guards the path: a forward
+      // media-time jump that keeps painting smoothly (MSE splice, live gap)
+      // is exactly the discontinuity VideoFrames cannot see.
       const mozTiming = metadata.mozTiming;
       const stale =
         seekFrame ||
         (mozTiming
-          ? mozTiming.discontinuity
+          ? mozTiming.discontinuity ||
+            elapsed < 0 ||
+            elapsed > CONTINUOUS_SECONDS
           : elapsed < 0 || elapsed > CONTINUOUS_SECONDS);
       if (stale) {
         this.#frames = 0;
@@ -1315,12 +1319,6 @@ export class Deinterlacer extends EventTarget {
       // Filtering it again would spend a frame's work on a canvas that
       // already holds the answer, and taking it into the ring would leave the
       // filter holding one moment twice over and calling it motion.
-      // The same picture presented again, which the compositor does whenever
-      // nothing new has been decoded: paused, stalled, or stopped at the end
-      // of a stream, and at the display's rate rather than the video's.
-      // Filtering it again would spend a frame's work on a canvas that
-      // already holds the answer, and taking it into the ring would leave the
-      // filter holding one moment twice over and calling it motion.
       // On the Firefox path mediaTime is the coarse media clock and repeats
       // across distinct painted pictures, so only a repeated painted count
       // means the same picture presented again.
@@ -1334,7 +1332,12 @@ export class Deinterlacer extends EventTarget {
       }
       if (!stale) {
         const mozPeriodMs = mozTiming?.periodMs ?? 0;
-        if (mozPeriodMs > 0) this.#measure(mozPeriodMs / 1000);
+        // #measure takes media seconds and divides by the rate to reach wall
+        // time; mozTiming is already wall-clock ms, so scale it back up.
+        if (mozPeriodMs > 0)
+          this.#measure(
+            (mozPeriodMs * (this.#video.playbackRate || 1)) / 1000,
+          );
         else if (elapsed > 0) this.#measure(elapsed);
       }
       this.#lastMediaTime = metadata.mediaTime;
@@ -1852,8 +1855,9 @@ export class Deinterlacer extends EventTarget {
     if (this.#externalHost) return;
     // Firefox カウンター経路では VideoFrames が新規画像の判断を所有し、
     // painted が進まない画像の取込みを意図的に抑止する。watchdog が復号
-    // カウンターから取込むと同一画像の重複登録になるため除外する。
-    if (this.#videoFrames.mozDriven) return;
+    // カウンターから取込むと同一画像の重複登録になるため除外する。ただし
+    // 一度も配信がない間 (カウンター無効などで凍結) は従来の救済を残す。
+    if (this.#videoFrames.mozDriven && this.#videoFrames.hasDelivered) return;
     if (
       now - this.#lastVideoFrameCallbackAt < FRAME_CALLBACK_TIMEOUT_MS ||
       this.#video.paused ||
