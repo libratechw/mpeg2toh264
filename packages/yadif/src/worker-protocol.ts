@@ -6,6 +6,11 @@ interface WorkerFrameObservation {
   presentedFrames: number;
   width: number;
   height: number;
+  /**
+   * Firefox カウンター計時。spread と structured clone で線を越えるため
+   * 宣言にも載せ、将来のリテラル化で moz 配線が外れないようにする。
+   */
+  mozTiming?: { periodMs: number; discontinuity: boolean };
 }
 
 /** Worker 内の描画エンジンへ渡せるデインタレーサー設定。 */
