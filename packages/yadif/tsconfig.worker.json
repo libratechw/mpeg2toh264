@@ -9,6 +9,7 @@
     "src/worker-dom.d.ts",
     "src/deinterlace.ts",
     "src/ivtc.ts",
-    "src/shader.ts"
+    "src/shader.ts",
+    "src/video-frame.ts"
   ]
 }

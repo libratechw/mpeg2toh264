@@ -73,6 +73,11 @@ export class VideoFrames {
     }
   }
 
+  /** Whether acquisition runs off the Firefox counters. */
+  get mozDriven(): boolean {
+    return this.#moz !== null;
+  }
+
   request(callback: FrameCallback): void {
     if (this.#handle !== null) return;
     this.#callback = callback;

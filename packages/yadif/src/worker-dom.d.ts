@@ -18,13 +18,6 @@ interface VideoPlaybackQuality {
   readonly corruptedVideoFrames: number;
 }
 
-interface VideoFrameCallbackMetadata {
-  readonly mediaTime: number;
-  readonly presentedFrames: number;
-  readonly width: number;
-  readonly height: number;
-}
-
 interface WorkerElementStyle {
   cssText: string;
   visibility: string;

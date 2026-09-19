@@ -137,6 +137,12 @@ interface FrameObservation {
   presentedFrames: number;
   width: number;
   height: number;
+  /**
+   * Firefox counter timing when the frame came through VideoFrames.
+   * mediaTime there is the coarse media clock (unsuited as frame identity
+   * or field clock); use presentedFrames and this instead.
+   */
+  mozTiming?: { periodMs: number; discontinuity: boolean };
 }
 
 /** The draw path that produced the picture still represented by the canvas. */
@@ -403,6 +409,8 @@ export class Deinterlacer extends EventTarget {
   /** How many of the held frames are consecutive, up to HISTORY. */
   #frames = 0;
   #lastMediaTime = 0;
+  /** presentedFrames at the last ingested frame; pairs with #lastMediaTime. */
+  #lastPresentedFrames = 0;
   #lastIngestedMediaTime = Number.NaN;
   /** A destination frame that arrived before the browser finished seeking. */
   #seekFrameReady = false;
@@ -1272,7 +1280,14 @@ export class Deinterlacer extends EventTarget {
       // the neighbours are then further apart than they should be, which is
       // worth less than filtering nothing at all.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
-      const stale = seekFrame || elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
+      // Firefox counters carry their own discontinuity signal and wall-clock
+      // cadence; the coarse media clock is not consulted on that path.
+      const mozTiming = metadata.mozTiming;
+      const stale =
+        seekFrame ||
+        (mozTiming
+          ? mozTiming.discontinuity
+          : elapsed < 0 || elapsed > CONTINUOUS_SECONDS);
       if (stale) {
         this.#frames = 0;
         this.#periodMs = 0;
@@ -1300,11 +1315,30 @@ export class Deinterlacer extends EventTarget {
       // Filtering it again would spend a frame's work on a canvas that
       // already holds the answer, and taking it into the ring would leave the
       // filter holding one moment twice over and calling it motion.
-      if (this.#frames > 0 && metadata.mediaTime === this.#lastMediaTime) {
+      // The same picture presented again, which the compositor does whenever
+      // nothing new has been decoded: paused, stalled, or stopped at the end
+      // of a stream, and at the display's rate rather than the video's.
+      // Filtering it again would spend a frame's work on a canvas that
+      // already holds the answer, and taking it into the ring would leave the
+      // filter holding one moment twice over and calling it motion.
+      // On the Firefox path mediaTime is the coarse media clock and repeats
+      // across distinct painted pictures, so only a repeated painted count
+      // means the same picture presented again.
+      if (
+        this.#frames > 0 &&
+        metadata.mediaTime === this.#lastMediaTime &&
+        (!metadata.mozTiming ||
+          metadata.presentedFrames === this.#lastPresentedFrames)
+      ) {
         return;
       }
-      if (!stale && elapsed > 0) this.#measure(elapsed);
+      if (!stale) {
+        const mozPeriodMs = mozTiming?.periodMs ?? 0;
+        if (mozPeriodMs > 0) this.#measure(mozPeriodMs / 1000);
+        else if (elapsed > 0) this.#measure(elapsed);
+      }
       this.#lastMediaTime = metadata.mediaTime;
+      this.#lastPresentedFrames = metadata.presentedFrames;
       const at = performance.now();
       // Frames stopped arriving for a while -- a pause, a stall, a tab in the
       // background -- and a rate averaged over time nothing was asked of the
@@ -1816,6 +1850,10 @@ export class Deinterlacer extends EventTarget {
   /** requestVideoFrameCallback() が来ない間も requestAnimationFrame() から復号フレームを取り込む。 */
   #recoverFrameCallback(now: DOMHighResTimeStamp): void {
     if (this.#externalHost) return;
+    // Firefox カウンター経路では VideoFrames が新規画像の判断を所有し、
+    // painted が進まない画像の取込みを意図的に抑止する。watchdog が復号
+    // カウンターから取込むと同一画像の重複登録になるため除外する。
+    if (this.#videoFrames.mozDriven) return;
     if (
       now - this.#lastVideoFrameCallbackAt < FRAME_CALLBACK_TIMEOUT_MS ||
       this.#video.paused ||
@@ -2340,6 +2378,7 @@ export class Deinterlacer extends EventTarget {
     }
     this.#frames = 0;
     this.#lastMediaTime = 0;
+    this.#lastPresentedFrames = 0;
     this.#queue.length = 0;
     this.#periodMs = 0;
     // The counts belong to the stream that has just gone; the next one starts
