@@ -9,6 +9,8 @@
 //  - Safari reports a large negative expectedDisplayTime. Believing it put
 //    every scheduled moment in the distant past, so the second field of every
 //    pair was dropped as late (30 fps instead of 60).
+//  - A capture must come back at the element's display shape, not the coded
+//    one, so the saved image keeps the ratio the viewer sees.
 //
 // These cover the decisions those paths make. The loop's actual registration
 // and release against a real document is a browser behaviour, verified
@@ -43,6 +45,7 @@ await build({
 
 const {
   EXPECTED_DISPLAY_TIME_TOLERANCE_MS,
+  captureSize,
   loopWindowFor,
   usableExpectedDisplayTime,
 } = await import(pathToFileURL(outFile).href);
@@ -124,4 +127,26 @@ test("loopWindowFor follows the canvas into another document and back", () => {
     if (saved) Object.defineProperty(globalThis, "window", saved);
     else delete globalThis.window;
   }
+});
+
+test("captureSize uses the element's display shape", () => {
+  // Anamorphic MPEG-2: coded 1440x1080 is shown as 1920x1080.
+  assert.deepEqual(captureSize(1920, 1080, 1440, 1080), {
+    width: 1920,
+    height: 1080,
+  });
+  // Square pixels: display equals coded.
+  assert.deepEqual(captureSize(1440, 1080, 1440, 1080), {
+    width: 1440,
+    height: 1080,
+  });
+  // The element has not reported a size yet: fall back to the coded one.
+  assert.deepEqual(captureSize(0, 0, 1440, 1080), {
+    width: 1440,
+    height: 1080,
+  });
+  assert.deepEqual(captureSize(1920, 0, 1440, 1080), {
+    width: 1920,
+    height: 1080,
+  });
 });

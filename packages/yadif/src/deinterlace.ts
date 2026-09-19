@@ -37,7 +37,11 @@ import {
   FILM_LOCK_FRAMES,
 } from "./film-shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
-import { loopWindowFor, usableExpectedDisplayTime } from "./runtime.js";
+import {
+  captureSize,
+  loopWindowFor,
+  usableExpectedDisplayTime,
+} from "./runtime.js";
 import { createProgram, VERTEX_SHADER } from "./utils.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
@@ -322,6 +326,12 @@ export class Deinterlacer {
   #textures: WebGLTexture[] = [];
   /** Somewhere to filter a field into, and to read it back out of. */
   #outputs: RenderTarget[] = [];
+  /**
+   * The texture last blitted to the canvas, and whether it went up flipped, so
+   * `capture()` can put the same picture back. See `capture`.
+   */
+  #lastTexture: WebGLTexture | null = null;
+  #lastFlip = false;
   /** Which output slot was written last; the next one follows round the ring. */
   #outputHead = FIELD_QUEUE_LENGTH - 1;
   /** Filtered fields waiting for their moment, oldest first. */
@@ -1162,7 +1172,40 @@ export class Deinterlacer {
     gl.uniform1i(this.#blitFlip, flip ? 1 : 0);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.#lastTexture = texture;
+    this.#lastFlip = flip;
     this.canvas.style.visibility = "visible";
+  }
+
+  /**
+   * The picture currently on the canvas, as an image.
+   *
+   * The drawing buffer is not preserved, so the texture is blitted again here
+   * and the canvas read in the same task: a read from outside a draw would
+   * find the buffer already cleared. The picture comes back at the element's
+   * own display shape so a saved image keeps the ratio the viewer sees.
+   */
+  capture(): Promise<ImageBitmap> {
+    if (this.#lost || this.#width === 0 || this.#lastTexture === null)
+      return Promise.reject(
+        new Error("the deinterlacer has no picture to capture"),
+      );
+    this.#showTexture(this.#lastTexture, this.#lastFlip);
+    const { width, height } = captureSize(
+      this.#video.videoWidth,
+      this.#video.videoHeight,
+      this.#width,
+      this.#height,
+    );
+    if (width === this.#width && height === this.#height)
+      return createImageBitmap(this.canvas);
+    const stretched = document.createElement("canvas");
+    stretched.width = width;
+    stretched.height = height;
+    const context = stretched.getContext("2d");
+    if (context === null) return createImageBitmap(this.canvas);
+    context.drawImage(this.canvas, 0, 0, width, height);
+    return createImageBitmap(stretched);
   }
 
   /**

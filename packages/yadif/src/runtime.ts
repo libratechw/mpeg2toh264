@@ -53,3 +53,23 @@ export function usableExpectedDisplayTime(
 export function loopWindowFor(canvas: HTMLCanvasElement): Window {
   return canvas.ownerDocument?.defaultView ?? window;
 }
+
+/**
+ * The size a captured picture should come back at.
+ *
+ * The canvas holds coded pixels; the element's picture is those stretched to
+ * its display shape (the sample aspect ratio). Returning the element's size
+ * keeps the ratio the viewer sees in the saved image. Falls back to the coded
+ * size when the element has not reported one.
+ */
+export function captureSize(
+  videoWidth: number,
+  videoHeight: number,
+  codedWidth: number,
+  codedHeight: number,
+): { width: number; height: number } {
+  return {
+    width: videoWidth || codedWidth,
+    height: videoHeight || codedHeight,
+  };
+}
