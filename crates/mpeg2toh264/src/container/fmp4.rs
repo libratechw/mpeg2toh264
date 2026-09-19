@@ -1,6 +1,7 @@
 //! Packaging this transcoder's Annex B output as a fragmented MP4.
 
 use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
+use crate::container::rff::{display_timing, frame_rate, is_film_repeat, supports_film, RffState};
 use crate::error::{bail, Result};
 use crate::h264::bitwriter::next_zero;
 use crate::mpeg2::constants::{start_code, PictureStructure, PictureType, FRAME_RATE};
@@ -250,11 +251,14 @@ pub struct Mpeg2VideoTimeline {
     pub width: u32,
     pub height: u32,
     pub sample_duration: u32,
+    /// Stable decode lead across ordinary video and soft telecine in the same
+    /// sequence. Zero uses `sample_duration` for caller-built timelines.
+    pub decode_lead: u32,
     /// Presentation time of each coded picture, relative to the first display
     /// slot in the unit. Parallel with `presentation_indices`.
     pub presentation_times: Vec<u64>,
-    /// Display duration of each coded picture. MPEG-2 `repeat_first_field`
-    /// makes this longer than `sample_duration` for telecined material.
+    /// Display duration of each coded picture. RFF timing redistributes half
+    /// a field from each repeated picture to the next without waiting for it.
     /// Parallel with `presentation_indices`.
     pub sample_durations: Vec<u32>,
     /// Field metadata of each coded picture, parallel with
@@ -328,12 +332,6 @@ impl Mpeg2VideoTimeline {
             .map(|index| self.presentation_time_at(index))
             .min()
             .unwrap_or(0)
-    }
-
-    /// Presentation time of the first picture in coding order. A GOP's PES
-    /// timestamp belongs here, even when leading B pictures display earlier.
-    pub(crate) fn first_coded_presentation_time(&self) -> u64 {
-        self.presentation_time_at(0)
     }
 }
 
@@ -414,7 +412,11 @@ pub fn mpeg2_video_timeline(
     has_references: bool,
     undecodable: &[bool],
 ) -> Result<Mpeg2VideoTimeline> {
-    Ok(walk_pictures(data, has_references, undecodable)?.timeline)
+    Ok(
+        timed_mpeg2_unit(data, has_references, undecodable, RffState::default())?
+            .unit
+            .timeline,
+    )
 }
 
 /// Cut a unit into the samples a passthrough MP4 carries, alongside the same
@@ -424,16 +426,55 @@ pub fn mpeg2_video_timeline(
 /// bar the ones it drops for being undecodable: nothing is decoded on this
 /// path, and a damaged slice is the decoder's business rather than this one's.
 pub fn mpeg2_passthrough_unit(data: &[u8], has_references: bool) -> Result<Mpeg2Unit> {
-    walk_pictures(data, has_references, &[])
+    Ok(timed_mpeg2_unit(data, has_references, &[], RffState::default())?.unit)
 }
 
-/// Walk a unit's pictures, keeping the ones that can be coded or carried.
-///
-/// Nothing is decoded here. A picture is kept if it has slices at all and was
-/// not named in `undecodable`, which is what the transcoder reports back once
-/// it has tried; passthrough hands the bytes on untouched and names nothing,
-/// since a damaged slice is then the decoder's business rather than this one's.
-fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Result<Mpeg2Unit> {
+/// Source-clock information kept alongside the public, retimed MP4 unit.
+pub(crate) struct TimedUnit {
+    pub unit: Mpeg2Unit,
+    /// Original first coded PTS relative to the retimed unit boundary. This
+    /// must not be inferred from the evenly spaced presentation times.
+    pub source_offset: i64,
+    pub before: RffState,
+    pub after: RffState,
+    display_fields: Vec<u8>,
+    repeats: Vec<bool>,
+    rate: (u32, u32),
+}
+
+impl TimedUnit {
+    /// Reuse the header walk when a discontinuity clears the previous unit's
+    /// committed timing phase.
+    pub(crate) fn retime(&mut self, before: RffState) {
+        let timing = display_timing(&self.display_fields, &self.repeats, self.rate, before);
+        let timeline = &mut self.unit.timeline;
+        self.source_offset = timeline.presentation_indices.first().map_or(0, |&index| {
+            timing.source_starts[index as usize] as i64 - timing.start_shift
+        });
+        timeline.presentation_times = timeline
+            .presentation_indices
+            .iter()
+            .map(|&index| timing.starts[index as usize])
+            .collect();
+        timeline.sample_durations = timeline
+            .presentation_indices
+            .iter()
+            .map(|&index| timing.durations[index as usize])
+            .collect();
+        self.before = before;
+        self.after = timing.after;
+    }
+}
+
+/// Walk a unit's pictures, keeping exactly those the transcoder can emit.
+/// Parsing reserves their display slots even when a damaged or missing picture
+/// leaves one empty; retiming must not close up that hole.
+pub(crate) fn timed_mpeg2_unit(
+    data: &[u8],
+    has_references: bool,
+    undecodable: &[bool],
+    before: RffState,
+) -> Result<TimedUnit> {
     let pictures = parse_elementary_stream(data)?;
     let Some(first) = pictures.first() else {
         bail!("no MPEG-2 pictures for MP4 timeline");
@@ -449,6 +490,13 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
     let numerator = base_rate.0 as f64 * (first.sequence_ext.frame_rate_extension_n + 1) as f64;
     let denominator = base_rate.1 as f64 * (first.sequence_ext.frame_rate_extension_d + 1) as f64;
     let sample_duration = round_half_up(TIMESCALE as f64 * denominator / numerator) as u32;
+    // The decode clock cannot change its lead at a film/video transition:
+    // doing so overlaps consecutive fragments' DTS ranges in MSE.
+    let decode_lead = if supports_film(first) {
+        (sample_duration * 3).div_ceil(2)
+    } else {
+        sample_duration
+    };
     // What this unit is described by, which is what its pictures have to be
     // coded under to belong to it.
     let description = picture_sequence_description(first);
@@ -470,6 +518,7 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
     // ordinary fields: temporal_reference can have holes where damaged source
     // pictures were absent altogether.
     let mut display_fields = vec![2u8];
+    let mut repeats = vec![false];
     let mut field_pairs = Vec::new();
     let mut samples = Vec::new();
     let mut picture_index = 0;
@@ -521,6 +570,7 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
         let presentation_index = (gop_base + tr + 1) as usize;
         if display_fields.len() <= presentation_index {
             display_fields.resize(presentation_index + 1, 2);
+            repeats.resize(presentation_index + 1, false);
         }
         display_fields[presentation_index] = if picture.coding.picture_structure
             == PictureStructure::Frame
@@ -530,6 +580,7 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
         } else {
             2
         };
+        repeats[presentation_index] = is_film_repeat(picture);
         // A lone field is no frame, and the transcoder drops it for the same
         // reason. Both have to, or the timeline reserves a sample the H.264
         // stream does not hold.
@@ -587,35 +638,14 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
             references = (references + 1).min(2);
         }
     }
-    // Round positions on the continuous field clock, not every RFF picture in
-    // isolation. At 30000/1001 fps a field is 1501.5 ticks, so successive
-    // three-field pictures must alternate between 4505 and 4504 ticks instead
-    // of gaining half a tick apiece.
-    let field_ticks = TIMESCALE as f64 * denominator / numerator / 2.0;
-    let mut starts = vec![0u64; display_fields.len()];
-    let mut display_durations = vec![sample_duration; display_fields.len()];
-    let mut fields = 0u64;
-    for index in 1..display_fields.len() {
-        starts[index] = round_half_up(fields as f64 * field_ticks) as u64;
-        fields += u64::from(display_fields[index]);
-        let end = round_half_up(fields as f64 * field_ticks) as u64;
-        display_durations[index] = (end - starts[index]) as u32;
-    }
-    let presentation_times = presentation_indices
-        .iter()
-        .map(|&index| starts[index as usize])
-        .collect();
-    let sample_durations = presentation_indices
-        .iter()
-        .map(|&index| display_durations[index as usize])
-        .collect();
-    Ok(Mpeg2Unit {
+    let unit = Mpeg2Unit {
         timeline: Mpeg2VideoTimeline {
             width: first.sequence.horizontal_size,
             height: first.sequence.vertical_size,
             sample_duration,
-            presentation_times,
-            sample_durations,
+            decode_lead,
+            presentation_times: Vec::new(),
+            sample_durations: Vec::new(),
             sample_scans,
             presentation_indices,
             field_pairs,
@@ -625,7 +655,18 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
         },
         samples,
         sequence_header_len: sequence_header_len(data),
-    })
+    };
+    let mut timed = TimedUnit {
+        unit,
+        source_offset: 0,
+        before,
+        after: RffState::default(),
+        display_fields,
+        repeats,
+        rate: frame_rate(first),
+    };
+    timed.retime(before);
+    Ok(timed)
 }
 
 /// How many MP4 samples the timeline's pictures occupy, before the IDR clone.
@@ -800,7 +841,7 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // order: an I picture is coded ahead of the B pictures that display before
     // it, and at a random access point those B pictures are missing entirely.
     let first_presentation_time = timeline.first_presentation_time() as i64;
-    let duration = timeline.sample_duration as i64;
+    let duration = timeline.decode_lead.max(timeline.sample_duration) as i64;
     let mut offsets: Vec<i64> = Vec::with_capacity(indices.len());
     let mut durations: Vec<u32> = Vec::with_capacity(indices.len());
     let mut decode_time = 0i64;
@@ -834,8 +875,9 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // every offset at or above zero without moving a single picture relative to
     // the audio.
     //
-    // The lead is one frame, and it is held back by a frame whether this unit
-    // needs it or not, because the delay sets where the unit's decode timeline
+    // Reserve the same lead whether this unit needs it or not: one ordinary
+    // frame, or three fields for a sequence that can carry soft telecine.
+    // The delay sets where the unit's decode timeline
     // begins and the units are appended to one timeline. A unit that measured
     // its own would start a frame later than its neighbours whenever it had no
     // picture displaying ahead of its decode slot -- a group coded without B
@@ -845,8 +887,8 @@ pub fn mpeg2_sample_timing(timeline: &Mpeg2VideoTimeline, lead_in: UnitLeadIn) -
     // Extensions reads that overlap as an append over buffered frames and
     // clears them back to a random access point, and these streams carry one
     // every few hundred pictures, so the picture freezes until the next one.
-    // MPEG-2 never leads by more than a frame: B pictures are not references,
-    // so only one anchor is ever held.
+    // B pictures are not references, so only one anchor is ever held, but an
+    // unpaired RFF picture can occupy three fields at the end of a film run.
     let measured = -offsets.iter().copied().min().unwrap_or(0).min(0);
     let reorder_delay = measured.max(duration);
     let mut compositions: Vec<u32> = offsets
@@ -1829,6 +1871,7 @@ mod tests {
             width: 720,
             height: 480,
             sample_duration: FRAME,
+            decode_lead: FRAME,
             presentation_times: Vec::new(),
             sample_durations: Vec::new(),
             sample_scans: Vec::new(),
