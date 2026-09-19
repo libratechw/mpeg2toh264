@@ -27,6 +27,12 @@
  * along with this file; if not, see <https://www.gnu.org/licenses/>.
  *
  */
+import {
+  FIELD_METRICS,
+  FILM_DUPLICATE_PHASE,
+  FILM_MIXED_PHASE,
+  SAME_BLOCKS_MAX,
+} from "./film-shader.js";
 
 /**
  * Everything this shader wants to be told, besides the three frames.
@@ -35,6 +41,11 @@
  * from the current frame, and every other line is what the filter builds. For
  * one output frame per input frame that is `tff ? 0 : 1`, which keeps the field
  * that came first and rebuilds the moment it was captured at.
+ *
+ * With `film`, a frame whose pulldown phase `fieldMetrics` (see
+ * film-shader.ts) gives is put back together into its film frame instead of
+ * filtered; a frame's `second` field is always filtered. `phase` is the
+ * phase the page expects, for the debug overlay only.
  */
 export const YADIF_UNIFORMS = {
   prev: "uPrev",
@@ -44,6 +55,11 @@ export const YADIF_UNIFORMS = {
   parity: "uParity",
   tff: "uTff",
   spatialCheck: "uSpatialCheck",
+  debug: "uDebug",
+  film: "uFilm",
+  second: "uSecond",
+  phase: "uPhase",
+  fieldMetrics: "uFieldMetrics",
 } as const;
 
 /**
@@ -70,6 +86,7 @@ precision highp int;
 uniform sampler2D uPrev;
 uniform sampler2D uCur;
 uniform sampler2D uNext;
+uniform sampler2D uFieldMetrics;
 /** The size of a frame in texels. */
 uniform ivec2 uSize;
 /** The parity of the lines that are kept; the others are interpolated. */
@@ -78,6 +95,10 @@ uniform int uParity;
 uniform int uTff;
 /** Whether the temporal bound is widened by the local vertical range. */
 uniform bool uSpatialCheck;
+uniform bool uDebug;
+uniform bool uFilm;
+uniform bool uSecond;
+uniform int uPhase;
 
 out vec4 fragColor;
 
@@ -215,6 +236,55 @@ vec3 filterPixel(sampler2D prev2, sampler2D next2, int x, int y) {
   return temporalPredictor(A, B, C, D, E, F, G, H, I, J, K, L, spatialPred, skipCheck);
 }
 
+int firstParity() {
+  return uTff != 0 ? 0 : 1;
+}
+
+bool same(int metric) {
+  return texelFetch(uFieldMetrics, ivec2(metric, 0), 0)[1] <= ${SAME_BLOCKS_MAX}.0;
+}
+
+/** The pulldown phase the detection gave this frame, or 0. See film-shader.ts. */
+int detectedPhase() {
+  return int(texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.phase}, 0), 0)[0]);
+}
+
+bool isMixedPhase(int phase) {
+  return phase == ${FILM_DUPLICATE_PHASE} || phase == ${FILM_MIXED_PHASE};
+}
+
+const int DEBUG_BAR_CELL = 32;
+const int DEBUG_BAR_WIDTH = DEBUG_BAR_CELL * 7;
+const int DEBUG_BAR_HEIGHT = 16;
+
+vec3 debugBar(int x) {
+  int cell = x / DEBUG_BAR_CELL;
+  bool lit = x % DEBUG_BAR_CELL >= DEBUG_BAR_CELL - 4;
+  if (cell == 6) return lit || uSecond ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
+  return lit || same(cell) ? vec3(1.0) : vec3(0.0);
+}
+
+const int DIGIT_WIDTH = 24;
+const int DIGIT_HEIGHT = 60;
+
+bool digitLit(int digit, int x, int y) {
+  bool a = y < 20;
+  bool b = x >= 20 && y < 40;
+  bool c = x >= 20 && y >= 40;
+  bool d = y >= 56;
+  bool e = x < 4 && y >= 40;
+  bool f = x < 4 && y < 40;
+  bool g = y >= 36 && y < 40;
+  switch (digit) {
+    case 1: return b || c;
+    case 2: return a || b || d || e || g;
+    case 3: return a || b || c || d || g;
+    case 4: return b || c || f || g;
+    case 5: return a || c || d || f || g;
+    default: return false;
+  }
+}
+
 void main() {
   ivec2 at = ivec2(gl_FragCoord.xy);
   int x = at.x;
@@ -222,7 +292,17 @@ void main() {
   int y = uSize.y - 1 - at.y;
 
   vec3 rgb;
-  if ((y & 1) == uParity) {
+  if (uFilm && uDebug && y < DEBUG_BAR_HEIGHT && x < DEBUG_BAR_WIDTH) {
+    rgb = debugBar(x);
+  } else if (uFilm && uDebug && x < DIGIT_WIDTH && y < DIGIT_HEIGHT && uPhase > 0) {
+    rgb = digitLit(uPhase, x, y) ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
+  } else if (uFilm && !uSecond && isMixedPhase(detectedPhase())) {
+    rgb = (y & 1) == firstParity() ? texelFetch(uCur, ivec2(x, y), 0).rgb
+                                   : texelFetch(uPrev, ivec2(x, y), 0).rgb;
+  } else if (uFilm && !uSecond && detectedPhase() != 0) {
+    // One film frame, whole.
+    rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+  } else if ((y & 1) == uParity) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
   } else if ((uParity ^ uTff) != 0) {
     // The first field of the frame: the moment it holds sits between the
@@ -232,136 +312,5 @@ void main() {
     rgb = filterPixel(uCur, uNext, x, y);
   }
   fragColor = vec4(rgb, 1.0);
-}
-`;
-
-/** Uniforms shared by the reduced luma and field-weave shaders. */
-export const FILM_UNIFORMS = {
-  prev: "uPrev",
-  cur: "uCur",
-  next: "uNext",
-  size: "uSize",
-  topFieldFirst: "uTopFieldFirst",
-  match: "uMatch",
-} as const;
-
-/** Width of the reduced fieldmatch and decimate inputs. */
-export const FILM_ANALYSIS_WIDTH = 288;
-
-/** Height of the reduced fieldmatch and decimate inputs. */
-export const FILM_ANALYSIS_HEIGHT = 162;
-
-/**
- * Reads reduced luma from the three frames available to fieldmatch.
- * RGB stores previous/current/next luma so one fixed-size readback supplies
- * the 8-bit analysis frames used by the CPU port of FFmpeg fieldmatch and
- * decimate. Scaling the two fields independently preserves their alternating
- * rows while the clean full-size frames stay on the GPU.
- */
-export const FILM_ANALYSIS_FRAGMENT_SHADER = `#version 300 es
-precision highp float;
-precision highp int;
-
-uniform sampler2D uPrev;
-uniform sampler2D uCur;
-uniform sampler2D uNext;
-uniform ivec2 uSize;
-out vec4 fragColor;
-
-float luma(vec3 rgb) {
-  return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-}
-
-int sourceY(int targetY, int targetHeight) {
-  // Scale both fields independently so every adjacent target row still
-  // alternates parity. A direct full-frame scale can select only one parity
-  // when the source-to-target ratio is even, erasing the borrowed field.
-  int parity = targetY & 1;
-  int sourceFieldHeight = uSize.y / 2;
-  int targetFieldHeight = targetHeight / 2;
-  int fieldY = (targetY / 2) * sourceFieldHeight / targetFieldHeight;
-  return clamp(fieldY * 2 + parity, 0, uSize.y - 1);
-}
-
-void main() {
-  ivec2 targetSize = ivec2(${FILM_ANALYSIS_WIDTH}, ${FILM_ANALYSIS_HEIGHT});
-  ivec2 target = ivec2(gl_FragCoord.xy);
-  // readPixels returns the framebuffer's bottom row first, so writing the
-  // source's top row there gives JavaScript a conventional top-origin image.
-  int y = target.y;
-  int sourceX = clamp(target.x * uSize.x / targetSize.x, 0, uSize.x - 1);
-  int sourceRow = sourceY(y, targetSize.y);
-  ivec2 source = ivec2(sourceX, sourceRow);
-  fragColor = vec4(
-    luma(texelFetch(uPrev, source, 0).rgb),
-    luma(texelFetch(uCur, source, 0).rgb),
-    luma(texelFetch(uNext, source, 0).rgb),
-    1.0
-  );
-}
-`;
-
-/** Reconstructs one progressive film picture from the selected field match. */
-export const FILM_WEAVE_FRAGMENT_SHADER = `#version 300 es
-precision highp float;
-precision highp int;
-
-uniform sampler2D uPrev;
-uniform sampler2D uCur;
-uniform sampler2D uNext;
-uniform ivec2 uSize;
-uniform int uTopFieldFirst;
-uniform int uMatch;
-
-out vec4 fragColor;
-
-void main() {
-  ivec2 at = ivec2(gl_FragCoord.xy);
-  int y = uSize.y - 1 - at.y;
-  // p/n borrow the matched field from a neighbour after converting the
-  // framebuffer's bottom-origin coordinate to the frame's top-origin row.
-  int borrowedParity = uTopFieldFirst != 0 ? 1 : 0;
-  if ((y & 1) != borrowedParity || uMatch == 1) {
-    fragColor = texelFetch(uCur, ivec2(at.x, y), 0);
-  } else if (uMatch == 0) {
-    fragColor = texelFetch(uPrev, ivec2(at.x, y), 0);
-  } else {
-    fragColor = texelFetch(uNext, ivec2(at.x, y), 0);
-  }
-}
-`;
-
-/** Produces a reduced RGB copy of the selected weave for decimate metrics. */
-export const FILM_SAMPLE_FRAGMENT_SHADER = `#version 300 es
-precision highp float;
-precision highp int;
-
-uniform sampler2D uPrev;
-uniform sampler2D uCur;
-uniform sampler2D uNext;
-uniform ivec2 uSize;
-uniform int uTopFieldFirst;
-uniform int uMatch;
-
-out vec4 fragColor;
-
-void main() {
-  ivec2 targetSize = ivec2(${FILM_ANALYSIS_WIDTH}, ${FILM_ANALYSIS_HEIGHT});
-  ivec2 target = ivec2(gl_FragCoord.xy);
-  int x = clamp(target.x * uSize.x / targetSize.x, 0, uSize.x - 1);
-  // The bottom framebuffer row becomes the first readPixels row, so it holds
-  // the source's top row for the CPU's top-origin decimate blocks.
-  int targetY = target.y;
-  int parity = targetY & 1;
-  int fieldY = (targetY / 2) * (uSize.y / 2) / (targetSize.y / 2);
-  int y = clamp(fieldY * 2 + parity, 0, uSize.y - 1);
-  int borrowedParity = uTopFieldFirst != 0 ? 1 : 0;
-  if ((y & 1) != borrowedParity || uMatch == 1) {
-    fragColor = texelFetch(uCur, ivec2(x, y), 0);
-  } else if (uMatch == 0) {
-    fragColor = texelFetch(uPrev, ivec2(x, y), 0);
-  } else {
-    fragColor = texelFetch(uNext, ivec2(x, y), 0);
-  }
 }
 `;

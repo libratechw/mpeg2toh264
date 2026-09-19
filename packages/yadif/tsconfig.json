@@ -4,6 +4,11 @@
     "src/index.ts",
     "src/deinterlace.ts",
     "src/probe.ts",
-    "src/worker-modules.d.ts"
+    "src/utils.ts",
+    "src/debug.ts",
+    "src/shader.ts",
+    "src/film-shader.ts",
+    "src/film-detect.ts",
+    "src/runtime.ts"
   ]
 }
