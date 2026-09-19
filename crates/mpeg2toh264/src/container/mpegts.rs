@@ -352,10 +352,20 @@ struct DeferredProgram {
     private_streams: Vec<PrivateStream>,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct PrivateStream {
     is_async: bool,
     pid: u16,
+}
+
+impl PrivateStream {
+    fn kind(self) -> ElementaryKind {
+        if self.is_async {
+            ElementaryKind::PrivateStream2
+        } else {
+            ElementaryKind::PrivateStream1
+        }
+    }
 }
 
 /// The elementary stream PIDs a program advertises.
@@ -788,7 +798,7 @@ pub struct MpegTsAvDemuxer {
     /// A sound stream the caller has asked to be read instead, which takes
     /// effect at the next packet boundary; see [`MpegTsAvDemuxer::select_audio`].
     audio_switch: Option<u16>,
-    private: HashMap<u16, PesState>,
+    private: HashMap<PrivateStream, PesState>,
     video_pts: Option<u64>,
     audio_pts: Option<u64>,
     scrambled: u64,
@@ -956,51 +966,31 @@ impl MpegTsAvDemuxer {
                     }
                 }
                 let fallback_pts = self.fallback_pts();
-                for (pid, state) in &mut self.private {
-                    if !self.program.private_streams.contains(&PrivateStream {
-                        is_async: false,
-                        pid: *pid,
-                    }) {
+                self.private.retain(|stream, state| {
+                    let retained = self.program.private_streams.contains(stream);
+                    if !retained {
                         state.flush(
-                            ElementaryKind::PrivateStream1,
-                            *pid,
+                            stream.kind(),
+                            stream.pid,
                             &mut output,
-                            fallback_pts,
-                        );
-                    } else if !self.program.private_streams.contains(&PrivateStream {
-                        is_async: true,
-                        pid: *pid,
-                    }) {
-                        state.flush(
-                            ElementaryKind::PrivateStream2,
-                            *pid,
-                            &mut output,
-                            fallback_pts,
+                            if stream.is_async { fallback_pts } else { None },
                         );
                     }
-                }
+                    retained
+                });
             }
             let fallback_pts = self.fallback_pts();
             let (kind, state) = if Some(packet.pid) == self.program.video_pid {
                 (ElementaryKind::Video, &mut self.video)
             } else if Some(packet.pid) == self.program.audio_pid {
                 (ElementaryKind::Audio, &mut self.audio)
-            } else if self.program.private_streams.contains(&PrivateStream {
-                is_async: false,
-                pid: packet.pid,
-            }) {
-                (
-                    ElementaryKind::PrivateStream1,
-                    self.private.entry(packet.pid).or_default(),
-                )
-            } else if self.program.private_streams.contains(&PrivateStream {
-                is_async: true,
-                pid: packet.pid,
-            }) {
-                (
-                    ElementaryKind::PrivateStream2,
-                    self.private.entry(packet.pid).or_default(),
-                )
+            } else if let Some(stream) = self
+                .program
+                .private_streams
+                .iter()
+                .find(|stream| stream.pid == packet.pid)
+            {
+                (stream.kind(), self.private.entry(*stream).or_default())
             } else {
                 continue;
             };
@@ -1076,15 +1066,13 @@ impl MpegTsAvDemuxer {
             self.audio
                 .flush(ElementaryKind::Audio, audio_pid, &mut output, None);
         }
-        for private in &mut self.program.private_streams {
-            if let Some(state) = self.private.get_mut(&private.pid) {
-                state.flush(
-                    ElementaryKind::PrivateStream1,
-                    private.pid,
-                    &mut output,
-                    fallback_pts,
-                );
-            }
+        for (stream, state) in &mut self.private {
+            state.flush(
+                stream.kind(),
+                stream.pid,
+                &mut output,
+                if stream.is_async { fallback_pts } else { None },
+            );
         }
         Ok(output)
     }

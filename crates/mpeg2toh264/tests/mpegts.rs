@@ -445,6 +445,79 @@ fn emits_private_stream_pes_from_the_selected_service() {
 }
 
 #[test]
+fn keeps_private_pes_across_repeated_program_tables() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_MPEG2_VIDEO,
+        STREAM_TYPE_PRIVATE_DATA,
+    };
+
+    let caption = vec![0x80; 500];
+    let superimpose = vec![0x81; 500];
+    let streams = &[
+        (0x101, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (0x120, STREAM_TYPE_PRIVATE_DATA, &[0x52, 1, 0x30][..]),
+        (0x121, STREAM_TYPE_PRIVATE_DATA, &[0x52, 1, 0x38][..]),
+    ];
+    for (pid, stream_id, pts, payload, kind) in [
+        (
+            0x120,
+            0xbd,
+            Some(180_000),
+            &caption,
+            ElementaryKind::PrivateStream1,
+        ),
+        (
+            0x121,
+            0xbf,
+            None,
+            &superimpose,
+            ElementaryKind::PrivateStream2,
+        ),
+    ] {
+        for table_index in 0..2 {
+            let mut continuity = HashMap::new();
+            let prefix = mux_transport_stream_with_descriptors(
+                streams,
+                &[
+                    PesUnit {
+                        pid: 0x101,
+                        stream_id: 0xe0,
+                        pts: Some(90_000),
+                        payload: &[0, 0, 1, 0xb3],
+                    },
+                    PesUnit {
+                        pid,
+                        stream_id,
+                        pts,
+                        payload,
+                    },
+                ],
+                &mut continuity,
+            );
+            let repeated = mux_transport_stream_with_descriptors(streams, &[], &mut continuity);
+            // PAT, PMT, video, and only the first of three private PES packets.
+            let mut ts = prefix[..4 * 188].to_vec();
+            ts.extend_from_slice(&repeated[table_index * 188..(table_index + 1) * 188]);
+            ts.extend_from_slice(&prefix[4 * 188..]);
+
+            // Also split the input inside a TS packet, as file reads do.
+            let mut demuxer = MpegTsAvDemuxer::new();
+            let mut packets = Vec::new();
+            for chunk in ts.chunks(197) {
+                packets.extend(demuxer.push(chunk).expect("demuxes"));
+            }
+            packets.extend(demuxer.finish().expect("flushes"));
+            let private: Vec<_> = packets.iter().filter(|packet| packet.pid == pid).collect();
+            assert_eq!(private.len(), 1, "PID {pid:#x}, table {table_index}");
+            assert_eq!(private[0].kind, kind);
+            assert_eq!(private[0].pts, pts.or(Some(90_000)));
+            assert_eq!(private[0].data, *payload);
+        }
+    }
+}
+
+#[test]
 fn emits_only_the_default_caption_and_superimpose_streams() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{
