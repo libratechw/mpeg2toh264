@@ -37,7 +37,7 @@ import {
   FILM_LOCK_FRAMES,
 } from "./film-shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
-import { loopWindowFor } from "./runtime.js";
+import { loopWindowFor, usableExpectedDisplayTime } from "./runtime.js";
 import { createProgram, VERTEX_SHADER } from "./utils.js";
 
 /** How far the presentation time may jump before the held frames are stale. */
@@ -836,8 +836,11 @@ export class Deinterlacer {
         }
         // Timed from when the frame reaches the screen, which unlike `now`
         // does not move when the callback runs late; a refresh of margin
-        // covers a late callback.
-        const shown = (metadata.expectedDisplayTime || now) + this.#refreshMs;
+        // covers a late callback. A value the browser cannot be taken at (see
+        // usableExpectedDisplayTime) falls back to the callback time.
+        const shown =
+          usableExpectedDisplayTime(metadata.expectedDisplayTime, now) +
+          this.#refreshMs;
         if (this.#filmLocked) {
           const phase = this.#phase.phase;
           if (phase === FILM_DUPLICATE_PHASE) {

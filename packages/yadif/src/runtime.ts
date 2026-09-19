@@ -8,6 +8,41 @@
  */
 
 /**
+ * How far `expectedDisplayTime` may sit from `now` and still describe the frame
+ * the callback is for, in milliseconds.
+ *
+ * The callback runs at or just after the moment it reports, so a usable value
+ * is near `now`; a late callback pushes it into the past by a few refreshes at
+ * most. A whole second is far past any real notification delay, so a value
+ * further away is not about this frame at all -- Safari returns a large
+ * negative number, and trusting it would put every scheduled moment in the
+ * distant past and drop the second field of every pair.
+ */
+export const EXPECTED_DISPLAY_TIME_TOLERANCE_MS = 1000;
+
+/**
+ * The moment to time a frame from.
+ *
+ * Returns `expected` only when it is a real, positive moment near `now`;
+ * otherwise the frame's own callback time (`now`) is used, which is what the
+ * filter did before it had any expected time to trust.
+ */
+export function usableExpectedDisplayTime(
+  expected: unknown,
+  now: number,
+): number {
+  if (
+    typeof expected !== "number" ||
+    !(expected > 0) ||
+    !Number.isFinite(expected) ||
+    Math.abs(expected - now) >= EXPECTED_DISPLAY_TIME_TOLERANCE_MS
+  ) {
+    return now;
+  }
+  return expected;
+}
+
+/**
  * The window whose `requestAnimationFrame` should drive the loop.
  *
  * The rAF grid and the `requestVideoFrameCallback` moments are only comparable

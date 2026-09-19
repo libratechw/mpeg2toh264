@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 
 // Focused regression tests for the browser-boundary decisions the
-// deinterlacer makes. This file starts with the rAF loop's window, which was
-// seen to matter on a device: Document Picture-in-Picture moves the element to
-// another window, whose rAF and rVFC timestamps are a different timebase, and
-// comparing across the two stopped the picture. The loop must follow the
-// canvas.
+// deinterlacer makes. Each case stands for something that was seen on a
+// device:
+//  - Document Picture-in-Picture moves the element to another window, whose
+//    rAF and rVFC timestamps are a different timebase; comparing across the
+//    two stopped the picture. The loop must follow the canvas.
+//  - Safari reports a large negative expectedDisplayTime. Believing it put
+//    every scheduled moment in the distant past, so the second field of every
+//    pair was dropped as late (30 fps instead of 60).
 //
-// This covers the decision that path makes. The loop's actual registration and
-// release against a real document is a browser behaviour, verified on-device
-// (Windows Document PiP continued after the fix); it is not reimplemented here.
+// These cover the decisions those paths make. The loop's actual registration
+// and release against a real document is a browser behaviour, verified
+// on-device (Windows Document PiP continued after the fix); it is not
+// reimplemented here.
 //
 // Run from the repository root:
 //   npm run test:yadif-runtime
@@ -37,10 +41,49 @@ await build({
   logLevel: "silent",
 });
 
-const { loopWindowFor } = await import(pathToFileURL(outFile).href);
+const {
+  EXPECTED_DISPLAY_TIME_TOLERANCE_MS,
+  loopWindowFor,
+  usableExpectedDisplayTime,
+} = await import(pathToFileURL(outFile).href);
 
 test.after(async () => {
   await rm(outDir, { recursive: true, force: true });
+});
+
+test("usableExpectedDisplayTime keeps a real moment near now", () => {
+  // The callback can run slightly before or after the moment it reports.
+  assert.equal(usableExpectedDisplayTime(1050, 1000), 1050);
+  assert.equal(usableExpectedDisplayTime(900, 1000), 900);
+  assert.equal(usableExpectedDisplayTime(1000, 1000), 1000);
+});
+
+test("usableExpectedDisplayTime keeps a value right up to the tolerance", () => {
+  const now = 5000;
+  const inside = now - (EXPECTED_DISPLAY_TIME_TOLERANCE_MS - 1);
+  const outside = now - EXPECTED_DISPLAY_TIME_TOLERANCE_MS;
+  assert.equal(usableExpectedDisplayTime(inside, now), inside);
+  assert.equal(usableExpectedDisplayTime(outside, now), now);
+});
+
+test("usableExpectedDisplayTime falls back when the value cannot be used", () => {
+  const now = 1234.5;
+  // Zero and negatives are not moments: the old `|| now` treated zero this way.
+  assert.equal(usableExpectedDisplayTime(0, now), now);
+  // Safari returns a large negative number (seen: -1009688640).
+  assert.equal(usableExpectedDisplayTime(-1009688640, now), now);
+  assert.equal(usableExpectedDisplayTime(-1, now), now);
+  // Values that are not finite numbers at all.
+  assert.equal(usableExpectedDisplayTime(Number.NaN, now), now);
+  assert.equal(usableExpectedDisplayTime(Number.POSITIVE_INFINITY, now), now);
+  assert.equal(usableExpectedDisplayTime(Number.NEGATIVE_INFINITY, now), now);
+  // A future value the clock has not reached is not this callback's moment.
+  assert.equal(usableExpectedDisplayTime(now + 60_000, now), now);
+  // Never trust a non-number; the metadata field is untrusted input.
+  assert.equal(usableExpectedDisplayTime("1000", now), now);
+  assert.equal(usableExpectedDisplayTime(undefined, now), now);
+  assert.equal(usableExpectedDisplayTime(null, now), now);
+  assert.equal(usableExpectedDisplayTime({}, now), now);
 });
 
 test("loopWindowFor follows the canvas into another document and back", () => {
