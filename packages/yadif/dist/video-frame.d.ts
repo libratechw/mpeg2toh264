@@ -26,6 +26,8 @@ export declare class VideoFrames {
     constructor(video: HTMLVideoElement);
     /** Whether acquisition runs off the Firefox counters. */
     get mozDriven(): boolean;
+    /** Whether any frame has been delivered yet (counters proven live). */
+    get hasDelivered(): boolean;
     request(callback: FrameCallback): void;
     cancel(): void;
     destroy(): void;
