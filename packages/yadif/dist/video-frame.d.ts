@@ -24,6 +24,8 @@ export declare function supportsVideoFrames(): boolean;
 export declare class VideoFrames {
     #private;
     constructor(video: HTMLVideoElement);
+    /** Whether acquisition runs off the Firefox counters. */
+    get mozDriven(): boolean;
     request(callback: FrameCallback): void;
     cancel(): void;
     destroy(): void;
