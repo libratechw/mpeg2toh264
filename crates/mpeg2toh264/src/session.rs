@@ -14,11 +14,11 @@ use crate::container::adts::{
     AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
-    h264_gop_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, mpeg2_passthrough_unit,
-    mpeg2_video_timeline, Fmp4AudioSamples, Fmp4Fragment, Mpeg2Unit, Mpeg2VideoTimeline,
-    UnitLeadIn,
+    h264_gop_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, timed_mpeg2_unit,
+    Fmp4AudioSamples, Fmp4Fragment, Mpeg2VideoTimeline, TimedUnit, UnitLeadIn,
 };
 use crate::container::mpegts::{AudioStream, ElementaryKind, ElementaryPacket, MpegTsAvDemuxer};
+use crate::container::rff::RffState;
 use crate::error::{bail, Result};
 use crate::job::PictureOutput;
 use crate::mpeg2::gop_stream::{Mpeg2Gop, Mpeg2GopStream};
@@ -116,22 +116,24 @@ pub enum Fragment {
 /// extra copy of its IDR there, and passthrough simply shows its first picture
 /// for longer.
 enum UnitPlan {
-    Transcode(Mpeg2VideoTimeline),
-    Passthrough(Mpeg2Unit),
+    Transcode(TimedUnit),
+    Passthrough(TimedUnit),
 }
 
 impl UnitPlan {
-    fn timeline(&self) -> &Mpeg2VideoTimeline {
+    fn timed(&self) -> &TimedUnit {
         match self {
-            Self::Transcode(timeline) => timeline,
-            Self::Passthrough(unit) => &unit.timeline,
+            Self::Transcode(unit) | Self::Passthrough(unit) => unit,
         }
+    }
+
+    fn timeline(&self) -> &Mpeg2VideoTimeline {
+        &self.timed().unit.timeline
     }
 
     fn timeline_mut(&mut self) -> &mut Mpeg2VideoTimeline {
         match self {
-            Self::Transcode(timeline) => timeline,
-            Self::Passthrough(unit) => &mut unit.timeline,
+            Self::Transcode(unit) | Self::Passthrough(unit) => &mut unit.unit.timeline,
         }
     }
 
@@ -354,6 +356,8 @@ pub struct Session {
     /// It moves only when a fragment goes out, so a unit that yields none
     /// leaves its own span to be counted as part of the next one's hole.
     expected_pts: Option<i64>,
+    /// Source field clock and the end time already committed across GOPs.
+    rff: RffState,
 }
 
 impl Session {
@@ -494,6 +498,7 @@ impl Session {
             timeline_origin: origin_ticks.map(|ticks| ticks as i64),
             timelines_aligned: false,
             expected_pts: None,
+            rff: RffState::default(),
         }
     }
 
@@ -824,29 +829,27 @@ impl Session {
     /// slice in it will convert. That is what the audio pairing below is
     /// measured against; a unit that turns out to hold a damaged picture is
     /// drawn again by [`Self::package`] once the transcoder has said so.
-    fn plan_unit(&self, data: &[u8], starts_at_idr: bool) -> Result<UnitPlan> {
-        self.plan_unit_without(data, starts_at_idr, &[])
+    fn plan_unit(&self, gop: &Mpeg2Gop, starts_at_idr: bool) -> Result<UnitPlan> {
+        let mut timed = timed_mpeg2_unit(&gop.data, !starts_at_idr, &[], self.rff)?;
+        // A seek, missing GOP, or timestamp jump resets the timing phase.
+        // The ordinary hole handling accounts for any outstanding half field.
+        if let (Some(pts), Some(expected)) = (gop.pts, self.expected_pts) {
+            let difference = (pts as i64 - timed.source_offset - expected + PTS_MODULUS / 2)
+                .rem_euclid(PTS_MODULUS)
+                - PTS_MODULUS / 2;
+            if difference.abs() > 2 {
+                timed.retime(RffState::default());
+            }
+        }
+        Ok(self.plan_from_timed(timed))
     }
 
-    /// The same, told which source pictures would not decode.
-    fn plan_unit_without(
-        &self,
-        data: &[u8],
-        starts_at_idr: bool,
-        undecodable: &[bool],
-    ) -> Result<UnitPlan> {
-        let mut plan = match self.video {
-            VideoPipeline::Transcode(_) => {
-                UnitPlan::Transcode(mpeg2_video_timeline(data, !starts_at_idr, undecodable)?)
-            }
-            VideoPipeline::Passthrough { .. } => {
-                UnitPlan::Passthrough(mpeg2_passthrough_unit(data, !starts_at_idr)?)
-            }
-        };
-        // Only the pipeline knows how many samples a field pair became, and the
-        // timeline has to reserve one for each.
-        plan.timeline_mut().split_field_samples = self.video.split_field_samples();
-        Ok(plan)
+    fn plan_from_timed(&self, mut timed: TimedUnit) -> UnitPlan {
+        timed.unit.timeline.split_field_samples = self.video.split_field_samples();
+        match self.video {
+            VideoPipeline::Transcode(_) => UnitPlan::Transcode(timed),
+            VideoPipeline::Passthrough { .. } => UnitPlan::Passthrough(timed),
+        }
     }
 
     /// Notice a unit coded under something other than what the initialization
@@ -910,8 +913,8 @@ impl Session {
     ///
     /// Not the timestamp the unit carries: that belongs to its first *coded*
     /// picture, which an open group displays after the pictures that lead it.
-    fn unit_start_pts(gop: &Mpeg2Gop, timeline: &Mpeg2VideoTimeline) -> Option<i64> {
-        Some(gop.pts? as i64 - timeline.first_coded_presentation_time() as i64)
+    fn unit_start_pts(gop: &Mpeg2Gop, plan: &UnitPlan) -> Option<i64> {
+        Some(gop.pts? as i64 - plan.timed().source_offset)
     }
 
     /// Hold this unit's opening sample over whatever the source lost in front
@@ -934,10 +937,8 @@ impl Session {
     /// A jump too long to sit through is left as a gap instead; see
     /// [`Session::open_a_gap`].
     fn hold_over_hole(&mut self, gop: &Mpeg2Gop, plan: &mut UnitPlan) -> Result<()> {
-        let (Some(expected), Some(start)) = (
-            self.expected_pts,
-            Self::unit_start_pts(gop, plan.timeline()),
-        ) else {
+        let (Some(expected), Some(start)) = (self.expected_pts, Self::unit_start_pts(gop, plan))
+        else {
             return Ok(());
         };
         // Signed, across the wrap: a unit that opens a little before the one
@@ -962,7 +963,8 @@ impl Session {
             self.video.request_random_access();
             // The plan was drawn for a unit that continues the one before it,
             // and this one no longer does.
-            *plan = self.plan_unit(&gop.data, true)?;
+            let timed = timed_mpeg2_unit(&gop.data, false, &[], plan.timed().before)?;
+            *plan = self.plan_from_timed(timed);
         }
         plan.timeline_mut().hold_ticks = ahead as u32;
         Ok(())
@@ -1033,9 +1035,9 @@ impl Session {
             }
             let gop = self.pending_gops.remove(0);
             self.note_description(&gop);
-            let mut plan = self.plan_unit(&gop.data, self.starts_at_idr())?;
+            let mut plan = self.plan_unit(&gop, self.starts_at_idr())?;
             self.hold_over_hole(&gop, &mut plan)?;
-            return Ok(Some(self.commit(gop, Vec::new(), Some(plan))?));
+            return Ok(Some(self.commit(gop, Vec::new(), plan)));
         }
         // Keep one GOP pending so all AAC packets up to the next GOP boundary
         // can share the same moof. MSE implementations then see both trafs per
@@ -1058,12 +1060,12 @@ impl Session {
         // changing calls for a new one.
         self.note_description(&gop);
         self.note_audio_description();
-        let mut plan = self.plan_unit(&gop.data, self.starts_at_idr())?;
+        let mut plan = self.plan_unit(&gop, self.starts_at_idr())?;
         // Before the audio is measured against the video, since a hole held
         // over is part of what the fragment spans and so of what it carries.
         self.hold_over_hole(&gop, &mut plan)?;
         let starts_at_idr = self.starts_at_idr();
-        self.align_timelines(&gop, plan.timeline());
+        self.align_timelines(&gop, &plan);
         let video_duration = mpeg2_fragment_duration(plan.timeline(), plan.lead_in(starts_at_idr));
         // Audio is measured from where the audio track itself starts, not
         // from where the video does.
@@ -1088,17 +1090,12 @@ impl Session {
         // short by is asked for again as soon as the next one is measured.
         let take = self.frames_under_one_configuration(take);
         let frames: Vec<AacFrame> = self.pending_audio.drain(..take).collect();
-        Ok(Some(self.commit(gop, frames, Some(plan))?))
+        Ok(Some(self.commit(gop, frames, plan)))
     }
 
     /// Settle what a unit that is going out will be: whether it carries a
     /// restart point, and so what its plan is.
-    fn commit(
-        &mut self,
-        gop: Mpeg2Gop,
-        audio: Vec<AacFrame>,
-        plan: Option<UnitPlan>,
-    ) -> Result<Ready> {
+    fn commit(&mut self, gop: Mpeg2Gop, audio: Vec<AacFrame>, plan: UnitPlan) -> Ready {
         if self.is_random_access_point() {
             match self.open_gop_recovery {
                 OpenGopRecovery::Idr | OpenGopRecovery::RecoveryPoint => {
@@ -1108,16 +1105,12 @@ impl Session {
             }
         }
         let starts_at_idr = self.video.awaiting_random_access();
-        let plan = match plan {
-            Some(plan) => plan,
-            None => self.plan_unit(&gop.data, starts_at_idr)?,
-        };
-        Ok(Ready {
+        Ready {
             gop,
             audio,
             plan,
             starts_at_idr,
-        })
+        }
     }
 
     /// Put the two tracks on one timeline, using the timestamps the transport
@@ -1129,7 +1122,8 @@ impl Session {
     /// placed at their real distance from the origin, which for a session that
     /// picks its own is whichever track starts first, and for an anchored one
     /// is the timestamp the caller named.
-    fn align_timelines(&mut self, gop: &Mpeg2Gop, timeline: &Mpeg2VideoTimeline) {
+    fn align_timelines(&mut self, gop: &Mpeg2Gop, plan: &UnitPlan) {
+        let timeline = plan.timeline();
         if self.timelines_aligned {
             return;
         }
@@ -1148,26 +1142,25 @@ impl Session {
         // runs on the opening fragment, where those pictures are missing and
         // the IDR covers their display slots, so the presentation still starts
         // where they would.
-        let video_start = video_pts as i64 - timeline.first_coded_presentation_time() as i64;
+        let video_start = video_pts as i64 - plan.timed().source_offset;
         let origin = match self.timeline_origin {
             Some(origin) => origin,
             None => {
                 let chosen = match self.audio_start_pts {
-                    // Decoding leads display by up to one frame, and the muxer
-                    // needs somewhere to put that, so the timeline starts a
-                    // frame before the earlier track.
-                    Some(audio_pts) => {
-                        (video_start - timeline.sample_duration as i64).min(audio_pts as i64)
-                    }
-                    // A stream with no audio track to wait for begins a frame
-                    // before its video, for the same reason: starting on the
+                    // Leave room for the sequence's decode lead, including
+                    // the three-field pictures soft telecine can carry.
+                    Some(audio_pts) => (video_start
+                        - timeline.decode_lead.max(timeline.sample_duration) as i64)
+                        .min(audio_pts as i64),
+                    // A stream with no audio track leaves the same room
+                    // before its video: starting on the
                     // video leaves the decode lead nowhere to go, and the
                     // opening fragment's decode timeline is clamped to zero and
                     // runs a frame into the one after it. One that has yet to
                     // name its audio waits, because the origin cannot be moved
                     // afterwards.
                     None if self.demuxer.has_aac_audio() => return,
-                    None => video_start - timeline.sample_duration as i64,
+                    None => video_start - timeline.decode_lead.max(timeline.sample_duration) as i64,
                 };
                 self.timeline_origin = Some(chosen);
                 chosen
@@ -1205,7 +1198,7 @@ impl Session {
         } = ready;
         let gop = &gop;
         // Aligning can still move the origin, so read the start after it.
-        self.align_timelines(gop, plan.timeline());
+        self.align_timelines(gop, &plan);
         let start = self.video_presentation_start as f64 / TIMESCALE as f64;
         let first_time = plan.timeline().first_presentation_time();
         let mut scans: Vec<VideoScan> = (0..plan.timeline().presentation_indices.len())
@@ -1257,9 +1250,10 @@ impl Session {
         // and the source cannot creep apart. The hold at the front covered the
         // hole in front of this unit and is not part of what it spans.
         let hold = plan.timeline().hold_ticks as u64;
-        if let Some(start) = Self::unit_start_pts(gop, plan.timeline()) {
+        if let Some(start) = Self::unit_start_pts(gop, &plan) {
             self.expected_pts = Some(start + fragment.duration.saturating_sub(hold) as i64);
         }
+        self.rff = plan.timed().after;
         self.audio_frames_emitted += audio_frames.len() as u64;
         self.gops_emitted += 1;
 
@@ -1311,7 +1305,8 @@ impl Session {
         converted: Option<TranscodeResult>,
     ) -> Result<(Fmp4Fragment, bool)> {
         match (&mut self.video, plan) {
-            (VideoPipeline::Transcode(transcoder), UnitPlan::Transcode(timeline)) => {
+            (VideoPipeline::Transcode(transcoder), UnitPlan::Transcode(timed)) => {
+                let timeline = &timed.unit.timeline;
                 let h264 = match converted {
                     Some(h264) => h264,
                     None => transcoder.push(&gop.data)?,
@@ -1323,12 +1318,20 @@ impl Session {
                 // the unit again knowing that, which is the one case where the
                 // timeline is worth walking twice.
                 let redrawn = if h264.undecodable.iter().any(|&damaged| damaged) {
-                    Some(self.plan_unit_without(&gop.data, starts_at_idr, &h264.undecodable)?)
+                    let mut redrawn = timed_mpeg2_unit(
+                        &gop.data,
+                        !starts_at_idr,
+                        &h264.undecodable,
+                        timed.before,
+                    )?;
+                    redrawn.unit.timeline.split_field_samples = timeline.split_field_samples;
+                    redrawn.unit.timeline.hold_ticks = timeline.hold_ticks;
+                    Some(redrawn)
                 } else {
                     None
                 };
                 let timeline = match &redrawn {
-                    Some(redrawn) => redrawn.timeline(),
+                    Some(redrawn) => &redrawn.unit.timeline,
                     None => timeline,
                 };
                 let fragment = h264_gop_to_fmp4(
@@ -1347,8 +1350,9 @@ impl Session {
                     recovery_pending,
                     ..
                 },
-                UnitPlan::Passthrough(unit),
+                UnitPlan::Passthrough(timed),
             ) => {
+                let unit = &timed.unit;
                 // A unit yields samples only once a picture a decoder can
                 // begin at has arrived, which is what this was waiting for.
                 *awaiting_intra &= unit.samples.is_empty();

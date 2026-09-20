@@ -7,6 +7,7 @@ pub mod chroma;
 pub mod cos_table;
 pub mod intra;
 pub mod mb;
+pub mod mbaff;
 pub mod mvmap;
 pub mod mvpred;
 pub mod params;

@@ -30,10 +30,12 @@ use crate::h264::chroma::{
 };
 use crate::h264::intra::{chroma_dc, luma_8x8_dc, CodingOrder, ReconstructedPicture};
 use crate::h264::mb::{
-    b16x8_mb_type, b_mb_type, make_luma_counts, mark_no_chroma_coefficients, mark_no_coefficients,
-    write_inter_macroblock, write_intra_macroblock, ChromaCounts, CoeffCountMap, InterMacroblock,
-    MotionPartition, PredictionMode, FIELD_SCAN_8X8,
+    b16x8_mb_type, b_mb_type, level_mask, make_luma_counts, mark_no_chroma_coefficients,
+    mark_no_coefficients, write_inter_macroblock, write_intra_macroblock, ChromaCounts,
+    CoeffCountMap, InterMacroblock, MotionPartition, PredictionMode, FIELD_SCAN_8X8,
+    INVERSE_FIELD_SCAN_8X8, INVERSE_ZIGZAG_8X8,
 };
+use crate::h264::mbaff::Frame as MbaffFrame;
 use crate::h264::mvmap::{map_vector, native_position, VectorKind};
 use crate::h264::mvpred::{MbMotion, MotionField};
 use crate::h264::params::{
@@ -41,8 +43,8 @@ use crate::h264::params::{
 };
 use crate::h264::params::{ZIGZAG_4X4, ZIGZAG_8X8};
 use crate::h264::quant::{
-    field_dct_to_frame_targets, frame_dct_to_field_targets, inter_targets, intra_targets,
-    Quantiser8x8, DEFAULT_OVERSAMPLE, FLAT_PREDICTION_DC,
+    column_mask, field_dct_to_frame_targets, frame_dct_to_field_targets, inter_targets,
+    intra_targets, Quantiser8x8, DEFAULT_OVERSAMPLE, FLAT_PREDICTION_DC,
 };
 use crate::h264::reconstruct::{
     chroma_dc_terms, chroma_residual_4x4, residual_8x8, InverseScale8x8,
@@ -224,6 +226,10 @@ struct PictureScratch {
     field_counts: [CoeffCountMap; 2],
     field_chroma_counts: [ChromaCounts; 2],
     field_motion: [MotionField; 2],
+    /// Where each macroblock's neighbours are, for the frame picture and for
+    /// each field of a picture coded as two field pictures.
+    frame: MbaffFrame,
+    field_frames: [MbaffFrame; 2],
 }
 
 impl PictureScratch {
@@ -246,6 +252,11 @@ impl PictureScratch {
             field_motion: [
                 MotionField::new(mb_width, field_height),
                 MotionField::new(mb_width, field_height),
+            ],
+            frame: MbaffFrame::new(mb_width, mb_height, false),
+            field_frames: [
+                MbaffFrame::new(mb_width, field_height, false),
+                MbaffFrame::new(mb_width, field_height, false),
             ],
         }
     }
@@ -2008,12 +2019,27 @@ fn write_recovery_point_sei() -> Vec<u8> {
     to_nal_unit(&[6, 1, 0xe4, 0x80], 0, nal_type::SEI)
 }
 
+/// Whether a macroblock pair has to be coded as field macroblocks.
+///
+/// Field and dual prime motion give each field of a source macroblock its own
+/// prediction, which one frame macroblock cannot carry. Nothing else asks for
+/// field macroblocks, and they are not free: see the chroma note where
+/// `picture_field_pairs` is worked out.
+fn pair_needs_field(top: Option<&Macroblock>, bottom: Option<&Macroblock>) -> bool {
+    [top, bottom]
+        .into_iter()
+        .flatten()
+        .any(|mb| matches!(mb.motion_type, motion_type::FIELD | motion_type::DUAL_PRIME))
+}
+
 /// Which of the two per-slot buffers a field macroblock's targets landed in, and
 /// which of its four blocks carry anything.
 #[derive(Clone, Copy, Default)]
 struct FieldTargetSet {
     converted: bool,
     active_mask: u32,
+    /// The positions of each block that may be non-zero.
+    nonzero: [u64; 4],
 }
 
 /// Dequantise one MPEG-2 macroblock of a field-coded pair, converting its
@@ -2025,12 +2051,14 @@ fn source_field_targets(
     converted: &mut [[f32; 64]; 4],
 ) -> FieldTargetSet {
     let mut active_mask = 0u32;
+    let mut nonzero = [0u64; 4];
     // A macroblock the source never coded carries nothing, which is the same
     // as one it coded as skipped.
     let Some(field_source) = field_source.filter(|mb| !mb.skipped) else {
         return FieldTargetSet {
             converted: false,
             active_mask,
+            nonzero,
         };
     };
     let quantiser_scale =
@@ -2042,29 +2070,32 @@ fn source_field_targets(
         &pic.quant.non_intra
     };
     for b in 0..4 {
-        let Some(block) = field_source.block(b) else {
+        let Some((block, mask)) = field_source.coded_block(b) else {
             continue;
         };
         active_mask |= 1 << b;
-        if source_intra {
+        nonzero[b] = if source_intra {
             intra_targets(
                 block,
+                mask,
                 matrix,
                 quantiser_scale,
                 pic.coding.intra_dc_precision,
                 &mut raw[b],
-            );
+            )
         } else {
-            inter_targets(block, matrix, quantiser_scale, &mut raw[b]);
-        }
+            inter_targets(block, mask, matrix, quantiser_scale, &mut raw[b])
+        };
     }
     if field_source.dct_type == 1 {
         return FieldTargetSet {
             converted: false,
             active_mask,
+            nonzero,
         };
     }
     let mut converted_mask = 0u32;
+    let mut converted_nonzero = [0u64; 4];
     if active_mask & 0b0101 != 0 {
         if active_mask & 0b0001 == 0 {
             raw[0].fill(0.0);
@@ -2075,6 +2106,9 @@ fn source_field_targets(
         let (upper, lower) = converted.split_at_mut(2);
         frame_dct_to_field_targets(&raw[0], &raw[2], &mut upper[0], &mut lower[0]);
         converted_mask |= 0b0101;
+        let columns = column_mask(nonzero[0] | nonzero[2]);
+        converted_nonzero[0] = columns;
+        converted_nonzero[2] = columns;
     }
     if active_mask & 0b1010 != 0 {
         if active_mask & 0b0010 == 0 {
@@ -2086,10 +2120,14 @@ fn source_field_targets(
         let (upper, lower) = converted.split_at_mut(2);
         frame_dct_to_field_targets(&raw[1], &raw[3], &mut upper[1], &mut lower[1]);
         converted_mask |= 0b1010;
+        let columns = column_mask(nonzero[1] | nonzero[3]);
+        converted_nonzero[1] = columns;
+        converted_nonzero[3] = columns;
     }
     FieldTargetSet {
         converted: true,
         active_mask: converted_mask,
+        nonzero: converted_nonzero,
     }
 }
 
@@ -2102,7 +2140,7 @@ fn field_chroma_source<'a>(
 ) -> FieldChromaSource<'a> {
     let source_intra = pair_source.is_some_and(Macroblock::is_intra);
     FieldChromaSource {
-        levels: pair_source.and_then(|mb| mb.block(4 + component)),
+        levels: pair_source.and_then(|mb| mb.coded_block(4 + component)),
         weight_scale: if source_intra {
             &pic.quant.chroma_intra
         } else {
@@ -2149,8 +2187,13 @@ fn write_picture(
         field_counts,
         field_chroma_counts,
         field_motion,
+        frame,
+        field_frames,
         ..
     } = scratch;
+    // A picture coded as two field pictures is not macroblock-adaptive whatever
+    // the sequence says; `field_pic_flag` has already settled it.
+    frame.set_mbaff(ctx.mbaff && paired_field.is_none());
     let mut targets = [[0.0f32; 64]; 4];
     let mut field_targets = [[0.0f32; 64]; 4];
     let mut luma_scratch = [[0i32; 64]; 4];
@@ -2193,6 +2236,22 @@ fn write_picture(
         l1_short_term_delta: None,
         anchor_second_field: true,
     };
+    // Field macroblock pairs are what a picture needs to say that a macroblock
+    // predicted its two fields separately, and nothing else needs them. They
+    // are not free: H.264 derives chroma motion from the luma vector, and for a
+    // field macroblock whose reference field is the other parity it shifts that
+    // vector by a quarter of a chroma sample (clause 8.4.1.4). MPEG-2's frame
+    // prediction has no such step, so the chroma the residual was coded against
+    // is not the chroma the decoder predicts, and in interlaced 4:2:0 -- where
+    // one chroma line belongs to each field -- the miss is a quarter of the
+    // difference between the fields. On saturated colour in motion that reaches
+    // tens of levels and alternates line by line, which is invisible woven and
+    // becomes a solid macroblock once a deinterlacer keeps one field.
+    //
+    // So a pair takes them only where one of its two macroblocks actually
+    // predicts field by field; see [`pair_needs_field`]. Which pairs those are
+    // is scattered, so the two kinds sit side by side and where a neighbour is
+    // becomes [`crate::h264::mbaff`]'s answer rather than arithmetic.
     let picture_field_pairs =
         direct_field_pair || (ctx.mbaff && pic.header.picture_coding_type != PictureType::I);
     let mut cached_pair_address: isize = -1;
@@ -2468,10 +2527,15 @@ fn write_picture(
         } else {
             by_address.get(((mb_y & !1) + 1) * g.mb_width + mb_x)
         };
-        // Use a uniform coding mode across an MBAFF picture. This makes every
-        // horizontal and vertical neighbour live in the same field coordinate
-        // system, so thousands of pair-isolating slices are unnecessary.
-        let field_pair = picture_field_pairs;
+        let address = frame.address(mb_x, mb_y);
+        let field_address = field_frames[mb_y & 1].address(mb_x, mb_y >> 1);
+        let field_pair =
+            picture_field_pairs && (direct_field_pair || pair_needs_field(pair_top, pair_bottom));
+        // Both macroblocks of a pair are coded the same way, and the neighbour
+        // derivation has to know which way before either of them looks around.
+        if !direct_field_pair && mb_y % 2 == 0 {
+            frame.set_field_pair(address, field_pair);
+        }
         let intra = match source {
             Some(mb) if !mb.skipped => mb.is_intra(),
             _ => false,
@@ -2505,6 +2569,9 @@ fn write_picture(
         let mut intra_luma_coded = false;
 
         let mut luma_active = [false; 4];
+        // Which positions of each block of `luma_scratch`, in scan order, hold
+        // a non-zero level. The rest of a block is not written and not read.
+        let mut luma_masks = [0u64; 4];
         let mut has_chroma = false;
         let mut chroma_from_pair = false;
         let mut qp = prev_qp;
@@ -2526,27 +2593,31 @@ fn write_picture(
                         &source_pic.quant.chroma_non_intra
                     };
 
+                    // Where each dequantised block may be non-zero, which is
+                    // what the quantiser visits.
+                    let mut target_masks = [0u64; 4];
                     for b in 0..4 {
                         let target = if source.dct_type == 1 && !direct_field_pair {
                             &mut field_targets[b]
                         } else {
                             &mut targets[b]
                         };
-                        target.fill(0.0);
-                        let Some(block) = source.block(b) else {
+                        let Some((block, mask)) = source.coded_block(b) else {
+                            target.fill(0.0);
                             continue;
                         };
-                        if intra {
+                        target_masks[b] = if intra {
                             intra_targets(
                                 block,
+                                mask,
                                 matrix,
                                 quantiser_scale,
                                 source_pic.coding.intra_dc_precision,
                                 target,
-                            );
+                            )
                         } else {
-                            inter_targets(block, matrix, quantiser_scale, target);
-                        }
+                            inter_targets(block, mask, matrix, quantiser_scale, target)
+                        };
                     }
                     if source.dct_type == 1 && !direct_field_pair {
                         let (upper, lower) = targets.split_at_mut(2);
@@ -2562,20 +2633,30 @@ fn write_picture(
                             &mut upper[1],
                             &mut lower[1],
                         );
+                        let left = column_mask(target_masks[0] | target_masks[2]);
+                        let right = column_mask(target_masks[1] | target_masks[3]);
+                        target_masks = [left, right, left, right];
                     }
                     let scan: &[usize; 64] = if direct_field_pair {
                         &FIELD_SCAN_8X8
                     } else {
                         &ZIGZAG_8X8
                     };
+                    let inverse_scan: &[u8; 64] = if direct_field_pair {
+                        &INVERSE_FIELD_SCAN_8X8
+                    } else {
+                        &INVERSE_ZIGZAG_8X8
+                    };
                     for b in 0..4 {
                         let Some(state) = intra_state.as_mut().filter(|_| intra) else {
-                            luma_active[b] = quant.scanned_levels_for(
+                            luma_masks[b] = quant.scanned_levels_masked(
                                 &targets[b],
+                                target_masks[b],
                                 qp,
-                                scan,
+                                inverse_scan,
                                 &mut luma_scratch[b],
                             );
+                            luma_active[b] = luma_masks[b] != 0;
                             continue;
                         };
                         // A block predicts from the ones already coded, its own
@@ -2594,6 +2675,7 @@ fn write_picture(
                         targets[b][0] += FLAT_PREDICTION_DC - 8.0 * pred as f32;
                         luma_active[b] =
                             quant.scanned_levels_for(&targets[b], qp, scan, &mut luma_scratch[b]);
+                        luma_masks[b] = level_mask(&luma_scratch[b]);
                         state.store_luma(
                             mb_x,
                             coded_mb_y,
@@ -2611,7 +2693,7 @@ fn write_picture(
                     for c in 0..2 {
                         let prediction =
                             chroma_prediction.as_ref().filter(|_| intra).map(|p| &p[c]);
-                        match (source.block(4 + c), prediction) {
+                        match (source.coded_block(4 + c), prediction) {
                             (Some(block), Some(prediction)) => convert_intra_chroma_block(
                                 block,
                                 chroma_matrix,
@@ -2668,6 +2750,7 @@ fn write_picture(
                     );
                 }
                 luma_active = [false; 4];
+                luma_masks = [0; 4];
             }
             let luma: [Option<&[i32; 64]>; 4] =
                 std::array::from_fn(|i| luma_active[i].then_some(&luma_scratch[i]));
@@ -2683,11 +2766,20 @@ fn write_picture(
                 } else {
                     &mut *chroma_counts
                 },
-                mb_x,
-                coded_mb_y,
+                if direct_field_pair {
+                    &field_frames[field]
+                } else {
+                    &*frame
+                },
+                if direct_field_pair {
+                    field_address
+                } else {
+                    address
+                },
                 qp,
                 prev_qp,
                 &luma,
+                &luma_masks,
                 has_chroma.then_some(&chroma_scratch),
             )?;
             prev_qp = written.qp;
@@ -2804,8 +2896,14 @@ fn write_picture(
                 } else {
                     &pair_raw_targets[b / 2][source_index]
                 };
-                luma_active[b] =
-                    quant.scanned_levels_for(selected, qp, &FIELD_SCAN_8X8, &mut luma_scratch[b]);
+                luma_masks[b] = quant.scanned_levels_masked(
+                    selected,
+                    set.nonzero[source_index],
+                    qp,
+                    &INVERSE_FIELD_SCAN_8X8,
+                    &mut luma_scratch[b],
+                );
+                luma_active[b] = luma_masks[b] != 0;
             }
             has_chroma =
                 !pair_field_chroma[field][0].is_empty() || !pair_field_chroma[field][1].is_empty();
@@ -2845,60 +2943,50 @@ fn write_picture(
 
         let uses_l0 = pred.mb_type != b_mb_type::L1_16X16;
         let uses_l1 = pred.mb_type != b_mb_type::L0_16X16;
+        // Where this macroblock's motion neighbours are, in whichever picture
+        // it is coded in, asked once for everything below.
+        let (motion_frame, motion_address): (&MbaffFrame, usize) = if direct_field_pair {
+            (&field_frames[mb_y & 1], field_address)
+        } else {
+            (frame, address)
+        };
+        let hood = motion_frame.neighbourhood(motion_address);
         let pred_l0 = if direct_field_pair && uses_l0 {
-            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 0, pred.ref_idx_l0)
+            field_motion[mb_y & 1].predict_in(
+                motion_frame,
+                motion_address,
+                &hood,
+                0,
+                pred.ref_idx_l0,
+            )
         } else if !field_pair && uses_l0 {
-            motion.predict(mb_x, mb_y, 0, pred.ref_idx_l0)
+            motion.predict_in(motion_frame, motion_address, &hood, 0, pred.ref_idx_l0)
         } else {
             [0, 0]
         };
         let pred_l1 = if direct_field_pair && uses_l1 {
-            field_motion[mb_y & 1].predict(mb_x, mb_y >> 1, 1, pred.ref_idx_l1)
+            field_motion[mb_y & 1].predict_in(
+                motion_frame,
+                motion_address,
+                &hood,
+                1,
+                pred.ref_idx_l1,
+            )
         } else if !field_pair && uses_l1 {
-            motion.predict(mb_x, mb_y, 1, pred.ref_idx_l1)
+            motion.predict_in(motion_frame, motion_address, &hood, 1, pred.ref_idx_l1)
         } else {
             [0, 0]
         };
 
-        let split_frame_mb = ctx.mbaff && !field_pair;
-        let mode = PredictionMode::from_mb_type(pred.mb_type);
-
         let mut partitions: Option<[MotionPartition; 2]> = None;
         let mut field_modes: Option<[PredictionMode; 2]> = None;
 
-        if split_frame_mb {
-            let mut built = [MotionPartition::default(); 2];
-            for (part, slot) in built.iter_mut().enumerate() {
-                let p_l0 = if uses_l0 {
-                    motion.predict_16x8(mb_x, mb_y, part, 0, pred.ref_idx_l0)
-                } else {
-                    [0, 0]
-                };
-                let p_l1 = if uses_l1 {
-                    motion.predict_16x8(mb_x, mb_y, part, 1, pred.ref_idx_l1)
-                } else {
-                    [0, 0]
-                };
-                let state = MbMotion {
-                    ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
-                    ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
-                    mv_l0x: if uses_l0 { pred.mv_l0[0] } else { 0 },
-                    mv_l0y: if uses_l0 { pred.mv_l0[1] } else { 0 },
-                    mv_l1x: if uses_l1 { pred.mv_l1[0] } else { 0 },
-                    mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
-                };
-                motion.set_16x8(mb_x, mb_y, part, &state);
-                *slot = MotionPartition {
-                    ref_idx_l0: state.ref_idx_l0,
-                    ref_idx_l1: state.ref_idx_l1,
-                    mvd_l0x: if uses_l0 { pred.mv_l0[0] - p_l0[0] } else { 0 },
-                    mvd_l0y: if uses_l0 { pred.mv_l0[1] - p_l0[1] } else { 0 },
-                    mvd_l1x: if uses_l1 { pred.mv_l1[0] - p_l1[0] } else { 0 },
-                    mvd_l1y: if uses_l1 { pred.mv_l1[1] - p_l1[1] } else { 0 },
-                };
-            }
-            partitions = Some(built);
-        } else if direct_field_pair
+        // A frame macroblock covers the same sixteen lines as the source
+        // macroblock it came from and carries that one vector, half of an MBAFF
+        // pair or not, so it goes out as a single 16x16 partition and `pred_l0`
+        // and `pred_l1` above are its predictors. Only the two halves of a field
+        // pair have anything to say separately.
+        if direct_field_pair
             && source
                 .is_some_and(|mb| mb.motion_type == motion_type::FRAME_OR_16X8 && mb.mv_count >= 2)
         {
@@ -2920,12 +3008,26 @@ fn write_picture(
                 let uses_part_l0 = part_pred.ref_idx_l0 >= 0;
                 let uses_part_l1 = part_pred.ref_idx_l1 >= 0;
                 let p_l0 = if uses_part_l0 {
-                    field_motion[field].predict_16x8(mb_x, mb_y >> 1, part, 0, part_pred.ref_idx_l0)
+                    field_motion[field].predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
+                        part,
+                        0,
+                        part_pred.ref_idx_l0,
+                    )
                 } else {
                     [0, 0]
                 };
                 let p_l1 = if uses_part_l1 {
-                    field_motion[field].predict_16x8(mb_x, mb_y >> 1, part, 1, part_pred.ref_idx_l1)
+                    field_motion[field].predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
+                        part,
+                        1,
+                        part_pred.ref_idx_l1,
+                    )
                 } else {
                     [0, 0]
                 };
@@ -2937,7 +3039,7 @@ fn write_picture(
                     mv_l1x: if uses_part_l1 { part_pred.mv_l1[0] } else { 0 },
                     mv_l1y: if uses_part_l1 { part_pred.mv_l1[1] } else { 0 },
                 };
-                field_motion[field].set_16x8(mb_x, mb_y >> 1, part, &state);
+                field_motion[field].set_16x8(field_address, part, &state);
                 *slot = MotionPartition {
                     ref_idx_l0: state.ref_idx_l0,
                     ref_idx_l1: state.ref_idx_l1,
@@ -2983,9 +3085,10 @@ fn write_picture(
                 let uses_field_l0 = field_pred.ref_idx_l0 >= 0;
                 let uses_field_l1 = field_pred.ref_idx_l1 >= 0;
                 let p_l0 = if uses_field_l0 {
-                    field_motion[field].predict_16x8(
-                        mb_x,
-                        mb_y >> 1,
+                    motion.predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
                         part,
                         0,
                         field_pred.ref_idx_l0,
@@ -2994,9 +3097,10 @@ fn write_picture(
                     [0, 0]
                 };
                 let p_l1 = if uses_field_l1 {
-                    field_motion[field].predict_16x8(
-                        mb_x,
-                        mb_y >> 1,
+                    motion.predict_16x8_in(
+                        motion_frame,
+                        motion_address,
+                        &hood,
                         part,
                         1,
                         field_pred.ref_idx_l1,
@@ -3004,9 +3108,8 @@ fn write_picture(
                 } else {
                     [0, 0]
                 };
-                field_motion[field].set_16x8(
-                    mb_x,
-                    mb_y >> 1,
+                motion.set_16x8(
+                    address,
                     part,
                     &MbMotion {
                         ref_idx_l0: field_pred.ref_idx_l0,
@@ -3065,17 +3168,18 @@ fn write_picture(
             ]);
         }
 
-        let mb_type = if split_frame_mb {
-            b16x8_mb_type(mode, mode)
-        } else if let Some(modes) = field_modes {
+        let mb_type = if let Some(modes) = field_modes {
             b16x8_mb_type(modes[0], modes[1])
         } else {
             pred.mb_type
         };
         let ref_count = layout.count as i32;
         let mb = InterMacroblock {
-            mb_x,
-            mb_y: if field_pair { mb_y >> 1 } else { mb_y },
+            address: if direct_field_pair {
+                field_address
+            } else {
+                address
+            },
             p_slice: output_slice_type == SliceType::P,
             mb_type,
             ref_idx_l0: pred.ref_idx_l0,
@@ -3120,8 +3224,7 @@ fn write_picture(
 
         if direct_field_pair && partitions.is_none() {
             field_motion[mb_y & 1].set(
-                mb_x,
-                mb_y >> 1,
+                field_address,
                 &MbMotion {
                     ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
                     ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
@@ -3131,10 +3234,9 @@ fn write_picture(
                     mv_l1y: if uses_l1 { pred.mv_l1[1] } else { 0 },
                 },
             );
-        } else if !split_frame_mb && !field_pair {
+        } else if partitions.is_none() {
             motion.set(
-                mb_x,
-                mb_y,
+                address,
                 &MbMotion {
                     ref_idx_l0: if uses_l0 { pred.ref_idx_l0 } else { -1 },
                     ref_idx_l1: if uses_l1 { pred.ref_idx_l1 } else { -1 },
@@ -3155,12 +3257,16 @@ fn write_picture(
             writer.flag(field_pair);
         }
         let field = mb_y & 1;
-        let active_counts: &mut CoeffCountMap = if field_pair {
+        // A picture coded as two field pictures keeps a map for each of them.
+        // Field macroblock pairs inside one picture do not: the neighbour
+        // derivation knows which macroblock of a pair holds a line, so one map
+        // per picture serves both kinds.
+        let active_counts: &mut CoeffCountMap = if direct_field_pair {
             &mut field_counts[field]
         } else {
             &mut *counts
         };
-        let active_chroma_counts: &mut ChromaCounts = if field_pair {
+        let active_chroma_counts: &mut ChromaCounts = if direct_field_pair {
             &mut field_chroma_counts[field]
         } else {
             &mut *chroma_counts
@@ -3178,15 +3284,21 @@ fn write_picture(
             writer,
             active_counts,
             active_chroma_counts,
+            if direct_field_pair {
+                &field_frames[mb_y & 1]
+            } else {
+                &*frame
+            },
             &mb,
             &luma,
+            &luma_masks,
             chroma,
         )?;
         if !luma_active.iter().any(|&active| active) {
-            mark_no_coefficients(active_counts, mb.mb_x, mb.mb_y);
+            mark_no_coefficients(active_counts, mb.address);
         }
         if chroma.is_none() {
-            mark_no_chroma_coefficients(active_chroma_counts, mb.mb_x, mb.mb_y);
+            mark_no_chroma_coefficients(active_chroma_counts, mb.address);
         }
         let end_of_field =
             direct_field_pair && mb_x == g.mb_width - 1 && field_position == field_size - 1;

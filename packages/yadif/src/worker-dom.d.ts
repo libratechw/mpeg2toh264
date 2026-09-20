@@ -18,13 +18,6 @@ interface VideoPlaybackQuality {
   readonly corruptedVideoFrames: number;
 }
 
-interface VideoFrameCallbackMetadata {
-  readonly mediaTime: number;
-  readonly presentedFrames: number;
-  readonly width: number;
-  readonly height: number;
-}
-
 interface WorkerElementStyle {
   cssText: string;
   visibility: string;
@@ -34,7 +27,19 @@ interface WorkerElementStyle {
   height: string;
 }
 
+/**
+ * The window of the document an element is in: its clock, and the animation
+ * frames it serves. Both change under the deinterlacer when a document
+ * picture-in-picture window adopts the element.
+ */
+interface WindowLike {
+  readonly performance: { readonly timeOrigin: number };
+  requestAnimationFrame(callback: FrameRequestCallback): number;
+  cancelAnimationFrame(handle: number): void;
+}
+
 interface HTMLElement extends EventTarget {
+  readonly ownerDocument: Document | null;
   readonly parentElement: HTMLElement | null;
   readonly offsetWidth: number;
   readonly offsetHeight: number;
@@ -73,7 +78,7 @@ interface HTMLVideoElement extends HTMLElement, VideoFrame {
   requestVideoFrameCallback(
     callback: (
       now: DOMHighResTimeStamp,
-      metadata: VideoFrameCallbackMetadata,
+      metadata: import("./video-frame.js").FrameMetadata,
     ) => void,
   ): number;
   cancelVideoFrameCallback(handle: number): void;
@@ -93,6 +98,9 @@ declare var ResizeObserver: {
 };
 
 interface Document {
+  readonly defaultView: WindowLike | null;
+  addEventListener(type: "visibilitychange", listener: () => void): void;
+  removeEventListener(type: "visibilitychange", listener: () => void): void;
   createElement(tagName: "canvas"): HTMLCanvasElement;
   createElement(tagName: "div"): HTMLElement;
 }

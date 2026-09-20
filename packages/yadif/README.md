@@ -30,12 +30,14 @@ Worker 内で OffscreenCanvas、WebGL2、Worker の `requestAnimationFrame()`、
 
 パッケージへ同梱した Worker の代わりに別のファイルを読み込む場合は、`workerUrl` へ URL を指定してください。
 
+Firefoxでは`moz*Frames`を`requestAnimationFrame`で監視する内部polyfillを使い、`mozPaintedFrames`の増加で新しいフレームを取り込みます。フィールド間隔もカウンターと描画時刻から計測するため、`requestVideoFrameCallback`や`currentTime`の更新間隔に依存しません。`currentTime`はソースの走査方式・サイズを選ぶ用途にのみ使います。他のブラウザーではネイティブの`requestVideoFrameCallback`を使用します。
+
 `probeDecoder()`と`decoderDeinterlaces()`は、ブラウザーのデコーダーがすでにデインターレースしているかを確認します。二重処理を避けるため、フィルターの有効化前に利用できます。
 
 ### `autoFilm`
 
 `autoFilm` を有効にすると、FFmpeg の `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` を移植したフィールド選択と、縮小画像上で `decimate=cycle=5:mixed=1` と同じ重複閾値を使うライブ向け周期判定により、3:2 プルダウン区間を 24000/1001fps で表示します。  
-FFmpeg の `decimate` は5フレームを保持してから同じ周期内の最小差分を選びますが、この実装は音声に対する映像遅延を増やさないよう、完了した周期の位相を次の周期へ適用します。  
+FFmpeg の `decimate` は5フレームを保持してから同じ周期内の最小差分を選びますが、この実装は音声に対する映像遅延を増やさないよう、完了した周期の位相を次の周期へ適用します。
 
 重複を含む周期でフィールドマッチが成立した場合だけ、24fps のフィルム区間として扱います。  
 フィルム周期として採用されていない区間は通常の YADIF 処理へ渡します。  
@@ -61,14 +63,38 @@ deinterlacer.scan = {
 deinterlacer.enabled = true;
 ```
 
+### `film`
+
+`film` を有効にすると、GPU 上で 2:3 プルダウン位相を検出し、フィルム区間を 24fps で表示します。CPU 側の `autoFilm` とは別の検出器です。両方が `true` の場合は CPU 優先となり、GPU 検出器は生成されません。CPU 優先中は GPU 専用の `EXT_color_buffer_float` は不要ですが、WebGL2 は常に必要です。
+
+GPU 専用経路の構築時に拡張不足や検出器の作成不能がある場合は同期例外となります。構築後の `film` setter で作成不能となった場合は例外とせず、plain YADIF へ退避（degrade）し、`failure` イベント / `onFailure` コールバックおよび統計の `filmError` で通知します（option は意図として残ります）。
+
+```ts
+const deinterlacer = new Deinterlacer(video, {
+  doubleRate: true,
+  film: true,
+});
+```
+
+統計の `film` は GPU 検出の lock 状態、`mode` は CPU (`autoFilm`) 側の cadence 状態を表します。両者は別エンジンの表示であり、一致するとは限りません。
+
+### 障害時の契約
+
+`film` / `autoFilm` は 24fps 再構成の意図であり、GPU 資源の確保を約束しません。GPU 専用経路の構築時（WebGL2 不在、`EXT_color_buffer_float` 不足、検出器作成不能）は同期例外として呼び出し側へ返します。
+
+実行中に GPU 検出器のみに障害が発生し WebGL コンテキストが健全な場合は、plain YADIF へ退避（degrade）し、`failure` イベント、`onFailure` オプション、統計の `filmError` で通知します。ライブラリが `film` や `autoFilm` オプションを黙って書き換えることはありません。CPU 側へフォールバックするかは呼び出し側の明示判断です（例: GPU 検出失敗を受けて `film = false` を先に設定してから `autoFilm = true` を設定）。CPU 自身の障害や WebGL コンテキスト喪失に対して無限再試行は行いません。
+
+復旧は資源の再確保契機（start、scan 変化、resize、明示的な option 再設定）で再試行し、再失敗は新しい episode として再通知します。なお、WebGL コンテキスト喪失や Worker 再起動後の再失敗は、plain YADIF の継続が保証されるものではなく、元 video 表示への退避または停止を伴う描画障害となります。
+
 ### `capture()` と統計イベント
 
 `capture()` は、その時点で Deinterlacer が表示しているフィールドまたはフィルムフレームを描き直し、`ImageBitmap` として返します。
 WebGL の描画バッファーを常時保持する設定には依存しません。
 
 再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。
-`late` と `maxQueuedFields` はスケジューラーの状態を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。
-容量確保で待機中のフィールドを破棄した場合は、残った表示予定を詰め、破棄したフィールドの表示時間を空白として残しません。
+`late` と `maxQueuedFields` はスケジューラーの状態を、`frameMs` は入力 picture あたりの平均 CPU 処理時間（フィルタ処理＋表示処理）を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。追加された `resynced`、`gpuMs`、`film`、`filmError` は任意プロパティであり（現在の実装は値を送信します）、古い型の stats を扱う利用側コードの変更は不要です。
+
+Worker へは `expectedDisplayTime` と取得側の `timeOrigin` を渡し、描画側の時計へ変換した表示予定を使用します（無効または不自然な予定値の場合は取り込み時刻へフォールバックします）。容量確保で待機中のフィールドを破棄した場合は、残った表示予定を詰め、破棄したフィールドの表示時間を空白として残しません。
 `requestVideoFrameCallback()` が 250ms 以上止まっても映像自体が進んでいる場合は、`requestAnimationFrame()` が復号フレーム数と再生時刻を監視して同じデインタレース処理を継続します。
 
 ```ts

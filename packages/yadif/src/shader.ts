@@ -27,6 +27,12 @@
  * along with this file; if not, see <https://www.gnu.org/licenses/>.
  *
  */
+import {
+  FIELD_METRICS,
+  FILM_DUPLICATE_PHASE,
+  FILM_MIXED_PHASE,
+  SAME_BLOCKS_MAX,
+} from "./film-shader.js";
 
 /**
  * Everything this shader wants to be told, besides the three frames.
@@ -35,6 +41,11 @@
  * from the current frame, and every other line is what the filter builds. For
  * one output frame per input frame that is `tff ? 0 : 1`, which keeps the field
  * that came first and rebuilds the moment it was captured at.
+ *
+ * With `film`, a frame whose pulldown phase `fieldMetrics` (see
+ * film-shader.ts) gives is put back together into its film frame instead of
+ * filtered; a frame's `second` field is always filtered. `phase` is the
+ * phase the page expects, for the debug overlay only.
  */
 export const YADIF_UNIFORMS = {
   prev: "uPrev",
@@ -44,6 +55,11 @@ export const YADIF_UNIFORMS = {
   parity: "uParity",
   tff: "uTff",
   spatialCheck: "uSpatialCheck",
+  debug: "uDebug",
+  film: "uFilm",
+  second: "uSecond",
+  phase: "uPhase",
+  fieldMetrics: "uFieldMetrics",
 } as const;
 
 /**
@@ -70,6 +86,7 @@ precision highp int;
 uniform sampler2D uPrev;
 uniform sampler2D uCur;
 uniform sampler2D uNext;
+uniform sampler2D uFieldMetrics;
 /** The size of a frame in texels. */
 uniform ivec2 uSize;
 /** The parity of the lines that are kept; the others are interpolated. */
@@ -78,6 +95,10 @@ uniform int uParity;
 uniform int uTff;
 /** Whether the temporal bound is widened by the local vertical range. */
 uniform bool uSpatialCheck;
+uniform bool uDebug;
+uniform bool uFilm;
+uniform bool uSecond;
+uniform int uPhase;
 
 out vec4 fragColor;
 
@@ -215,6 +236,55 @@ vec3 filterPixel(sampler2D prev2, sampler2D next2, int x, int y) {
   return temporalPredictor(A, B, C, D, E, F, G, H, I, J, K, L, spatialPred, skipCheck);
 }
 
+int firstParity() {
+  return uTff != 0 ? 0 : 1;
+}
+
+bool same(int metric) {
+  return texelFetch(uFieldMetrics, ivec2(metric, 0), 0)[1] <= ${SAME_BLOCKS_MAX}.0;
+}
+
+/** The pulldown phase the detection gave this frame, or 0. See film-shader.ts. */
+int detectedPhase() {
+  return int(texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.phase}, 0), 0)[0]);
+}
+
+bool isMixedPhase(int phase) {
+  return phase == ${FILM_DUPLICATE_PHASE} || phase == ${FILM_MIXED_PHASE};
+}
+
+const int DEBUG_BAR_CELL = 32;
+const int DEBUG_BAR_WIDTH = DEBUG_BAR_CELL * 7;
+const int DEBUG_BAR_HEIGHT = 16;
+
+vec3 debugBar(int x) {
+  int cell = x / DEBUG_BAR_CELL;
+  bool lit = x % DEBUG_BAR_CELL >= DEBUG_BAR_CELL - 4;
+  if (cell == 6) return lit || uSecond ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
+  return lit || same(cell) ? vec3(1.0) : vec3(0.0);
+}
+
+const int DIGIT_WIDTH = 24;
+const int DIGIT_HEIGHT = 60;
+
+bool digitLit(int digit, int x, int y) {
+  bool a = y < 20;
+  bool b = x >= 20 && y < 40;
+  bool c = x >= 20 && y >= 40;
+  bool d = y >= 56;
+  bool e = x < 4 && y >= 40;
+  bool f = x < 4 && y < 40;
+  bool g = y >= 36 && y < 40;
+  switch (digit) {
+    case 1: return b || c;
+    case 2: return a || b || d || e || g;
+    case 3: return a || b || c || d || g;
+    case 4: return b || c || f || g;
+    case 5: return a || c || d || f || g;
+    default: return false;
+  }
+}
+
 void main() {
   ivec2 at = ivec2(gl_FragCoord.xy);
   int x = at.x;
@@ -222,7 +292,17 @@ void main() {
   int y = uSize.y - 1 - at.y;
 
   vec3 rgb;
-  if ((y & 1) == uParity) {
+  if (uFilm && uDebug && y < DEBUG_BAR_HEIGHT && x < DEBUG_BAR_WIDTH) {
+    rgb = debugBar(x);
+  } else if (uFilm && uDebug && x < DIGIT_WIDTH && y < DIGIT_HEIGHT && uPhase > 0) {
+    rgb = digitLit(uPhase, x, y) ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
+  } else if (uFilm && !uSecond && isMixedPhase(detectedPhase())) {
+    rgb = (y & 1) == firstParity() ? texelFetch(uCur, ivec2(x, y), 0).rgb
+                                   : texelFetch(uPrev, ivec2(x, y), 0).rgb;
+  } else if (uFilm && !uSecond && detectedPhase() != 0) {
+    // One film frame, whole.
+    rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+  } else if ((y & 1) == uParity) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
   } else if ((uParity ^ uTff) != 0) {
     // The first field of the frame: the moment it holds sits between the

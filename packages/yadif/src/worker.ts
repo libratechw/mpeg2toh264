@@ -104,10 +104,18 @@ function post(
 function applySettings(
   renderer: Deinterlacer,
   options: WorkerRenderingOptions,
+  retryFilm?: "film" | "autoFilm",
 ): void {
   renderer.doubleRate = options.doubleRate;
-  renderer.autoFilm = options.autoFilm;
+  // Settings snapshots also carry unrelated changes. Only an explicit
+  // option retry may re-arm an unchanged, degraded engine.
+  if (renderer.autoFilm !== options.autoFilm || retryFilm === "autoFilm")
+    renderer.autoFilm = options.autoFilm;
   renderer.filmCombThreshold = options.filmCombThreshold;
+  renderer.spatialCheck = options.spatialCheck;
+  if (renderer.film !== options.film || retryFilm === "film")
+    renderer.film = options.film;
+  renderer.debug = options.debug;
 }
 
 workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
@@ -129,9 +137,11 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
         requestWorkerAnimationFrame,
         cancelWorkerAnimationFrame,
       );
+      let filmFailure = 0;
+      deinterlacer.addEventListener("failure", () => filmFailure++);
       deinterlacer.addEventListener("stats", (statsEvent) => {
         const { dropped: _dropped, ...stats } = statsEvent.detail;
-        post({ type: "stats", stats });
+        post({ type: "stats", stats, filmFailure });
       });
       deinterlacer.scan = command.scan;
       deinterlacer.videoTimeline = command.videoTimeline;
@@ -144,7 +154,10 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
       case "frame":
         video.update(command.video);
         try {
-          // ページと Worker の performance は時刻原点が一致する保証がないため、表示予定は描画ループと同じ Worker の時計で作る。
+          // 渡す now は Worker の時計で測った取込み時刻 (キューの現在時刻)。
+          // 表示予定時刻は取得側の時計のままで、同梱の timeOrigin との差から
+          // 描画側で変換する。転送の遅れを表示予定へ持ち込まないために、
+          // ここで performance.now() へ置き換えてはならない。
           deinterlacer.ingestExternalFrame(
             performance.now(),
             command.metadata,
@@ -156,7 +169,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
         }
         break;
       case "settings":
-        applySettings(deinterlacer, command.options);
+        applySettings(deinterlacer, command.options, command.retryFilm);
         break;
       case "scan":
         deinterlacer.scan = command.scan;
