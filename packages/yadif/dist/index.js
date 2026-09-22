@@ -1,4 +1,4 @@
-const ne = "" + new URL("assets/worker-CKKhL_T4.js", import.meta.url).href, C = `#version 300 es
+const ne = "" + new URL("assets/worker-C2gq7Ax4.js", import.meta.url).href, C = `#version 300 es
 void main() {
   // From the vertex index alone. There is no geometry here worth a buffer.
   vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
@@ -874,7 +874,7 @@ class X {
     ], this.#g = 0, this.reset()), this.#o === null && (this.#o = e.createBuffer(), e.bindBuffer(e.PIXEL_PACK_BUFFER, this.#o), e.bufferData(
       e.PIXEL_PACK_BUFFER,
       this.metrics.byteLength,
-      e.STREAM_READ
+      e.STREAM_COPY
     ), e.bindBuffer(e.PIXEL_PACK_BUFFER, null));
   }
 }
