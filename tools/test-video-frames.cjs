@@ -19,7 +19,7 @@ const modulePromise = import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`
 );
 
-async function fixture(t, moz = true) {
+async function fixture(t, moz = true, playbackRate = 1) {
   const { VideoFrames, supportsVideoFrames } = await modulePromise;
   let next = 1;
   const raf = new Map();
@@ -59,6 +59,7 @@ async function fixture(t, moz = true) {
   const previous = globalThis.HTMLVideoElement;
   globalThis.HTMLVideoElement = Video;
   const video = new Video();
+  video.playbackRate = playbackRate;
   const frames = new VideoFrames(video);
   t.after(() => {
     frames.destroy();
@@ -121,6 +122,36 @@ test("read-ahead and delayed presentation accounting do not duplicate a painted 
   f.paint(2, 66);
   assert.equal(f.seen.length, 2);
 });
+
+for (const initialRate of [1, 1.25]) {
+  test(`Firefox preserves distinct pictures at accelerated rates starting at ${initialRate}x`, async (t) => {
+    const previous = globalThis.VideoFrame;
+    globalThis.VideoFrame = class {
+      constructor(video) {
+        this.timestamp = Math.floor(video.currentTime);
+      }
+      close() {}
+    };
+    t.after(() => {
+      globalThis.VideoFrame = previous;
+    });
+    const f = await fixture(t, true, initialRate);
+    let painted = 0;
+    let now = 0;
+    for (const rate of [initialRate, 1.25, 1.5, 1]) {
+      f.video.playbackRate = rate;
+      f.video.dispatchEvent(new Event("ratechange"));
+      for (let frame = 0; frame < 12; frame++) {
+        now += 1000 / (30 * rate);
+        f.video.currentTime += 1 / 30;
+        f.paint(++painted, now);
+      }
+      assert.equal(f.seen.length, painted);
+      assert.equal(f.seen.at(-1).presentedFrames, painted);
+      assert.equal(f.seen.at(-1).mediaTime, f.video.currentTime);
+    }
+  });
+}
 
 test("Firefox works without native rVFC and can initialize a paused unpainted image", async (t) => {
   const f = await fixture(t);

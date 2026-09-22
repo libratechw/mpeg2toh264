@@ -109,7 +109,9 @@ export class VideoFrames {
     this.#video = video;
     this.#takeFrame = takeFrame;
     this.#moz = hasMozFrames(video) ? video : null;
-    this.#canCapture = typeof VideoFrame !== "undefined";
+    // Firefox 156 reports VideoFrame(video).timestamp in integer seconds
+    // Use painted counters to identify distinct pictures at every playback rate
+    this.#canCapture = this.#moz === null && typeof VideoFrame !== "undefined";
     this.#capture = this.#canCapture && video.playbackRate > 1;
     if (this.#moz) {
       for (const event of ["emptied", "seeking", "seeked"])
