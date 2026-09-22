@@ -42,7 +42,7 @@ export interface DeinterlaceStats {
      * frame. Climbing during steady playback means the cadence is not holding.
      * (otya)
      */
-    resynced?: number;
+    resynced: number;
     /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
     late: number;
     /**
@@ -59,34 +59,24 @@ export interface DeinterlaceStats {
      * across both the field-rate and film scheduling paths.
      */
     maxQueuedFields: number;
-    /** The render path currently selected by automatic cadence detection. */
-    mode: "film" | "video";
-    /** The field match selected for the most recently analysed frame. */
-    match: "p" | "c" | "n";
-    /** Largest 16 by 16 block count of vertically adjacent combed pixels. */
-    combScore: number;
     /** Pictures actually copied to the canvas per second. */
     outputFps: number;
-    /** Smallest block difference in the most recently completed decimate cycle. */
-    duplicateScore: number;
-    /** Next-smallest block difference in the most recently completed cycle. */
-    duplicateRunnerUp: number;
     /**
      * GPU processing time, supported only in Chrome. On ANGLE's Metal backend
      * it spans command buffers rather than the work in them, so it overstates
      * anything split into many small passes; a change is best judged by its
      * direction here and by a synchronous readback in isolation.
      */
-    gpuMs?: number;
+    gpuMs: number | undefined;
     /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
-    film?: boolean;
+    film: boolean;
     /**
      * Why requested film reconstruction is currently unavailable, or null
-     * while healthy. The requesting option (`film` / `autoFilm`) stays as the
+     * while healthy. The requesting option (`film`) stays as the
      * caller set it -- intent is preserved -- while pictures continue through
      * plain YADIF. Cleared on the next retry (start, scan change, resize, or
      * re-setting the option); a repeated failure notifies again as a new
-     * episode. Always null when neither film engine is requested.
+     * episode. Always null when film reconstruction is not requested.
      */
     filmError?: string | null;
 }
@@ -115,20 +105,6 @@ export interface DeinterlacerOptions {
      */
     doubleRate?: boolean;
     /**
-     * Whether hard-telecined film is reconstructed and shown at its native
-     * 24000/1001 cadence. Matching follows FFmpeg's
-     * `fieldmatch=mode=pc_n:combmatch=full:mchroma=0`, and duplicate decisions
-     * follow `decimate=cycle=5:mixed=1`. Frames that do not form a clean film
-     * cadence continue through YADIF.
-     */
-    autoFilm?: boolean;
-    /**
-     * The combed-pixel threshold for a 16 by 16 block. A fieldmatch result with
-     * a score at or above this value is considered combed. This is the browser
-     * equivalent of FFmpeg fieldmatch's `combpel` threshold.
-     */
-    filmCombThreshold?: number;
-    /**
      * Whether to let the local vertical range widen what the temporal check
      * allows. This is yadif's default and its `nospatial` mode turns it off.
      */
@@ -146,16 +122,14 @@ export interface DeinterlacerOptions {
      */
     film?: boolean;
     /**
-     * Called when a rendering resource fails after construction: a GPU film
-     * detector that throws mid-stream, an autoFilm analysis target that will
-     * not allocate, a Worker that died twice, or a lost WebGL context. The
-     * same message is dispatched as a `failure` event; this option exists for
-     * callers that prefer a constructor callback like `onStats`.
+     * Called when a rendering resource fails after construction: a GPU film detector that throws mid-stream,
+     * a Worker that died twice, or a lost WebGL context.
+     * The same message is dispatched as a `failure` event.
+     * This option lets callers install the handler alongside `onStats`.
      */
     onFailure?(message: string): void;
     /**
-     * Whether to draw the pulldown detection over the picture. Applies to
-     * the GPU (`film`) path only; inert under `autoFilm` alone.
+     * Whether to draw the pulldown detection over the picture while `film` is enabled.
      */
     debug?: boolean;
 }
@@ -229,12 +203,6 @@ export declare class Deinterlacer extends EventTarget {
     set film(film: boolean);
     get debug(): boolean;
     set debug(debug: boolean);
-    /** Whether hard-telecined material is reconstructed at film cadence. */
-    get autoFilm(): boolean;
-    set autoFilm(autoFilm: boolean);
-    /** The combed-pixel limit used by automatic film detection. */
-    get filmCombThreshold(): number;
-    set filmCombThreshold(value: number);
     start(): void;
     /** Take the deinterlaced picture away, leaving the element's own showing. */
     stop(): void;
