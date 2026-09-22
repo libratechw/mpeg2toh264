@@ -110,6 +110,9 @@ class WebGL2RenderingContext {
   #program = null;
   #framebuffer = null;
   #texture = null;
+  #unit = 0;
+  #textures = new Map();
+  #uniforms = new Map();
   #nextId = 1;
 
   getExtension(name) { return name === "EXT_color_buffer_float" ? {} : null; }
@@ -129,10 +132,15 @@ class WebGL2RenderingContext {
   deleteProgram() {}
   getUniformLocation(program, name) { return { program: program.id, name }; }
   createTexture() { return { id: this.#nextId++ }; }
-  bindTexture(target, texture) { this.#texture = texture; }
+  bindTexture(target, texture) {
+    this.#texture = texture;
+    this.#textures.set(this.#unit, texture);
+  }
   texParameteri() {}
-  texImage2D(target, level, format, width, height) {
+  texImage2D(target, level, format, width, height, source) {
     if (this.#texture) Object.assign(this.#texture, { format, width, height });
+    if (source && this.#texture)
+      this.#texture.mediaTime = source.currentTime ?? source.timestamp / 1e6;
   }
   texSubImage2D() {}
   deleteTexture() {}
@@ -147,8 +155,10 @@ class WebGL2RenderingContext {
   }
   deleteFramebuffer() {}
   useProgram(program) { this.#program = program; }
-  activeTexture() {}
-  uniform1i() {}
+  activeTexture(unit) { this.#unit = unit - this.TEXTURE0; }
+  uniform1i(location, value) {
+    this.#uniforms.set(location.program + ":" + location.name, value);
+  }
   uniform2i() {}
   viewport() {}
   readPixels() { __host.readback(__realm, this.#framebuffer.texture); }
@@ -168,11 +178,20 @@ class WebGL2RenderingContext {
   endQuery() {}
   getQueryParameter() { return false; }
   drawArrays() {
+    const blit = (this.#program && this.#program.fragment || "").includes(__blitMark);
+    const uniform = name => this.#uniforms.get(this.#program.id + ":" + name);
+    const current = this.#textures.get(uniform("uCur"));
+    const picture = blit ? this.#texture?.picture : {
+      mediaTime: current?.mediaTime,
+      second: uniform("uSecond"),
+    };
+    if (this.#framebuffer) this.#framebuffer.texture.picture = picture;
     __host.draw(__realm, {
       t: __host.now(),
-      blit: (this.#program && this.#program.fragment || "").includes(__blitMark),
+      blit,
       toCanvas: this.#framebuffer === null,
       texture: this.#texture ? this.#texture.id : null,
+      picture,
     });
   }
 }
@@ -808,6 +827,7 @@ export function presentations(draws) {
     .map((draw) => ({
       refresh: Math.round((draw.t - BASE_MS) / REFRESH_MS),
       texture: draw.texture,
+      picture: draw.picture,
     }));
 }
 

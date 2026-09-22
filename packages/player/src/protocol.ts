@@ -179,6 +179,8 @@ export interface LoadCommand {
    */
   serviceId: number | null;
   sink: SinkKind;
+  /** Also forward compressed video to a filter that decodes its own input before presentation. */
+  encodedVideo: boolean;
   /**
    * Open a Managed Media Source where the browser has both. It reaches the
    * worker because either side may be the one holding the source.
@@ -228,6 +230,7 @@ export type Notification =
     }
   /** Open a `SourceBuffer` and append this. Main-sink loads only. */
   | { type: "open"; id: number; mimeCodec: string; data: ArrayBuffer }
+  | { type: "video-data"; id: number; data: ArrayBuffer | null }
   | {
       type: "video-config";
       id: number;

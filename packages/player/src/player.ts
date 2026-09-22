@@ -65,6 +65,12 @@ const TIMED_EVENTS: TimingMark[] = [
 
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {
+  /** Optional compressed video input for filtering before browser presentation can drop frames. */
+  readonly encodedVideo?: {
+    append(data: ArrayBuffer): void;
+    reset(): void;
+    finish(): void;
+  } | null;
   readonly running: boolean;
   /** Field information selected for the picture most recently presented. */
   readonly scan: Scan | null;
@@ -441,7 +447,9 @@ export class Mpeg2TsPlayer extends EventTarget {
   #applyDeinterlace(): void {
     if (this.#destroyed) return;
     try {
-      if (this.#wanted && !this.#deinterlacer && this.#options.deinterlacer) {
+      // Supply input early so buffered content can be decoded at higher rates when the filter is enabled later.
+      // Rendering and supplemental decoding follow enabled; retain only compressed data while stopped.
+      if (!this.#deinterlacer && this.#options.deinterlacer) {
         this.#deinterlacer = this.#options.deinterlacer(this.video);
       }
       if (this.#deinterlacer) {
@@ -545,6 +553,7 @@ export class Mpeg2TsPlayer extends EventTarget {
       pictureWorkers: this.#options.pictureWorkers,
       serviceId: this.#options.serviceId ?? null,
       sink: this.#sinkKind,
+      encodedVideo: this.#deinterlacer?.encodedVideo != null,
       preferManagedMediaSource: this.#options.preferManagedMediaSource ?? false,
       queueHighWaterMark:
         this.#options.queueHighWaterMark ?? DEFAULT_QUEUE_HIGH_WATER_MARK,
@@ -649,6 +658,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#mark("attached", now());
         break;
       case "open":
+        this.#deinterlacer?.encodedVideo?.append(notification.data);
         this.#openSink(notification.mimeCodec, notification.data);
         break;
       case "video-config":
@@ -659,6 +669,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         );
         break;
       case "fragment":
+        this.#deinterlacer?.encodedVideo?.append(notification.data);
         this.#sink?.push(
           notification.data,
           notification.start,
@@ -675,6 +686,7 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#emit("seekable", { duration: notification.duration });
         break;
       case "reset":
+        this.#deinterlacer?.encodedVideo?.reset();
         this.#clearVideoTimeline();
         this.#sink?.reset();
         break;
@@ -720,11 +732,17 @@ export class Mpeg2TsPlayer extends EventTarget {
         this.#drainSink();
         break;
       case "completed":
+        this.#deinterlacer?.encodedVideo?.finish();
         this.#setState("completed");
         // Nothing more will be appended, so the buffer cannot fill again and
         // the worker has no further use for the playhead. The page path waits
         // for its own queue to drain instead; see #drainSink.
         if (this.#sinkKind === "worker") this.#stopPlayhead();
+        break;
+      case "video-data":
+        if (notification.data === null)
+          this.#deinterlacer?.encodedVideo?.reset();
+        else this.#deinterlacer?.encodedVideo?.append(notification.data);
         break;
       case "error":
         this.#fail(new Error(notification.message));
@@ -972,6 +990,7 @@ export class Mpeg2TsPlayer extends EventTarget {
 
   #teardown(): void {
     this.#stopPlayhead();
+    this.#deinterlacer?.encodedVideo?.reset();
     this.#clearVideoTimeline();
     this.#sink?.close();
     this.#sink = null;

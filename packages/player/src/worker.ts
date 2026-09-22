@@ -323,6 +323,8 @@ class Playback {
     const leg = this.#nextLeg();
     const signal = this.#leg!.signal;
     this.#sink.reset();
+    if (this.#command.encodedVideo && this.#command.sink === "worker")
+      post({ type: "video-data", id: this.#command.id, data: null });
     const restart = this.#restartBefore(time);
     const offset =
       restart && time - restart.seconds <= SEEK_LEAD_SECONDS
@@ -787,6 +789,16 @@ class Playback {
    */
   async #deliver(leg: number, fragments: Fragment[]): Promise<boolean> {
     for (const [index, fragment] of fragments.entries()) {
+      if (!this.#running(leg)) return false;
+      // Forward transmuxed video to the filter even when the Worker owns MSE.
+      if (
+        this.#command.encodedVideo &&
+        this.#command.sink === "worker" &&
+        (fragment.kind === "init" || fragment.kind === "media")
+      ) {
+        const data = fragment.data.slice().buffer;
+        post({ type: "video-data", id: this.#command.id, data }, [data]);
+      }
       if (fragment.kind === "init") {
         const media = fragments
           .slice(index + 1)

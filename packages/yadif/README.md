@@ -10,7 +10,7 @@ const player = new Mpeg2TsPlayer(video, {
   deinterlace: true,
   deinterlacer: (element) =>
     new Deinterlacer(element, {
-      autoFilm: true,
+      film: true,
       doubleRate: true,
     }),
 });
@@ -20,17 +20,33 @@ const player = new Mpeg2TsPlayer(video, {
 
 ### 描画先
 
-既定の `rendering: "auto"` では、対応ブラウザーで YADIF、`autoFilm` の判定、WebGL 描画、表示キュー、統計集計を OffscreenCanvas と専用 Worker へ移します。
+既定の `rendering: "main"` では、メインスレッドから WebGL を使って描画します。  
+入力画像の Worker への転送待ちがなく、倍速時も各フレームを判定器へ渡せます。  
+プレイヤーの変換処理は Worker で実行され、MediaSource の実行先は別の `mediaSource` オプションで指定します。
 
-`HTMLVideoElement` からのフレーム取得、`requestVideoFrameCallback()` が停止した場合の `requestAnimationFrame()` による復旧、DOM レイアウトはメインスレッド側に残ります。
-
-Worker 内で OffscreenCanvas、WebGL2、Worker の `requestAnimationFrame()`、転送可能な `VideoFrame` を初期化できない場合、`auto` は従来のメインスレッド描画へ戻ります。
-
-比較や互換性確認では `rendering: "main"`、Worker 経路の強制確認では `rendering: "worker"` を指定できます。
+`rendering: "worker"` を指定すると、YADIF、フィルム判定、WebGL 描画、表示キュー、統計集計を OffscreenCanvas と専用 Worker へ移します。  
+フレーム取得と DOM レイアウトはメインスレッドに残ります。  
+`rendering: "auto"` も Worker を優先しますが、必要な API を初期化できない場合はメインスレッド描画へ戻ります。  
+Worker への画像転送が追いつかない環境では入力が欠けるため、特に倍速時の品質はメインスレッド描画で確認してください。
 
 パッケージへ同梱した Worker の代わりに別のファイルを読み込む場合は、`workerUrl` へ URL を指定してください。
 
-Firefoxでは`moz*Frames`を`requestAnimationFrame`で監視する内部polyfillを使い、`mozPaintedFrames`の増加で新しいフレームを取り込みます。フィールド間隔もカウンターと描画時刻から計測するため、`requestVideoFrameCallback`や`currentTime`の更新間隔に依存しません。`currentTime`はソースの走査方式・サイズを選ぶ用途にのみ使います。他のブラウザーではネイティブの`requestVideoFrameCallback`を使用します。
+通常速度の Firefox では `mozPaintedFrames` の増加から新しいフレームを取得し、フィールド間隔もカウンターと描画時刻から計測します。  
+他のブラウザーではネイティブの `requestVideoFrameCallback()` を使用します。
+
+### 倍速再生
+
+1倍を超えて 1.25 倍以下の再生では、`VideoFrame(video)` で短周期に画像を取得し、表示通知の間で変わる入力も保持します。  
+追加のデコーダーは起動せず、画像の時刻から重複と欠落を区別します。
+
+1.25 倍を超える再生では、プレイヤーが生成した H.264 の圧縮映像を WebCodecs の `VideoDecoder` にも渡します。  
+ブラウザーの表示段階で間引かれる前の画像を取得し、音声を再生する動画要素の時刻に合わせて表示します。  
+圧縮データの保持範囲は MediaSource のバッファーに合わせ、シーク・速度変更・停止時には追加デコーダーと未表示画像を解放します。
+
+この追加デコードは `Mpeg2TsPlayer` と組み合わせた H.264 変換経路で利用できます。  
+単体の動画要素、MPEG-2 パススルー、WebCodecs のデコードに非対応の環境では、動画要素から画像を取得します。  
+その経路で画像の取得が追いつかない速度では、フィルム判定が外れることがあります。  
+出力の表示回数は画面のリフレッシュレートが上限で、60Hz の画面に 60i 映像を 1.5 倍で表示する場合は、復元した毎秒約90枚から表示時刻に合う画像を選びます。
 
 `probeDecoder()`と`decoderDeinterlaces()`は、ブラウザーのデコーダーがすでにデインターレースしているかを確認します。二重処理を避けるため、フィルターの有効化前に利用できます。
 
@@ -76,7 +92,9 @@ const deinterlacer = new Deinterlacer(video, {
 });
 ```
 
-統計の `film` は GPU 検出の lock 状態、`mode` は CPU (`autoFilm`) 側の cadence 状態を表します。両者は別エンジンの表示であり、一致するとは限りません。
+統計の `mode` は、選択中の検出器がフィルム区間と判定している場合に `"film"` 、それ以外は `"video"` となります。  
+統計の `film` は GPU 検出器の確定状態を表します。  
+新規の利用では GPU 上で判定する `film` を推奨し、CPU へ縮小画像を読み戻す `autoFilm` は既存の比較・明示選択用として保持しています。
 
 ### 障害時の契約
 
@@ -92,7 +110,9 @@ const deinterlacer = new Deinterlacer(video, {
 WebGL の描画バッファーを常時保持する設定には依存しません。
 
 再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。
-`late` と `maxQueuedFields` はスケジューラーの状態を、`frameMs` は入力 picture あたりの平均 CPU 処理時間（フィルタ処理＋表示処理）を、`mode`、`match`、`combScore`、`outputFps`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` の判定状態を表します。追加された `resynced`、`gpuMs`、`film`、`filmError` は任意プロパティであり（現在の実装は値を送信します）、古い型の stats を扱う利用側コードの変更は不要です。
+`late` と `maxQueuedFields` は表示予定の状態、`frameMs` は入力1枚あたりの描画スレッドでの平均処理時間、`mode` と `outputFps` は選択中の描画経路の判定と出力頻度を表します。  
+`match`、`combScore`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` 用の値です。  
+`resynced`、`gpuMs`、`film`、`filmError` は任意プロパティとして定義されています。
 
 Worker へは `expectedDisplayTime` と取得側の `timeOrigin` を渡し、描画側の時計へ変換した表示予定を使用します（無効または不自然な予定値の場合は取り込み時刻へフォールバックします）。容量確保で待機中のフィールドを破棄した場合は、残った表示予定を詰め、破棄したフィールドの表示時間を空白として残しません。
 `requestVideoFrameCallback()` が 250ms 以上止まっても映像自体が進んでいる場合は、`requestAnimationFrame()` が復号フレーム数と再生時刻を監視して同じデインタレース処理を継続します。

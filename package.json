@@ -25,6 +25,7 @@
     "packages:build": "./tools/build-wasm.sh && npm run build --workspace @mpeg2toh264/player && node tools/check-player-wasm.mjs && npm run build --workspace @mpeg2toh264/yadif",
     "test:yadif-contract": "node tools/test-yadif-contract.mjs",
     "test:worker-clock": "node tools/test-worker-clock.mjs",
+    "test:encoded-video": "node tools/test-encoded-video.mjs",
     "test:pip-owner": "node tools/test-pip-owner.mjs",
     "test:yadif-debug": "node tools/test-yadif-debug.mjs",
     "test:film-retry": "node tools/test-film-retry.mjs",

@@ -28,6 +28,11 @@ await player.load('https://example.com/video.ts');
 - `keepBehindSeconds`: 再生済み範囲を保持する秒数
 - `deinterlace` / `deinterlacer`: 差し替え可能なデインターレーサー
 
+`deinterlacer` を指定すると、フィルターは読み込み時に構築され、`deinterlace` に従って描画を開始・停止します。  
+フィルターが任意の `encodedVideo` 受け口を公開している場合は、MediaSource と同じ初期化セグメント・映像セグメントを渡します。  
+これにより、停止中に読み込んだ区間も、有効化後にフィルター側で追加デコードできます。  
+`encodedVideo` は `append()`、`reset()`、`finish()` を持つインターフェースで、プレイヤー自体はデコード処理や YADIF に依存しません。
+
 ## イベント
 
 - `statechange`: `idle`、`loading`、`converting`などの状態変化

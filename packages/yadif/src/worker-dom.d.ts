@@ -36,6 +36,8 @@ interface WindowLike {
   readonly performance: { readonly timeOrigin: number };
   requestAnimationFrame(callback: FrameRequestCallback): number;
   cancelAnimationFrame(handle: number): void;
+  setTimeout(callback: () => void, milliseconds: number): number;
+  clearTimeout(handle: number): void;
 }
 
 interface HTMLElement extends EventTarget {

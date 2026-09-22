@@ -41,11 +41,29 @@ const VSYNCS = 200;
 const ALTERNATING = (id) => (id % 2 ? 0.5 : 20);
 const STEADY = () => 0.5;
 
-/** The scheduler's decisions, as a comparable string. */
+/** Compare the picture and field, independently of reusable output texture IDs. */
 function schedule(result) {
-  return presentations(result.draws)
-    .map((entry) => `${entry.refresh}:${entry.texture}`)
-    .join(" ");
+  const decisions = presentations(result.draws);
+  for (const entry of decisions) {
+    assert.ok(
+      Number.isFinite(entry.picture?.mediaTime),
+      "presentation has no source picture",
+    );
+    assert.ok(
+      entry.picture.second === 0 || entry.picture.second === 1,
+      "presentation has no field identity",
+    );
+  }
+  return (
+    decisions
+      // Worker startup may miss the first input; both paths need two inputs to measure the period.
+      .filter((entry) => entry.refresh >= 10)
+      .map(
+        (entry) =>
+          `${entry.refresh}:${entry.picture?.mediaTime?.toFixed(6)}:${entry.picture?.second}`,
+      )
+      .join(" ")
+  );
 }
 
 /** Every refresh in the covered span carried one decision. */

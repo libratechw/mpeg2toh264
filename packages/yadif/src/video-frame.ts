@@ -16,6 +16,8 @@ export interface FrameMetadata {
    * it used and the timestamps stay convertible.
    */
   timeOrigin: number;
+  /** The frame for this notification, valid only until the callback returns. */
+  frame?: VideoFrame;
   /** Firefox counters supply identity and wall-clock cadence, not a frame PTS. */
   mozTiming?: { periodMs: number; discontinuity: boolean };
 }
@@ -79,6 +81,7 @@ const STALL_MS = 500;
  */
 export class VideoFrames {
   readonly #video: HTMLVideoElement;
+  readonly #takeFrame: (() => VideoFrame | null | undefined) | undefined;
   readonly #moz: MozVideo | null;
   #handle: number | null = null;
   #callback: FrameCallback | null = null;
@@ -89,21 +92,55 @@ export class VideoFrames {
   #lastAt: number | null = null;
   #sample: { at: number; frames: number } | null = null;
   #periodMs = 0;
+  readonly #canCapture: boolean;
+  #capture: boolean;
+  #captureTimer: (() => void) | null = null;
+  #captureDocument: Document | null = null;
+  #nativeHandle: number | null = null;
+  #capturedTimestamp: number | null = null;
+  #captureCount = 0;
+  #captureDeltas: number[] = [];
+  #pending: { frame: VideoFrame; at: number; count: number }[] = [];
 
-  constructor(video: HTMLVideoElement) {
+  constructor(
+    video: HTMLVideoElement,
+    takeFrame?: () => VideoFrame | null | undefined,
+  ) {
     this.#video = video;
+    this.#takeFrame = takeFrame;
     this.#moz = hasMozFrames(video) ? video : null;
+    this.#canCapture = typeof VideoFrame !== "undefined";
+    this.#capture = this.#canCapture && video.playbackRate > 1;
     if (this.#moz) {
       for (const event of ["emptied", "seeking", "seeked"])
         video.addEventListener(event, this.#reset);
       for (const event of ["pause", "playing", "waiting", "ratechange"])
         video.addEventListener(event, this.#resetTiming);
     }
+    if (this.#canCapture) {
+      // Suspend acquisition while paused and request fresh frames after seeking or resuming.
+      for (const event of [
+        "loadeddata",
+        "playing",
+        "pause",
+        "ended",
+        "seeking",
+        "seeked",
+        "emptied",
+        "ratechange",
+      ])
+        video.addEventListener(event, this.#captureChanged);
+    }
   }
 
   /** Whether acquisition runs off the Firefox counters. */
   get mozDriven(): boolean {
-    return this.#moz !== null;
+    return this.#moz !== null && !this.#capture;
+  }
+
+  /** Whether frequent capture is active, excluding fallback notifications based on video.currentTime. */
+  get captureDriven(): boolean {
+    return this.#capture;
   }
 
   /** Whether any frame has been delivered yet (counters proven live). */
@@ -112,8 +149,12 @@ export class VideoFrames {
   }
 
   request(callback: FrameCallback): void {
-    if (this.#handle !== null) return;
+    if (this.#callback !== null) return;
     this.#callback = callback;
+    if (this.#capture) {
+      this.#armCapture();
+      return;
+    }
     this.#handle = this.#moz
       ? requestAnimationFrame(this.#poll)
       : this.#video.requestVideoFrameCallback(this.#present);
@@ -126,6 +167,14 @@ export class VideoFrames {
     }
     this.#handle = null;
     this.#callback = null;
+    this.#captureTimer?.();
+    this.#captureTimer = null;
+    if (this.#nativeHandle !== null)
+      this.#video.cancelVideoFrameCallback(this.#nativeHandle);
+    this.#nativeHandle = null;
+    this.#clearCaptured();
+    this.#capturedTimestamp = null;
+    this.#captureDeltas = [];
     this.#reset();
   }
 
@@ -135,7 +184,168 @@ export class VideoFrames {
       this.#video.removeEventListener(event, this.#reset);
     for (const event of ["pause", "playing", "waiting", "ratechange"])
       this.#video.removeEventListener(event, this.#resetTiming);
+    for (const event of [
+      "loadeddata",
+      "playing",
+      "pause",
+      "ended",
+      "seeking",
+      "seeked",
+      "emptied",
+      "ratechange",
+    ])
+      this.#video.removeEventListener(event, this.#captureChanged);
   }
+
+  /** Deliver pending input on the rendering window's refresh, before drawing. */
+  flush(now: number): void {
+    if (!this.#capture) return;
+    if (this.#video.ownerDocument !== this.#captureDocument) {
+      this.#captureTimer?.();
+      this.#captureTimer = null;
+      this.#armCapture();
+    }
+    while (this.#pending.length > 0 && this.#callback !== null) {
+      const captured = this.#pending.shift()!;
+      const frame = captured.frame;
+      try {
+        this.#deliver(now, {
+          width: frame.visibleRect?.width ?? frame.codedWidth,
+          height: frame.visibleRect?.height ?? frame.codedHeight,
+          mediaTime: frame.timestamp / 1e6,
+          presentedFrames: captured.count,
+          expectedDisplayTime: captured.at,
+          timeOrigin: performance.timeOrigin,
+          frame,
+        });
+      } finally {
+        // The receiver has cloned any frame sent to a Worker, so the original can now be closed.
+        frame.close();
+      }
+    }
+  }
+
+  #clearCaptured(): void {
+    for (const captured of this.#pending) captured.frame.close();
+    this.#pending = [];
+  }
+
+  #captureChanged = (event: Event): void => {
+    const capture = this.#canCapture && this.#video.playbackRate > 1;
+    if (capture !== this.#capture) {
+      const callback = this.#callback;
+      this.cancel();
+      this.#capture = capture;
+      if (callback !== null) this.request(callback);
+      return;
+    }
+    if (!this.#capture) return;
+    if (event.type === "pause" || event.type === "ended")
+      this.flush(performance.now());
+    this.#clearCaptured();
+    if (["seeking", "seeked", "emptied", "ratechange"].includes(event.type)) {
+      this.#capturedTimestamp = null;
+      this.#captureDeltas = [];
+    }
+    this.#captureTimer?.();
+    this.#captureTimer = null;
+    if (this.#callback !== null) this.#armCapture();
+  };
+
+  #armCapture(): void {
+    if (this.#captureTimer !== null || this.#callback === null) return;
+    if (
+      (this.#video.paused || this.#video.ended) &&
+      this.#capturedTimestamp !== null
+    )
+      return;
+    if (
+      this.#nativeHandle === null &&
+      typeof this.#video.requestVideoFrameCallback === "function"
+    )
+      this.#nativeHandle = this.#video.requestVideoFrameCallback(
+        this.#capturePresented,
+      );
+    // At up to 1.25x, capture the video element frequently enough to retain briefly available frames.
+    const interval = Math.max(4, 8 / Math.max(1, this.#video.playbackRate));
+    // After a picture-in-picture move, use the new window's timer to continue acquisition.
+    // Cancel through the same window to avoid inheriting throttling from the hidden original window.
+    const owner = this.#video.ownerDocument?.defaultView;
+    this.#captureDocument = this.#video.ownerDocument;
+    if (owner) {
+      const handle = owner.setTimeout(this.#captureFrame, interval);
+      this.#captureTimer = () => owner.clearTimeout(handle);
+    } else {
+      const handle = setTimeout(this.#captureFrame, interval);
+      this.#captureTimer = () => clearTimeout(handle);
+    }
+  }
+
+  #capturePresented = (): void => {
+    this.#nativeHandle = null;
+    this.#captureTimer?.();
+    this.#captureTimer = null;
+    this.#captureFrame();
+  };
+
+  #captureFrame = (): void => {
+    this.#captureTimer = null;
+    const video = this.#video;
+    if (this.#callback === null) return;
+    if (video.readyState < 2 || video.seeking) {
+      this.#armCapture();
+      return;
+    }
+    let frame: VideoFrame;
+    let decoded = false;
+    try {
+      const captured = this.#takeFrame?.();
+      if (captured === null) {
+        this.#armCapture();
+        return;
+      }
+      decoded = captured !== undefined;
+      frame = captured ?? new VideoFrame(video);
+    } catch (error) {
+      // Immediately after loading, a frame may become available later than readyState indicates.
+      if (
+        !(error instanceof DOMException) ||
+        error.name !== "InvalidStateError"
+      )
+        throw error;
+      this.#armCapture();
+      return;
+    }
+    if (frame.timestamp === this.#capturedTimestamp) {
+      frame.close();
+    } else {
+      let steps = 1;
+      if (this.#capturedTimestamp !== null) {
+        const delta = frame.timestamp - this.#capturedTimestamp;
+        if (delta > 1000 && delta < 250000) {
+          // Count missing input from the median timestamp delta, independently of playback speed.
+          this.#captureDeltas.push(delta);
+          if (this.#captureDeltas.length > 7) this.#captureDeltas.shift();
+          const ordered = [...this.#captureDeltas].sort((a, b) => a - b);
+          const period = ordered[Math.floor(ordered.length / 2)]!;
+          steps = Math.max(1, Math.round(delta / period));
+        }
+      }
+      this.#capturedTimestamp = frame.timestamp;
+      this.#captureCount += steps;
+      // Schedule decoded frames by media time to keep acquisition timer jitter out of presentation.
+      const at =
+        performance.now() +
+        (decoded
+          ? ((frame.timestamp / 1e6 - video.currentTime) * 1000) /
+            video.playbackRate
+          : 0);
+      this.#pending.push({ frame, at, count: this.#captureCount });
+      // After a long rendering stall, retain the newest frames and signal losses through the counter gap.
+      while (this.#pending.length > 4) this.#pending.shift()!.frame.close();
+    }
+    this.#armCapture();
+  };
 
   #resetTiming = (): void => {
     this.#lastAt = null;

@@ -43,6 +43,7 @@ import {
 } from "./shader.js";
 import { FFmpegIVTC } from "./ivtc.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
+import { EncodedVideoFrames } from "./encoded-video.js";
 import {
   FIELD_METRICS,
   FILM_DUPLICATE_PHASE,
@@ -328,7 +329,7 @@ export interface DeinterlaceStats {
 }
 
 export interface DeinterlacerOptions {
-  /** 描画先。`auto` は同梱 Worker を優先し、初期化できない場合はメインスレッドへ戻る。 */
+  /** Rendering target, defaulting to `main`; `auto` prefers the bundled Worker and falls back to the main thread if initialization fails. */
   rendering?: "auto" | "worker" | "main";
   /** module Worker の URL。省略時はパッケージへ同梱したファイルを使う。 */
   workerUrl?: string | URL;
@@ -500,6 +501,8 @@ interface PendingWorkerFrame {
  * the same snapshot for callers that prefer a constructor option.
  */
 export class Deinterlacer extends EventTarget {
+  /** Receive fMP4 from the player and decode supplemental input only above 1.25x playback speed. */
+  readonly encodedVideo: EncodedVideoFrames | null;
   readonly #renderCanvas: HTMLCanvasElement | OffscreenCanvas;
   #displayCanvas: HTMLCanvasElement;
 
@@ -723,7 +726,7 @@ export class Deinterlacer extends EventTarget {
     this.#onStats = options.onStats;
     this.#onFailure = options.onFailure;
     this.#externalHost = externalHost;
-    this.#rendering = externalHost ? "main" : (options.rendering ?? "auto");
+    this.#rendering = externalHost ? "main" : (options.rendering ?? "main");
     this.#workerURL = options.workerUrl ?? bundledWorkerURL;
     this.#workerState = this.#rendering === "main" ? "main" : "idle";
     this.#displayCanvas = externalHost
@@ -741,7 +744,8 @@ export class Deinterlacer extends EventTarget {
       this.#displayCanvas.style.cssText =
         "position:absolute;pointer-events:none;visibility:hidden";
     const gl = this.#renderCanvas.getContext("webgl2", {
-      alpha: false,
+      // Keep the underlying video in Chromium's compositor to receive frame notifications at the source rate.
+      alpha: true,
       antialias: false,
       depth: false,
       stencil: false,
@@ -780,7 +784,11 @@ export class Deinterlacer extends EventTarget {
     this.#resizes = externalHost
       ? null
       : new ResizeObserver(() => this.#layout());
-    this.#videoFrames = new VideoFrames(video);
+    this.encodedVideo =
+      !externalHost && typeof VideoDecoder !== "undefined"
+        ? new EncodedVideoFrames(video)
+        : null;
+    this.#videoFrames = new VideoFrames(video, () => this.encodedVideo?.take());
     // A frame the filter has not seen the neighbours of is not worth holding:
     // whatever is next will have been somewhere else entirely.
     video.addEventListener("emptied", this.#onEmptied);
@@ -1427,6 +1435,7 @@ export class Deinterlacer extends EventTarget {
     if (!this.#running) return;
     this.#running = false;
     this.#videoFrames.cancel();
+    this.encodedVideo?.suspend();
     this.#stopFrameWatchdog();
     this.#stopLoop();
     this.#frames = 0;
@@ -1461,6 +1470,7 @@ export class Deinterlacer extends EventTarget {
       this.#onContextLost,
     );
     this.#videoFrames.destroy();
+    this.encodedVideo?.destroy();
     this.#video.removeEventListener("emptied", this.#onEmptied);
     this.#video.removeEventListener("resize", this.#onResize);
     this.#video.removeEventListener("pause", this.#onFlush);
@@ -1615,12 +1625,15 @@ export class Deinterlacer extends EventTarget {
   #queueWorkerFrame(
     now: DOMHighResTimeStamp,
     metadata: FrameObservation,
+    captured?: VideoFrame,
   ): void {
     let frame: VideoFrame;
     try {
-      frame = new VideoFrame(this.#video, {
-        timestamp: Math.max(0, Math.round(metadata.mediaTime * 1_000_000)),
-      });
+      frame =
+        captured?.clone() ??
+        new VideoFrame(this.#video, {
+          timestamp: Math.max(0, Math.round(metadata.mediaTime * 1_000_000)),
+        });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // 最初のフレームを生成できない環境では Worker 経路を利用できないため、自動選択時はメインスレッドの描画へ移す
@@ -1868,7 +1881,14 @@ export class Deinterlacer extends EventTarget {
       this.#lastObservedVideoFrames,
       this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
     );
-    this.#ingestFrame(at, metadata);
+    // Pass frames only to their explicit transfer destination, excluding them from Worker metadata.
+    const { frame, ...observation } = metadata;
+    this.#frameSource = frame ?? this.#video;
+    try {
+      this.#ingestFrame(at, observation, frame);
+    } finally {
+      this.#frameSource = this.#video;
+    }
     this.#request();
   };
 
@@ -1876,10 +1896,14 @@ export class Deinterlacer extends EventTarget {
    * どちらの通知経路で見つけたフレームも選択中の描画先へ取り込む。
    * `now` はこの realm の時計で測った取込み時刻。
    */
-  #ingestFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
+  #ingestFrame(
+    now: DOMHighResTimeStamp,
+    metadata: FrameObservation,
+    frame?: VideoFrame,
+  ): void {
     this.#lastIngestedMediaTime = metadata.mediaTime;
     if (this.#workerState === "active") {
-      this.#queueWorkerFrame(now, metadata);
+      this.#queueWorkerFrame(now, metadata, frame);
       return;
     }
     if (this.#workerState !== "starting") this.#processFrame(now, metadata);
@@ -2005,8 +2029,12 @@ export class Deinterlacer extends EventTarget {
         // #measure takes media seconds and divides by the rate to reach wall
         // time; mozTiming is already wall-clock ms, so scale it back up.
         if (mozPeriodMs > 0)
-          this.#measure((mozPeriodMs * (this.#video.playbackRate || 1)) / 1000);
-        else if (elapsed > 0) this.#measure(elapsed);
+          this.#measure(
+            (mozPeriodMs * (this.#video.playbackRate || 1)) / 1000,
+            1,
+          );
+        else if (this.#frames > 0 && elapsed > 0)
+          this.#measure(elapsed, missed + 1);
       }
       this.#lastMediaTime = metadata.mediaTime;
       this.#lastPresentedFrames = metadata.presentedFrames;
@@ -2322,11 +2350,10 @@ export class Deinterlacer extends EventTarget {
    * half a frame late and hold the picture through a refresh it should have
    * moved in.
    */
-  #measure(elapsed: number): void {
+  #measure(elapsed: number, observedFrames: number): void {
     const step = (elapsed * 1000) / (this.#video.playbackRate || 1);
-    const frames =
-      this.#periodMs > 0 ? Math.max(1, Math.round(step / this.#periodMs)) : 1;
-    const period = step / frames;
+    // Inferring the frame count from the previous period can perpetuate an incorrectly short estimate.
+    const period = step / observedFrames;
     if (period < MIN_PERIOD_MS || period > MAX_PERIOD_MS) return;
     // A much shorter period means the estimate was a multiple of it.
     this.#periodMs =
@@ -2709,6 +2736,9 @@ export class Deinterlacer extends EventTarget {
     this.#loopRequest = null;
     if (!this.#running || this.#lost) return;
     this.#measureRefresh(now);
+    const revision = this.#playbackRevision;
+    this.#videoFrames.flush(now);
+    if (!this.#frameIsCurrent(revision)) return;
     if (this.#workerState === "main") this.#present(this.#gridAt, now);
     this.#loopRequest = this.#armAnimationFrame(this.#onLoop);
   };
@@ -2868,6 +2898,8 @@ export class Deinterlacer extends EventTarget {
     this.#watchdogRequest = null;
     if (!this.#running || this.#lost) return;
     const revision = this.#playbackRevision;
+    this.#videoFrames.flush(now);
+    if (!this.#frameIsCurrent(revision)) return;
     this.#recoverFrameCallback(now);
     if (this.#frameIsCurrent(revision))
       this.#watchdogRequest = this.#armAnimationFrame(this.#onFrameWatchdog);
@@ -2876,6 +2908,7 @@ export class Deinterlacer extends EventTarget {
   /** requestVideoFrameCallback() が来ない間も requestAnimationFrame() から復号フレームを取り込む。 */
   #recoverFrameCallback(now: DOMHighResTimeStamp): void {
     if (this.#externalHost) return;
+    if (this.#videoFrames.captureDriven) return;
     // Firefox カウンター経路では VideoFrames が新規画像の判断を所有し、
     // painted が進まない画像の取込みを意図的に抑止する。watchdog が復号
     // カウンターから取込むと同一画像の重複登録になるため除外する。ただし
@@ -3620,6 +3653,7 @@ export class Deinterlacer extends EventTarget {
     if (rateChanged) {
       // 新しい再生速度のフレームが3枚そろうまで、旧周期の field match と decimate 位相を持ち越さずに通常の YADIF で表示する。
       this.#frames = 0;
+      this.#lastPresented = 0;
       this.#resetFilm();
       this.#resetFieldMetrics();
     }
