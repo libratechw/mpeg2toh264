@@ -16,6 +16,8 @@ export interface FrameMetadata {
      * it used and the timestamps stay convertible.
      */
     timeOrigin: number;
+    /** The frame for this notification, valid only until the callback returns. */
+    frame?: VideoFrame;
     /** Firefox counters supply identity and wall-clock cadence, not a frame PTS. */
     mozTiming?: {
         periodMs: number;
@@ -35,14 +37,18 @@ export declare function supportsVideoFrames(): boolean;
  */
 export declare class VideoFrames {
     #private;
-    constructor(video: HTMLVideoElement);
+    constructor(video: HTMLVideoElement, takeFrame?: () => VideoFrame | null | undefined);
     /** Whether acquisition runs off the Firefox counters. */
     get mozDriven(): boolean;
+    /** Whether frequent capture is active, excluding fallback notifications based on video.currentTime. */
+    get captureDriven(): boolean;
     /** Whether any frame has been delivered yet (counters proven live). */
     get hasDelivered(): boolean;
     request(callback: FrameCallback): void;
     cancel(): void;
     destroy(): void;
+    /** Deliver pending input on the rendering window's refresh, before drawing. */
+    flush(now: number): void;
 }
 export {};
 //# sourceMappingURL=video-frame.d.ts.map

@@ -41,7 +41,9 @@ export declare class FilmDetector {
      * The phase of the last frame measured, once the GPU has handed it back,
      * and null while it is still on its way. It is handed back once.
      */
-    poll(): Phase | null;
+    poll(): (Phase & {
+        age: number;
+    }) | null;
     destroy(): void;
 }
 //# sourceMappingURL=film-detect.d.ts.map

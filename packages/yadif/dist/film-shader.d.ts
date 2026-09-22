@@ -45,12 +45,8 @@ export declare const FIELD_METRICS: {
     readonly phase: 6;
 };
 export declare const FIELD_METRICS_SIZE = 7;
-/**
- * Differing blocks up to which two fields are the same (encoder noise on a
- * still), and from which they are plainly different. Between is neither.
- */
+/** Differing blocks tolerated when two fields repeat with encoder noise. */
 export declare const SAME_BLOCKS_MAX = 2;
-export declare const DIFFERENT_BLOCKS_MIN = 16;
 /** The phases whose frame holds two film frames; the first is the repeat. */
 export declare const FILM_DUPLICATE_PHASE = 1;
 export declare const FILM_MIXED_PHASE = 2;

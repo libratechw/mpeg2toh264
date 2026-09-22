@@ -1,3 +1,4 @@
+import { EncodedVideoFrames } from "./encoded-video.js";
 /**
  * How the filter is getting on, and where it is being let down.
  *
@@ -90,7 +91,7 @@ export interface DeinterlaceStats {
     filmError?: string | null;
 }
 export interface DeinterlacerOptions {
-    /** 描画先。`auto` は同梱 Worker を優先し、初期化できない場合はメインスレッドへ戻る。 */
+    /** Rendering target, defaulting to `main`; `auto` prefers the bundled Worker and falls back to the main thread if initialization fails. */
     rendering?: "auto" | "worker" | "main";
     /** module Worker の URL。省略時はパッケージへ同梱したファイルを使う。 */
     workerUrl?: string | URL;
@@ -198,6 +199,8 @@ export declare function supportsDeinterlace(): boolean;
  */
 export declare class Deinterlacer extends EventTarget {
     #private;
+    /** Receive fMP4 from the player and decode supplemental input only above 1.25x playback speed. */
+    readonly encodedVideo: EncodedVideoFrames | null;
     constructor(video: HTMLVideoElement, options?: DeinterlacerOptions);
     get running(): boolean;
     /** 現在 media element の上に配置している HTML canvas。 */

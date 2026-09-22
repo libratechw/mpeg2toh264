@@ -1,6 +1,12 @@
 import { type AudioTracks, type PlayerState, type PrivateStream, type Progress, type Scan, type VideoState, type Services, type SinkKind, type Stats, type Timing } from "./protocol.js";
 /** A replaceable deinterlacer controlled by the source picture timeline. */
 export interface PlayerDeinterlacer {
+    /** Optional compressed video input for filtering before browser presentation can drop frames. */
+    readonly encodedVideo?: {
+        append(data: ArrayBuffer): void;
+        reset(): void;
+        finish(): void;
+    } | null;
     readonly running: boolean;
     /** Field information selected for the picture most recently presented. */
     readonly scan: Scan | null;
