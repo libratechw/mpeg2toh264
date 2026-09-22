@@ -56,6 +56,10 @@ const audioSelectLabel = document.querySelector<HTMLElement>("#audio-label")!;
 const passthrough = document.querySelector<HTMLInputElement>("#passthrough")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
+const film = document.querySelector<HTMLInputElement>("#film")!;
+const autoFilm = document.querySelector<HTMLInputElement>("#auto-film")!;
+const deinterlaceDebug =
+  document.querySelector<HTMLInputElement>("#deinterlace-debug")!;
 const splitFieldSamples = document.querySelector<HTMLInputElement>(
   "#split-field-samples",
 )!;
@@ -433,6 +437,9 @@ function createPlayer(): Mpeg2TsPlayer {
       yadif = new Deinterlacer(element, {
         doubleRate: doubleRate.checked,
         onStats: showDeinterlaceStats,
+        debug: deinterlaceDebug.checked,
+        film: film.checked,
+        autoFilm: autoFilm.checked,
       });
       return yadif;
     },
@@ -601,12 +608,12 @@ function createCaptionOverlay(created: Mpeg2TsPlayer): {
 
 function showDeinterlaceStats(stats: DeinterlaceStats): void {
   const { filtered, missed, dropped, degraded, discontinuities, late } = stats;
-  const { fps: presentedFps, frameMs } = stats;
+  const { fps: presentedFps, frameMs, gpuMs, resynced, film } = stats;
   deinterlaceStats.textContent =
-    `${presentedFps.toFixed(2)} FPS ${frameMs.toFixed(3)} ms/フレーム` +
+    `${presentedFps.toFixed(2)} FPS${film ? " (24p)" : ""} ${frameMs.toFixed(3)} ms/フレーム (CPU) ${gpuMs?.toFixed(3) ?? "不明"} ms/フレーム (GPU)` +
     ` 適用: ${filtered} 取りこぼし: ${missed} 端: ${degraded}` +
-    ` 未表示: ${late}` +
-    ` 不連続: ${discontinuities} ドロップ: ${dropped} キュー長: ${stats.maxQueuedFields}`;
+    ` 未表示: ${late} 再同期: ${resynced}` +
+    ` 不連続: ${discontinuities} ドロップ: ${dropped} キューリセット数: ${stats.queueResetted} キュー長: ${stats.maxQueuedFields}`;
 }
 
 /** The service a viewer picked, which only a fresh load can act on. */
@@ -1040,7 +1047,14 @@ document.addEventListener("keydown", (event) => {
 function applyDeinterlace() {
   if (!player) return;
   player.deinterlace = deinterlace.checked;
-  if (yadif) yadif.doubleRate = doubleRate.checked;
+  if (yadif) {
+    yadif.doubleRate = doubleRate.checked;
+    // The runtime setter never throws: without float buffers the engine
+    // stands down with a failure notification instead (see README).
+    yadif.film = film.checked;
+    yadif.autoFilm = autoFilm.checked;
+    yadif.debug = deinterlaceDebug.checked;
+  }
   syncControls();
 }
 
@@ -1081,6 +1095,9 @@ service.addEventListener("change", () => {
 
 deinterlace.addEventListener("change", applyDeinterlace);
 doubleRate.addEventListener("change", applyDeinterlace);
+deinterlaceDebug.addEventListener("change", applyDeinterlace);
+film.addEventListener("change", applyDeinterlace);
+autoFilm.addEventListener("change", applyDeinterlace);
 
 if (!canPassthrough) {
   passthrough.checked = false;

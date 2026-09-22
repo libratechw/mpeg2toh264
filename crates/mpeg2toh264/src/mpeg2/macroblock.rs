@@ -37,9 +37,43 @@ static V_DC_LUMA: LazyLock<VlcTable> =
 static V_DC_CHROMA: LazyLock<VlcTable> =
     LazyLock::new(|| VlcTable::new("dct_dc_size_chrominance", DCT_DC_SIZE_CHROMA));
 static V_COEFF0: LazyLock<VlcTable> =
-    LazyLock::new(|| VlcTable::new("dct_coefficients_0", DCT_COEFF_TABLE0));
+    LazyLock::new(|| signed_coefficient_table("dct_coefficients_0", DCT_COEFF_TABLE0));
 static V_COEFF1: LazyLock<VlcTable> =
-    LazyLock::new(|| VlcTable::new("dct_coefficients_1", DCT_COEFF_TABLE1));
+    LazyLock::new(|| signed_coefficient_table("dct_coefficients_1", DCT_COEFF_TABLE1));
+
+/// How a coefficient comes out of [`signed_coefficient_table`]: the run in
+/// the high bits and the level, offset so that it is never negative, in the
+/// low twelve.
+const COEFFICIENT_RUN_SHIFT: u32 = 12;
+const COEFFICIENT_LEVEL_BIAS: i32 = 2048;
+
+/// Table B.14 or B.15 with the sign bit that follows every run/level code
+/// folded into the code itself, so a coefficient is one lookup rather than a
+/// lookup and a bit. End of block and escape carry no sign and stay as they
+/// are. The first lookup covers ten bits: the codes a broadcast spends most
+/// of its time in are six to nine bits before their sign.
+fn signed_coefficient_table(name: &'static str, entries: &[(&str, i32)]) -> VlcTable {
+    let mut signed: Vec<(String, i32)> = Vec::with_capacity(entries.len() * 2);
+    for &(code, value) in entries {
+        if value == EOB || value == ESCAPE {
+            signed.push((code.to_string(), value));
+            continue;
+        }
+        let run = value >> 8;
+        let level = value & 0xff;
+        for (sign, level) in [("0", level), ("1", -level)] {
+            signed.push((
+                format!("{code}{sign}"),
+                (run << COEFFICIENT_RUN_SHIFT) | (level + COEFFICIENT_LEVEL_BIAS),
+            ));
+        }
+    }
+    let entries: Vec<(&str, i32)> = signed
+        .iter()
+        .map(|(code, value)| (code.as_str(), *value))
+        .collect();
+    VlcTable::with_primary_bits(name, &entries, 10)
+}
 
 /// `frame_motion_type` / `field_motion_type` values (Tables 6-17, 6-18).
 pub mod motion_type {
@@ -76,18 +110,27 @@ pub struct Macroblock {
     pub field_select: [u8; 4],
     /// How many of the two vector slots are in use.
     pub mv_count: usize,
-    /// Six 8x8 blocks of quantised levels in raster order.
+    /// Six 8x8 blocks of quantised levels in raster order. Only the positions
+    /// `nonzero` names were written for this picture; the rest hold whatever
+    /// an earlier picture left there, and nothing reads them.
     blocks: [[i16; 64]; 6],
+    /// Which positions of each block the stream coded, bit `p` for raster
+    /// position `p`. A block carries five non-zero levels in sixty-four on a
+    /// broadcast, so what reads the block walks these bits rather than the
+    /// whole of it -- and the decoder need not clear the other fifty-nine.
+    nonzero: [u64; 6],
     /// Bit `i` is set when block `i` carries decoded levels.
     coded_blocks: u8,
 }
 
 impl Macroblock {
-    /// Levels of one 8x8 block, or `None` where the source did not code it.
+    /// Levels of one 8x8 block and the positions the source coded, or `None`
+    /// where it did not code the block. Positions outside the mask are not
+    /// zero, they are unwritten; read the mask, not the block.
     #[inline]
-    pub fn block(&self, index: usize) -> Option<&[i16; 64]> {
+    pub fn coded_block(&self, index: usize) -> Option<(&[i16; 64], u64)> {
         if self.coded_blocks & (1 << index) != 0 {
-            Some(&self.blocks[index])
+            Some((&self.blocks[index], self.nonzero[index]))
         } else {
             None
         }
@@ -112,6 +155,7 @@ impl Macroblock {
             field_select: [0; 4],
             mv_count: 1,
             blocks: [[0; 64]; 6],
+            nonzero: [0; 6],
             coded_blocks: 0,
         }
     }
@@ -349,8 +393,11 @@ fn decode_block(
     block_index: usize,
     intra: bool,
     out: &mut [i16; 64],
+    nonzero: &mut u64,
 ) -> Result<()> {
-    out.fill(0);
+    // `out` is not cleared: `nonzero` says which of it was written, and that
+    // is all any reader looks at.
+    *nonzero = 0;
     let scan: &[usize; 64] = if pic.coding.alternate_scan {
         &ALTERNATE_SCAN
     } else {
@@ -375,6 +422,7 @@ fn decode_block(
         let component = if is_luma { 0 } else { block_index - 3 }; // 0 = Y, 1 = Cb, 2 = Cr
         state.dc_pred[component] += signed_dc_differential(r, size);
         out[0] = state.dc_pred[component] as i16;
+        *nonzero = 1;
         n = 1;
     } else {
         // The first coefficient of a non-intra block uses the one-bit code '1'
@@ -383,6 +431,7 @@ fn decode_block(
         if r.peek(1) == 1 {
             r.skip(1);
             out[scan[0]] = if r.flag() { -1 } else { 1 };
+            *nonzero = 1 << scan[0];
             n = 1;
         } else {
             n = 0;
@@ -399,18 +448,17 @@ fn decode_block(
             let raw = r.u(12) as i32;
             (run, if raw >= 2048 { raw - 4096 } else { raw })
         } else {
-            let run = (sym >> 8) as usize;
-            let mut level = sym & 0xff;
-            if r.flag() {
-                level = -level;
-            }
-            (run, level)
+            (
+                (sym >> COEFFICIENT_RUN_SHIFT) as usize,
+                (sym & ((1 << COEFFICIENT_RUN_SHIFT) - 1)) - COEFFICIENT_LEVEL_BIAS,
+            )
         };
         n += run;
         if n > 63 {
             bail!("coefficient index {n} out of range at bit {}", r.bit_pos());
         }
         out[scan[n]] = level as i16;
+        *nonzero |= 1 << scan[n];
         n += 1;
     }
     Ok(())
@@ -652,7 +700,15 @@ fn decode_macroblock(
             // Straight into the macroblock: a block built on the stack and
             // assigned in is another hundred and twenty-eight bytes copied per
             // coded block, which the browser build pays for in memcpy.
-            decode_block(r, pic, state, i, intra, &mut mb.blocks[i])?;
+            decode_block(
+                r,
+                pic,
+                state,
+                i,
+                intra,
+                &mut mb.blocks[i],
+                &mut mb.nonzero[i],
+            )?;
             mb.coded_blocks |= 1 << i;
         }
     }

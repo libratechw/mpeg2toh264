@@ -22,9 +22,17 @@
     "packages/*"
   ],
   "scripts": {
-    "packages:build": "npm run build --workspace @mpeg2toh264/player && npm run build --workspace @mpeg2toh264/yadif",
+    "packages:build": "./tools/build-wasm.sh && npm run build --workspace @mpeg2toh264/player && node tools/check-player-wasm.mjs && npm run build --workspace @mpeg2toh264/yadif",
+    "test:yadif-contract": "node tools/test-yadif-contract.mjs",
+    "test:worker-clock": "node tools/test-worker-clock.mjs",
+    "test:pip-owner": "node tools/test-pip-owner.mjs",
+    "test:yadif-debug": "node tools/test-yadif-debug.mjs",
+    "test:film-retry": "node tools/test-film-retry.mjs",
+    "test:film-program-retry": "node tools/test-film-program-retry.mjs",
+    "test:film-failure-lifecycle": "node tools/test-film-failure-lifecycle.mjs",
     "test:ivtc": "node tools/test-ivtc.cjs",
     "test:mse": "node tools/test-mse-reset.mjs",
+    "test:range-eof": "node tools/test-range-eof.mjs && node tools/test-range-reading.mjs",
     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
     "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
     "typecheck": "npm run typecheck --workspaces --if-present",

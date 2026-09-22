@@ -11,14 +11,26 @@
  * The filter is supplied by the separate @mpeg2toh264/yadif package because it
  * is derived from FFmpeg and licensed differently. Everything here
  * is the machinery around it: three frames' worth of textures, a program, and
- * `requestVideoFrameCallback()` to say when a frame is worth uploading.
+ * frame callbacks (Firefox's moz counters, native rVFC elsewhere) to say when
+ * a frame is worth uploading.
  *
  * Frames are filtered one behind the element. yadif wants the frame either
  * side of the one it is working on, and the only way to hold the next one is
  * to wait for it, so the canvas is one frame -- around 33 ms -- behind the
  * audio. That is well inside what a viewer can tell, and the alternative is a
  * filter with half its motion measurements missing.
+ *
+ * With `film` on, 2:3 pulldown is detected on the GPU (see film-shader.ts):
+ * each frame is put back together into the film frame it came from, the
+ * repeated one in every five is dropped, and the rest are shown at 24 a
+ * second, evenly spaced.
  */
+import {
+  destroyDebugRenderState,
+  drawText,
+  initDebugRenderState,
+  type DebugRenderState,
+} from "./debug.js";
 import {
   FILM_ANALYSIS_HEIGHT,
   FILM_ANALYSIS_FRAGMENT_SHADER,
@@ -30,6 +42,17 @@ import {
   YADIF_UNIFORMS,
 } from "./shader.js";
 import { FFmpegIVTC } from "./ivtc.js";
+import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
+import {
+  FIELD_METRICS,
+  FILM_DUPLICATE_PHASE,
+  FILM_LOCK_FRAMES,
+} from "./film-shader.js";
+import {
+  VideoFrames,
+  supportsVideoFrames,
+  type FrameMetadata,
+} from "./video-frame.js";
 import type {
   WorkerCommand,
   WorkerNotification,
@@ -47,8 +70,8 @@ export function setBundledWorkerURL(url: string | URL): void {
 /** How far the presentation time may jump before the held frames are stale. */
 const CONTINUOUS_SECONDS = 0.5;
 
-/** prev, cur and next: everything the filter reads. */
-const HISTORY = 3;
+/** pprev, prev, cur and next: the filter reads three, the detection four. */
+const HISTORY = 4;
 
 const FIELD_QUEUE_LENGTH = 5;
 
@@ -70,9 +93,6 @@ const PERIOD_SMOOTHING = 0.25;
 
 /** The screen's refresh interval until animation frames have said otherwise. */
 const DEFAULT_REFRESH_MS = 1000 / 60;
-
-/** How fast the refresh estimate is allowed to climb back towards a long gap. */
-const REFRESH_DECAY = 0.02;
 
 /** 復号済み映像の進行を requestVideoFrameCallback() なしで待つ時間。 */
 const FRAME_CALLBACK_TIMEOUT_MS = 250;
@@ -96,6 +116,60 @@ void main() {
   gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
 }
 `;
+
+/** A measurement under this fraction of the period replaces it outright. */
+const PERIOD_SHORTER = 0.75;
+
+/**
+ * How much of the gap between the schedule and the clock each picture makes
+ * up, and the most one picture is moved by, in milliseconds. See #schedule.
+ * (otya: drift-corrected chaining keeps chained pictures on the clock without
+ * any of them ever moving across a refresh.)
+ */
+const DRIFT_GAIN = 0.1;
+const DRIFT_STEP_MS = 1;
+
+/** How much of each animation frame's error the refresh grid takes. (otya) */
+const GRID_PERIOD_GAIN = 0.02;
+const GRID_PHASE_GAIN = 0.1;
+
+/** Hysteresis around the half-refresh boundary, in milliseconds. (otya) */
+const PRESENT_HYSTERESIS_MS = 1;
+
+/**
+ * How far from the moment a frame was taken in hand its reported display time
+ * may be and still be believed, in whichever of the refresh and frame periods
+ * is longer. A report that cannot describe this frame is not one to schedule
+ * from: WebKit has reported times already past, and a translation across two
+ * clocks is only as good as the origin the other side stamped.
+ */
+const DISPLAY_TIME_REACH = 4;
+
+/** Broadcast frames in a pulldown cycle, and the film frames they hold. */
+const PULLDOWN_FRAMES = 5;
+const FILM_FRAMES = 4;
+
+/**
+ * How long after its frame arrives a film frame of each phase is shown, in
+ * frame periods, so that the film frames come out 1.25 periods apart. Phase
+ * 2 is whole only once the frame after it has arrived, so it goes up at
+ * once and the others are held back to match. Phase 1 is the repeat.
+ * (otya)
+ */
+const FILM_LEAD: Record<number, number> = {
+  2: 0,
+  3: 0.25,
+  4: 0.5,
+  5: 0.75,
+};
+
+/**
+ * How many consecutive unusable autoFilm analyses stand down the CPU film
+ * engine. Allocation either works or it does not -- the target and programs
+ * are (re)built at resize and toggles -- so a short run already means a
+ * persistent failure, not a startup race.
+ */
+const FILM_ANALYSE_FAILURE_LIMIT = 3;
 
 /**
  * Putting a picture that has already been filtered onto the canvas.
@@ -123,14 +197,36 @@ interface Ready {
   /** When it belongs on the screen, on `performance.now()`'s clock. */
   at: number;
   duration: number;
+  /** Which schedule chained it (otya): a cadence change restarts the chain. */
+  cadence: Cadence;
+  /** GPU pulldown phase, field number, or 0 for ordinary/CPU film frames. */
+  phase: number;
+  droppedBefore: number;
 }
+
+type Cadence = "frame" | "field" | "film";
 
 /** 表示済み映像を1フレーム取り込むために使う callback metadata。 */
 interface FrameObservation {
   mediaTime: number;
   presentedFrames: number;
+  /**
+   * requestVideoFrameCallback() が報告した表示予定時刻。予定スケジュールの
+   * 起点に使う (otya)。取得側と描画側で performance の時刻原点は一致しない
+   * ため、必ず `timeOrigin` とともに扱い、描画側の時計へ変換してから使う。
+   * Firefox カウンター経路では VideoFrames がポーリング時刻を入れる。
+   */
+  expectedDisplayTime: number;
+  /** `expectedDisplayTime` を測った realm の performance.timeOrigin。 */
+  timeOrigin: number;
   width: number;
   height: number;
+  /**
+   * Firefox counter timing when the frame came through VideoFrames.
+   * mediaTime there is the coarse media clock (unsuited as frame identity
+   * or field clock); use presentedFrames and this instead.
+   */
+  mozTiming?: { periodMs: number; discontinuity: boolean };
 }
 
 /** The draw path that produced the picture still represented by the canvas. */
@@ -154,9 +250,10 @@ export interface DeinterlaceStats {
   filtered: number;
   /**
    * Frames the element presented that the filter never saw, counted from the
-   * gaps in `presentedFrames`. The neighbours of the frames either side of a
-   * gap are further apart in time than the filter believes, so its idea of
-   * what moved is wrong. A page that sees this climbing is asking the filter
+   * gaps in `presentedFrames` (`mozPaintedFrames` on Firefox). The neighbours
+   * of the frames either side of a gap are further apart in time than the
+   * filter believes, so its idea of what moved is wrong. A page that sees
+   * this climbing is asking the filter
    * to keep up with more than it can.
    */
   missed: number;
@@ -175,6 +272,13 @@ export interface DeinterlaceStats {
   degraded: number;
   /** Times the held frames were dropped as stale: seeks, and stream changes. */
   discontinuities: number;
+  /**
+   * Times the schedule was restarted from the clock instead of following on
+   * from the last picture: a seek, a stall, a cadence change, or a missed
+   * frame. Climbing during steady playback means the cadence is not holding.
+   * (otya)
+   */
+  resynced?: number;
   /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
   late: number;
   /**
@@ -203,6 +307,24 @@ export interface DeinterlaceStats {
   duplicateScore: number;
   /** Next-smallest block difference in the most recently completed cycle. */
   duplicateRunnerUp: number;
+  /**
+   * GPU processing time, supported only in Chrome. On ANGLE's Metal backend
+   * it spans command buffers rather than the work in them, so it overstates
+   * anything split into many small passes; a change is best judged by its
+   * direction here and by a synchronous readback in isolation.
+   */
+  gpuMs?: number;
+  /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
+  film?: boolean;
+  /**
+   * Why requested film reconstruction is currently unavailable, or null
+   * while healthy. The requesting option (`film` / `autoFilm`) stays as the
+   * caller set it -- intent is preserved -- while pictures continue through
+   * plain YADIF. Cleared on the next retry (start, scan change, resize, or
+   * re-setting the option); a repeated failure notifies again as a new
+   * episode. Always null when neither film engine is requested.
+   */
+  filmError?: string | null;
 }
 
 export interface DeinterlacerOptions {
@@ -254,6 +376,25 @@ export interface DeinterlacerOptions {
    * being asked for anything.
    */
   onStats?(stats: DeinterlaceStats): void;
+  /**
+   * Whether to detect 2:3 pulldown and show film at 24 frames a second.
+   * Frames that are not film are filtered as usual. Needs
+   * `EXT_color_buffer_float`.
+   */
+  film?: boolean;
+  /**
+   * Called when a rendering resource fails after construction: a GPU film
+   * detector that throws mid-stream, an autoFilm analysis target that will
+   * not allocate, a Worker that died twice, or a lost WebGL context. The
+   * same message is dispatched as a `failure` event; this option exists for
+   * callers that prefer a constructor callback like `onStats`.
+   */
+  onFailure?(message: string): void;
+  /**
+   * Whether to draw the pulldown detection over the picture. Applies to
+   * the GPU (`film`) path only; inert under `autoFilm` alone.
+   */
+  debug?: boolean;
 }
 
 /** Field information supplied by a player or another video source. */
@@ -270,24 +411,65 @@ export interface VideoState {
 
 export interface DeinterlacerEventMap {
   stats: CustomEvent<DeinterlaceStats>;
+  /** A rendering resource failed after construction; detail is the reason. */
+  failure: CustomEvent<string>;
 }
 
 /** Whether this browser has the two things the deinterlacer is built on. */
 export function supportsDeinterlace(): boolean {
-  return (
-    typeof HTMLVideoElement !== "undefined" &&
-    "requestVideoFrameCallback" in HTMLVideoElement.prototype &&
-    typeof WebGL2RenderingContext !== "undefined"
-  );
+  return supportsVideoFrames() && typeof WebGL2RenderingContext !== "undefined";
+}
+
+type RenderTarget = {
+  texture: WebGLTexture;
+  framebuffer: WebGLFramebuffer;
+};
+
+interface EXT_disjoint_timer_query_webgl2 {
+  readonly QUERY_COUNTER_BITS_EXT: 0x8864;
+  readonly TIME_ELAPSED_EXT: 0x88bf;
+  readonly TIMESTAMP_EXT: 0x8e28;
+  readonly GPU_DISJOINT_EXT: 0x8fbb;
+
+  queryCounterEXT(query: WebGLQuery, target: GLenum): void;
+}
+
+/**
+ * Somewhere animation frames come from.
+ *
+ * A `Window` is one, and so is the Worker host below. Which one is in use is
+ * not fixed for the lifetime of a deinterlacer: a document picture-in-picture
+ * window can adopt the element and its canvas, and from then on it is that
+ * window that composites them. The object itself is the identity a pending
+ * request is cancelled against, so it has to be the same object each time the
+ * same source is asked for.
+ */
+interface AnimationFrames {
+  requestAnimationFrame(callback: FrameRequestCallback): number;
+  cancelAnimationFrame(handle: number): void;
+}
+
+/**
+ * The frames this module's own realm hands out, for when the canvas is in no
+ * document that has a window: a detached element, or a picture-in-picture
+ * window that has since closed.
+ */
+const moduleAnimationFrames: AnimationFrames = {
+  requestAnimationFrame: (callback) => requestAnimationFrame(callback),
+  cancelAnimationFrame: (handle) => cancelAnimationFrame(handle),
+};
+
+/** An outstanding request, with the source that must be used to cancel it. */
+interface AnimationRequest {
+  frames: AnimationFrames;
+  handle: number;
 }
 
 /** Worker の入口だけが、同じクラスから描画エンジンを構築するために渡す内部接続。 */
-interface ExternalRenderingHost {
+interface ExternalRenderingHost extends AnimationFrames {
   canvas: OffscreenCanvas;
   onFailure(message: string): void;
   onVisibility(visible: boolean): void;
-  requestAnimationFrame(callback: FrameRequestCallback): number;
-  cancelAnimationFrame(handle: number): void;
 }
 
 /** ACK を待つ間にページ側が所有する最新フレームと、その観測状態。 */
@@ -322,7 +504,10 @@ export class Deinterlacer extends EventTarget {
   #displayCanvas: HTMLCanvasElement;
 
   readonly #video: HTMLVideoElement;
+  readonly #videoFrames: VideoFrames;
   readonly #gl: WebGL2RenderingContext;
+  /** The pulldown detection, built only while the `film` option needs it. */
+  #detector: FilmDetector | null = null;
   readonly #program: WebGLProgram;
   readonly #location: Record<
     keyof typeof YADIF_UNIFORMS,
@@ -360,7 +545,7 @@ export class Deinterlacer extends EventTarget {
   } | null = null;
   #textures: WebGLTexture[] = [];
   /** Somewhere to filter a field into, and to read it back out of. */
-  #outputs: { texture: WebGLTexture; framebuffer: WebGLFramebuffer }[] = [];
+  #outputs: RenderTarget[] = [];
   /** Which output slot was written last; the next one follows round the ring. */
   #outputHead = OUTPUT_POOL_LENGTH - 1;
   /** The draw path currently shown on the canvas, retained for snapshots. */
@@ -368,12 +553,35 @@ export class Deinterlacer extends EventTarget {
   /** Filtered fields waiting for their moment, oldest first. */
   #queue: Ready[] = [];
   /** The requestAnimationFrame() loop that puts them up, which is all that draws on the canvas. */
-  #loopHandle: number | null = null;
+  #loopRequest: AnimationRequest | null = null;
   #lastLoopAt = 0;
-  /** ページ側で requestVideoFrameCallback() の停止を監視する requestAnimationFrame()。 */
-  #frameWatchdogHandle: number | null = null;
+  /** ページ側で frame callback の停止を監視する requestAnimationFrame()。 */
+  #watchdogRequest: AnimationRequest | null = null;
+  /** The document the owner-change listener is on, if any. */
+  #ownerDocument: Document | null = null;
   /** The gap between animation frames: as near as the page gets to the screen. */
   #refreshMs = DEFAULT_REFRESH_MS;
+  /** Where the refresh grid fitted to the animation frames stands. (otya) */
+  #gridAt = 0;
+  /** How far ahead of its animation frame the last picture shown stood. (otya) */
+  #shownAhead = 0;
+  #shownAt = 0;
+  #droppedBefore = 0;
+  /** The last picture chained onto the schedule; a break restarts it. (otya) */
+  #lastScheduled: Ready | null = null;
+
+  /**
+   * Drop the presentation queue and restart the schedule from the clock.
+   * Every schedule restart goes through here (otya nulls #lastScheduled at
+   * each queue clear): the old chain's clock no longer applies, so keeping
+   * it would either count a phantom resync or pop freshly queued pictures
+   * as late. Restart accounting for cadence changes lives in #schedule.
+   */
+  #dropQueue(): void {
+    this.#queue.length = 0;
+    this.#lastScheduled = null;
+    this.#droppedBefore = 0;
+  }
   /** The `<div>` this put around the element, so it can be taken away again. */
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver | null;
@@ -389,6 +597,9 @@ export class Deinterlacer extends EventTarget {
   #duplicateScore = Infinity;
   #duplicateRunnerUp = Infinity;
   #outputSinceReport = 0;
+  /** otya GPU pulldown path: enabled by the `film` option (see below). */
+  #debug: boolean;
+  #film: boolean;
   /** How long a frame lasts in wall time, from what the frames themselves say. */
   #periodMs = 0;
   /** The size of a frame as it is coded, which is what a texture holds. */
@@ -399,23 +610,27 @@ export class Deinterlacer extends EventTarget {
   /** How many of the held frames are consecutive, up to HISTORY. */
   #frames = 0;
   #lastMediaTime = 0;
+  /** presentedFrames at the last ingested frame; pairs with #lastMediaTime. */
+  #lastPresentedFrames = 0;
   #lastIngestedMediaTime = Number.NaN;
   /** A destination frame that arrived before the browser finished seeking. */
   #seekFrameReady = false;
-  #handle: number | null = null;
-  /** requestVideoFrameCallback() の停止を検出するために保持する最終通知時刻。 */
+  /** 最終通知時刻。rVFC と Firefox カウンターのどちらの取得経路でも更新する。 */
   #lastVideoFrameCallbackAt = 0;
   /** どちらの取得経路からも参照するブラウザの復号フレーム数。 */
   #lastObservedVideoFrames = 0;
   /** animation loop の代替経路が最後にフレームを取り込んだ時刻。 */
   #lastFallbackAt = 0;
   #running = false;
+  /** Cancels work suspended inside a synchronous owner callback. */
+  #playbackRevision = 0;
   #enabled = false;
   #destroyed = false;
   #scan: Scan | null = null;
   #videoTimeline: readonly VideoState[] = [];
   #lost = false;
   readonly #onStats: ((stats: DeinterlaceStats) => void) | undefined;
+  readonly #onFailure: ((message: string) => void) | undefined;
   readonly #externalHost: ExternalRenderingHost | null;
   #frameSource: TexImageSource;
   readonly #rendering: "auto" | "worker" | "main";
@@ -440,6 +655,7 @@ export class Deinterlacer extends EventTarget {
     missed: 0,
     degraded: 0,
     discontinuities: 0,
+    resynced: 0,
     late: 0,
     queueResetted: 0,
   };
@@ -453,7 +669,35 @@ export class Deinterlacer extends EventTarget {
   #showFramesSinceReport = 0;
   #showMsSinceReport = 0;
   #reportMaxQueuedFields = 0;
-
+  readonly #timerQueryExtension: EXT_disjoint_timer_query_webgl2 | null;
+  #freeQueries: WebGLQuery[] = [];
+  #timerUsingQueries: { q: WebGLQuery; isField: boolean }[] = [];
+  #gpuFrameNanosecondsSinceReport = 0;
+  #gpuFrameCountSinceReport = 0;
+  #gpuFieldNanosecondsSinceReport = 0;
+  #gpuFieldCountSinceReport = 0;
+  /** The last phase read back from the GPU, and how many frames ago it was for. */
+  #known: Phase = NO_PHASE;
+  #knownAge = 0;
+  /** The phase of the frame being filtered: #known advanced by #knownAge. */
+  #phase: Phase = NO_PHASE;
+  #filmLocked = false;
+  #debugRenderState: DebugRenderState | null = null;
+  #debugText = "";
+  /** Debug only: frames given each phase (0 for none), and repeats dropped. */
+  #phaseCounts = [0, 0, 0, 0, 0, 0];
+  #filmDropped = 0;
+  /**
+   * Why requested film reconstruction is currently degraded, or null while
+   * healthy. The `film` / `autoFilm` options stay as the caller set them;
+   * only the engine stands down, so this is never a silent option change.
+   */
+  #filmDegraded: string | null = null;
+  /** Consecutive autoFilm analyses with no usable target or programs. */
+  #filmAnalyseFailures = 0;
+  /** Last worker-reported filmError, to derive the page-side failure event. */
+  #workerFilmError: string | null = null;
+  #workerFilmFailure = 0;
   constructor(video: HTMLVideoElement, options?: DeinterlacerOptions);
   /** @internal Worker の描画エンジンを構築する場合だけ使う。 */
   constructor(
@@ -474,7 +718,10 @@ export class Deinterlacer extends EventTarget {
       options.filmCombThreshold ?? FFmpegIVTC.COMBED_PIXEL_LIMIT,
     );
     this.#spatialCheck = options.spatialCheck ?? true;
+    this.#debug = options.debug ?? false;
+    this.#film = options.film ?? false;
     this.#onStats = options.onStats;
+    this.#onFailure = options.onFailure;
     this.#externalHost = externalHost;
     this.#rendering = externalHost ? "main" : (options.rendering ?? "auto");
     this.#workerURL = options.workerUrl ?? bundledWorkerURL;
@@ -501,8 +748,13 @@ export class Deinterlacer extends EventTarget {
       preserveDrawingBuffer: false,
       powerPreference: "high-performance",
     });
-    if (!gl) throw new Error("this browser has no WebGL2");
+    if (!(gl instanceof WebGL2RenderingContext))
+      throw new Error("this browser has no WebGL2");
     this.#gl = gl;
+    if (this.#film && !this.#autoFilm) {
+      this.#requireFloatBuffers();
+      this.#detector = new FilmDetector(gl);
+    }
     this.#program = createProgram(gl, YADIF_FRAGMENT_SHADER);
     const program = this.#program;
     this.#location = Object.fromEntries(
@@ -515,6 +767,9 @@ export class Deinterlacer extends EventTarget {
     this.#blitField = gl.getUniformLocation(this.#blit, "uField");
     this.#blitFlip = gl.getUniformLocation(this.#blit, "uFlip");
     if (this.#autoFilm) this.#ensureFilmPrograms();
+    this.#timerQueryExtension = gl.getExtension(
+      "EXT_disjoint_timer_query_webgl2",
+    );
     this.#renderCanvas.addEventListener(
       "webglcontextlost",
       this.#onContextLost,
@@ -525,6 +780,7 @@ export class Deinterlacer extends EventTarget {
     this.#resizes = externalHost
       ? null
       : new ResizeObserver(() => this.#layout());
+    this.#videoFrames = new VideoFrames(video);
     // A frame the filter has not seen the neighbours of is not worth holding:
     // whatever is next will have been somewhere else entirely.
     video.addEventListener("emptied", this.#onEmptied);
@@ -561,6 +817,8 @@ export class Deinterlacer extends EventTarget {
       autoFilm: this.#autoFilm,
       filmCombThreshold: this.#filmCombThreshold,
       spatialCheck: this.#spatialCheck,
+      film: this.#film,
+      debug: this.#debug,
     };
   }
 
@@ -584,6 +842,7 @@ export class Deinterlacer extends EventTarget {
     const changed =
       interlacingChanged || this.#scan?.topFieldFirst !== scan?.topFieldFirst;
     this.#scan = scan;
+    if (changed && (!this.#recoverFilm() || this.#scan !== scan)) return;
     this.#worker?.postMessage({ type: "scan", scan } satisfies WorkerCommand);
     if (changed) {
       // A standalone caller may update scan metadata without a timeline entry.
@@ -591,6 +850,7 @@ export class Deinterlacer extends EventTarget {
       // the new source state.
       this.#frames = 0;
       this.#resetFilm();
+      this.#resetFieldMetrics();
       // Progressive video carries no cadence measurement, so schedule fields
       // only after measuring the first complete interlaced interval
       if (interlacingChanged) this.#periodMs = 0;
@@ -647,15 +907,102 @@ export class Deinterlacer extends EventTarget {
     this.#postWorkerSettings();
     // A rate change gives every queued field a different presentation cadence,
     // so the next decoded frame starts a new schedule on the current timeline.
-    this.#queue.length = 0;
-    if (doubleRate) {
+    this.#dropQueue();
+    this.#applyScheduling();
+  }
+
+  get spatialCheck(): boolean {
+    return this.#spatialCheck;
+  }
+
+  set spatialCheck(spatialCheck: boolean) {
+    if (spatialCheck === this.#spatialCheck) return;
+    this.#spatialCheck = spatialCheck;
+    this.#postWorkerSettings();
+  }
+
+  get film(): boolean {
+    return this.#film;
+  }
+
+  set film(film: boolean) {
+    // autoFilm owns cadence when both options are requested. Changing the
+    // inactive GPU intent must not allocate it or clear a CPU failure.
+    if (this.#autoFilm) {
+      this.#film = film;
+      this.#postWorkerSettings();
+      return;
+    }
+    // A degraded engine re-arms on an explicit `film = true`: the identity
+    // guard below would otherwise make the documented manual retry a no-op
+    // precisely when it is needed (degrade keeps the option on).
+    const filmError = this.#worker ? this.#workerFilmError : this.#filmDegraded;
+    if (film === this.#film && (film === false || filmError === null)) return;
+    if (this.#worker) {
+      this.#film = film;
+      this.#postWorkerSettings(film ? "film" : undefined);
+      return;
+    }
+    if (film) {
+      if (!this.#recoverFilm()) return;
+      try {
+        this.#ensureDetector();
+      } catch (error) {
+        // A runtime toggle that cannot build the detector degrades with
+        // notice instead of throwing: only construction probes capability
+        // with an exception, so the worker's applySettings path and page
+        // toggles cannot take the whole deinterlacer down (F5). The option
+        // stays on as intent; the engine stands down until a retry point.
+        this.#film = true;
+        this.#postWorkerSettings();
+        this.#degradeFilm(
+          `film detector unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+    }
+    this.#film = film;
+    this.#postWorkerSettings();
+    if (!film) {
+      // Withdrawing the intent clears the error with it: nothing is
+      // requested, so nothing is degraded.
+      if (!this.#recoverFilm()) return;
+      this.#filmLocked = false;
+      this.#phase = NO_PHASE;
+      this.#resetFieldMetrics();
+      this.#detector?.destroy();
+      this.#detector = null;
+    }
+    this.#applyScheduling();
+  }
+
+  get debug(): boolean {
+    return this.#debug;
+  }
+
+  set debug(debug: boolean) {
+    if (debug === this.#debug) return;
+    this.#debug = debug;
+    this.#postWorkerSettings();
+  }
+
+  /** Whether pictures are queued and put up by the loop rather than drawn on arrival.
+   * autoFilm joins the otya condition so the CPU film path keeps its loop.
+   */
+  get #scheduled(): boolean {
+    return this.#doubleRate || this.#film || this.#autoFilm;
+  }
+
+  #applyScheduling(): void {
+    if (this.#destroyed) return;
+    if (this.#scheduled) {
       if (this.#width > 0) this.#allocateOutputs();
       if (
         (this.#scan?.interlaced ?? true) &&
         (this.#externalHost || this.#workerState === "main")
       )
         this.#startLoop();
-    } else if (!this.#autoFilm) {
+    } else if (!this.#autoFilm && !this.#film) {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
       this.#presentedPicture = null;
@@ -670,14 +1017,25 @@ export class Deinterlacer extends EventTarget {
   }
 
   set autoFilm(autoFilm: boolean) {
-    if (autoFilm === this.#autoFilm) return;
+    const filmError = this.#worker ? this.#workerFilmError : this.#filmDegraded;
+    if (autoFilm === this.#autoFilm && (!autoFilm || filmError === null))
+      return;
     this.#autoFilm = autoFilm;
+    if (this.#worker) {
+      this.#postWorkerSettings(autoFilm ? "autoFilm" : undefined);
+      return;
+    }
     this.#postWorkerSettings();
     this.#resetFilm();
     if (autoFilm) {
-      this.#ensureFilmPrograms();
+      // Stop the unselected detector as well as bypassing its output. A GPU
+      // failure must not disable the healthy CPU engine on the next frame.
+      this.#resetFieldMetrics();
+      this.#detector?.destroy();
+      this.#detector = null;
+      // Re-setting the option is a manual retry for a degraded engine.
+      if (!this.#recoverFilm() || this.#autoFilm !== autoFilm) return;
       if (this.#width > 0) {
-        this.#allocateAnalysisTarget();
         this.#allocateOutputs();
       }
       if (
@@ -686,12 +1044,10 @@ export class Deinterlacer extends EventTarget {
       )
         this.#startLoop();
     } else {
+      // Withdrawing the intent clears the error with it.
+      if (!this.#recoverFilm() || this.#autoFilm !== autoFilm) return;
       this.#freeAnalysisTarget();
-      if (!this.#doubleRate) {
-        this.#presentedPicture = null;
-        this.#setVisible(false);
-        this.#freeOutputs();
-      }
+      this.#applyScheduling();
     }
   }
 
@@ -709,11 +1065,26 @@ export class Deinterlacer extends EventTarget {
   }
 
   /** Worker と canvas を再構築せずに変更可能なフィルター設定を反映する。 */
-  #postWorkerSettings(): void {
+  #postWorkerSettings(retryFilm?: "film" | "autoFilm"): void {
     this.#worker?.postMessage({
       type: "settings",
       options: this.#workerRenderingOptions(),
+      retryFilm,
     } satisfies WorkerCommand);
+  }
+
+  #requireFloatBuffers(): void {
+    if (this.#gl.getExtension("EXT_color_buffer_float") === null)
+      throw new Error("film needs EXT_color_buffer_float");
+  }
+
+  /** Build the GPU pulldown detector the `film` option needs, or throw. */
+  #ensureDetector(): void {
+    this.#requireFloatBuffers();
+    this.#detector ??= new FilmDetector(this.#gl);
+    // A detector built outside #resize has no dimensions; size it now so
+    // a runtime toggle engages instead of idling on zero-size targets.
+    if (this.#width > 0) this.#detector.resize(this.#width, this.#height);
   }
 
   #apply(): void {
@@ -756,6 +1127,8 @@ export class Deinterlacer extends EventTarget {
     this.#worker = null;
     this.#workerFrameInFlight = false;
     this.#workerAcceptedFrame = false;
+    this.#workerFilmError = null;
+    this.#workerFilmFailure = 0;
     let canvas = this.#displayCanvas;
     // 初回は公開済みの要素をそのまま使い、片方向転送済みの canvas を復旧する場合だけ新しい要素へ差し替える。
     if (this.#displayCanvasTransferred) {
@@ -841,6 +1214,26 @@ export class Deinterlacer extends EventTarget {
           dropped:
             this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
         };
+        // A retry and an identical failure can both occur between reports.
+        // The Worker counts episodes so that this is still a new failure.
+        const workerFilmError = stats.filmError ?? null;
+        const previousFailure = this.#workerFilmFailure;
+        // A failure listener may synchronously request another attempt.
+        this.#workerFilmError = workerFilmError;
+        this.#workerFilmFailure = notification.filmFailure;
+        if (
+          workerFilmError !== null &&
+          notification.filmFailure !== previousFailure
+        ) {
+          this.dispatchEvent(
+            new CustomEvent("failure", { detail: workerFilmError }),
+          );
+          try {
+            this.#onFailure?.(workerFilmError);
+          } catch {
+            // A failing failure-listener must not break the frame loop.
+          }
+        }
         this.dispatchEvent(new CustomEvent("stats", { detail: stats }));
         this.#onStats?.(stats);
         break;
@@ -861,6 +1254,81 @@ export class Deinterlacer extends EventTarget {
         break;
       }
     }
+  }
+
+  /**
+   * Tell the owner that a rendering resource failed after construction.
+   * In the worker domain the boundary counts episodes: the reason travels in
+   * `stats.filmError` and the page derives the event from the episode count,
+   * so a film degradation is never mistaken for worker death.
+   */
+  #notifyFailure(message: string): void {
+    this.dispatchEvent(new CustomEvent("failure", { detail: message }));
+    if (this.#externalHost) return;
+    try {
+      this.#onFailure?.(message);
+    } catch {
+      // A failing failure-listener must not break the frame loop.
+    }
+  }
+
+  /**
+   * Stand down film reconstruction without touching the caller's options.
+   * Pictures keep flowing through plain YADIF; the reason is reported once
+   * per episode through the failure event/option and `stats.filmError`.
+   * Silently turning the `film` option off is not a fallback -- it would
+   * rewrite the caller's 24fps intent -- so the option stays on and only
+   * the engine stands down.
+   *
+   * NOTE: the reason prefixes below (`film detector unavailable`,
+   * `film detection failed`, `autoFilm analysis unavailable`) are
+   * load-bearing for the KonomiTV caller, which matches on them to decide
+   * the explicit autoFilm recovery (G6). Rewording them silently drops that
+   * recovery to a log line; prefer a typed detail if this grows further.
+   */
+  #degradeFilm(reason: string): void {
+    // A repeated identical reason stays one episode; a different reason is
+    // new information and notifies again (F11).
+    if (this.#filmDegraded === reason) return;
+    this.#filmDegraded = reason;
+    this.#filmLocked = false;
+    this.#phase = NO_PHASE;
+    this.#resetFieldMetrics();
+    this.#filmAnalyseFailures = 0;
+    // A detector that threw once would throw every frame; drop it so the
+    // loop does useful work until a retry point rebuilds it.
+    this.#detector?.destroy();
+    this.#detector = null;
+    this.#notifyFailure(reason);
+  }
+
+  /**
+   * Re-arm film reconstruction at a resource-reallocation point (start, scan
+   * change, resize, or re-setting the option). The next frame retries; a
+   * repeated failure degrades again and notifies as a new episode.
+   */
+  #recoverFilm(): boolean {
+    if (this.#destroyed) return false;
+    if (this.#worker) return true;
+    const revision = this.#playbackRevision;
+    this.#filmDegraded = null;
+    this.#filmAnalyseFailures = 0;
+    // Retry all CPU analysis resources here, not only its framebuffer: a
+    // runtime option change can also fail while linking the programs.
+    if (this.#autoFilm) {
+      try {
+        this.#ensureFilmPrograms();
+        if (this.#width > 0) this.#allocateAnalysisTarget();
+      } catch (error) {
+        this.#degradeFilm(
+          `autoFilm programs unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    // A stop, destruction or restart invalidates the suspended operation.
+    // Changing engines alone does not: start() must still finish acquiring
+    // frames, using the current options instead of leaving running=true idle.
+    return !this.#destroyed && revision === this.#playbackRevision;
   }
 
   /** 一時的な Worker 障害を1回だけ復旧し、再失敗時は media element 自体を表示する。 */
@@ -884,6 +1352,7 @@ export class Deinterlacer extends EventTarget {
     this.#worker?.terminate();
     this.#worker = null;
     this.#closePendingWorkerFrame();
+    this.#notifyFailure(`deinterlacer worker stopped: ${message}`);
     this.stop();
   }
 
@@ -925,9 +1394,12 @@ export class Deinterlacer extends EventTarget {
 
   start(): void {
     if (this.#running || this.#destroyed || this.#lost) return;
+    this.#playbackRevision++;
     this.#running = true;
     this.#resetStats();
     this.#resetFilm();
+    // A new playback attempts the requested engines again.
+    if (!this.#recoverFilm()) return;
     this.#lastVideoFrameCallbackAt = performance.now();
     this.#lastFallbackAt = this.#lastVideoFrameCallbackAt;
     this.#lastIngestedMediaTime = Number.NaN;
@@ -951,11 +1423,10 @@ export class Deinterlacer extends EventTarget {
 
   /** Take the deinterlaced picture away, leaving the element's own showing. */
   stop(): void {
+    this.#playbackRevision++;
     if (!this.#running) return;
     this.#running = false;
-    if (this.#handle !== null)
-      this.#video.cancelVideoFrameCallback(this.#handle);
-    this.#handle = null;
+    this.#videoFrames.cancel();
     this.#stopFrameWatchdog();
     this.#stopLoop();
     this.#frames = 0;
@@ -978,10 +1449,18 @@ export class Deinterlacer extends EventTarget {
     this.#worker = null;
     this.#closePendingWorkerFrame();
     this.#rejectCaptureRequests("the deinterlacer was destroyed");
+    // `stop()` cancelled both requests on whichever window held them; the
+    // listener that would have re-armed them goes with the same move.
+    this.#ownerDocument?.removeEventListener(
+      "visibilitychange",
+      this.#onOwnerVisibility,
+    );
+    this.#ownerDocument = null;
     this.#renderCanvas.removeEventListener(
       "webglcontextlost",
       this.#onContextLost,
     );
+    this.#videoFrames.destroy();
     this.#video.removeEventListener("emptied", this.#onEmptied);
     this.#video.removeEventListener("resize", this.#onResize);
     this.#video.removeEventListener("pause", this.#onFlush);
@@ -994,6 +1473,20 @@ export class Deinterlacer extends EventTarget {
     this.#textures = [];
     this.#freeOutputs();
     this.#freeAnalysisTarget();
+    for (const q of [
+      ...this.#freeQueries,
+      ...this.#timerUsingQueries.map(({ q }) => q),
+    ]) {
+      this.#gl.deleteQuery(q);
+    }
+    this.#freeQueries.length = 0;
+    this.#timerUsingQueries.length = 0;
+    this.#detector?.destroy();
+    this.#detector = null;
+    if (this.#debugRenderState !== null) {
+      destroyDebugRenderState(this.#debugRenderState);
+      this.#debugRenderState = null;
+    }
     this.#gl.deleteProgram(this.#program);
     this.#gl.deleteProgram(this.#blit);
     if (this.#filmAnalysis) this.#gl.deleteProgram(this.#filmAnalysis);
@@ -1093,8 +1586,8 @@ export class Deinterlacer extends EventTarget {
   }
 
   #request(): void {
-    if (this.#externalHost || !this.#running || this.#handle !== null) return;
-    this.#handle = this.#video.requestVideoFrameCallback(this.#onFrame);
+    if (this.#externalHost || !this.#running) return;
+    this.#videoFrames.request(this.#onFrame);
   }
 
   /** seek と表示周期の判断に必要な DOM 側の再生状態を複製する。 */
@@ -1166,7 +1659,16 @@ export class Deinterlacer extends EventTarget {
       return;
     }
     this.#workerFrameInFlight = true;
-    const command: WorkerCommand = { type: "frame", ...pending };
+    // Built out rather than spread: `pending.now` is this realm's ingestion
+    // clock and has no meaning on the other side of the boundary, so it stays
+    // off the wire. The clock the Worker does need travels in the metadata.
+    const command: WorkerCommand = {
+      type: "frame",
+      id: pending.id,
+      frame: pending.frame,
+      metadata: pending.metadata,
+      video: pending.video,
+    };
     try {
       worker.postMessage(command, [pending.frame]);
     } catch (error) {
@@ -1187,22 +1689,188 @@ export class Deinterlacer extends EventTarget {
     }
   }
 
-  #onFrame = (
-    now: DOMHighResTimeStamp,
-    metadata: VideoFrameCallbackMetadata,
-  ): void => {
-    this.#handle = null;
+  #drawText(text: string, x: number, y: number): void {
+    if (this.#debugRenderState == null) {
+      this.#debugRenderState = initDebugRenderState(this.#gl, "20px monospace");
+    }
+    drawText(this.#debugRenderState, text, x, y, this.#width, this.#height, 20);
+  }
+
+  #beginGpuTimer(isField: boolean): WebGLQuery | undefined {
+    if (this.#timerQueryExtension == null) {
+      return undefined;
+    }
+    if (this.#timerUsingQueries.length > 30) {
+      return undefined;
+    }
+    const q = this.#freeQueries.pop() ?? this.#gl.createQuery();
+    this.#gl.beginQuery(this.#timerQueryExtension.TIME_ELAPSED_EXT, q);
+    this.#timerUsingQueries.push({ q, isField });
+    return q;
+  }
+
+  #endGpuTimer(q: WebGLQuery | undefined): void {
+    if (this.#timerQueryExtension == null) {
+      return;
+    }
+    if (q != null) {
+      this.#gl.endQuery(this.#timerQueryExtension.TIME_ELAPSED_EXT);
+    }
+    this.#timerUsingQueries = this.#timerUsingQueries.filter(
+      ({ q, isField }) => {
+        if (this.#gl.getQueryParameter(q, this.#gl.QUERY_RESULT_AVAILABLE)) {
+          const result = this.#gl.getQueryParameter(q, this.#gl.QUERY_RESULT);
+          if (isField) {
+            this.#gpuFieldNanosecondsSinceReport += result;
+            this.#gpuFieldCountSinceReport++;
+          } else {
+            this.#gpuFrameNanosecondsSinceReport += result;
+            this.#gpuFrameCountSinceReport++;
+          }
+          this.#freeQueries.push(q);
+          return false;
+        }
+        return true;
+      },
+    );
+  }
+
+  #resetFieldMetrics(): void {
+    this.#phase = NO_PHASE;
+    this.#known = NO_PHASE;
+    this.#knownAge = 0;
+    this.#filmLocked = false;
+    this.#detector?.reset();
+  }
+
+  /** Detect the pulldown phase of the frame being filtered on the GPU. */
+  #detect(): void {
+    const { cur, next } = this.#neighbours(false);
+    const curTexture = this.#textures[cur];
+    const nextTexture = this.#textures[next];
+    if (!curTexture || !nextTexture) return;
+    const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
+    this.#detector?.detect(curTexture, nextTexture, first);
+  }
+
+  /**
+   * Read back the previous frame's phase if it has arrived, and advance it
+   * to the frame being filtered. The run is not advanced: only the GPU
+   * counts observed frames.
+   */
+  #collectPhase(): void {
+    const known = this.#detector?.poll() ?? null;
+    if (known !== null) {
+      this.#known = known;
+      this.#knownAge = 0;
+    }
+    this.#knownAge++;
+    const { phase, run } = this.#known;
+    if (phase === 0 || this.#knownAge > PULLDOWN_FRAMES) {
+      this.#phase = NO_PHASE;
+    } else {
+      this.#phase = {
+        phase: ((phase - 1 + this.#knownAge) % PULLDOWN_FRAMES) + 1,
+        run,
+      };
+    }
+  }
+
+  #describePhase(frame: number): string {
+    const columns: string[] = [];
+    // Debug-only path; only reachable with the detector built.
+    const metrics = this.#detector?.metrics ?? new Float32Array(0);
+    for (let index = 0; index < FIELD_METRICS.phase; index++) {
+      const max = metrics[index * 4] ?? 0;
+      const differing = metrics[index * 4 + 1] ?? 0;
+      const mean = metrics[index * 4 + 2] ?? 0;
+      columns.push(
+        `${max.toFixed(3)},${differing.toString().padStart(4)},${mean.toFixed(3)}`,
+      );
+    }
+    const counts = this.#phaseCounts
+      .map((count, phase) => `${phase === 0 ? "-" : phase}:${count}`)
+      .join(" ");
+    return (
+      `frame=${frame} phase=${this.#phase.phase} run=${this.#phase.run}` +
+      ` known=${this.#known.phase}/${this.#known.run} age=${this.#knownAge}` +
+      ` ${this.#filmLocked ? "film" : "video"} period=${this.#periodMs.toFixed(3)}\n` +
+      `${columns.join(" ")}\n${counts} dropped:${this.#filmDropped}`
+    );
+  }
+
+  /**
+   * A timestamp taken on `origin`'s clock, expressed on this realm's.
+   *
+   * `performance.timeOrigin` is defined against the same moment in every
+   * realm, so the difference between two origins is the whole of the
+   * conversion between their clocks (W3C HR-Time 1.2). The origins are
+   * subtracted from one another before the timestamp is added: they are the
+   * large numbers, their difference is not, and doing it the other way round
+   * would spend the precision the schedule is measured in.
+   */
+  #localTime(timestamp: number, origin: number): number {
+    const offset = origin - performance.timeOrigin;
+    // Same realm, which is every case but a Worker renderer and a video node
+    // a picture-in-picture window has adopted: leave the value untouched. An
+    // origin that is not a number leaves it untouched as well rather than
+    // turning the timestamp into one -- the callers below still check that
+    // what comes back can describe the frame.
+    return Number.isFinite(offset) && offset !== 0
+      ? timestamp + offset
+      : timestamp;
+  }
+
+  /**
+   * When this frame reaches the screen, on the clock this renderer draws by.
+   *
+   * requestVideoFrameCallback()'s display time is what holds the schedule on
+   * the refresh grid, so it is preferred wherever it is usable -- including
+   * across realms, since #localTime converts it exactly. It is not always
+   * usable: 0 and NaN have both been reported, an origin may be missing, and
+   * a time that cannot belong to this frame is worse than no time at all.
+   * Those fall back to the moment the frame was taken in hand, which is this
+   * renderer's own clock and always valid.
+   */
+  #displayTime(metadata: FrameObservation, now: number): number {
+    const expected = metadata.expectedDisplayTime;
+    if (!Number.isFinite(expected) || expected <= 0) return now;
+    // A missing origin cannot be translated, and an untranslated page clock is
+    // not this renderer's; the reach below would reject it, but say so here.
+    if (!Number.isFinite(metadata.timeOrigin)) return now;
+    const at = this.#localTime(expected, metadata.timeOrigin);
+    const reach =
+      DISPLAY_TIME_REACH * Math.max(this.#refreshMs, this.#periodMs);
+    if (at < now - reach || at > now + reach) return now;
+    return at;
+  }
+
+  #onFrame = (now: DOMHighResTimeStamp, metadata: FrameMetadata): void => {
     if (!this.#running || this.#lost) return;
-    this.#lastVideoFrameCallbackAt = now;
+    // A frame arriving is the observation that keeps running through an
+    // adoption -- it comes from the window that now owns the element, which
+    // is the visible one -- so it is where the loop finds out it is armed on
+    // a window that has stopped serving frames.
+    this.#followOwner();
+    // The acquisition reports on the clock of whichever window owns the video
+    // node; everything this class times -- the watchdog, the statistics
+    // interval, the presentation queue -- is on this realm's. Convert the one
+    // timestamp here, and let the reported display time travel with its own
+    // origin so that a Worker renderer can convert it in turn.
+    const at = this.#localTime(now, metadata.timeOrigin);
+    this.#lastVideoFrameCallbackAt = at;
     this.#lastObservedVideoFrames = Math.max(
       this.#lastObservedVideoFrames,
       this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
     );
-    this.#ingestFrame(now, metadata);
+    this.#ingestFrame(at, metadata);
     this.#request();
   };
 
-  /** どちらの通知経路で見つけたフレームも選択中の描画先へ取り込む。 */
+  /**
+   * どちらの通知経路で見つけたフレームも選択中の描画先へ取り込む。
+   * `now` はこの realm の時計で測った取込み時刻。
+   */
   #ingestFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
     this.#lastIngestedMediaTime = metadata.mediaTime;
     if (this.#workerState === "active") {
@@ -1212,7 +1880,11 @@ export class Deinterlacer extends EventTarget {
     if (this.#workerState !== "starting") this.#processFrame(now, metadata);
   }
 
-  /** @internal Worker でもメインスレッドと同じ履歴と描画判断を使うための入口。 */
+  /**
+   * @internal Worker でもメインスレッドと同じ履歴と描画判断を使うための入口。
+   * `now` はこの Worker の時計で測った取込み時刻を渡す。metadata の表示予定
+   * 時刻はページ側の時計のままでよく、同梱の timeOrigin から変換する。
+   */
   ingestExternalFrame(
     now: DOMHighResTimeStamp,
     metadata: FrameObservation,
@@ -1228,7 +1900,10 @@ export class Deinterlacer extends EventTarget {
 
   /** 1枚の入力を共通の履歴へ取り込み、YADIF と IVTC の表示判断を完了する。 */
   #processFrame(now: DOMHighResTimeStamp, metadata: FrameObservation): void {
+    const revision = this.#playbackRevision;
+    if (!this.#frameIsCurrent(revision)) return;
     this.#selectVideoState(metadata.mediaTime);
+    if (!this.#frameIsCurrent(revision)) return;
     if (metadata.width > 0 && metadata.height > 0) {
       // Chromium can submit the destination frame while `seeking` is still
       // true, immediately before `seeked`. Remember that this frame already
@@ -1259,6 +1934,7 @@ export class Deinterlacer extends EventTarget {
       // callback dimensions remain the best available fallback.
       if (this.#width === 0 || this.#height === 0)
         this.#resize(metadata.width, metadata.height);
+      if (!this.#frameIsCurrent(revision)) return;
       if (this.#scan && !this.#scan.interlaced) {
         this.#showVideo();
         return;
@@ -1269,7 +1945,18 @@ export class Deinterlacer extends EventTarget {
       // the neighbours are then further apart than they should be, which is
       // worth less than filtering nothing at all.
       const elapsed = metadata.mediaTime - this.#lastMediaTime;
-      const stale = seekFrame || elapsed < 0 || elapsed > CONTINUOUS_SECONDS;
+      // Firefox counters carry their own discontinuity signal and wall-clock
+      // cadence. The coarse media clock still guards the path: a forward
+      // media-time jump that keeps painting smoothly (MSE splice, live gap)
+      // is exactly the discontinuity VideoFrames cannot see.
+      const mozTiming = metadata.mozTiming;
+      const stale =
+        seekFrame ||
+        (mozTiming
+          ? mozTiming.discontinuity ||
+            elapsed < 0 ||
+            elapsed > CONTINUOUS_SECONDS
+          : elapsed < 0 || elapsed > CONTINUOUS_SECONDS);
       if (stale) {
         this.#frames = 0;
         this.#periodMs = 0;
@@ -1277,17 +1964,18 @@ export class Deinterlacer extends EventTarget {
         // The fields still waiting stand for moments the element has left
         // behind, and the clock they were timed by is pinned to the same
         // place. Both start again from where playback actually is.
-        this.#queue.length = 0;
+        this.#dropQueue();
         this.#resetFilm();
+        this.#resetFieldMetrics();
       }
       const skippedFilmFrame =
         this.#autoFilm &&
         this.#lastPresented !== 0 &&
         metadata.presentedFrames - this.#lastPresented > 1;
-      this.#count(metadata.presentedFrames, stale);
+      const missed = this.#count(metadata.presentedFrames, stale);
       if (!stale && skippedFilmFrame) {
         // A cadence decision cannot span a picture the callback did not see.
-        // Refill the three-frame history before matching fields again.
+        // Refill the four-frame history before matching fields again.
         this.#frames = 0;
         this.#resetFilm();
       }
@@ -1297,11 +1985,26 @@ export class Deinterlacer extends EventTarget {
       // Filtering it again would spend a frame's work on a canvas that
       // already holds the answer, and taking it into the ring would leave the
       // filter holding one moment twice over and calling it motion.
-      if (this.#frames > 0 && metadata.mediaTime === this.#lastMediaTime) {
+      // On the Firefox path mediaTime is the coarse media clock and repeats
+      // across distinct painted pictures, so only a repeated painted count
+      // means the same picture presented again.
+      if (
+        this.#frames > 0 &&
+        metadata.mediaTime === this.#lastMediaTime &&
+        (!mozTiming || metadata.presentedFrames === this.#lastPresentedFrames)
+      ) {
         return;
       }
-      if (!stale && elapsed > 0) this.#measure(elapsed);
+      if (!stale) {
+        const mozPeriodMs = mozTiming?.periodMs ?? 0;
+        // #measure takes media seconds and divides by the rate to reach wall
+        // time; mozTiming is already wall-clock ms, so scale it back up.
+        if (mozPeriodMs > 0)
+          this.#measure((mozPeriodMs * (this.#video.playbackRate || 1)) / 1000);
+        else if (elapsed > 0) this.#measure(elapsed);
+      }
       this.#lastMediaTime = metadata.mediaTime;
+      this.#lastPresentedFrames = metadata.presentedFrames;
       const at = performance.now();
       // Frames stopped arriving for a while -- a pause, a stall, a tab in the
       // background -- and a rate averaged over time nothing was asked of the
@@ -1314,26 +2017,116 @@ export class Deinterlacer extends EventTarget {
         this.#showMsSinceReport = 0;
         this.#reportMaxQueuedFields = 0;
         this.#outputSinceReport = 0;
+        this.#gpuFrameNanosecondsSinceReport = 0;
+        this.#gpuFrameCountSinceReport = 0;
+        this.#gpuFieldNanosecondsSinceReport = 0;
+        this.#gpuFieldCountSinceReport = 0;
       }
       this.#lastFrameAt = at;
       const begin = performance.now();
+      const q = this.#beginGpuTimer(false);
       this.#push();
       const previousMode = this.#mode;
-      const filmFrameShouldBeDropped =
-        this.#autoFilm && this.#frames === HISTORY && this.#analyseFilm();
+      // A degraded engine attempts no new cadence decisions; the frame
+      // continues through YADIF below while the caller's intent is kept.
+      const analysis =
+        this.#autoFilm && !this.#filmDegraded && this.#frames === HISTORY
+          ? this.#analyseFilm()
+          : false;
+      if (analysis === "unavailable") {
+        if (++this.#filmAnalyseFailures >= FILM_ANALYSE_FAILURE_LIMIT) {
+          this.#degradeFilm(
+            "autoFilm analysis unavailable: the GPU analysis target or programs would not allocate",
+          );
+        }
+      } else {
+        this.#filmAnalyseFailures = 0;
+      }
+      if (!this.#frameIsCurrent(revision)) {
+        if (!this.#destroyed) this.#endGpuTimer(q);
+        return;
+      }
+      const filmFrameShouldBeDropped = analysis === true;
       const cadenceChanged = previousMode !== this.#mode;
       // A duplicate that confirms film cadence adds no output, but stale field
       // deadlines from the old mode still need discarding at the transition
-      if (cadenceChanged) this.#queue.length = 0;
+      if (cadenceChanged) this.#dropQueue();
       // Decimation is only safe when the output schedule can retain the
       // selected film picture. If allocation or timing is not ready, keep the
       // frame on the direct path rather than silently dropping it.
       const shouldDropFilmFrame =
         filmFrameShouldBeDropped && this.#scheduling();
+      if (
+        this.#film &&
+        !this.#autoFilm &&
+        !this.#filmDegraded &&
+        !this.#detector
+      ) {
+        // A retry point stood the engine back up; rebuild the detector the
+        // setter would have built. A repeated failure degrades as a new
+        // episode rather than silently idling without pulldown detection.
+        try {
+          this.#ensureDetector();
+        } catch (error) {
+          this.#degradeFilm(
+            `film detector unavailable: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (!this.#frameIsCurrent(revision)) {
+        if (!this.#destroyed) this.#endGpuTimer(q);
+        return;
+      }
+      if (this.#film && !this.#autoFilm && !this.#filmDegraded) {
+        // GPU pulldown detection (otya): a missed frame leaves a gap in the
+        // held frames, so the comparisons carried over would be between
+        // frames that were never neighbours.
+        if (this.#frames === HISTORY && missed === 0) {
+          try {
+            this.#collectPhase();
+            this.#detect();
+          } catch (error) {
+            // A GPU failure must not stop the frame loop (e.g. an
+            // incomplete RGBA32F framebuffer despite the extension being
+            // present). The engine stands down with notification -- the
+            // `film` option stays on, so this is not a silent fallback --
+            // and a retry point attempts the GPU path again.
+            this.#degradeFilm(
+              `film detection failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        } else {
+          this.#resetFieldMetrics();
+        }
+        this.#phaseCounts[this.#phase.phase] =
+          (this.#phaseCounts[this.#phase.phase] ?? 0) + 1;
+        this.#filmLocked =
+          this.#phase.phase !== 0 && this.#phase.run >= FILM_LOCK_FRAMES;
+        if (this.#debug)
+          this.#debugText = this.#describePhase(metadata.presentedFrames);
+      }
+      if (!this.#frameIsCurrent(revision)) {
+        if (!this.#destroyed) this.#endGpuTimer(q);
+        return;
+      }
+      // Timed from when the frame reaches the screen, which unlike `now`
+      // does not move when the callback runs late; a refresh of margin
+      // covers a late callback. (otya) Worker rendering keeps the same
+      // anchor: the metadata says which clock its display time was measured
+      // against, so it converts rather than being replaced by an arrival
+      // time that carries the transit across the thread boundary with it.
+      const frameAt = this.#displayTime(metadata, now);
+      const shown = frameAt + this.#refreshMs;
       if (shouldDropFilmFrame) {
+        this.#droppedBefore++;
         // decimate removes this duplicate before YADIF, so it contributes no
         // output picture to the reconstructed film cadence.
-      } else if (this.#autoFilm && !this.#isCombed && this.#mode === "film") {
+      } else if (
+        this.#autoFilm &&
+        !this.#filmDegraded &&
+        !this.#isCombed &&
+        this.#mode === "film"
+      ) {
         if (this.#scheduling()) {
           // Five input frames become four film pictures. The interval between
           // them is therefore five quarters of the measured input period.
@@ -1341,17 +2134,50 @@ export class Deinterlacer extends EventTarget {
           const queueResetted = this.#prepareQueue(1, now, duration);
           // The first picture needs one output interval of presentation slack;
           // otherwise the next animation frame can consume its turn before presentation.
-          const last = this.#queue.at(-1);
-          const at = queueResetted
-            ? now
-            : last == null
-              ? now + duration
-              : last.at + last.duration;
-          this.#filterFilm(at, duration);
+          // The slack applies only when no chain exists: gating it on the
+          // pending queue instead would resync on every frame whose pictures
+          // were already shown (F1).
+          const ideal =
+            queueResetted || this.#lastScheduled === null
+              ? shown + duration
+              : shown;
+          this.#filterFilm(this.#schedule("film", ideal, duration), duration);
         } else {
           // Until a period and output pool exist, keep the direct film draw
           // path rather than inventing a second presentation scheduler.
           this.#renderFilm(null);
+        }
+      } else if (this.#filmLocked && !this.#autoFilm) {
+        // GPU pulldown path (otya) through the shared queue. The weave
+        // itself happens in #render via the film uniforms, driven by the
+        // lock computed above. autoFilm takes precedence: with both options
+        // on, the CPU engine owns the cadence and the GPU branch stays out.
+        if (this.#scheduling()) {
+          const phase = this.#phase.phase;
+          if (phase === FILM_DUPLICATE_PHASE) {
+            this.#filmDropped++;
+            this.#droppedBefore++;
+            // The repeated frame contributes no output picture.
+          } else {
+            const duration = (this.#periodMs * PULLDOWN_FRAMES) / FILM_FRAMES;
+            const queueResetted = this.#prepareQueue(1, now, duration);
+            // Phase 2 is whole only once the frame after it has arrived; the
+            // others are held back to match, so the film frames come out 1.25
+            // periods apart. (otya FILM_LEAD)
+            const lead = FILM_LEAD[phase] ?? 0;
+            const ideal =
+              queueResetted || this.#lastScheduled === null
+                ? shown + duration
+                : shown + lead * this.#periodMs;
+            this.#filter(
+              "film",
+              false,
+              this.#schedule("film", ideal, duration),
+              duration,
+            );
+          }
+        } else {
+          this.#render(false, false, null);
         }
       } else if (this.#doubleRate && this.#scheduling()) {
         const duration = this.#periodMs / 2;
@@ -1360,32 +2186,65 @@ export class Deinterlacer extends EventTarget {
         // video callback runs just after the animation callback for the same
         // composite. Without it, both fields are due at the next animation
         // callback and the scheduler retires the first one before drawing it.
-        const last = this.#queue.at(-1);
-        const at = queueResetted
-          ? now
-          : last == null
-            ? now + duration * 2
-            : last.at + last.duration;
-        this.#filter(false, at, duration);
-        this.#filter(true, at + duration, duration);
+        // Like the film branches, the slack applies only when no chain
+        // exists (F1).
+        const ideal =
+          queueResetted || this.#lastScheduled === null
+            ? shown + duration * 2
+            : shown;
+        const at = this.#schedule("field", ideal, duration);
+        this.#filter("field", false, at, duration);
+        this.#filter("field", true, at + duration, duration);
+      } else if (this.#scheduling()) {
+        // Ordinary frames go through the same drift-corrected chain (otya
+        // "frame" cadence) instead of bypassing the schedule: paced,
+        // drift-corrected presentation with the loop running. Only when the
+        // loop is off do pictures go straight to the canvas.
+        const duration = this.#periodMs;
+        const queueResetted = this.#prepareQueue(1, now, duration);
+        const frameIdeal =
+          queueResetted || this.#lastScheduled === null
+            ? shown + duration
+            : shown;
+        // A saturated output pool leaves no slot to queue into; drawing
+        // straight to the canvas keeps a picture for now instead of holding
+        // the previous one with no count (G1).
+        const queued = this.#filter(
+          "frame",
+          false,
+          this.#schedule("frame", frameIdeal, duration),
+          duration,
+        );
+        if (!queued) {
+          this.#stats.late++;
+          this.#render(false, false, null);
+        }
       } else {
         // Direct video output supersedes any older film pictures that still
         // have future deadlines in the shared presentation queue.
         this.#stats.late += this.#queue.length;
-        this.#queue.length = 0;
+        this.#dropQueue();
         this.#render(false, false, null);
       }
       this.#reportMaxQueuedFields = Math.max(
         this.#reportMaxQueuedFields,
         this.#queue.length,
       );
+      this.#endGpuTimer(q);
       this.#renderMsSinceReport += performance.now() - begin;
       this.#renderFramesSinceReport++;
       this.#report(at);
     }
   }
 
+  #frameIsCurrent(revision: number): boolean {
+    return (
+      !this.#destroyed && this.#running && revision === this.#playbackRevision
+    );
+  }
+
   #selectVideoState(mediaTime: number): void {
+    const revision = this.#playbackRevision;
     let selected: VideoState | undefined;
     for (let index = this.#videoTimeline.length - 1; index >= 0; index--) {
       const state = this.#videoTimeline[index]!;
@@ -1402,6 +2261,7 @@ export class Deinterlacer extends EventTarget {
         selected.codedSize.height !== this.#height)
     )
       this.#resize(selected.codedSize.width, selected.codedSize.height);
+    if (!this.#frameIsCurrent(revision)) return;
     const scan = selected?.scan;
     if (
       !scan ||
@@ -1412,8 +2272,10 @@ export class Deinterlacer extends EventTarget {
     const previousInterlaced = this.#scan?.interlaced;
     this.#scan = scan;
     this.#frames = 0;
-    this.#queue.length = 0;
+    this.#dropQueue();
     this.#resetFilm();
+    // A new section reallocates and retries the requested engines.
+    if (!this.#recoverFilm()) return;
     // Progressive sections provide no cadence measurement, and a discontinuity
     // may change the input rate, so remeasure the next interlaced section
     if (previousInterlaced !== scan.interlaced) this.#periodMs = 0;
@@ -1425,10 +2287,11 @@ export class Deinterlacer extends EventTarget {
     } else {
       this.#stopLoop();
     }
+    this.#resetFieldMetrics();
   }
 
   /**
-   * Whether fields are being filtered ahead of time and queued, rather than
+   * Whether pictures are being filtered ahead of time and queued, rather than
    * drawn as their frame arrives.
    *
    * A picture for every frame has nothing to schedule -- there is one of them
@@ -1437,7 +2300,7 @@ export class Deinterlacer extends EventTarget {
    */
   #scheduling(): boolean {
     return (
-      (this.#doubleRate || this.#autoFilm) &&
+      (this.#doubleRate || this.#autoFilm || this.#film) &&
       this.#periodMs > 0 &&
       this.#outputs.length === OUTPUT_POOL_LENGTH
     );
@@ -1460,8 +2323,9 @@ export class Deinterlacer extends EventTarget {
       this.#periodMs > 0 ? Math.max(1, Math.round(step / this.#periodMs)) : 1;
     const period = step / frames;
     if (period < MIN_PERIOD_MS || period > MAX_PERIOD_MS) return;
+    // A much shorter period means the estimate was a multiple of it.
     this.#periodMs =
-      this.#periodMs > 0
+      this.#periodMs > 0 && period > this.#periodMs * PERIOD_SHORTER
         ? this.#periodMs + (period - this.#periodMs) * PERIOD_SMOOTHING
         : period;
   }
@@ -1470,9 +2334,23 @@ export class Deinterlacer extends EventTarget {
   #ensureFilmPrograms(): void {
     if (this.#filmAnalysis && this.#filmWeave && this.#filmSample) return;
     const gl = this.#gl;
-    const filmAnalysis = createProgram(gl, FILM_ANALYSIS_FRAGMENT_SHADER);
-    const filmWeave = createProgram(gl, FILM_WEAVE_FRAGMENT_SHADER);
-    const filmSample = createProgram(gl, FILM_SAMPLE_FRAGMENT_SHADER);
+    // Publish the set only after all passes link. A failed later pass must
+    // not leak earlier programs every time the caller requests recovery.
+    const programs: WebGLProgram[] = [];
+    let filmAnalysis: WebGLProgram;
+    let filmWeave: WebGLProgram;
+    let filmSample: WebGLProgram;
+    try {
+      filmAnalysis = createProgram(gl, FILM_ANALYSIS_FRAGMENT_SHADER);
+      programs.push(filmAnalysis);
+      filmWeave = createProgram(gl, FILM_WEAVE_FRAGMENT_SHADER);
+      programs.push(filmWeave);
+      filmSample = createProgram(gl, FILM_SAMPLE_FRAGMENT_SHADER);
+      programs.push(filmSample);
+    } catch (error) {
+      for (const program of programs) gl.deleteProgram(program);
+      throw error;
+    }
     this.#filmAnalysis = filmAnalysis;
     this.#filmAnalysisLocation = Object.fromEntries(
       Object.entries(FILM_UNIFORMS)
@@ -1503,8 +2381,13 @@ export class Deinterlacer extends EventTarget {
    * Full decoded frames remain in GPU textures, while the first readback packs
    * the previous, current and next luma proxies into RGB. A second readback
    * supplies the selected RGB weave to its chroma-sensitive decimate metric.
+   *
+   * Returns whether the frame is a pulldown duplicate, or `"unavailable"`
+   * when the analysis target or programs never allocated: allocation either
+   * works or it does not, so the caller treats a short run of those as a
+   * persistent failure rather than a startup race.
    */
-  #analyseFilm(): boolean {
+  #analyseFilm(): "unavailable" | boolean {
     const target = this.#analysisTarget;
     const analysis = this.#filmAnalysis;
     const analysisLocation = this.#filmAnalysisLocation;
@@ -1517,11 +2400,11 @@ export class Deinterlacer extends EventTarget {
       !sampleProgram ||
       !sampleLocation
     )
-      return false;
+      return "unavailable";
     const gl = this.#gl;
     const newest = this.#head;
     const cur = (this.#head + HISTORY - 1) % HISTORY;
-    const prev = (this.#head + 1) % HISTORY;
+    const prev = (this.#head + HISTORY - 2) % HISTORY;
     const isTopFieldFirst = this.#topFieldFirst;
 
     // One GPU draw and readback supplies the three luma frames without moving
@@ -1615,7 +2498,17 @@ export class Deinterlacer extends EventTarget {
       this.#stats.late++;
     }
     this.#renderFilm(output.framebuffer);
-    this.#queue.push({ slot, at, duration });
+    const ready: Ready = {
+      slot,
+      at,
+      duration,
+      cadence: "film",
+      phase: 0,
+      droppedBefore: this.#droppedBefore,
+    };
+    this.#droppedBefore = 0;
+    this.#queue.push(ready);
+    this.#lastScheduled = ready;
   }
 
   /** Draw the selected p/c/n field weave into a full-size output texture. */
@@ -1626,7 +2519,7 @@ export class Deinterlacer extends EventTarget {
     const gl = this.#gl;
     const newest = this.#head;
     const cur = (this.#head + HISTORY - 1) % HISTORY;
-    const prev = (this.#head + 1) % HISTORY;
+    const prev = (this.#head + HISTORY - 2) % HISTORY;
     const isTopFieldFirst = this.#topFieldFirst;
     gl.bindFramebuffer(gl.FRAMEBUFFER, target);
     gl.useProgram(program);
@@ -1660,11 +2553,16 @@ export class Deinterlacer extends EventTarget {
    * held as pictures. What is queued after that is a copy waiting for a
    * moment, which no later frame can take away.
    */
-  #filter(second: boolean, at: number, duration: number): void {
+  #filter(
+    cadence: Cadence,
+    second: boolean,
+    at: number,
+    duration: number,
+  ): boolean {
     const slot = this.#nextOutputSlot();
-    if (slot === null) return;
+    if (slot === null) return false;
     const output = this.#outputs[slot];
-    if (!output) return;
+    if (!output) return false;
     this.#outputHead = slot;
     // Whatever this slot held has been waiting two frames for a turn it never
     // got, and its moment is far enough past that showing it now would be a
@@ -1674,7 +2572,58 @@ export class Deinterlacer extends EventTarget {
       this.#stats.late++;
     }
     this.#render(false, second, output.framebuffer);
-    this.#queue.push({ slot, at, duration });
+    const ready: Ready = {
+      slot,
+      at,
+      duration,
+      cadence,
+      phase:
+        cadence === "film"
+          ? this.#phase.phase
+          : cadence === "field"
+            ? second
+              ? 2
+              : 1
+            : 0,
+      droppedBefore: this.#droppedBefore,
+    };
+    this.#droppedBefore = 0;
+    this.#queue.push(ready);
+    this.#lastScheduled = ready;
+    return true;
+  }
+
+  /**
+   * When a picture goes up: one duration after the last one of its cadence,
+   * nudged towards `ideal` by a fraction of the gap so that the schedule
+   * follows the clock without a picture ever moving across a refresh. It
+   * restarts from `ideal` when the gap has grown to a whole picture or the
+   * cadence has changed. (otya)
+   */
+  #schedule(cadence: Cadence, ideal: number, duration: number): number {
+    // A non-positive duration cannot anchor a chain; schedule at the ideal
+    // instead of resyncing on every picture (G1).
+    if (!(duration > 0)) return ideal;
+    const last = this.#lastScheduled;
+    if (last !== null && last.cadence === cadence) {
+      const chain = last.at + last.duration;
+      const error = ideal - chain;
+      if (Math.abs(error) < duration) {
+        const step = Math.max(
+          -DRIFT_STEP_MS,
+          Math.min(DRIFT_STEP_MS, error * DRIFT_GAIN),
+        );
+        return chain + step;
+      }
+    }
+    if (last !== null) this.#stats.resynced++;
+    // Pictures queued after the new moment would never be shown in order.
+    for (let tail = this.#queue.at(-1); tail && tail.at >= ideal;) {
+      this.#queue.pop();
+      this.#stats.late++;
+      tail = this.#queue.at(-1);
+    }
+    return ideal;
   }
 
   /** Make room without treating ordinary capacity pressure as clock divergence. */
@@ -1687,7 +2636,7 @@ export class Deinterlacer extends EventTarget {
     const maximumUsefulLead =
       (FIELD_QUEUE_LENGTH + 1) * Math.max(this.#refreshMs, outputDuration);
     if (last && last.at - now > maximumUsefulLead) {
-      this.#queue.length = 0;
+      this.#dropQueue();
       this.#stats.queueResetted++;
       return true;
     }
@@ -1739,80 +2688,194 @@ export class Deinterlacer extends EventTarget {
 
   /** The loop that puts filtered fields up, and the only thing that draws. */
   #startLoop(): void {
-    if (this.#loopHandle !== null) return;
+    if (this.#loopRequest !== null) return;
     if (!this.#running || this.#lost) return;
     this.#lastLoopAt = 0;
-    this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
+    this.#loopRequest = this.#armAnimationFrame(this.#onLoop);
   }
 
   #stopLoop(): void {
-    if (this.#loopHandle !== null) this.#cancelAnimationFrame(this.#loopHandle);
-    this.#loopHandle = null;
-    this.#queue.length = 0;
+    this.#cancelAnimationRequest(this.#loopRequest);
+    this.#loopRequest = null;
+    this.#dropQueue();
   }
 
   #onLoop = (now: DOMHighResTimeStamp): void => {
-    this.#loopHandle = null;
+    this.#loopRequest = null;
     if (!this.#running || this.#lost) return;
-    // Short ordinary gaps identify the refresh interval, while a long task
-    // only moves the estimate gradually until regular animation resumes.
-    if (this.#lastLoopAt > 0) {
-      const gap = now - this.#lastLoopAt;
-      if (gap >= 1 && gap <= MAX_PERIOD_MS) {
-        this.#refreshMs =
-          gap < this.#refreshMs
-            ? gap
-            : this.#refreshMs + (gap - this.#refreshMs) * REFRESH_DECAY;
-      }
-    }
-    this.#lastLoopAt = now;
-    if (this.#workerState === "main") this.#present(now);
-    this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
+    this.#measureRefresh(now);
+    if (this.#workerState === "main") this.#present(this.#gridAt, now);
+    this.#loopRequest = this.#armAnimationFrame(this.#onLoop);
   };
 
-  /** ページと Worker のそれぞれが所有する requestAnimationFrame() へ表示ループを委ねる。 */
-  #requestAnimationFrame(callback: FrameRequestCallback): number {
-    return this.#externalHost
-      ? this.#externalHost.requestAnimationFrame(callback)
-      : requestAnimationFrame(callback);
+  /**
+   * Fit a grid of refreshes (period and phase) to the animation frames. rAF
+   * timestamps wander by a millisecond or so, which is more than the
+   * nearest-refresh decision in #present can take; the grid is what it
+   * compares against. A frame far off the grid restarts it. (otya)
+   */
+  #measureRefresh(now: number): void {
+    const step = now - this.#lastLoopAt;
+    this.#lastLoopAt = now;
+    const refreshes = Math.max(1, Math.round(step / this.#refreshMs));
+    const predicted = this.#gridAt + refreshes * this.#refreshMs;
+    const error = now - predicted;
+    if (
+      this.#gridAt === 0 ||
+      step <= 0 ||
+      step > MAX_PERIOD_MS ||
+      Math.abs(error) > this.#refreshMs / 4
+    ) {
+      if (step > 0 && step <= MAX_PERIOD_MS) this.#refreshMs = step;
+      this.#gridAt = now;
+      return;
+    }
+    this.#refreshMs += (error / refreshes) * GRID_PERIOD_GAIN;
+    this.#gridAt = predicted + error * GRID_PHASE_GAIN;
   }
 
-  /** 選択中の描画先で予約した表示機会を取り消す。 */
-  #cancelAnimationFrame(handle: number): void {
-    if (this.#externalHost) this.#externalHost.cancelAnimationFrame(handle);
-    else cancelAnimationFrame(handle);
+  /**
+   * Where animation frames come from, and the clock their timestamps carry.
+   *
+   * For Worker rendering it is the host the Worker entry supplied, whose
+   * frames are already this realm's. Otherwise it is the window of the
+   * document the canvas is in, which is the window that composites it -- and
+   * which a document picture-in-picture window becomes by adopting the
+   * element. The element is consulted as well, because the two move together
+   * and either may be read first while a move is in progress.
+   */
+  #animationSource(): { frames: AnimationFrames; origin: number } {
+    const externalHost = this.#externalHost;
+    if (externalHost)
+      return { frames: externalHost, origin: performance.timeOrigin };
+    const view =
+      this.#displayCanvas.ownerDocument?.defaultView ??
+      this.#video.ownerDocument?.defaultView ??
+      null;
+    return view === null
+      ? { frames: moduleAnimationFrames, origin: performance.timeOrigin }
+      : { frames: view, origin: view.performance.timeOrigin };
   }
+
+  /**
+   * Ask the current source for one frame, on this module's clock.
+   *
+   * An animation frame is timestamped against the clock of the window that
+   * served it, and after an adoption that is not the clock the presentation
+   * deadlines are on. The conversion belongs to the request rather than to
+   * the callback: the source that was asked is the source that answers, so
+   * the origin captured here is the right one however often the owner moves.
+   */
+  #armAnimationFrame(callback: FrameRequestCallback): AnimationRequest {
+    const { frames, origin } = this.#animationSource();
+    const handle = frames.requestAnimationFrame((timestamp) =>
+      callback(this.#localTime(timestamp, origin)),
+    );
+    return { frames, handle };
+  }
+
+  /** 予約した表示機会を、それを発行した window 自身で取り消す。 */
+  #cancelAnimationRequest(request: AnimationRequest | null): void {
+    request?.frames.cancelAnimationFrame(request.handle);
+  }
+
+  /**
+   * Follow the window that composites the canvas.
+   *
+   * A request already outstanding on the previous window is not merely late.
+   * A window that has gone hidden serves no animation frames at all, so
+   * waiting for that callback to notice the move waits for something that
+   * will not happen; and cancelling it anywhere but on that same window
+   * leaves it outstanding. Every other thing still being observed -- a frame
+   * arriving, a layout, the old window saying it is going away -- re-points
+   * both requests instead.
+   *
+   * Nothing queued moves: presentation deadlines are on this module's clock,
+   * which no adoption changes. Only the refresh grid starts again, because a
+   * grid describes one compositor and this is a different one.
+   */
+  #followOwner(): void {
+    if (this.#externalHost) return;
+    this.#watchOwnerDocument();
+    const { frames } = this.#animationSource();
+    const loopMoved =
+      this.#loopRequest !== null && this.#loopRequest.frames !== frames;
+    const watchdogMoved =
+      this.#watchdogRequest !== null && this.#watchdogRequest.frames !== frames;
+    if (!loopMoved && !watchdogMoved) return;
+    this.#lastLoopAt = 0;
+    if (loopMoved) {
+      this.#cancelAnimationRequest(this.#loopRequest);
+      this.#loopRequest = this.#armAnimationFrame(this.#onLoop);
+    }
+    if (watchdogMoved) {
+      this.#cancelAnimationRequest(this.#watchdogRequest);
+      this.#watchdogRequest = this.#armAnimationFrame(this.#onFrameWatchdog);
+    }
+  }
+
+  /**
+   * The one owner-change signal that does not need an animation frame.
+   *
+   * On Firefox the frames themselves are found by this module's own animation
+   * frames (see VideoFrames), so a hidden window stops the acquisition that
+   * would otherwise notice the move. A document going hidden is exactly when
+   * its frames stop, and it is delivered as an ordinary task, so it arrives.
+   * One listener, moved with the owner and dropped with the deinterlacer.
+   */
+  #watchOwnerDocument(): void {
+    const owner = this.#externalHost
+      ? null
+      : (this.#displayCanvas.ownerDocument ?? null);
+    if (owner === this.#ownerDocument) return;
+    this.#ownerDocument?.removeEventListener(
+      "visibilitychange",
+      this.#onOwnerVisibility,
+    );
+    this.#ownerDocument = owner;
+    owner?.addEventListener("visibilitychange", this.#onOwnerVisibility);
+  }
+
+  #onOwnerVisibility = (): void => {
+    if (!this.#destroyed) this.#followOwner();
+  };
 
   /** ページ側の監視を開始し、描画ループの停止中も復号フレームの到着を検査する。 */
   #startFrameWatchdog(): void {
     if (
       this.#externalHost ||
-      this.#frameWatchdogHandle !== null ||
+      this.#watchdogRequest !== null ||
       !this.#running ||
       this.#lost
     )
       return;
-    this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
+    this.#watchdogRequest = this.#armAnimationFrame(this.#onFrameWatchdog);
   }
 
   /** ページ側で予約済みのフレーム監視を取り消す。 */
   #stopFrameWatchdog(): void {
-    if (this.#frameWatchdogHandle !== null)
-      cancelAnimationFrame(this.#frameWatchdogHandle);
-    this.#frameWatchdogHandle = null;
+    this.#cancelAnimationRequest(this.#watchdogRequest);
+    this.#watchdogRequest = null;
   }
 
   /** requestAnimationFrame() ごとにフレーム通知の停止を検査し、次の監視を予約する。 */
   #onFrameWatchdog = (now: DOMHighResTimeStamp): void => {
-    this.#frameWatchdogHandle = null;
+    this.#watchdogRequest = null;
     if (!this.#running || this.#lost) return;
+    const revision = this.#playbackRevision;
     this.#recoverFrameCallback(now);
-    this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
+    if (this.#frameIsCurrent(revision))
+      this.#watchdogRequest = this.#armAnimationFrame(this.#onFrameWatchdog);
   };
 
   /** requestVideoFrameCallback() が来ない間も requestAnimationFrame() から復号フレームを取り込む。 */
   #recoverFrameCallback(now: DOMHighResTimeStamp): void {
     if (this.#externalHost) return;
+    // Firefox カウンター経路では VideoFrames が新規画像の判断を所有し、
+    // painted が進まない画像の取込みを意図的に抑止する。watchdog が復号
+    // カウンターから取込むと同一画像の重複登録になるため除外する。ただし
+    // 一度も配信がない間 (カウンター無効などで凍結) は従来の救済を残す。
+    if (this.#videoFrames.mozDriven && this.#videoFrames.hasDelivered) return;
     if (
       now - this.#lastVideoFrameCallbackAt < FRAME_CALLBACK_TIMEOUT_MS ||
       this.#video.paused ||
@@ -1845,6 +2908,12 @@ export class Deinterlacer extends EventTarget {
     this.#ingestFrame(now, {
       mediaTime,
       presentedFrames: Math.max(this.#lastPresented + 1, totalVideoFrames),
+      // The fallback has no compositor timestamp. The animation frame that
+      // found the picture is the best stand-in, and it was taken on this
+      // realm's clock -- the same one #displayTime converts towards, so it
+      // passes through unchanged.
+      expectedDisplayTime: now,
+      timeOrigin: performance.timeOrigin,
       width: this.#video.videoWidth,
       height: this.#video.videoHeight,
     });
@@ -1859,27 +2928,70 @@ export class Deinterlacer extends EventTarget {
    * refresh either side of it. Where two of them have come due since the last
    * one, only the newer is shown: a screen has one picture per refresh, and
    * the older of the two is a moment the viewer should already be past.
+   *
+   * Near the half-refresh boundary a picture goes the way the last one went,
+   * so that the slip a cadence the refresh does not divide into must make
+   * every so often happens once rather than flapping.
    */
-  #present(now: number): void {
-    // A draw requested now reaches the upcoming composite, so select the
-    // newest picture whose deadline belongs to that presentation opportunity.
-    const deadline = now + this.#refreshMs * 1.5;
-    while (this.#queue[1] && this.#queue[1].at <= deadline) {
+  #present(now: number, frameAt: number): void {
+    // `now` is the refresh-grid time, which is the moment being filled: what
+    // is drawn during an animation frame reaches the screen at the composite
+    // after it, and a field goes up at whichever composite falls nearest the
+    // moment it stands for -- half a refresh either side of it. Where two of
+    // them have come due since the last one, only the newer is shown: a
+    // screen has one picture per refresh, and the older of the two is a
+    // moment the viewer should already be past.
+    //
+    // Near the half-refresh boundary a picture goes the way the last one
+    // went, so that the slip a cadence the refresh does not divide into must
+    // make every so often happens once rather than flapping. (otya)
+    const half = this.#refreshMs / 2;
+    const due = (ready: Ready) => {
+      const ahead = ready.at - now;
+      if (ahead <= half - PRESENT_HYSTERESIS_MS) return true;
+      if (ahead > half + PRESENT_HYSTERESIS_MS) return false;
+      return this.#shownAhead > 0;
+    };
+    while (this.#queue[1] && due(this.#queue[1])) {
       this.#stats.late++;
       this.#queue.shift();
     }
-    let ready = this.#queue[0];
-    if (!ready) {
-      return;
-    }
-    if (ready.at > deadline) {
-      return;
-    }
+    const ready = this.#queue[0];
+    if (!ready || !due(ready)) return;
     this.#queue.shift();
+    this.#shownAhead = ready.at - now;
     const begin = performance.now();
+    const q = this.#beginGpuTimer(true);
     this.#show(ready.slot);
+    this.#endGpuTimer(q);
     this.#showMsSinceReport += performance.now() - begin;
     this.#showFramesSinceReport++;
+    if (this.#debug) this.#logShown(ready, frameAt);
+    this.#shownAt = frameAt;
+  }
+
+  /** Preserve upstream's opt-in presentation timing log in either renderer. */
+  #logShown(ready: Ready, frameAt: number): void {
+    const step = this.#shownAt === 0 ? 0 : frameAt - this.#shownAt;
+    const refreshes = step / this.#refreshMs;
+    const which =
+      ready.cadence === "film"
+        ? ready.phase === 0
+          ? "CPU film"
+          : `phase ${ready.phase}`
+        : ready.cadence === "field"
+          ? `field ${ready.phase}`
+          : "frame";
+    const duplicate =
+      ready.phase === 0 ? "duplicate" : `phase ${FILM_DUPLICATE_PHASE}`;
+    const dropped =
+      ready.droppedBefore > 0
+        ? `, ${duplicate} dropped before it` +
+          (ready.droppedBefore > 1 ? ` (${ready.droppedBefore})` : "")
+        : "";
+    console.log(
+      `yadif: +${step.toFixed(2)} ms (${refreshes.toFixed(2)} refreshes) ${ready.cadence} ${which}, due ${(ready.at - frameAt).toFixed(2)} ms${dropped}`,
+    );
   }
 
   /** Copy one of the filtered pictures onto the canvas. */
@@ -1930,32 +3042,60 @@ export class Deinterlacer extends EventTarget {
    * more than one. Frames thrown away either side of a discontinuity are not
    * counted: the held frames were being dropped anyway, and a seek presents
    * what it passes over.
+   *
+   * Returns how many frames were missed between the last one and this one.
    */
-  #count(presented: number, stale: boolean): void {
+  #count(presented: number, stale: boolean): number {
+    let missed = 0;
     if (this.#lastPresented !== 0 && !stale) {
-      this.#stats.missed += Math.max(0, presented - this.#lastPresented - 1);
+      missed = Math.max(0, presented - this.#lastPresented - 1);
+      this.#stats.missed += missed;
     }
     this.#lastPresented = presented;
+    return missed;
   }
 
   #report(at: number): void {
     const elapsed = at - this.#reportedAt;
     if (elapsed < STATS_INTERVAL_MS) return;
     const frames =
-      this.#scheduling() && (this.#doubleRate || this.#mode === "film")
+      this.#scheduling() &&
+      (this.#doubleRate || this.#mode === "film" || this.#filmLocked)
         ? this.#showFramesSinceReport
         : this.#renderFramesSinceReport;
+    // Keep the published per-input-picture CPU cost: both fields' filtering
+    // and presentation belong to that one input. Output cadence can change
+    // (single-rate, double-rate or film); it must not change this denominator.
+    const frameMs = this.#renderFramesSinceReport
+      ? (this.#renderMsSinceReport + this.#showMsSinceReport) /
+        this.#renderFramesSinceReport
+      : 0;
+
+    let gpuMs: number | undefined;
+    if (this.#timerQueryExtension != null) {
+      gpuMs = 0;
+      if (this.#gpuFrameCountSinceReport !== 0) {
+        gpuMs +=
+          this.#gpuFrameNanosecondsSinceReport /
+          1_000_000 /
+          this.#gpuFrameCountSinceReport;
+      }
+      if (this.#gpuFieldCountSinceReport !== 0) {
+        gpuMs +=
+          this.#gpuFieldNanosecondsSinceReport /
+          1_000_000 /
+          this.#gpuFieldCountSinceReport /
+          2;
+      }
+    }
+
     const stats: DeinterlaceStats = {
       ...this.#stats,
       // The element's own count of what its decoder could not keep up with,
       // which is the machine being behind rather than this filter.
       dropped: this.#video.getVideoPlaybackQuality?.().droppedVideoFrames ?? 0,
       fps: (frames * 1000) / elapsed,
-      frameMs:
-        this.#renderFramesSinceReport === 0
-          ? 0
-          : (this.#renderMsSinceReport + this.#showMsSinceReport) /
-            this.#renderFramesSinceReport,
+      frameMs,
       maxQueuedFields: this.#reportMaxQueuedFields,
       mode: this.#mode,
       match: this.#match,
@@ -1963,10 +3103,13 @@ export class Deinterlacer extends EventTarget {
       outputFps: (this.#outputSinceReport * 1000) / elapsed,
       duplicateScore: this.#duplicateScore,
       duplicateRunnerUp: this.#duplicateRunnerUp,
+      gpuMs,
+      film: this.#filmLocked,
+      filmError: this.#filmDegraded,
     };
-    // A single snapshot is the canonical value for both public observation
-    // paths: DPlayer listens to the event, while standalone callers can use
-    // the callback supplied at construction time.
+    // Main-thread reports use the same observation paths as worker
+    // notifications: DPlayer listens to the event, standalone callers can
+    // use the callback supplied at construction time.
     this.dispatchEvent(new CustomEvent("stats", { detail: stats }));
     this.#onStats?.(stats);
     this.#reportedAt = at;
@@ -1976,6 +3119,10 @@ export class Deinterlacer extends EventTarget {
     this.#showMsSinceReport = 0;
     this.#reportMaxQueuedFields = 0;
     this.#outputSinceReport = 0;
+    this.#gpuFrameNanosecondsSinceReport = 0;
+    this.#gpuFrameCountSinceReport = 0;
+    this.#gpuFieldNanosecondsSinceReport = 0;
+    this.#gpuFieldCountSinceReport = 0;
   }
 
   /** Take the newest frame into the ring. */
@@ -2002,17 +3149,13 @@ export class Deinterlacer extends EventTarget {
    * there is one per frame and nothing to schedule. An output framebuffer is a
    * field being kept for its moment.
    *
-   * Which of the held frames is the one being filtered depends on how many
-   * there are. In flight it is the middle one, with the newest waiting its
-   * turn; where there is nothing on one side -- the start of a stream, or a
-   * `flush` because the last frame has been presented and no more are coming
-   * -- that side is the frame itself, which is what the reference filter does
-   * at the ends of its input.
-   *
    * `second` asks for the frame's other field: the same three frames filtered
    * the other way round, keeping the field that came second and rebuilding
    * the first. The shader takes the pair of frames the missing line sits
    * between from the parity, so this is the whole of it.
+   *
+   * With `film` on, the shader is also given the field metrics, and puts a
+   * film frame back together rather than filtering it.
    */
   #render(
     flush: boolean,
@@ -2026,33 +3169,7 @@ export class Deinterlacer extends EventTarget {
       else this.#stats.degraded++;
     }
     const gl = this.#gl;
-    const newest = this.#head;
-    const older = (this.#head + HISTORY - 1) % HISTORY;
-    const oldest = (this.#head + 1) % HISTORY;
-    let prev: number;
-    let cur: number;
-    let next: number;
-    if (this.#frames === 1) {
-      // One frame, standing in for its own neighbours, which is what the
-      // reference does where its input ends. Nothing moved as far as the
-      // filter can tell, so what comes back is very nearly the frame itself.
-      prev = cur = next = newest;
-    } else if (flush) {
-      // The newest frame is the last there will be, so it stands in for the
-      // one that would have come after it.
-      prev = older;
-      cur = next = newest;
-    } else if (this.#frames === 2) {
-      // The start of a stream: the older of the two is being filtered, and it
-      // stands in for the frame before itself.
-      prev = cur = older;
-      next = newest;
-    } else {
-      prev = oldest;
-      cur = older;
-      next = newest;
-    }
-
+    const { prev, cur, next } = this.#neighbours(flush);
     gl.bindFramebuffer(gl.FRAMEBUFFER, target);
     gl.useProgram(this.#program);
     for (const [unit, texture] of [prev, cur, next].entries()) {
@@ -2062,6 +3179,17 @@ export class Deinterlacer extends EventTarget {
     gl.uniform1i(this.#location.prev, 0);
     gl.uniform1i(this.#location.cur, 1);
     gl.uniform1i(this.#location.next, 2);
+    // The GPU engine owns pixels only when it also owns the cadence: under
+    // autoFilm the CPU engine schedules, so its fields must not be woven
+    // by the GPU detector behind its back.
+    const metrics =
+      this.#film && !this.#autoFilm ? (this.#detector?.texture ?? null) : null;
+    const film = metrics !== null;
+    if (metrics !== null) {
+      gl.activeTexture(gl.TEXTURE0 + 3);
+      gl.bindTexture(gl.TEXTURE_2D, metrics);
+      gl.uniform1i(this.#location.fieldMetrics, 3);
+    }
     gl.uniform2i(this.#location.size, this.#width, this.#height);
     // The lines that survive are the ones of the field being shown: the first
     // field is the top one when the top field leads, and the second is the
@@ -2069,15 +3197,33 @@ export class Deinterlacer extends EventTarget {
     const first = this.#topFieldFirst ? 0 : 1;
     gl.uniform1i(this.#location.parity, second ? 1 - first : first);
     gl.uniform1i(this.#location.tff, this.#topFieldFirst ? 1 : 0);
+    gl.uniform1i(this.#location.second, second ? 1 : 0);
     gl.uniform1i(this.#location.spatialCheck, this.#spatialCheck ? 1 : 0);
+    gl.uniform1i(this.#location.debug, this.#debug ? 1 : 0);
+    gl.uniform1i(this.#location.film, film ? 1 : 0);
+    gl.uniform1i(this.#location.phase, this.#phase.phase);
     gl.viewport(0, 0, this.#width, this.#height);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (this.#debug && film) this.#drawText(this.#debugText, 0, 90);
     // A picture filtered into a texture is not on the screen yet, and showing
     // the canvas for it would put up whatever was drawn on it last.
     if (target === null) {
       this.#presentedPicture = { kind: "yadif", flush, second };
       this.#setVisible(true);
       if (countOutput) this.#outputSinceReport++;
+    }
+  }
+
+  #neighbours(flush: boolean): { prev: number; cur: number; next: number } {
+    const back = (frames: number) => (this.#head + HISTORY - frames) % HISTORY;
+    if (this.#frames === 1) {
+      return { prev: this.#head, cur: this.#head, next: this.#head };
+    } else if (flush) {
+      return { prev: back(1), cur: this.#head, next: this.#head };
+    } else if (this.#frames === 2) {
+      return { prev: back(1), cur: back(1), next: this.#head };
+    } else {
+      return { prev: back(2), cur: back(1), next: this.#head };
     }
   }
 
@@ -2093,6 +3239,10 @@ export class Deinterlacer extends EventTarget {
    * `contain` it is by default.
    */
   #layout(): void {
+    // Being laid out again is the other thing that survives an adoption: the
+    // element arrives in a box of a different shape, and the observer that
+    // reports it is the one already watching for that.
+    this.#followOwner();
     if (!this.#wrapper) return;
     const video = this.#video;
     // The size the picture is to be seen at, sample aspect ratio and all.
@@ -2149,8 +3299,12 @@ export class Deinterlacer extends EventTarget {
     }
     this.#freeOutputs();
     this.#freeAnalysisTarget();
-    if (this.#autoFilm) this.#allocateAnalysisTarget();
-    if (this.#doubleRate || this.#autoFilm) this.#allocateOutputs();
+    if (this.#doubleRate || this.#autoFilm || this.#film)
+      this.#allocateOutputs();
+    this.#detector?.resize(width, height);
+    // Fresh resources mean fresh attempts: a degraded engine retries on the
+    // next frame instead of staying stood down for the stream's lifetime.
+    this.#recoverFilm();
   }
 
   /** Allocate the fixed-size framebuffer used by both cadence passes. */
@@ -2278,7 +3432,7 @@ export class Deinterlacer extends EventTarget {
       gl.deleteTexture(texture);
     }
     this.#outputs = [];
-    this.#queue.length = 0;
+    this.#dropQueue();
   }
 
   /**
@@ -2337,7 +3491,9 @@ export class Deinterlacer extends EventTarget {
     }
     this.#frames = 0;
     this.#lastMediaTime = 0;
-    this.#queue.length = 0;
+    this.#lastPresentedFrames = 0;
+    this.#dropQueue();
+    this.#resetFieldMetrics();
     this.#periodMs = 0;
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
@@ -2353,9 +3509,12 @@ export class Deinterlacer extends EventTarget {
       missed: 0,
       degraded: 0,
       discontinuities: 0,
+      resynced: 0,
       late: 0,
       queueResetted: 0,
     };
+    this.#phaseCounts.fill(0);
+    this.#filmDropped = 0;
     this.#lastPresented = 0;
     this.#reportedAt = 0;
     this.#lastFrameAt = 0;
@@ -2366,11 +3525,15 @@ export class Deinterlacer extends EventTarget {
     this.#reportMaxQueuedFields = 0;
     this.#outputSinceReport = 0;
     this.#resetFilm();
+    this.#gpuFrameNanosecondsSinceReport = 0;
+    this.#gpuFrameCountSinceReport = 0;
+    this.#gpuFieldNanosecondsSinceReport = 0;
+    this.#gpuFieldCountSinceReport = 0;
   }
 
   /** Return FFmpeg's fieldmatch and decimate windows to their initial state. */
   #resetFilm(): void {
-    this.#queue.length = 0;
+    this.#dropQueue();
     this.#mode = "video";
     this.#match = "c";
     this.#combScore = 0;
@@ -2420,6 +3583,7 @@ export class Deinterlacer extends EventTarget {
       // refills every texture from the new timeline.
       this.#frames = 0;
       this.#resetFilm();
+      this.#resetFieldMetrics();
       this.#presentedPicture = null;
       this.#setVisible(false);
       return;
@@ -2434,7 +3598,7 @@ export class Deinterlacer extends EventTarget {
     // The fields still queued stand for moments after this one and nothing is
     // coming to make sense of them, so the picture goes straight to the canvas
     // rather than through a schedule that has nothing left to keep to.
-    this.#queue.length = 0;
+    this.#dropQueue();
     if (this.#running && this.#frames > 0) {
       const slot = this.#nextOutputSlot();
       const output = slot === null ? undefined : this.#outputs[slot];
@@ -2452,6 +3616,7 @@ export class Deinterlacer extends EventTarget {
       // 新しい再生速度のフレームが3枚そろうまで、旧周期の field match と decimate 位相を持ち越さずに通常の YADIF で表示する。
       this.#frames = 0;
       this.#resetFilm();
+      this.#resetFieldMetrics();
     }
   };
 
@@ -2468,6 +3633,7 @@ export class Deinterlacer extends EventTarget {
     }
     if (this.#workerState === "active") return;
     this.#lost = true;
+    this.#notifyFailure("the deinterlacer WebGL context was lost");
     this.stop();
   };
 }

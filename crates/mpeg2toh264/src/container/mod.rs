@@ -5,3 +5,4 @@ mod aac_huffman;
 pub mod adts;
 pub mod fmp4;
 pub mod mpegts;
+pub(crate) mod rff;

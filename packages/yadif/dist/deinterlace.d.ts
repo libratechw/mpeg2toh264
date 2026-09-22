@@ -13,9 +13,10 @@ export interface DeinterlaceStats {
     filtered: number;
     /**
      * Frames the element presented that the filter never saw, counted from the
-     * gaps in `presentedFrames`. The neighbours of the frames either side of a
-     * gap are further apart in time than the filter believes, so its idea of
-     * what moved is wrong. A page that sees this climbing is asking the filter
+     * gaps in `presentedFrames` (`mozPaintedFrames` on Firefox). The neighbours
+     * of the frames either side of a gap are further apart in time than the
+     * filter believes, so its idea of what moved is wrong. A page that sees
+     * this climbing is asking the filter
      * to keep up with more than it can.
      */
     missed: number;
@@ -34,6 +35,13 @@ export interface DeinterlaceStats {
     degraded: number;
     /** Times the held frames were dropped as stale: seeks, and stream changes. */
     discontinuities: number;
+    /**
+     * Times the schedule was restarted from the clock instead of following on
+     * from the last picture: a seek, a stall, a cadence change, or a missed
+     * frame. Climbing during steady playback means the cadence is not holding.
+     * (otya)
+     */
+    resynced?: number;
     /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
     late: number;
     /**
@@ -62,6 +70,24 @@ export interface DeinterlaceStats {
     duplicateScore: number;
     /** Next-smallest block difference in the most recently completed cycle. */
     duplicateRunnerUp: number;
+    /**
+     * GPU processing time, supported only in Chrome. On ANGLE's Metal backend
+     * it spans command buffers rather than the work in them, so it overstates
+     * anything split into many small passes; a change is best judged by its
+     * direction here and by a synchronous readback in isolation.
+     */
+    gpuMs?: number;
+    /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
+    film?: boolean;
+    /**
+     * Why requested film reconstruction is currently unavailable, or null
+     * while healthy. The requesting option (`film` / `autoFilm`) stays as the
+     * caller set it -- intent is preserved -- while pictures continue through
+     * plain YADIF. Cleared on the next retry (start, scan change, resize, or
+     * re-setting the option); a repeated failure notifies again as a new
+     * episode. Always null when neither film engine is requested.
+     */
+    filmError?: string | null;
 }
 export interface DeinterlacerOptions {
     /** 描画先。`auto` は同梱 Worker を優先し、初期化できない場合はメインスレッドへ戻る。 */
@@ -112,6 +138,25 @@ export interface DeinterlacerOptions {
      * being asked for anything.
      */
     onStats?(stats: DeinterlaceStats): void;
+    /**
+     * Whether to detect 2:3 pulldown and show film at 24 frames a second.
+     * Frames that are not film are filtered as usual. Needs
+     * `EXT_color_buffer_float`.
+     */
+    film?: boolean;
+    /**
+     * Called when a rendering resource fails after construction: a GPU film
+     * detector that throws mid-stream, an autoFilm analysis target that will
+     * not allocate, a Worker that died twice, or a lost WebGL context. The
+     * same message is dispatched as a `failure` event; this option exists for
+     * callers that prefer a constructor callback like `onStats`.
+     */
+    onFailure?(message: string): void;
+    /**
+     * Whether to draw the pulldown detection over the picture. Applies to
+     * the GPU (`film`) path only; inert under `autoFilm` alone.
+     */
+    debug?: boolean;
 }
 /** Field information supplied by a player or another video source. */
 export interface Scan {
@@ -128,6 +173,8 @@ export interface VideoState {
 }
 export interface DeinterlacerEventMap {
     stats: CustomEvent<DeinterlaceStats>;
+    /** A rendering resource failed after construction; detail is the reason. */
+    failure: CustomEvent<string>;
 }
 /** Whether this browser has the two things the deinterlacer is built on. */
 export declare function supportsDeinterlace(): boolean;
@@ -173,6 +220,12 @@ export declare class Deinterlacer extends EventTarget {
     /** Whether a picture goes up for every field rather than every frame. */
     get doubleRate(): boolean;
     set doubleRate(doubleRate: boolean);
+    get spatialCheck(): boolean;
+    set spatialCheck(spatialCheck: boolean);
+    get film(): boolean;
+    set film(film: boolean);
+    get debug(): boolean;
+    set debug(debug: boolean);
     /** Whether hard-telecined material is reconstructed at film cadence. */
     get autoFilm(): boolean;
     set autoFilm(autoFilm: boolean);

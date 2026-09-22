@@ -27,7 +27,14 @@ import {
   type TimingMark,
 } from "./protocol.js";
 import { defaultPoolSize, PicturePool } from "./pool.js";
-import { openSource, readSlice, readTail, type Source } from "./source.js";
+import {
+  isRangeExhaustion,
+  openSource,
+  readSlice,
+  readTail,
+  withRangeContext,
+  type Source,
+} from "./source.js";
 import {
   detach,
   firstTimestamp,
@@ -556,7 +563,15 @@ class Playback {
       mark(id, "wasm");
       await this.#openPool(module);
       if (!this.#running(leg)) return;
-      const source = await openSource(this.#command.url, signal, offset);
+      let source: Source;
+      try {
+        source = await openSource(this.#command.url, signal, offset);
+      } catch (error) {
+        // The range open owns this failure, so it carries where reading
+        // stood. Everything below -- WASM, pool, transcoder, and sink --
+        // reaches the leg catch unmodified.
+        throw withRangeContext(error, offset, this.#totalBytes);
+      }
       if (!this.#running(leg)) return;
       mark(id, "response");
       this.#totalBytes ??= source.totalBytes;
@@ -626,11 +641,23 @@ class Playback {
             if (!this.#running(leg)) return;
           }
           if (!response) {
-            response = await openSource(
-              this.#command.url,
-              this.#leg!.signal,
-              nextByte,
-            );
+            try {
+              response = await openSource(
+                this.#command.url,
+                this.#leg!.signal,
+                nextByte,
+              );
+            } catch (error) {
+              // Only a refused reopen can complete a known finite range.
+              // Reader and queue failures must never masquerade as EOF.
+              if (
+                this.#running(leg) &&
+                !this.#leg!.signal.aborted &&
+                isRangeExhaustion(nextByte, this.#totalBytes, error)
+              )
+                return;
+              throw error;
+            }
             if (!this.#running(leg)) return;
           }
           const reader = response.stream.getReader();
@@ -696,7 +723,9 @@ class Playback {
           if (!reopen) continue;
         }
       } catch (error) {
-        if (this.#running(leg) && !this.#leg!.signal.aborted) readError = error;
+        if (this.#running(leg) && !this.#leg!.signal.aborted) {
+          readError = withRangeContext(error, nextByte, this.#totalBytes);
+        }
       } finally {
         ended = true;
         available.abandon();

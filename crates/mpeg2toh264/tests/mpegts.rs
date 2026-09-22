@@ -558,6 +558,79 @@ fn emits_private_stream_pes_from_the_selected_service() {
 }
 
 #[test]
+fn keeps_private_pes_across_repeated_program_tables() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{
+        mux_transport_stream_with_descriptors, PesUnit, STREAM_TYPE_MPEG2_VIDEO,
+        STREAM_TYPE_PRIVATE_DATA,
+    };
+
+    let caption = vec![0x80; 500];
+    let superimpose = vec![0x81; 500];
+    let streams = &[
+        (0x101, STREAM_TYPE_MPEG2_VIDEO, &[][..]),
+        (0x120, STREAM_TYPE_PRIVATE_DATA, &[0x52, 1, 0x30][..]),
+        (0x121, STREAM_TYPE_PRIVATE_DATA, &[0x52, 1, 0x38][..]),
+    ];
+    for (pid, stream_id, pts, payload, kind) in [
+        (
+            0x120,
+            0xbd,
+            Some(180_000),
+            &caption,
+            ElementaryKind::PrivateStream1,
+        ),
+        (
+            0x121,
+            0xbf,
+            None,
+            &superimpose,
+            ElementaryKind::PrivateStream2,
+        ),
+    ] {
+        for table_index in 0..2 {
+            let mut continuity = HashMap::new();
+            let prefix = mux_transport_stream_with_descriptors(
+                streams,
+                &[
+                    PesUnit {
+                        pid: 0x101,
+                        stream_id: 0xe0,
+                        pts: Some(90_000),
+                        payload: &[0, 0, 1, 0xb3],
+                    },
+                    PesUnit {
+                        pid,
+                        stream_id,
+                        pts,
+                        payload,
+                    },
+                ],
+                &mut continuity,
+            );
+            let repeated = mux_transport_stream_with_descriptors(streams, &[], &mut continuity);
+            // PAT, PMT, video, and only the first of three private PES packets.
+            let mut ts = prefix[..4 * 188].to_vec();
+            ts.extend_from_slice(&repeated[table_index * 188..(table_index + 1) * 188]);
+            ts.extend_from_slice(&prefix[4 * 188..]);
+
+            // Also split the input inside a TS packet, as file reads do.
+            let mut demuxer = MpegTsAvDemuxer::new();
+            let mut packets = Vec::new();
+            for chunk in ts.chunks(197) {
+                packets.extend(demuxer.push(chunk).expect("demuxes"));
+            }
+            packets.extend(demuxer.finish().expect("flushes"));
+            let private: Vec<_> = packets.iter().filter(|packet| packet.pid == pid).collect();
+            assert_eq!(private.len(), 1, "PID {pid:#x}, table {table_index}");
+            assert_eq!(private[0].kind, kind);
+            assert_eq!(private[0].pts, pts.or(Some(90_000)));
+            assert_eq!(private[0].data, *payload);
+        }
+    }
+}
+
+#[test]
 fn emits_only_the_default_caption_and_superimpose_streams() {
     use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
     use support::{
@@ -1042,6 +1115,71 @@ fn a_superseded_stream_recovers_after_packet_loss() {
             (0x200, vec![0xaa]),
             (0x200, vec![0xdd]),
             (0x100, vec![0xbb]),
+        ]
+    );
+}
+
+#[test]
+fn a_superseded_audio_pid_keeps_reading_until_the_replacement_starts() {
+    use mpeg2toh264::container::mpegts::{ElementaryKind, MpegTsAvDemuxer};
+    use support::{PesUnit, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_MPEG2_VIDEO};
+
+    // A service with no picture is not watched unless named, so the video
+    // PID rides along unchanged while only the audio PID moves.
+    let before: &[(u16, u8)] = &[
+        (0x200, STREAM_TYPE_MPEG2_VIDEO),
+        (0x201, STREAM_TYPE_AAC_ADTS),
+    ];
+    let after: &[(u16, u8)] = &[
+        (0x200, STREAM_TYPE_MPEG2_VIDEO),
+        (0x101, STREAM_TYPE_AAC_ADTS),
+    ];
+    let mut stream = mux_programs(
+        &[(101, 0x1f0, before)],
+        &[PesUnit {
+            pid: 0x201,
+            stream_id: 0xc0,
+            pts: Some(9000),
+            payload: &[0xaa],
+        }],
+        &mut HashMap::new(),
+    );
+    stream.extend_from_slice(&mux_programs(
+        &[(101, 0x1f0, after)],
+        &[
+            PesUnit {
+                pid: 0x201,
+                stream_id: 0xc0,
+                pts: Some(13_500),
+                payload: &[0xdd],
+            },
+            PesUnit {
+                pid: 0x101,
+                stream_id: 0xc0,
+                pts: Some(18_000),
+                payload: &[0xbb],
+            },
+        ],
+        &mut HashMap::new(),
+    ));
+
+    let mut demuxer = MpegTsAvDemuxer::new();
+    let mut packets = demuxer.push(&stream).expect("demuxes across the move");
+    packets.extend(demuxer.finish().expect("flushes the new stream"));
+    let audio: Vec<(u16, Vec<u8>)> = packets
+        .into_iter()
+        .filter(|packet| packet.kind == ElementaryKind::Audio)
+        .map(|packet| (packet.pid, packet.data))
+        .collect();
+
+    // The old audio PID keeps feeding the superseded assembly until the
+    // replacement PID starts; dropping the dispatch arm loses the middle PES.
+    assert_eq!(
+        audio,
+        vec![
+            (0x201, vec![0xaa]),
+            (0x201, vec![0xdd]),
+            (0x101, vec![0xbb]),
         ]
     );
 }
