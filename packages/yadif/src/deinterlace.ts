@@ -2275,7 +2275,9 @@ export class Deinterlacer extends EventTarget {
       step > MAX_PERIOD_MS ||
       Math.abs(error) > this.#refreshMs / 4
     ) {
-      if (step > 0 && step <= MAX_PERIOD_MS) this.#refreshMs = step;
+      // Coalesced callbacks can have nearly identical timestamps at startup.
+      // Keep the refresh margin until a physically plausible interval is observed.
+      if (step >= 1 && step <= MAX_PERIOD_MS) this.#refreshMs = step;
       this.#gridAt = now;
       return;
     }

@@ -33,6 +33,7 @@ import {
   gaps,
   heldRefreshes,
   presentations,
+  REFRESH_MS,
   run,
 } from "./yadif-clock-harness.mjs";
 
@@ -110,6 +111,44 @@ test("the Worker keeps the schedule main-thread rendering would have", async ({
   assertUnbroken(worker, "worker rendering");
   assertUnbroken(main, "main rendering");
   assert.equal(schedule(worker), schedule(main));
+});
+
+test("nearly identical animation timestamps preserve presentation timing", async ({
+  fixed,
+}) => {
+  for (const rendering of ["main", "worker"]) {
+    // A source display time between animation callbacks needs the measured refresh margin.
+    const displayTime = (_index, expected) => expected - REFRESH_MS / 4;
+    const steady = await run(fixed, { vsyncs: VSYNCS, rendering, displayTime });
+    let currentVsync = 0;
+    const coalesced = await run(fixed, {
+      vsyncs: VSYNCS,
+      rendering,
+      displayTime,
+      beforeVsync(vsync, control) {
+        currentVsync = vsync;
+        if (vsync !== 0) return;
+        const host = control.pageContext.__host;
+        const request = host.requestAnimationFrame;
+        // Chrome can deliver consecutive startup callbacks only microseconds apart.
+        // Later timestamps are rounded to tenths of a millisecond.
+        host.requestAnimationFrame = (realm, callback) =>
+          request(realm, (timestamp) =>
+            callback(
+              currentVsync === 3
+                ? Math.round((timestamp - REFRESH_MS) * 10) / 10 + 0.002
+                : Math.round(timestamp * 10) / 10,
+            ),
+          );
+      },
+    });
+    assertUnbroken(coalesced, `${rendering}: coalesced callbacks`);
+    assert.equal(
+      schedule(coalesced),
+      schedule(steady),
+      `${rendering}: a sub-millisecond callback interval changed presentation timing`,
+    );
+  }
 });
 
 test("main-thread rendering is unchanged by the clock contract", async ({
