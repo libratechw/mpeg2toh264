@@ -1,4 +1,4 @@
-const Ce = "" + new URL("assets/worker-DqNgmEDp.js", import.meta.url).href, ie = `#version 300 es
+const Ce = "" + new URL("assets/worker-CICxC4kp.js", import.meta.url).href, ie = `#version 300 es
 void main() {
   // From the vertex index alone. There is no geometry here worth a buffer.
   vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
@@ -1509,7 +1509,7 @@ class it {
   #w = [];
   #N = [];
   constructor(e, t) {
-    if (this.#s = e, this.#r = t, this.#e = Se(e) ? e : null, this.#p = typeof VideoFrame < "u", this.#x = this.#p && e.playbackRate > 1, this.#e) {
+    if (this.#s = e, this.#r = t, this.#e = Se(e) ? e : null, this.#p = this.#e === null && typeof VideoFrame < "u", this.#x = this.#p && e.playbackRate > 1, this.#e) {
       for (const i of ["emptied", "seeking", "seeked"])
         e.addEventListener(i, this.#B);
       for (const i of ["pause", "playing", "waiting", "ratechange"])
