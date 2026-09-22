@@ -200,6 +200,43 @@ fn rff_is_even_across_odd_gops_on_both_paths() {
 }
 
 #[test]
+fn a_frame_rate_change_clears_the_previous_repeat_shift() {
+    for (rate_code, frame_ticks) in [(3, 3600), (5, 3000)] {
+        // The preceding GOP ends on a repeated-field picture at 30000/1001 fps
+        let first = gop(Some(1));
+        let mut next = gop(None);
+        for at in 0..next.len() - 7 {
+            if next[at..at + 4] == [0, 0, 1, 0xb3] {
+                next[at + 7] = (next[at + 7] & 0xf0) | rate_code;
+            }
+        }
+        let mut continuity = HashMap::new();
+        let mut source = wrap_mpeg2_es_in_ts(&first, Some(START), &mut continuity);
+        source.extend(wrap_mpeg2_es_in_ts(
+            &next,
+            Some(START + ticks(field_count(Some(1)))),
+            &mut continuity,
+        ));
+        for mode in [VideoMode::Transcode, VideoMode::Passthrough] {
+            let fragments = run(&source, mode, 97);
+            let next = fragments
+                .iter()
+                .filter(|fragment| matches!(fragment, Fragment::Media { .. }))
+                .nth(1)
+                .expect("the new frame rate has its own fragment");
+            let frames = samples(std::slice::from_ref(next));
+            assert_eq!(frames.len(), 15);
+            for frame in frames {
+                assert_eq!(
+                    frame.duration, frame_ticks,
+                    "{mode:?}, rate code {rate_code}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn mixed_video_has_no_gap_and_returns_to_source_time_after_one_picture() {
     let source = stream(&[None, Some(0), Some(15), None], None);
     for mode in [VideoMode::Transcode, VideoMode::Passthrough] {

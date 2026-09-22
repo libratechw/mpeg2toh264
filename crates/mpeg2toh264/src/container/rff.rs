@@ -65,14 +65,13 @@ pub(crate) fn display_timing(
     before: RffState,
 ) -> DisplayTiming {
     let field_ticks = 90_000.0 * f64::from(rate.1) / f64::from(rate.0) / 2.0;
-    let mut position = if before.rate == rate {
-        before.fields
+    let (mut position, start_shift) = if before.rate == rate {
+        (before.fields, before.end_shift)
     } else {
-        0
+        (0, 0)
     };
     let tick = |position: f64| round_half_up(position * field_ticks) as u64;
     let source_origin = tick(position as f64);
-    let start_shift = before.end_shift;
     let mut shift = start_shift;
     let mut starts = vec![0; fields.len()];
     let mut source_starts = vec![0; fields.len()];
