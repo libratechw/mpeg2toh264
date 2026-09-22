@@ -1,4 +1,4 @@
-const ne = "" + new URL("assets/worker-C2gq7Ax4.js", import.meta.url).href, C = `#version 300 es
+const ne = "" + new URL("assets/worker-D1333Nr8.js", import.meta.url).href, C = `#version 300 es
 void main() {
   // From the vertex index alone. There is no geometry here worth a buffer.
   vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
@@ -198,7 +198,7 @@ const p = {
   /** The previous frame's first field was the one before's. */
   previousFirstRepeated: 5,
   phase: 6
-}, g = 7, J = 2, N = 1, fe = 2, z = 5, de = {
+}, g = 7, J = 2, N = 1, fe = 2, z = 10, de = {
   a: "uA",
   b: "uB",
   fieldMetrics: "uFieldMetrics",
@@ -2387,7 +2387,7 @@ ${s} dropped:${this.#st}`;
     this.#E = e;
     const i = Math.max(1, Math.round(t / this.#y)), s = this.#H + i * this.#y, r = e - s;
     if (this.#H === 0 || t <= 0 || t > R || Math.abs(r) > this.#y / 4) {
-      t > 0 && t <= R && (this.#y = t), this.#H = e;
+      t >= 1 && t <= R && (this.#y = t), this.#H = e;
       return;
     }
     this.#y += r / i * Ue, this.#H = s + r * Ne;

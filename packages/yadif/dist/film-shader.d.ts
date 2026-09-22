@@ -50,8 +50,11 @@ export declare const SAME_BLOCKS_MAX = 2;
 /** The phases whose frame holds two film frames; the first is the repeat. */
 export declare const FILM_DUPLICATE_PHASE = 1;
 export declare const FILM_MIXED_PHASE = 2;
-/** Frames in a row with a phase before the cadence is believed: a cycle. */
-export declare const FILM_LOCK_FRAMES = 5;
+/**
+ * Informative phases required to confirm a cadence: two cycles.
+ * Brief asymmetry between moving fields can resemble one pulldown cycle.
+ */
+export declare const FILM_LOCK_FRAMES = 10;
 export declare const FIELD_COMPARE_UNIFORMS: {
     readonly a: "uA";
     readonly b: "uB";
@@ -92,8 +95,8 @@ export declare const METRICS_UNIFORMS: {
  * two comparisons just measured, and decide the pulldown phase.
  *
  * Each phase is told by one field that repeats and one that does not. Held
- * film frames (animation) make the latter unreliable, so once a cycle has
- * been seen whole it is carried on by the repeat alone; until then every
+ * film frames (animation) make the latter unreliable, so once two cycles have
+ * been observed the cadence is carried on by the repeat alone; until then every
  * frame has to show both. A still (both fields the same as a neighbour's)
  * keeps the cycle's place but counts only once the cycle is believed.
  */
