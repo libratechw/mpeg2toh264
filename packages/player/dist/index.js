@@ -339,7 +339,7 @@ class v {
     );
   }
 }
-const E = "" + new URL("assets/worker-__XfoF4J.js", import.meta.url).href, S = E, d = 0.1, c = [
+const E = "" + new URL("assets/worker-DFu10K5r.js", import.meta.url).href, S = E, d = 0.1, c = [
   "loadedmetadata",
   "loadeddata",
   "canplay",
