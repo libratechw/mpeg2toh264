@@ -311,10 +311,13 @@ export class FilmDetector {
     if (this.#pixelBuffer === null) {
       this.#pixelBuffer = gl.createBuffer();
       gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#pixelBuffer);
+      // Chromium's getBufferSubData() can leave READ shadow copies unused
+      // COPY skips those extra copies; poll() still waits for the GPU fence
+      // https://chromium.googlesource.com/chromium/src/+/main/gpu/command_buffer/client/gles2_implementation.cc
       gl.bufferData(
         gl.PIXEL_PACK_BUFFER,
         this.metrics.byteLength,
-        gl.STREAM_READ,
+        gl.STREAM_COPY,
       );
       gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     }
