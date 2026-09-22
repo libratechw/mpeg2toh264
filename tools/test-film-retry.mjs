@@ -4,16 +4,11 @@ import assert from "node:assert/strict";
 import { BASE_MS, buildBundles, run } from "./yadif-clock-harness.mjs";
 
 const bundles = await buildBundles(process.cwd());
-const isTarget = (engine, resource) =>
-  engine === "film"
-    ? resource.format === 0x8814
-    : resource.format === 0x1908 &&
-      resource.width === 288 &&
-      resource.height === 162;
+const isTarget = (resource) => resource.format === 0x8814;
 let checked = 0;
 
-async function exercise(rendering, engine, trigger, restored) {
-  const label = `${rendering}/${engine}/${trigger}/${restored ? "recovered" : "still broken"}`;
+async function exercise(rendering, trigger, restored) {
+  const label = `${rendering}/${trigger}/${restored ? "recovered" : "still broken"}`;
   let available = false;
   let control;
   let retried = false;
@@ -32,7 +27,7 @@ async function exercise(rendering, engine, trigger, restored) {
       case "event":
       case "callback":
       case "later":
-        control.deinterlacer(`__deinterlacer.${engine} = true`);
+        control.deinterlacer("__deinterlacer.film = true");
         break;
       case "parity":
         control.deinterlacer(
@@ -63,14 +58,14 @@ async function exercise(rendering, engine, trigger, restored) {
     rendering,
     vsyncs: 200,
     deinterlacerOptions: {
-      [engine]: true,
+      film: true,
       onFailure(message) {
         callbacks.push(message);
         if (trigger === "callback" && callbacks.length === 1) retry();
       },
     },
     resourceAvailable(resource) {
-      if (resource.realm !== realm || !isTarget(engine, resource)) return true;
+      if (resource.realm !== realm || !isTarget(resource)) return true;
       targetAttempts++;
       return available;
     },
@@ -96,8 +91,6 @@ async function exercise(rendering, engine, trigger, restored) {
         control.deinterlacer(
           "__deinterlacer.spatialCheck = false; __deinterlacer.scan = { interlaced: true, topFieldFirst: true }",
         );
-        if (engine === "autoFilm")
-          control.deinterlacer("__deinterlacer.film = true");
       }
       if (vsync === 90 && !["event", "callback"].includes(trigger)) {
         assert.equal(events.length, 1, `${label}: initial failure`);
@@ -138,7 +131,7 @@ async function exercise(rendering, engine, trigger, restored) {
     `${label}: final error`,
   );
   const reads = result.readbacks.filter(
-    (resource) => resource.realm === realm && isTarget(engine, resource),
+    (resource) => resource.realm === realm && isTarget(resource),
   );
   assert.equal(
     reads.length > 10,
@@ -146,7 +139,7 @@ async function exercise(rendering, engine, trigger, restored) {
     `${label}: analysis must really resume`,
   );
   assert.equal(
-    control.deinterlacer(`__deinterlacer.${engine}`),
+    control.deinterlacer("__deinterlacer.film"),
     true,
     `${label}: intent changed`,
   );
@@ -163,13 +156,13 @@ async function exercise(rendering, engine, trigger, restored) {
     if (["event", "callback", "later"].includes(trigger))
       assert.ok(
         result.commands.some(
-          (command) => command.type === "settings" && command.options[engine],
+          (command) => command.type === "settings" && command.options.film,
         ),
         `${label}: retry did not cross Worker boundary`,
       );
     assert.equal(
       result.allocations.filter(
-        (resource) => resource.realm === "page" && isTarget(engine, resource),
+        (resource) => resource.realm === "page" && isTarget(resource),
       ).length,
       0,
       `${label}: page allocated inactive engine`,
@@ -181,17 +174,16 @@ async function exercise(rendering, engine, trigger, restored) {
 }
 
 for (const rendering of ["main", "worker"])
-  for (const engine of ["film", "autoFilm"])
-    for (const trigger of [
-      "event",
-      "callback",
-      "later",
-      "parity",
-      "interlacing",
-      "timeline",
-      "start",
-      "resize",
-    ])
-      for (const restored of [true, false])
-        await exercise(rendering, engine, trigger, restored);
+  for (const trigger of [
+    "event",
+    "callback",
+    "later",
+    "parity",
+    "interlacing",
+    "timeline",
+    "start",
+    "resize",
+  ])
+    for (const restored of [true, false])
+      await exercise(rendering, trigger, restored);
 console.log(`film retry: ${checked} cases passed`);

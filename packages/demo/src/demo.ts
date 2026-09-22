@@ -57,7 +57,6 @@ const passthrough = document.querySelector<HTMLInputElement>("#passthrough")!;
 const deinterlace = document.querySelector<HTMLInputElement>("#deinterlace")!;
 const doubleRate = document.querySelector<HTMLInputElement>("#double-rate")!;
 const film = document.querySelector<HTMLInputElement>("#film")!;
-const autoFilm = document.querySelector<HTMLInputElement>("#auto-film")!;
 const deinterlaceDebug =
   document.querySelector<HTMLInputElement>("#deinterlace-debug")!;
 const splitFieldSamples = document.querySelector<HTMLInputElement>(
@@ -439,7 +438,6 @@ function createPlayer(): Mpeg2TsPlayer {
         onStats: showDeinterlaceStats,
         debug: deinterlaceDebug.checked,
         film: film.checked,
-        autoFilm: autoFilm.checked,
       });
       return yadif;
     },
@@ -1052,7 +1050,6 @@ function applyDeinterlace() {
     // The runtime setter never throws: without float buffers the engine
     // stands down with a failure notification instead (see README).
     yadif.film = film.checked;
-    yadif.autoFilm = autoFilm.checked;
     yadif.debug = deinterlaceDebug.checked;
   }
   syncControls();
@@ -1097,7 +1094,6 @@ deinterlace.addEventListener("change", applyDeinterlace);
 doubleRate.addEventListener("change", applyDeinterlace);
 deinterlaceDebug.addEventListener("change", applyDeinterlace);
 film.addEventListener("change", applyDeinterlace);
-autoFilm.addEventListener("change", applyDeinterlace);
 
 if (!canPassthrough) {
   passthrough.checked = false;

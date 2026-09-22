@@ -31,17 +31,7 @@ import {
   initDebugRenderState,
   type DebugRenderState,
 } from "./debug.js";
-import {
-  FILM_ANALYSIS_HEIGHT,
-  FILM_ANALYSIS_FRAGMENT_SHADER,
-  FILM_ANALYSIS_WIDTH,
-  FILM_SAMPLE_FRAGMENT_SHADER,
-  FILM_UNIFORMS,
-  FILM_WEAVE_FRAGMENT_SHADER,
-  YADIF_FRAGMENT_SHADER,
-  YADIF_UNIFORMS,
-} from "./shader.js";
-import { FFmpegIVTC } from "./ivtc.js";
+import { YADIF_FRAGMENT_SHADER, YADIF_UNIFORMS } from "./shader.js";
 import { FilmDetector, NO_PHASE, type Phase } from "./film-detect.js";
 import { EncodedVideoFrames } from "./encoded-video.js";
 import {
@@ -101,14 +91,6 @@ const FRAME_CALLBACK_TIMEOUT_MS = 250;
 /** requestVideoFrameCallback() から周期を実測できるまで使う控えめな入力周期。 */
 const DEFAULT_FALLBACK_PERIOD_MS = 1000 / 30;
 
-function validateFilmCombThreshold(value: number): number {
-  if (!Number.isFinite(value) || value < 0)
-    throw new RangeError(
-      "filmCombThreshold must be a finite number greater than or equal to 0",
-    );
-  return value;
-}
-
 const VERTEX_SHADER = `#version 300 es
 void main() {
   // One triangle over the whole viewport, from the vertex index alone. There
@@ -165,14 +147,6 @@ const FILM_LEAD: Record<number, number> = {
 };
 
 /**
- * How many consecutive unusable autoFilm analyses stand down the CPU film
- * engine. Allocation either works or it does not -- the target and programs
- * are (re)built at resize and toggles -- so a short run already means a
- * persistent failure, not a startup race.
- */
-const FILM_ANALYSE_FAILURE_LIMIT = 3;
-
-/**
  * Putting a picture that has already been filtered onto the canvas.
  *
  * Both the texture it reads and the canvas it writes are held the way a
@@ -200,7 +174,7 @@ interface Ready {
   duration: number;
   /** Which schedule chained it (otya): a cadence change restarts the chain. */
   cadence: Cadence;
-  /** GPU pulldown phase, field number, or 0 for ordinary/CPU film frames. */
+  /** GPU pulldown phase, field number, or 0 for ordinary frames. */
   phase: number;
   droppedBefore: number;
 }
@@ -233,8 +207,7 @@ interface FrameObservation {
 /** The draw path that produced the picture still represented by the canvas. */
 type PresentedPicture =
   | { kind: "texture"; texture: WebGLTexture; flip: boolean }
-  | { kind: "yadif"; flush: boolean; second: boolean }
-  | { kind: "film" };
+  | { kind: "yadif"; flush: boolean; second: boolean };
 
 /**
  * How the filter is getting on, and where it is being let down.
@@ -279,7 +252,7 @@ export interface DeinterlaceStats {
    * frame. Climbing during steady playback means the cadence is not holding.
    * (otya)
    */
-  resynced?: number;
+  resynced: number;
   /** 表示機会を過ぎたか、表示時計と予定時刻が食い違ったために描画されなかったフィールド数。 */
   late: number;
   /**
@@ -296,34 +269,24 @@ export interface DeinterlaceStats {
    * across both the field-rate and film scheduling paths.
    */
   maxQueuedFields: number;
-  /** The render path currently selected by automatic cadence detection. */
-  mode: "film" | "video";
-  /** The field match selected for the most recently analysed frame. */
-  match: "p" | "c" | "n";
-  /** Largest 16 by 16 block count of vertically adjacent combed pixels. */
-  combScore: number;
   /** Pictures actually copied to the canvas per second. */
   outputFps: number;
-  /** Smallest block difference in the most recently completed decimate cycle. */
-  duplicateScore: number;
-  /** Next-smallest block difference in the most recently completed cycle. */
-  duplicateRunnerUp: number;
   /**
    * GPU processing time, supported only in Chrome. On ANGLE's Metal backend
    * it spans command buffers rather than the work in them, so it overstates
    * anything split into many small passes; a change is best judged by its
    * direction here and by a synchronous readback in isolation.
    */
-  gpuMs?: number;
+  gpuMs: number | undefined;
   /** Whether 2:3 pulldown has been detected and the frames are shown at 24p. */
-  film?: boolean;
+  film: boolean;
   /**
    * Why requested film reconstruction is currently unavailable, or null
-   * while healthy. The requesting option (`film` / `autoFilm`) stays as the
+   * while healthy. The requesting option (`film`) stays as the
    * caller set it -- intent is preserved -- while pictures continue through
    * plain YADIF. Cleared on the next retry (start, scan change, resize, or
    * re-setting the option); a repeated failure notifies again as a new
-   * episode. Always null when neither film engine is requested.
+   * episode. Always null when film reconstruction is not requested.
    */
   filmError?: string | null;
 }
@@ -353,20 +316,6 @@ export interface DeinterlacerOptions {
    */
   doubleRate?: boolean;
   /**
-   * Whether hard-telecined film is reconstructed and shown at its native
-   * 24000/1001 cadence. Matching follows FFmpeg's
-   * `fieldmatch=mode=pc_n:combmatch=full:mchroma=0`, and duplicate decisions
-   * follow `decimate=cycle=5:mixed=1`. Frames that do not form a clean film
-   * cadence continue through YADIF.
-   */
-  autoFilm?: boolean;
-  /**
-   * The combed-pixel threshold for a 16 by 16 block. A fieldmatch result with
-   * a score at or above this value is considered combed. This is the browser
-   * equivalent of FFmpeg fieldmatch's `combpel` threshold.
-   */
-  filmCombThreshold?: number;
-  /**
    * Whether to let the local vertical range widen what the temporal check
    * allows. This is yadif's default and its `nospatial` mode turns it off.
    */
@@ -384,16 +333,14 @@ export interface DeinterlacerOptions {
    */
   film?: boolean;
   /**
-   * Called when a rendering resource fails after construction: a GPU film
-   * detector that throws mid-stream, an autoFilm analysis target that will
-   * not allocate, a Worker that died twice, or a lost WebGL context. The
-   * same message is dispatched as a `failure` event; this option exists for
-   * callers that prefer a constructor callback like `onStats`.
+   * Called when a rendering resource fails after construction: a GPU film detector that throws mid-stream,
+   * a Worker that died twice, or a lost WebGL context.
+   * The same message is dispatched as a `failure` event.
+   * This option lets callers install the handler alongside `onStats`.
    */
   onFailure?(message: string): void;
   /**
-   * Whether to draw the pulldown detection over the picture. Applies to
-   * the GPU (`film`) path only; inert under `autoFilm` alone.
+   * Whether to draw the pulldown detection over the picture while `film` is enabled.
    */
   debug?: boolean;
 }
@@ -520,32 +467,6 @@ export class Deinterlacer extends EventTarget {
   readonly #blit: WebGLProgram;
   readonly #blitField: WebGLUniformLocation | null;
   readonly #blitFlip: WebGLUniformLocation | null;
-  /** The reduced pass that reads previous, current and next luma together. */
-  #filmAnalysis: WebGLProgram | null = null;
-  #filmAnalysisLocation: Record<
-    Exclude<keyof typeof FILM_UNIFORMS, "match" | "topFieldFirst">,
-    WebGLUniformLocation | null
-  > | null = null;
-  /** The pass that weaves the selected pair of fields into one film picture. */
-  #filmWeave: WebGLProgram | null = null;
-  #filmWeaveLocation: Record<
-    keyof typeof FILM_UNIFORMS,
-    WebGLUniformLocation | null
-  > | null = null;
-  /** The selected weave reduced to RGB for FFmpeg decimate's block metrics. */
-  #filmSample: WebGLProgram | null = null;
-  #filmSampleLocation: Record<
-    keyof typeof FILM_UNIFORMS,
-    WebGLUniformLocation | null
-  > | null = null;
-  #analysisTarget: {
-    texture: WebGLTexture;
-    framebuffer: WebGLFramebuffer;
-    pixels: Uint8Array;
-    previousLuma: Uint8Array;
-    currentLuma: Uint8Array;
-    nextLuma: Uint8Array;
-  } | null = null;
   #textures: WebGLTexture[] = [];
   /** Somewhere to filter a field into, and to read it back out of. */
   #outputs: RenderTarget[] = [];
@@ -589,16 +510,7 @@ export class Deinterlacer extends EventTarget {
   #wrapper: HTMLElement | null = null;
   readonly #resizes: ResizeObserver | null;
   #doubleRate: boolean;
-  #autoFilm: boolean;
-  #filmCombThreshold: number;
   #spatialCheck: boolean;
-  #mode: "film" | "video" = "video";
-  #match: "p" | "c" | "n" = "c";
-  #combScore = 0;
-  #isCombed = true;
-  readonly #ivtc = new FFmpegIVTC(FILM_ANALYSIS_WIDTH, FILM_ANALYSIS_HEIGHT);
-  #duplicateScore = Infinity;
-  #duplicateRunnerUp = Infinity;
   #outputSinceReport = 0;
   /** otya GPU pulldown path: enabled by the `film` option (see below). */
   #debug: boolean;
@@ -692,12 +604,10 @@ export class Deinterlacer extends EventTarget {
   #filmDropped = 0;
   /**
    * Why requested film reconstruction is currently degraded, or null while
-   * healthy. The `film` / `autoFilm` options stay as the caller set them;
+   * healthy. The `film` option stays as the caller set it;
    * only the engine stands down, so this is never a silent option change.
    */
   #filmDegraded: string | null = null;
-  /** Consecutive autoFilm analyses with no usable target or programs. */
-  #filmAnalyseFailures = 0;
   /** Last worker-reported filmError, to derive the page-side failure event. */
   #workerFilmError: string | null = null;
   #workerFilmFailure = 0;
@@ -716,10 +626,6 @@ export class Deinterlacer extends EventTarget {
     super();
     this.#video = video;
     this.#doubleRate = options.doubleRate ?? false;
-    this.#autoFilm = options.autoFilm ?? false;
-    this.#filmCombThreshold = validateFilmCombThreshold(
-      options.filmCombThreshold ?? FFmpegIVTC.COMBED_PIXEL_LIMIT,
-    );
     this.#spatialCheck = options.spatialCheck ?? true;
     this.#debug = options.debug ?? false;
     this.#film = options.film ?? false;
@@ -755,7 +661,7 @@ export class Deinterlacer extends EventTarget {
     if (!(gl instanceof WebGL2RenderingContext))
       throw new Error("this browser has no WebGL2");
     this.#gl = gl;
-    if (this.#film && !this.#autoFilm) {
+    if (this.#film) {
       this.#requireFloatBuffers();
       this.#detector = new FilmDetector(gl);
     }
@@ -770,7 +676,6 @@ export class Deinterlacer extends EventTarget {
     this.#blit = createProgram(gl, BLIT_FRAGMENT_SHADER);
     this.#blitField = gl.getUniformLocation(this.#blit, "uField");
     this.#blitFlip = gl.getUniformLocation(this.#blit, "uFlip");
-    if (this.#autoFilm) this.#ensureFilmPrograms();
     this.#timerQueryExtension = gl.getExtension(
       "EXT_disjoint_timer_query_webgl2",
     );
@@ -822,8 +727,6 @@ export class Deinterlacer extends EventTarget {
   #workerRenderingOptions(): WorkerRenderingOptions {
     return {
       doubleRate: this.#doubleRate,
-      autoFilm: this.#autoFilm,
-      filmCombThreshold: this.#filmCombThreshold,
       spatialCheck: this.#spatialCheck,
       film: this.#film,
       debug: this.#debug,
@@ -857,7 +760,7 @@ export class Deinterlacer extends EventTarget {
       // Do not let history or queued fields measured under the old parity cross
       // the new source state.
       this.#frames = 0;
-      this.#resetFilm();
+      this.#dropQueue();
       this.#resetFieldMetrics();
       // Progressive video carries no cadence measurement, so schedule fields
       // only after measuring the first complete interlaced interval
@@ -934,13 +837,6 @@ export class Deinterlacer extends EventTarget {
   }
 
   set film(film: boolean) {
-    // autoFilm owns cadence when both options are requested. Changing the
-    // inactive GPU intent must not allocate it or clear a CPU failure.
-    if (this.#autoFilm) {
-      this.#film = film;
-      this.#postWorkerSettings();
-      return;
-    }
     // A degraded engine re-arms on an explicit `film = true`: the identity
     // guard below would otherwise make the documented manual retry a no-op
     // precisely when it is needed (degrade keeps the option on).
@@ -994,11 +890,9 @@ export class Deinterlacer extends EventTarget {
     this.#postWorkerSettings();
   }
 
-  /** Whether pictures are queued and put up by the loop rather than drawn on arrival.
-   * autoFilm joins the otya condition so the CPU film path keeps its loop.
-   */
+  /** Whether pictures are queued for presentation by the frame loop. */
   get #scheduled(): boolean {
-    return this.#doubleRate || this.#film || this.#autoFilm;
+    return this.#doubleRate || this.#film;
   }
 
   #applyScheduling(): void {
@@ -1010,7 +904,7 @@ export class Deinterlacer extends EventTarget {
         (this.#externalHost || this.#workerState === "main")
       )
         this.#startLoop();
-    } else if (!this.#autoFilm && !this.#film) {
+    } else if (!this.#film) {
       // Turning it off leaves fields on their way to a canvas that is about to
       // stop expecting them, and a frame's worth of texture each behind them.
       this.#presentedPicture = null;
@@ -1019,61 +913,8 @@ export class Deinterlacer extends EventTarget {
     }
   }
 
-  /** Whether hard-telecined material is reconstructed at film cadence. */
-  get autoFilm(): boolean {
-    return this.#autoFilm;
-  }
-
-  set autoFilm(autoFilm: boolean) {
-    const filmError = this.#worker ? this.#workerFilmError : this.#filmDegraded;
-    if (autoFilm === this.#autoFilm && (!autoFilm || filmError === null))
-      return;
-    this.#autoFilm = autoFilm;
-    if (this.#worker) {
-      this.#postWorkerSettings(autoFilm ? "autoFilm" : undefined);
-      return;
-    }
-    this.#postWorkerSettings();
-    this.#resetFilm();
-    if (autoFilm) {
-      // Stop the unselected detector as well as bypassing its output. A GPU
-      // failure must not disable the healthy CPU engine on the next frame.
-      this.#resetFieldMetrics();
-      this.#detector?.destroy();
-      this.#detector = null;
-      // Re-setting the option is a manual retry for a degraded engine.
-      if (!this.#recoverFilm() || this.#autoFilm !== autoFilm) return;
-      if (this.#width > 0) {
-        this.#allocateOutputs();
-      }
-      if (
-        (this.#scan?.interlaced ?? true) &&
-        (this.#externalHost || this.#workerState === "main")
-      )
-        this.#startLoop();
-    } else {
-      // Withdrawing the intent clears the error with it.
-      if (!this.#recoverFilm() || this.#autoFilm !== autoFilm) return;
-      this.#freeAnalysisTarget();
-      this.#applyScheduling();
-    }
-  }
-
-  /** The combed-pixel limit used by automatic film detection. */
-  get filmCombThreshold(): number {
-    return this.#filmCombThreshold;
-  }
-
-  set filmCombThreshold(value: number) {
-    const validated = validateFilmCombThreshold(value);
-    if (validated === this.#filmCombThreshold) return;
-    this.#filmCombThreshold = validated;
-    this.#postWorkerSettings();
-    if (this.#autoFilm) this.#resetFilm();
-  }
-
   /** Worker と canvas を再構築せずに変更可能なフィルター設定を反映する。 */
-  #postWorkerSettings(retryFilm?: "film" | "autoFilm"): void {
+  #postWorkerSettings(retryFilm?: "film"): void {
     this.#worker?.postMessage({
       type: "settings",
       options: this.#workerRenderingOptions(),
@@ -1287,12 +1128,6 @@ export class Deinterlacer extends EventTarget {
    * Silently turning the `film` option off is not a fallback -- it would
    * rewrite the caller's 24fps intent -- so the option stays on and only
    * the engine stands down.
-   *
-   * NOTE: the reason prefixes below (`film detector unavailable`,
-   * `film detection failed`, `autoFilm analysis unavailable`) are
-   * load-bearing for the KonomiTV caller, which matches on them to decide
-   * the explicit autoFilm recovery (G6). Rewording them silently drops that
-   * recovery to a log line; prefer a typed detail if this grows further.
    */
   #degradeFilm(reason: string): void {
     // A repeated identical reason stays one episode; a different reason is
@@ -1302,7 +1137,6 @@ export class Deinterlacer extends EventTarget {
     this.#filmLocked = false;
     this.#phase = NO_PHASE;
     this.#resetFieldMetrics();
-    this.#filmAnalyseFailures = 0;
     // A detector that threw once would throw every frame; drop it so the
     // loop does useful work until a retry point rebuilds it.
     this.#detector?.destroy();
@@ -1318,25 +1152,8 @@ export class Deinterlacer extends EventTarget {
   #recoverFilm(): boolean {
     if (this.#destroyed) return false;
     if (this.#worker) return true;
-    const revision = this.#playbackRevision;
     this.#filmDegraded = null;
-    this.#filmAnalyseFailures = 0;
-    // Retry all CPU analysis resources here, not only its framebuffer: a
-    // runtime option change can also fail while linking the programs.
-    if (this.#autoFilm) {
-      try {
-        this.#ensureFilmPrograms();
-        if (this.#width > 0) this.#allocateAnalysisTarget();
-      } catch (error) {
-        this.#degradeFilm(
-          `autoFilm programs unavailable: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-    // A stop, destruction or restart invalidates the suspended operation.
-    // Changing engines alone does not: start() must still finish acquiring
-    // frames, using the current options instead of leaving running=true idle.
-    return !this.#destroyed && revision === this.#playbackRevision;
+    return true;
   }
 
   /** 一時的な Worker 障害を1回だけ復旧し、再失敗時は media element 自体を表示する。 */
@@ -1405,8 +1222,7 @@ export class Deinterlacer extends EventTarget {
     this.#playbackRevision++;
     this.#running = true;
     this.#resetStats();
-    this.#resetFilm();
-    // A new playback attempts the requested engines again.
+    // A new playback retries film detection if it was requested.
     if (!this.#recoverFilm()) return;
     this.#lastVideoFrameCallbackAt = performance.now();
     this.#lastFallbackAt = this.#lastVideoFrameCallbackAt;
@@ -1482,7 +1298,6 @@ export class Deinterlacer extends EventTarget {
     for (const texture of this.#textures) this.#gl.deleteTexture(texture);
     this.#textures = [];
     this.#freeOutputs();
-    this.#freeAnalysisTarget();
     for (const q of [
       ...this.#freeQueries,
       ...this.#timerUsingQueries.map(({ q }) => q),
@@ -1499,9 +1314,6 @@ export class Deinterlacer extends EventTarget {
     }
     this.#gl.deleteProgram(this.#program);
     this.#gl.deleteProgram(this.#blit);
-    if (this.#filmAnalysis) this.#gl.deleteProgram(this.#filmAnalysis);
-    if (this.#filmWeave) this.#gl.deleteProgram(this.#filmWeave);
-    if (this.#filmSample) this.#gl.deleteProgram(this.#filmSample);
     this.#gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 
@@ -1540,9 +1352,7 @@ export class Deinterlacer extends EventTarget {
       return createImageBitmap(this.#video);
     if (picture.kind === "texture")
       this.#showTexture(picture.texture, picture.flip, false);
-    else if (picture.kind === "yadif")
-      this.#render(picture.flush, picture.second, null, false);
-    else this.#renderFilm(null, false);
+    else this.#render(picture.flush, picture.second, null, false);
     const width = this.#video.videoWidth;
     const height = this.#video.videoHeight;
     if (
@@ -1994,20 +1804,9 @@ export class Deinterlacer extends EventTarget {
         // behind, and the clock they were timed by is pinned to the same
         // place. Both start again from where playback actually is.
         this.#dropQueue();
-        this.#resetFilm();
         this.#resetFieldMetrics();
       }
-      const skippedFilmFrame =
-        this.#autoFilm &&
-        this.#lastPresented !== 0 &&
-        metadata.presentedFrames - this.#lastPresented > 1;
       const missed = this.#count(metadata.presentedFrames, stale);
-      if (!stale && skippedFilmFrame) {
-        // A cadence decision cannot span a picture the callback did not see.
-        // Refill the four-frame history before matching fields again.
-        this.#frames = 0;
-        this.#resetFilm();
-      }
       // The same picture presented again, which the compositor does whenever
       // nothing new has been decoded: paused, stalled, or stopped at the end
       // of a stream, and at the display's rate rather than the video's.
@@ -2059,42 +1858,7 @@ export class Deinterlacer extends EventTarget {
       const begin = performance.now();
       const q = this.#beginGpuTimer(false);
       this.#push();
-      const previousMode = this.#mode;
-      // A degraded engine attempts no new cadence decisions; the frame
-      // continues through YADIF below while the caller's intent is kept.
-      const analysis =
-        this.#autoFilm && !this.#filmDegraded && this.#frames === HISTORY
-          ? this.#analyseFilm()
-          : false;
-      if (analysis === "unavailable") {
-        if (++this.#filmAnalyseFailures >= FILM_ANALYSE_FAILURE_LIMIT) {
-          this.#degradeFilm(
-            "autoFilm analysis unavailable: the GPU analysis target or programs would not allocate",
-          );
-        }
-      } else {
-        this.#filmAnalyseFailures = 0;
-      }
-      if (!this.#frameIsCurrent(revision)) {
-        if (!this.#destroyed) this.#endGpuTimer(q);
-        return;
-      }
-      const filmFrameShouldBeDropped = analysis === true;
-      const cadenceChanged = previousMode !== this.#mode;
-      // A duplicate that confirms film cadence adds no output, but stale field
-      // deadlines from the old mode still need discarding at the transition
-      if (cadenceChanged) this.#dropQueue();
-      // Decimation is only safe when the output schedule can retain the
-      // selected film picture. If allocation or timing is not ready, keep the
-      // frame on the direct path rather than silently dropping it.
-      const shouldDropFilmFrame =
-        filmFrameShouldBeDropped && this.#scheduling();
-      if (
-        this.#film &&
-        !this.#autoFilm &&
-        !this.#filmDegraded &&
-        !this.#detector
-      ) {
+      if (this.#film && !this.#filmDegraded && !this.#detector) {
         // A retry point stood the engine back up; rebuild the detector the
         // setter would have built. A repeated failure degrades as a new
         // episode rather than silently idling without pulldown detection.
@@ -2110,7 +1874,7 @@ export class Deinterlacer extends EventTarget {
         if (!this.#destroyed) this.#endGpuTimer(q);
         return;
       }
-      if (this.#film && !this.#autoFilm && !this.#filmDegraded) {
+      if (this.#film && !this.#filmDegraded) {
         // GPU pulldown detection (otya): a missed frame leaves a gap in the
         // held frames, so the comparisons carried over would be between
         // frames that were never neighbours.
@@ -2150,41 +1914,8 @@ export class Deinterlacer extends EventTarget {
       // time that carries the transit across the thread boundary with it.
       const frameAt = this.#displayTime(metadata, now);
       const shown = frameAt + this.#refreshMs;
-      if (shouldDropFilmFrame) {
-        this.#droppedBefore++;
-        // decimate removes this duplicate before YADIF, so it contributes no
-        // output picture to the reconstructed film cadence.
-      } else if (
-        this.#autoFilm &&
-        !this.#filmDegraded &&
-        !this.#isCombed &&
-        this.#mode === "film"
-      ) {
-        if (this.#scheduling()) {
-          // Five input frames become four film pictures. The interval between
-          // them is therefore five quarters of the measured input period.
-          const duration = (this.#periodMs * 5) / 4;
-          const queueResetted = this.#prepareQueue(1, now, duration);
-          // The first picture needs one output interval of presentation slack;
-          // otherwise the next animation frame can consume its turn before presentation.
-          // The slack applies only when no chain exists: gating it on the
-          // pending queue instead would resync on every frame whose pictures
-          // were already shown (F1).
-          const ideal =
-            queueResetted || this.#lastScheduled === null
-              ? shown + duration
-              : shown;
-          this.#filterFilm(this.#schedule("film", ideal, duration), duration);
-        } else {
-          // Until a period and output pool exist, keep the direct film draw
-          // path rather than inventing a second presentation scheduler.
-          this.#renderFilm(null);
-        }
-      } else if (this.#filmLocked && !this.#autoFilm) {
-        // GPU pulldown path (otya) through the shared queue. The weave
-        // itself happens in #render via the film uniforms, driven by the
-        // lock computed above. autoFilm takes precedence: with both options
-        // on, the CPU engine owns the cadence and the GPU branch stays out.
+      if (this.#filmLocked) {
+        // Reconstruct film through the shared queue using the detector's field metrics.
         if (this.#scheduling()) {
           const phase = this.#phase.phase;
           if (phase === FILM_DUPLICATE_PHASE) {
@@ -2219,8 +1950,7 @@ export class Deinterlacer extends EventTarget {
         // video callback runs just after the animation callback for the same
         // composite. Without it, both fields are due at the next animation
         // callback and the scheduler retires the first one before drawing it.
-        // Like the film branches, the slack applies only when no chain
-        // exists (F1).
+        // As in the film path, the slack applies only when no chain exists.
         const ideal =
           queueResetted || this.#lastScheduled === null
             ? shown + duration * 2
@@ -2306,8 +2036,7 @@ export class Deinterlacer extends EventTarget {
     this.#scan = scan;
     this.#frames = 0;
     this.#dropQueue();
-    this.#resetFilm();
-    // A new section reallocates and retries the requested engines.
+    // A new section reallocates resources and retries film detection.
     if (!this.#recoverFilm()) return;
     // Progressive sections provide no cadence measurement, and a discontinuity
     // may change the input rate, so remeasure the next interlaced section
@@ -2333,7 +2062,7 @@ export class Deinterlacer extends EventTarget {
    */
   #scheduling(): boolean {
     return (
-      (this.#doubleRate || this.#autoFilm || this.#film) &&
+      (this.#doubleRate || this.#film) &&
       this.#periodMs > 0 &&
       this.#outputs.length === OUTPUT_POOL_LENGTH
     );
@@ -2360,221 +2089,6 @@ export class Deinterlacer extends EventTarget {
       this.#periodMs > 0 && period > this.#periodMs * PERIOD_SHORTER
         ? this.#periodMs + (period - this.#periodMs) * PERIOD_SMOOTHING
         : period;
-  }
-
-  /** Build the optional film passes only for callers that enable them. */
-  #ensureFilmPrograms(): void {
-    if (this.#filmAnalysis && this.#filmWeave && this.#filmSample) return;
-    const gl = this.#gl;
-    // Publish the set only after all passes link. A failed later pass must
-    // not leak earlier programs every time the caller requests recovery.
-    const programs: WebGLProgram[] = [];
-    let filmAnalysis: WebGLProgram;
-    let filmWeave: WebGLProgram;
-    let filmSample: WebGLProgram;
-    try {
-      filmAnalysis = createProgram(gl, FILM_ANALYSIS_FRAGMENT_SHADER);
-      programs.push(filmAnalysis);
-      filmWeave = createProgram(gl, FILM_WEAVE_FRAGMENT_SHADER);
-      programs.push(filmWeave);
-      filmSample = createProgram(gl, FILM_SAMPLE_FRAGMENT_SHADER);
-      programs.push(filmSample);
-    } catch (error) {
-      for (const program of programs) gl.deleteProgram(program);
-      throw error;
-    }
-    this.#filmAnalysis = filmAnalysis;
-    this.#filmAnalysisLocation = Object.fromEntries(
-      Object.entries(FILM_UNIFORMS)
-        .filter(([key]) => key !== "match" && key !== "topFieldFirst")
-        .map(([key, name]) => [key, gl.getUniformLocation(filmAnalysis, name)]),
-    ) as Record<
-      Exclude<keyof typeof FILM_UNIFORMS, "match" | "topFieldFirst">,
-      WebGLUniformLocation | null
-    >;
-    this.#filmWeave = filmWeave;
-    this.#filmWeaveLocation = Object.fromEntries(
-      Object.entries(FILM_UNIFORMS).map(([key, name]) => [
-        key,
-        gl.getUniformLocation(filmWeave, name),
-      ]),
-    ) as Record<keyof typeof FILM_UNIFORMS, WebGLUniformLocation | null>;
-    this.#filmSample = filmSample;
-    this.#filmSampleLocation = Object.fromEntries(
-      Object.entries(FILM_UNIFORMS).map(([key, name]) => [
-        key,
-        gl.getUniformLocation(filmSample, name),
-      ]),
-    ) as Record<keyof typeof FILM_UNIFORMS, WebGLUniformLocation | null>;
-  }
-
-  /**
-   * Run FFmpeg's fieldmatch and live decimate decisions on reduced luma.
-   * Full decoded frames remain in GPU textures, while the first readback packs
-   * the previous, current and next luma proxies into RGB. A second readback
-   * supplies the selected RGB weave to its chroma-sensitive decimate metric.
-   *
-   * Returns whether the frame is a pulldown duplicate, or `"unavailable"`
-   * when the analysis target or programs never allocated: allocation either
-   * works or it does not, so the caller treats a short run of those as a
-   * persistent failure rather than a startup race.
-   */
-  #analyseFilm(): "unavailable" | boolean {
-    const target = this.#analysisTarget;
-    const analysis = this.#filmAnalysis;
-    const analysisLocation = this.#filmAnalysisLocation;
-    const sampleProgram = this.#filmSample;
-    const sampleLocation = this.#filmSampleLocation;
-    if (
-      !target ||
-      !analysis ||
-      !analysisLocation ||
-      !sampleProgram ||
-      !sampleLocation
-    )
-      return "unavailable";
-    const gl = this.#gl;
-    const newest = this.#head;
-    const cur = (this.#head + HISTORY - 1) % HISTORY;
-    const prev = (this.#head + HISTORY - 2) % HISTORY;
-    const isTopFieldFirst = this.#topFieldFirst;
-
-    // One GPU draw and readback supplies the three luma frames without moving
-    // full-resolution RGBA pictures through JavaScript.
-    gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
-    gl.useProgram(analysis);
-    for (const [unit, texture] of [prev, cur, newest].entries()) {
-      gl.activeTexture(gl.TEXTURE0 + unit);
-      gl.bindTexture(gl.TEXTURE_2D, this.#textures[texture] ?? null);
-    }
-    gl.uniform1i(analysisLocation.prev, 0);
-    gl.uniform1i(analysisLocation.cur, 1);
-    gl.uniform1i(analysisLocation.next, 2);
-    gl.uniform2i(analysisLocation.size, this.#width, this.#height);
-    gl.viewport(0, 0, FILM_ANALYSIS_WIDTH, FILM_ANALYSIS_HEIGHT);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.readPixels(
-      0,
-      0,
-      FILM_ANALYSIS_WIDTH,
-      FILM_ANALYSIS_HEIGHT,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      target.pixels,
-    );
-    const { previousLuma, currentLuma, nextLuma } = target;
-    for (let pixel = 0; pixel < previousLuma.length; pixel++) {
-      const offset = pixel * 4;
-      previousLuma[pixel] = target.pixels[offset] ?? 0;
-      currentLuma[pixel] = target.pixels[offset + 1] ?? 0;
-      nextLuma[pixel] = target.pixels[offset + 2] ?? 0;
-    }
-    const fieldMatch = this.#ivtc.fieldMatch(
-      previousLuma,
-      currentLuma,
-      nextLuma,
-      isTopFieldFirst,
-      this.#filmCombThreshold,
-    );
-
-    // Decimate returns the selected RGB weave to YUV 4:2:0 sample density, so
-    // brightness noise and colour-only changes share FFmpeg's metric scale.
-    gl.useProgram(sampleProgram);
-    gl.uniform1i(sampleLocation.prev, 0);
-    gl.uniform1i(sampleLocation.cur, 1);
-    gl.uniform1i(sampleLocation.next, 2);
-    gl.uniform2i(sampleLocation.size, this.#width, this.#height);
-    gl.uniform1i(sampleLocation.topFieldFirst, isTopFieldFirst ? 1 : 0);
-    gl.uniform1i(
-      sampleLocation.match,
-      fieldMatch.match === "p" ? 0 : fieldMatch.match === "c" ? 1 : 2,
-    );
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.readPixels(
-      0,
-      0,
-      FILM_ANALYSIS_WIDTH,
-      FILM_ANALYSIS_HEIGHT,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      target.pixels,
-    );
-    const decimate = this.#ivtc.decimate(target.pixels);
-    this.#match = fieldMatch.match;
-    this.#combScore = fieldMatch.combScore;
-    this.#isCombed = fieldMatch.isCombed;
-    this.#duplicateScore = decimate.lowestCycleDifference;
-    this.#duplicateRunnerUp = decimate.runnerUpCycleDifference;
-
-    // Only a clean match inside a decimated cycle enters film mode. Every
-    // non-decimated cycle retains the original YADIF path.
-    const isFilmCycle = decimate.dropIndex !== null && !fieldMatch.isCombed;
-    if ((isFilmCycle ? "film" : "video") !== this.#mode) {
-      // Queued deadlines belong to their originating cadence, so anchor the
-      // first picture of the new cadence to this frame callback
-      this.#mode = isFilmCycle ? "film" : "video";
-    }
-    return decimate.shouldDrop && !fieldMatch.isCombed;
-  }
-
-  /** Weave the selected film fields into an output texture and queue it. */
-  #filterFilm(at: number, duration: number): void {
-    const slot = this.#nextOutputSlot();
-    if (slot === null) return;
-    const output = this.#outputs[slot];
-    if (!output) return;
-    this.#outputHead = slot;
-    // Reusing a framebuffer retires the picture whose pixels it replaces.
-    while (this.#queue.length > 0 && this.#queue[0]?.slot === slot) {
-      this.#queue.shift();
-      this.#stats.late++;
-    }
-    this.#renderFilm(output.framebuffer);
-    const ready: Ready = {
-      slot,
-      at,
-      duration,
-      cadence: "film",
-      phase: 0,
-      droppedBefore: this.#droppedBefore,
-    };
-    this.#droppedBefore = 0;
-    this.#queue.push(ready);
-    this.#lastScheduled = ready;
-  }
-
-  /** Draw the selected p/c/n field weave into a full-size output texture. */
-  #renderFilm(target: WebGLFramebuffer | null, countOutput = true): void {
-    const program = this.#filmWeave;
-    const location = this.#filmWeaveLocation;
-    if (!program || !location) return;
-    const gl = this.#gl;
-    const newest = this.#head;
-    const cur = (this.#head + HISTORY - 1) % HISTORY;
-    const prev = (this.#head + HISTORY - 2) % HISTORY;
-    const isTopFieldFirst = this.#topFieldFirst;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, target);
-    gl.useProgram(program);
-    for (const [unit, texture] of [prev, cur, newest].entries()) {
-      gl.activeTexture(gl.TEXTURE0 + unit);
-      gl.bindTexture(gl.TEXTURE_2D, this.#textures[texture] ?? null);
-    }
-    gl.uniform1i(location.prev, 0);
-    gl.uniform1i(location.cur, 1);
-    gl.uniform1i(location.next, 2);
-    gl.uniform2i(location.size, this.#width, this.#height);
-    gl.uniform1i(location.topFieldFirst, isTopFieldFirst ? 1 : 0);
-    gl.uniform1i(
-      location.match,
-      this.#match === "p" ? 0 : this.#match === "c" ? 1 : 2,
-    );
-    gl.viewport(0, 0, this.#width, this.#height);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    if (target === null) {
-      this.#presentedPicture = { kind: "film" };
-      this.#setVisible(true);
-      if (countOutput) this.#outputSinceReport++;
-    }
   }
 
   /**
@@ -3014,9 +2528,7 @@ export class Deinterlacer extends EventTarget {
     const refreshes = step / this.#refreshMs;
     const which =
       ready.cadence === "film"
-        ? ready.phase === 0
-          ? "CPU film"
-          : `phase ${ready.phase}`
+        ? `phase ${ready.phase}`
         : ready.cadence === "field"
           ? `field ${ready.phase}`
           : "frame";
@@ -3097,8 +2609,7 @@ export class Deinterlacer extends EventTarget {
     const elapsed = at - this.#reportedAt;
     if (elapsed < STATS_INTERVAL_MS) return;
     const frames =
-      this.#scheduling() &&
-      (this.#doubleRate || this.#mode === "film" || this.#filmLocked)
+      this.#scheduling() && (this.#doubleRate || this.#filmLocked)
         ? this.#showFramesSinceReport
         : this.#renderFramesSinceReport;
     // Keep the published per-input-picture CPU cost: both fields' filtering
@@ -3135,12 +2646,7 @@ export class Deinterlacer extends EventTarget {
       fps: (frames * 1000) / elapsed,
       frameMs,
       maxQueuedFields: this.#reportMaxQueuedFields,
-      mode: this.#autoFilm ? this.#mode : this.#filmLocked ? "film" : "video",
-      match: this.#match,
-      combScore: this.#combScore,
       outputFps: (this.#outputSinceReport * 1000) / elapsed,
-      duplicateScore: this.#duplicateScore,
-      duplicateRunnerUp: this.#duplicateRunnerUp,
       gpuMs,
       film: this.#filmLocked,
       filmError: this.#filmDegraded,
@@ -3217,11 +2723,8 @@ export class Deinterlacer extends EventTarget {
     gl.uniform1i(this.#location.prev, 0);
     gl.uniform1i(this.#location.cur, 1);
     gl.uniform1i(this.#location.next, 2);
-    // The GPU engine owns pixels only when it also owns the cadence: under
-    // autoFilm the CPU engine schedules, so its fields must not be woven
-    // by the GPU detector behind its back.
-    const metrics =
-      this.#film && !this.#autoFilm ? (this.#detector?.texture ?? null) : null;
+    // Use the detector's field metrics while film reconstruction is enabled.
+    const metrics = this.#film ? (this.#detector?.texture ?? null) : null;
     const film = metrics !== null;
     if (metrics !== null) {
       gl.activeTexture(gl.TEXTURE0 + 3);
@@ -3307,7 +2810,7 @@ export class Deinterlacer extends EventTarget {
     this.#height = height;
     this.#frames = 0;
     this.#presentedPicture = null;
-    this.#resetFilm();
+    this.#dropQueue();
     this.#layout();
     for (const texture of this.#textures) gl.deleteTexture(texture);
     this.#textures = [];
@@ -3336,68 +2839,11 @@ export class Deinterlacer extends EventTarget {
       this.#textures.push(texture);
     }
     this.#freeOutputs();
-    this.#freeAnalysisTarget();
-    if (this.#doubleRate || this.#autoFilm || this.#film)
-      this.#allocateOutputs();
+    if (this.#doubleRate || this.#film) this.#allocateOutputs();
     this.#detector?.resize(width, height);
     // Fresh resources mean fresh attempts: a degraded engine retries on the
     // next frame instead of staying stood down for the stream's lifetime.
     this.#recoverFilm();
-  }
-
-  /** Allocate the fixed-size framebuffer used by both cadence passes. */
-  #allocateAnalysisTarget(): void {
-    if (this.#analysisTarget) return;
-    const gl = this.#gl;
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA,
-      FILM_ANALYSIS_WIDTH,
-      FILM_ANALYSIS_HEIGHT,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      null,
-    );
-    const framebuffer = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-    gl.framebufferTexture2D(
-      gl.FRAMEBUFFER,
-      gl.COLOR_ATTACHMENT0,
-      gl.TEXTURE_2D,
-      texture,
-      0,
-    );
-    const complete =
-      gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    if (!complete) {
-      gl.deleteFramebuffer(framebuffer);
-      gl.deleteTexture(texture);
-      return;
-    }
-    this.#analysisTarget = {
-      texture,
-      framebuffer,
-      pixels: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT * 4),
-      previousLuma: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT),
-      currentLuma: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT),
-      nextLuma: new Uint8Array(FILM_ANALYSIS_WIDTH * FILM_ANALYSIS_HEIGHT),
-    };
-  }
-
-  #freeAnalysisTarget(): void {
-    if (!this.#analysisTarget) return;
-    this.#gl.deleteFramebuffer(this.#analysisTarget.framebuffer);
-    this.#gl.deleteTexture(this.#analysisTarget.texture);
-    this.#analysisTarget = null;
   }
 
   /**
@@ -3536,7 +2982,6 @@ export class Deinterlacer extends EventTarget {
     // The counts belong to the stream that has just gone; the next one starts
     // its own. The element resets its own dropped count for the same reason.
     this.#resetStats();
-    this.#resetFilm();
     this.#presentedPicture = null;
     this.#setVisible(false);
   };
@@ -3562,23 +3007,11 @@ export class Deinterlacer extends EventTarget {
     this.#showMsSinceReport = 0;
     this.#reportMaxQueuedFields = 0;
     this.#outputSinceReport = 0;
-    this.#resetFilm();
+    this.#dropQueue();
     this.#gpuFrameNanosecondsSinceReport = 0;
     this.#gpuFrameCountSinceReport = 0;
     this.#gpuFieldNanosecondsSinceReport = 0;
     this.#gpuFieldCountSinceReport = 0;
-  }
-
-  /** Return FFmpeg's fieldmatch and decimate windows to their initial state. */
-  #resetFilm(): void {
-    this.#dropQueue();
-    this.#mode = "video";
-    this.#match = "c";
-    this.#combScore = 0;
-    this.#isCombed = true;
-    this.#ivtc.reset();
-    this.#duplicateScore = Infinity;
-    this.#duplicateRunnerUp = Infinity;
   }
 
   /**
@@ -3620,7 +3053,7 @@ export class Deinterlacer extends EventTarget {
       // belongs to the former position, so expose the video until the callback
       // refills every texture from the new timeline.
       this.#frames = 0;
-      this.#resetFilm();
+      this.#dropQueue();
       this.#resetFieldMetrics();
       this.#presentedPicture = null;
       this.#setVisible(false);
@@ -3651,10 +3084,9 @@ export class Deinterlacer extends EventTarget {
       }
     }
     if (rateChanged) {
-      // 新しい再生速度のフレームが3枚そろうまで、旧周期の field match と decimate 位相を持ち越さずに通常の YADIF で表示する。
+      // Rebuild frame history and cadence for the new playback rate before reconstructing film.
       this.#frames = 0;
       this.#lastPresented = 0;
-      this.#resetFilm();
       this.#resetFieldMetrics();
     }
   };

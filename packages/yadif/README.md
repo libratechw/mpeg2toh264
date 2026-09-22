@@ -53,25 +53,28 @@ Firefox は倍速時も描画済みフレーム数を使い、追加のデコー
 
 `probeDecoder()`と`decoderDeinterlaces()`は、ブラウザーのデコーダーがすでにデインターレースしているかを確認します。二重処理を避けるため、フィルターの有効化前に利用できます。
 
-### `autoFilm`
+### `film`
 
-`autoFilm` を有効にすると、FFmpeg の `fieldmatch=mode=pc_n:combmatch=full:mchroma=0` を移植したフィールド選択と、縮小画像上で `decimate=cycle=5:mixed=1` と同じ重複閾値を使うライブ向け周期判定により、3:2 プルダウン区間を 24000/1001fps で表示します。  
-FFmpeg の `decimate` は5フレームを保持してから同じ周期内の最小差分を選びますが、この実装は音声に対する映像遅延を増やさないよう、完了した周期の位相を次の周期へ適用します。
-
-重複を含む周期でフィールドマッチが成立した場合だけ、24fps のフィルム区間として扱います。  
-フィルム周期として採用されていない区間は通常の YADIF 処理へ渡します。  
-フィールドマッチ後もインターレースと判定されたフレームは間引かず、YADIF で処理します。  
+`film` を有効にすると、GPU 上で 2:3 プルダウンの周期とフィールドの組み合わせを検出し、フィルム区間を 24000/1001fps 相当で表示します。  
+フィルム判定が確定していない区間は YADIF で処理します。  
 `doubleRate` が有効なら 60000/1001fps 相当、無効なら入力フレームレートで表示するため、実写の 60i 区間はフィールドレートの動きを維持します。
 
-`autoFilm` の既定値は `false` です。  
-無効時には判定用シェーダーとフレームバッファーを生成せず、通常の YADIF 経路だけを使用します。
+`film` の既定値は `false` です。  
+有効時には WebGL2 と `EXT_color_buffer_float` が必要で、無効時にはフィルム検出器を生成しません。
 
-`filmCombThreshold` で fieldmatch の comb 判定閾値を変更できます。
-既定値は FFmpeg の `combpel=80` 相当で、`combScore` がこの値以上のフィールドはインターレースとして扱われます。
+```ts
+const deinterlacer = new Deinterlacer(video, {
+  doubleRate: true,
+  film: true,
+});
+```
 
-field order は `scan` から受け取ります。
-通常の player 経由では MPEG-2 bitstream から自動的に設定されます。
-standalone で BFF を指定する場合は、次のように設定します。
+統計の `film` は検出器の判定が確定している場合に `true` 、それ以外は `false` となります。  
+設定の `film` はフィルム検出の有効・無効を指定するため、現在の映像がフィルムかどうかは統計側で確認してください。
+
+フィールド順は `scan` から受け取ります。  
+通常のプレイヤー経由では MPEG-2 ビットストリームから自動的に設定されます。  
+単体でボトムフィールドを先に表示する場合は、次のように設定してください。
 
 ```ts
 const deinterlacer = new Deinterlacer(video);
@@ -82,30 +85,16 @@ deinterlacer.scan = {
 deinterlacer.enabled = true;
 ```
 
-### `film`
-
-`film` を有効にすると、GPU 上で 2:3 プルダウン位相を検出し、フィルム区間を 24fps で表示します。CPU 側の `autoFilm` とは別の検出器です。両方が `true` の場合は CPU 優先となり、GPU 検出器は生成されません。CPU 優先中は GPU 専用の `EXT_color_buffer_float` は不要ですが、WebGL2 は常に必要です。
-
-GPU 専用経路の構築時に拡張不足や検出器の作成不能がある場合は同期例外となります。構築後の `film` setter で作成不能となった場合は例外とせず、plain YADIF へ退避（degrade）し、`failure` イベント / `onFailure` コールバックおよび統計の `filmError` で通知します（option は意図として残ります）。
-
-```ts
-const deinterlacer = new Deinterlacer(video, {
-  doubleRate: true,
-  film: true,
-});
-```
-
-統計の `mode` は、選択中の検出器がフィルム区間と判定している場合に `"film"` 、それ以外は `"video"` となります。  
-統計の `film` は GPU 検出器の確定状態を表します。  
-新規の利用では GPU 上で判定する `film` を推奨し、CPU へ縮小画像を読み戻す `autoFilm` は既存の比較・明示選択用として保持しています。
-
 ### 障害時の契約
 
-`film` / `autoFilm` は 24fps 再構成の意図であり、GPU 資源の確保を約束しません。GPU 専用経路の構築時（WebGL2 不在、`EXT_color_buffer_float` 不足、検出器作成不能）は同期例外として呼び出し側へ返します。
+`film: true` での構築時に WebGL2 や `EXT_color_buffer_float` が利用できない場合、または検出器を作成できない場合は、同期例外として呼び出し側へ返します。
 
-実行中に GPU 検出器のみに障害が発生し WebGL コンテキストが健全な場合は、plain YADIF へ退避（degrade）し、`failure` イベント、`onFailure` オプション、統計の `filmError` で通知します。ライブラリが `film` や `autoFilm` オプションを黙って書き換えることはありません。CPU 側へフォールバックするかは呼び出し側の明示判断です（例: GPU 検出失敗を受けて `film = false` を先に設定してから `autoFilm = true` を設定）。CPU 自身の障害や WebGL コンテキスト喪失に対して無限再試行は行いません。
+実行中の検出器の障害や、構築後の `film` 設定変更で検出器を作成できない場合は、通常の YADIF 処理へ戻ります。  
+`failure` イベント、`onFailure` コールバック、統計の `filmError` で理由を通知し、設定の `film` は維持します。  
+この間も WebGL コンテキストが健全で `doubleRate` が有効なら、フィールドごとのデインターレースを継続します。
 
-復旧は資源の再確保契機（start、scan 変化、resize、明示的な option 再設定）で再試行し、再失敗は新しい episode として再通知します。なお、WebGL コンテキスト喪失や Worker 再起動後の再失敗は、plain YADIF の継続が保証されるものではなく、元 video 表示への退避または停止を伴う描画障害となります。
+`start()` 、`scan` の変化、映像サイズの変化、明示的な `film = true` の再設定で復旧を試み、再び失敗した場合は通知します。  
+WebGL コンテキスト喪失や Worker 再起動後の再失敗は、元の動画要素の表示への切り替え、または描画停止を伴います。
 
 ### `capture()` と統計イベント
 
@@ -113,9 +102,10 @@ const deinterlacer = new Deinterlacer(video, {
 WebGL の描画バッファーを常時保持する設定には依存しません。
 
 再生中は、`DeinterlaceStats` の同じスナップショットを約1秒ごとに `stats` イベントと `onStats` コールバックへ通知します。
-`late` と `maxQueuedFields` は表示予定の状態、`frameMs` は入力1枚あたりの描画スレッドでの平均処理時間、`mode` と `outputFps` は選択中の描画経路の判定と出力頻度を表します。  
-`match`、`combScore`、`duplicateScore`、`duplicateRunnerUp` は `autoFilm` 用の値です。  
-`resynced`、`gpuMs`、`film`、`filmError` は任意プロパティとして定義されています。
+`late` と `maxQueuedFields` は表示予定の状態、`frameMs` は入力1枚あたりの描画スレッドでの平均処理時間、`film` と `outputFps` はフィルム判定と出力頻度を表します。  
+`resynced` は、シークや停止、周期の変化などで表示予定を時計に合わせ直した回数です。  
+`gpuMs` は GPU の計時に対応している場合の平均処理時間で、非対応時は `undefined` となります。  
+任意プロパティの `filmError` は、検出器が停止している理由、または正常時の `null` を返します。
 
 Worker へは `expectedDisplayTime` と取得側の `timeOrigin` を渡し、描画側の時計へ変換した表示予定を使用します（無効または不自然な予定値の場合は取り込み時刻へフォールバックします）。容量確保で待機中のフィールドを破棄した場合は、残った表示予定を詰め、破棄したフィールドの表示時間を空白として残しません。
 `requestVideoFrameCallback()` が 250ms 以上止まっても映像自体が進んでいる場合は、`requestAnimationFrame()` が復号フレーム数と再生時刻を監視して同じデインタレース処理を継続します。

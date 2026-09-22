@@ -104,15 +104,11 @@ function post(
 function applySettings(
   renderer: Deinterlacer,
   options: WorkerRenderingOptions,
-  retryFilm?: "film" | "autoFilm",
+  retryFilm?: "film",
 ): void {
   renderer.doubleRate = options.doubleRate;
-  // Settings snapshots also carry unrelated changes. Only an explicit
-  // option retry may re-arm an unchanged, degraded engine.
-  if (renderer.autoFilm !== options.autoFilm || retryFilm === "autoFilm")
-    renderer.autoFilm = options.autoFilm;
-  renderer.filmCombThreshold = options.filmCombThreshold;
   renderer.spatialCheck = options.spatialCheck;
+  // Only an explicit retry may re-arm an unchanged, degraded detector.
   if (renderer.film !== options.film || retryFilm === "film")
     renderer.film = options.film;
   renderer.debug = options.debug;

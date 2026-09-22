@@ -1,18 +1,8 @@
 // Owner callbacks run synchronously. A recovery must not outlive the stop or
 // destruction requested by that callback, including in the frame watchdog.
 import assert from "node:assert/strict";
-import { build } from "esbuild";
 import { buildBundles, run } from "./yadif-clock-harness.mjs";
 
-const compiled = await build({
-  entryPoints: ["packages/yadif/src/shader.ts"],
-  bundle: true,
-  format: "esm",
-  write: false,
-});
-const shaders = await import(
-  `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`
-);
 const bundles = await buildBundles(process.cwd());
 let cases = 0;
 for (const listener of ["event", "callback"])
@@ -23,7 +13,6 @@ for (const listener of ["event", "callback"])
       "scan",
       "timeline",
       "resize",
-      "frame",
       "watchdog",
     ]) {
       const label = `${listener}/${action}/${trigger}`;
@@ -44,31 +33,23 @@ for (const listener of ["event", "callback"])
         );
         control.deinterlacer(
           action === "withdraw"
-            ? "__deinterlacer.autoFilm = false"
+            ? "__deinterlacer.film = false"
             : `__deinterlacer.${action}()`,
         );
         atAction = allocations;
         requestsAtAction = control.requests.length;
       };
-      const inFrame = ["frame", "watchdog"].includes(trigger);
       const result = await run(bundles, {
         rendering: "main",
         vsyncs: 145,
         deinterlacerOptions: {
-          autoFilm: false,
+          film: false,
           doubleRate: action !== "withdraw",
           onFailure: listener === "callback" ? onFailure : undefined,
         },
-        programAvailable({ fragment }) {
-          return inFrame || fragment !== shaders.FILM_ANALYSIS_FRAGMENT_SHADER;
-        },
         resourceAvailable(resource) {
           allocations++;
-          return !(
-            inFrame &&
-            resource.width === 288 &&
-            resource.height === 162
-          );
+          return resource.format !== 0x8814;
         },
         beforeVsync(n, current) {
           control = current;
@@ -82,14 +63,13 @@ for (const listener of ["event", "callback"])
               '__deinterlacer.addEventListener("failure", e => __onFailure(e.detail))',
             );
           }
-          if (n === 12 && !inFrame)
-            current.deinterlacer("__deinterlacer.autoFilm = true");
+          if (n === 12) current.deinterlacer("__deinterlacer.film = true");
           if (n !== 65) return;
           armed = true;
           if (trigger === "watchdog") current.frames(false);
-          if (trigger === "setter" || inFrame)
-            current.deinterlacer("__deinterlacer.autoFilm = true");
-          if (trigger === "start")
+          if (trigger === "setter")
+            current.deinterlacer("__deinterlacer.film = true");
+          if (trigger === "start" || trigger === "watchdog")
             current.deinterlacer(
               "__deinterlacer.stop(); __deinterlacer.start()",
             );
@@ -114,11 +94,7 @@ for (const listener of ["event", "callback"])
           true,
           label,
         );
-        assert.equal(
-          control.deinterlacer("__deinterlacer.autoFilm"),
-          false,
-          label,
-        );
+        assert.equal(control.deinterlacer("__deinterlacer.film"), false, label);
         assert.ok(
           result.draws.some(
             (draw) => draw.toCanvas && draw.t > actionTime + 300,

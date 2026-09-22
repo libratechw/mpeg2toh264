@@ -31,8 +31,6 @@ interface WorkerFrameObservation {
 /** Worker 内の描画エンジンへ渡せるデインタレーサー設定。 */
 export interface WorkerRenderingOptions {
   doubleRate: boolean;
-  autoFilm: boolean;
-  filmCombThreshold: number;
   spatialCheck: boolean;
   film: boolean;
   debug: boolean;
@@ -71,7 +69,7 @@ export type WorkerCommand =
   | {
       type: "settings";
       options: WorkerRenderingOptions;
-      retryFilm?: "film" | "autoFilm";
+      retryFilm?: "film";
     }
   | { type: "scan"; scan: Scan | null }
   | { type: "timeline"; videoTimeline: readonly VideoState[] }
