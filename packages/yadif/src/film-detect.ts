@@ -86,6 +86,8 @@ export class FilmDetector {
   /** The metrics being read back asynchronously. */
   #pixelBuffer: WebGLBuffer | null = null;
   #fence: WebGLSync | null = null;
+  #frame = 0;
+  #pendingFrame = 0;
   /** The last metrics read back, laid out as FIELD_METRICS says. */
   readonly metrics = new Float32Array(FIELD_METRICS_SIZE * 4);
   #width = 0;
@@ -139,6 +141,7 @@ export class FilmDetector {
     const gl = this.#gl;
     gl.deleteSync(this.#fence);
     this.#fence = null;
+    this.#frame = 0;
     const newest = this.#metrics?.[this.#head];
     if (!newest) return;
     const metrics = new Float32Array(FIELD_METRICS_SIZE * 4);
@@ -206,7 +209,13 @@ export class FilmDetector {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.#head = 1 - this.#head;
 
-    gl.deleteSync(this.#fence);
+    this.#frame++;
+    // Keep the pending fence so a later poll can collect the completed readback.
+    if (this.#fence !== null) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return;
+    }
+    this.#pendingFrame = this.#frame;
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.#pixelBuffer);
     gl.readPixels(0, 0, FIELD_METRICS_SIZE, 1, gl.RGBA, gl.FLOAT, 0);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
@@ -219,7 +228,7 @@ export class FilmDetector {
    * The phase of the last frame measured, once the GPU has handed it back,
    * and null while it is still on its way. It is handed back once.
    */
-  poll(): Phase | null {
+  poll(): (Phase & { age: number }) | null {
     const gl = this.#gl;
     const fence = this.#fence;
     if (fence === null || this.#pixelBuffer === null) return null;
@@ -234,6 +243,7 @@ export class FilmDetector {
         return {
           phase: this.metrics[FIELD_METRICS.phase * 4] ?? 0,
           run: this.metrics[FIELD_METRICS.phase * 4 + 1] ?? 0,
+          age: this.#frame - this.#pendingFrame,
         };
       default:
         return null;

@@ -1762,11 +1762,16 @@ export class Deinterlacer extends EventTarget {
     const known = this.#detector?.poll() ?? null;
     if (known !== null) {
       this.#known = known;
-      this.#knownAge = 0;
+      this.#knownAge = known.age;
     }
     this.#knownAge++;
     const { phase, run } = this.#known;
-    if (phase === 0 || this.#knownAge > PULLDOWN_FRAMES) {
+    // Keep the same wall-clock allowance for GPU readback at higher playback rates.
+    if (
+      phase === 0 ||
+      this.#knownAge >
+        Math.ceil(PULLDOWN_FRAMES * Math.max(1, this.#video.playbackRate))
+    ) {
       this.#phase = NO_PHASE;
     } else {
       this.#phase = {
@@ -3097,7 +3102,7 @@ export class Deinterlacer extends EventTarget {
       fps: (frames * 1000) / elapsed,
       frameMs,
       maxQueuedFields: this.#reportMaxQueuedFields,
-      mode: this.#mode,
+      mode: this.#autoFilm ? this.#mode : this.#filmLocked ? "film" : "video",
       match: this.#match,
       combScore: this.#combScore,
       outputFps: (this.#outputSinceReport * 1000) / elapsed,

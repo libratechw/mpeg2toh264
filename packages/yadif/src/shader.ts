@@ -30,6 +30,7 @@
 import {
   FIELD_METRICS,
   FILM_DUPLICATE_PHASE,
+  FILM_LOCK_FRAMES,
   FILM_MIXED_PHASE,
   SAME_BLOCKS_MAX,
 } from "./film-shader.js";
@@ -246,11 +247,28 @@ bool same(int metric) {
 
 /** The pulldown phase the detection gave this frame, or 0. See film-shader.ts. */
 int detectedPhase() {
-  return int(texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.phase}, 0), 0)[0]);
+  vec4 phase = texelFetch(uFieldMetrics, ivec2(${FIELD_METRICS.phase}, 0), 0);
+  // Deinterlace each field normally until the cadence is confirmed.
+  return phase[1] >= ${FILM_LOCK_FRAMES}.0 ? int(phase[0]) : 0;
 }
 
 bool isMixedPhase(int phase) {
   return phase == ${FILM_DUPLICATE_PHASE} || phase == ${FILM_MIXED_PHASE};
+}
+
+/** Detect new combing in phase 4, whose cadence is inferred from previous repeats. */
+bool movingComb(vec3 pixel, int x, int y) {
+  vec3 above = fetch(uCur, x, y - 1);
+  vec3 below = fetch(uCur, x, y + 1);
+  vec3 comb = max(min(above, below) - pixel, pixel - max(above, below));
+  // Phase 3 is a complete film frame, so use its vertical detail as the reference.
+  // Preserve existing horizontal lines and interpolate only pixels with new combing.
+  vec3 previous = fetch(uPrev, x, y);
+  vec3 previousAbove = fetch(uPrev, x, y - 1);
+  vec3 previousBelow = fetch(uPrev, x, y + 1);
+  vec3 previousComb = max(min(previousAbove, previousBelow) - previous,
+                          previous - max(previousAbove, previousBelow));
+  return any(greaterThan(comb, max(previousComb, vec3(0.0)) + vec3(8.0 / 255.0)));
 }
 
 const int DEBUG_BAR_CELL = 32;
@@ -296,12 +314,13 @@ void main() {
     rgb = debugBar(x);
   } else if (uFilm && uDebug && x < DIGIT_WIDTH && y < DIGIT_HEIGHT && uPhase > 0) {
     rgb = digitLit(uPhase, x, y) ? vec3(1.0, 0.0, 0.0) : vec3(0.0);
-  } else if (uFilm && !uSecond && isMixedPhase(detectedPhase())) {
-    rgb = (y & 1) == firstParity() ? texelFetch(uCur, ivec2(x, y), 0).rgb
-                                   : texelFetch(uPrev, ivec2(x, y), 0).rgb;
   } else if (uFilm && !uSecond && detectedPhase() != 0) {
-    // One film frame, whole.
-    rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
+    bool mixed = isMixedPhase(detectedPhase());
+    rgb = mixed && (y & 1) != firstParity()
+      ? texelFetch(uPrev, ivec2(x, y), 0).rgb
+      : texelFetch(uCur, ivec2(x, y), 0).rgb;
+    if (detectedPhase() == 4 && (y & 1) != uParity && movingComb(rgb, x, y))
+      rgb = filterPixel(uPrev, uCur, x, y);
   } else if ((y & 1) == uParity) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
   } else if ((uParity ^ uTff) != 0) {

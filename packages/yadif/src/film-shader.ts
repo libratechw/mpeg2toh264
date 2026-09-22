@@ -48,12 +48,8 @@ export const FIELD_METRICS = {
 
 export const FIELD_METRICS_SIZE = 7;
 
-/**
- * Differing blocks up to which two fields are the same (encoder noise on a
- * still), and from which they are plainly different. Between is neither.
- */
+/** Differing blocks tolerated when two fields repeat with encoder noise. */
 export const SAME_BLOCKS_MAX = 2;
-export const DIFFERENT_BLOCKS_MIN = 16;
 
 /** The phases whose frame holds two film frames; the first is the repeat. */
 export const FILM_DUPLICATE_PHASE = 1;
@@ -132,7 +128,8 @@ void main()
         float a = luma(texelFetch(uA, p, 0).rgb);
         float b = luma(texelFetch(uB, p, 0).rgb);
 
-        diffEven += abs(a - b);
+        // Ignore small compression artifacts when accumulating differences at moving edges.
+        diffEven += max(abs(a - b) - 8.0 / 255.0, 0.0);
         totalEven += 1;
       }
       p.y += 1;
@@ -140,7 +137,7 @@ void main()
         float a = luma(texelFetch(uA, p, 0).rgb);
         float b = luma(texelFetch(uB, p, 0).rgb);
 
-        diffOdd += abs(a - b);
+        diffOdd += max(abs(a - b) - 8.0 / 255.0, 0.0);
         totalOdd += 1;
       }
     }
@@ -253,31 +250,34 @@ bool same(float differing) {
   return differing <= ${SAME_BLOCKS_MAX}.0;
 }
 
-bool differs(float differing) {
-  return differing >= ${DIFFERENT_BLOCKS_MIN}.0;
+// A repeated field changes less than the opposite field.
+// Distinguish motion shared by both fields from a still image with small absolute differences.
+bool repeats(vec4 field, vec4 other) {
+  return same(field[1]) &&
+    (max(field[0], other[0]) < 0.025 || field[2] < other[2] * 0.75);
 }
 
 /** The phase texel, (phase, run), from the six comparisons' differing counts. */
-vec4 decide(vec4 last, float dFirstRepeatsPrevious, float dSecondRepeatsNext,
-            float dSecondRepeatsPrevious, float dPreviousSecondRepeated,
-            float dFirstRepeatsNext, float dPreviousFirstRepeated)
+vec4 decide(vec4 last, vec4 dFirstRepeatsPrevious, vec4 dSecondRepeatsNext,
+            vec4 dSecondRepeatsPrevious, vec4 dPreviousSecondRepeated,
+            vec4 dFirstRepeatsNext, vec4 dPreviousFirstRepeated)
 {
-  bool firstRepeatsPrevious = same(dFirstRepeatsPrevious);
-  bool secondRepeatsNext = same(dSecondRepeatsNext);
-  bool secondRepeatsPrevious = same(dSecondRepeatsPrevious);
-  bool previousSecondRepeated = same(dPreviousSecondRepeated);
-  bool firstRepeatsNext = same(dFirstRepeatsNext);
-  bool previousFirstRepeated = same(dPreviousFirstRepeated);
+  bool firstRepeatsPrevious = repeats(dFirstRepeatsPrevious, dSecondRepeatsPrevious);
+  bool secondRepeatsNext = repeats(dSecondRepeatsNext, dFirstRepeatsNext);
+  bool secondRepeatsPrevious = repeats(dSecondRepeatsPrevious, dFirstRepeatsPrevious);
+  bool previousSecondRepeated = repeats(dPreviousSecondRepeated, dPreviousFirstRepeated);
+  bool firstRepeatsNext = repeats(dFirstRepeatsNext, dSecondRepeatsNext);
+  bool previousFirstRepeated = repeats(dPreviousFirstRepeated, dPreviousSecondRepeated);
   bool still = (firstRepeatsPrevious && secondRepeatsPrevious) || (secondRepeatsNext && firstRepeatsNext);
 
   int previous = int(last[0]);
   float run = last[1];
   // What each phase looks like: one field repeats, the other plainly does not.
-  bool looks1 = firstRepeatsPrevious && differs(dSecondRepeatsPrevious);
-  bool looks2 = secondRepeatsNext && differs(dFirstRepeatsNext);
-  bool looks3 = secondRepeatsPrevious && differs(dFirstRepeatsPrevious);
-  bool looks4 = previousSecondRepeated && differs(dPreviousFirstRepeated);
-  bool looks5 = firstRepeatsNext && differs(dSecondRepeatsNext);
+  bool looks1 = firstRepeatsPrevious && !secondRepeatsPrevious;
+  bool looks2 = secondRepeatsNext && !firstRepeatsNext;
+  bool looks3 = secondRepeatsPrevious && !firstRepeatsPrevious;
+  bool looks4 = previousSecondRepeated && !previousFirstRepeated;
+  bool looks5 = firstRepeatsNext && !secondRepeatsNext;
 
   int expected = previous == 0 ? 0 : (previous == 5 ? 1 : previous + 1);
   bool expectedRepeat =
@@ -338,12 +338,12 @@ void main()
   } else {
     outValue = decide(
       previous(${FIELD_METRICS.phase}),
-      previous(${FIELD_METRICS.firstRepeatsNext})[1],
-      fold(uSecond)[1],
-      previous(${FIELD_METRICS.secondRepeatsNext})[1],
-      previous(${FIELD_METRICS.secondRepeatsPrevious})[1],
-      fold(uFirst)[1],
-      previous(${FIELD_METRICS.firstRepeatsPrevious})[1]
+      previous(${FIELD_METRICS.firstRepeatsNext}),
+      fold(uSecond),
+      previous(${FIELD_METRICS.secondRepeatsNext}),
+      previous(${FIELD_METRICS.secondRepeatsPrevious}),
+      fold(uFirst),
+      previous(${FIELD_METRICS.firstRepeatsPrevious})
     );
   }
 }
