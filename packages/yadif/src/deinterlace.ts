@@ -536,6 +536,8 @@ export class Deinterlacer extends EventTarget {
   #lastObservedVideoFrames = 0;
   /** animation loop の代替経路が最後にフレームを取り込んだ時刻。 */
   #lastFallbackAt = 0;
+  /** 代替経路が requestVideoFrameCallback() を最後に予約し直した時刻。 */
+  #lastFrameCallbackRearmAt = 0;
   #running = false;
   /** Cancels work suspended inside a synchronous owner callback. */
   #playbackRevision = 0;
@@ -2445,15 +2447,25 @@ export class Deinterlacer extends EventTarget {
       this.#periodMs >= MIN_PERIOD_MS
         ? this.#periodMs
         : DEFAULT_FALLBACK_PERIOD_MS;
-    const frameCounterAdvanced =
-      totalVideoFrames > this.#lastObservedVideoFrames;
-    const mediaTimeAdvanced =
-      mediaTime !== this.#lastIngestedMediaTime &&
-      now - this.#lastFallbackAt >= fallbackPeriod * 0.75;
-    if (!frameCounterAdvanced && !mediaTimeAdvanced) return;
-
-    // 復号フレーム数を提供するブラウザではその増加から新しい画像を正確に識別する。
+    // 復号フレーム数を提供するブラウザではその増加だけから新しい画像を識別する。
     // カウンターがゼロのブラウザでは時刻差で間隔を空け、requestAnimationFrame() の周期で同じ画像を履歴へ重複登録せずに代替経路を維持する
+    // currentTime は画像単位ではなく描画のたびに進むため、カウンターがあるのに時刻の変化でも取り込むと同じ画像を二度取り込む。
+    // その2回の間隔が半フレームの周期として測られ、以後は毎回の描画が新しいフレーム扱いになって、フィルム再構成が 24fps ではなく 48fps で出力し続ける
+    const newPicture =
+      totalVideoFrames > 0
+        ? totalVideoFrames > this.#lastObservedVideoFrames
+        : mediaTime !== this.#lastIngestedMediaTime &&
+          now - this.#lastFallbackAt >= fallbackPeriod * 0.75;
+    if (!newPicture) return;
+
+    // requestVideoFrameCallback() は自分のコールバックの中で予約し直すため、コールバックが例外で抜けたり、
+    // ブラウザが予約を捨てたりすると、以後は代替経路だけが動き続ける。通知が止まったまま映像が進んでいる間は予約をやり直し、戻れば通常の経路へ復帰させる
+    if (now - this.#lastFrameCallbackRearmAt >= FRAME_CALLBACK_TIMEOUT_MS) {
+      this.#lastFrameCallbackRearmAt = now;
+      this.#videoFrames.cancel();
+      this.#request();
+    }
+
     this.#lastObservedVideoFrames = Math.max(
       this.#lastObservedVideoFrames,
       totalVideoFrames,

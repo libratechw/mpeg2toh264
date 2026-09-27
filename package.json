@@ -30,6 +30,7 @@
     "test:yadif-debug": "node tools/test-yadif-debug.mjs",
     "test:film-retry": "node tools/test-film-retry.mjs",
     "test:film-failure-lifecycle": "node tools/test-film-failure-lifecycle.mjs",
+    "test:frame-callback": "node tools/test-frame-callback-recovery.mjs",
     "test:mse": "node tools/test-mse-reset.mjs",
     "test:range-eof": "node tools/test-range-eof.mjs && node tools/test-range-reading.mjs",
     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
