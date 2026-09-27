@@ -1780,7 +1780,20 @@ export class Deinterlacer extends EventTarget {
         this.#resize(metadata.width, metadata.height);
       if (!this.#frameIsCurrent(revision)) return;
       if (this.#scan && !this.#scan.interlaced) {
+        // A progressive picture goes up as it is, but it is output all the
+        // same and has to be reported. Soft-telecined film is exactly this --
+        // 24 progressive pictures a second between short hard-telecined runs
+        // -- and without a report here the rate of the last interlaced run,
+        // doubled or averaged with the film around it, stayed on show for as
+        // long as the progressive stretch lasted.
+        const at = performance.now();
+        this.#restartReportAfterIdle(at);
+        this.#lastFrameAt = at;
         this.#showVideo();
+        this.#renderMsSinceReport += performance.now() - at;
+        this.#renderFramesSinceReport++;
+        this.#showFramesSinceReport++;
+        this.#report(at);
         return;
       }
       // A seek, or a stream that starts again somewhere else, leaves the held
@@ -1843,22 +1856,7 @@ export class Deinterlacer extends EventTarget {
       this.#lastMediaTime = metadata.mediaTime;
       this.#lastPresentedFrames = metadata.presentedFrames;
       const at = performance.now();
-      // Frames stopped arriving for a while -- a pause, a stall, a tab in the
-      // background -- and a rate averaged over time nothing was asked of the
-      // filter says nothing about it. Begin the interval at this frame.
-      if (at - this.#lastFrameAt > STATS_INTERVAL_MS) {
-        this.#reportedAt = at;
-        this.#renderFramesSinceReport = 0;
-        this.#renderMsSinceReport = 0;
-        this.#showFramesSinceReport = 0;
-        this.#showMsSinceReport = 0;
-        this.#reportMaxQueuedFields = 0;
-        this.#outputSinceReport = 0;
-        this.#gpuFrameNanosecondsSinceReport = 0;
-        this.#gpuFrameCountSinceReport = 0;
-        this.#gpuFieldNanosecondsSinceReport = 0;
-        this.#gpuFieldCountSinceReport = 0;
-      }
+      this.#restartReportAfterIdle(at);
       this.#lastFrameAt = at;
       const begin = performance.now();
       const q = this.#beginGpuTimer(false);
@@ -2620,6 +2618,26 @@ export class Deinterlacer extends EventTarget {
     }
     this.#lastPresented = presented;
     return missed;
+  }
+
+  /**
+   * Frames stopped arriving for a while -- a pause, a stall, a tab in the
+   * background -- and a rate averaged over time nothing was asked of the
+   * filter says nothing about it. Begin the interval at this frame.
+   */
+  #restartReportAfterIdle(at: number): void {
+    if (at - this.#lastFrameAt <= STATS_INTERVAL_MS) return;
+    this.#reportedAt = at;
+    this.#renderFramesSinceReport = 0;
+    this.#renderMsSinceReport = 0;
+    this.#showFramesSinceReport = 0;
+    this.#showMsSinceReport = 0;
+    this.#reportMaxQueuedFields = 0;
+    this.#outputSinceReport = 0;
+    this.#gpuFrameNanosecondsSinceReport = 0;
+    this.#gpuFrameCountSinceReport = 0;
+    this.#gpuFieldNanosecondsSinceReport = 0;
+    this.#gpuFieldCountSinceReport = 0;
   }
 
   #report(at: number): void {
