@@ -9,7 +9,10 @@
  * With `film`, a frame whose pulldown phase `fieldMetrics` (see
  * film-shader.ts) gives is put back together into its film frame instead of
  * filtered; a frame's `second` field is always filtered. `phase` is the
- * phase the page expects, for the debug overlay only.
+ * phase the page expects, for the debug overlay only. `comb` is the detector's
+ * count of the combing each way of weaving would leave, block by block (see
+ * COMB_FRAGMENT_SHADER), and a block past COMB_BLOCK_PIXELS is filtered
+ * instead of woven.
  */
 export declare const YADIF_UNIFORMS: {
     readonly prev: "uPrev";
@@ -24,6 +27,7 @@ export declare const YADIF_UNIFORMS: {
     readonly second: "uSecond";
     readonly phase: "uPhase";
     readonly fieldMetrics: "uFieldMetrics";
+    readonly comb: "uComb";
 };
 /**
  * The filter itself.

@@ -1,1 +1,1 @@
-{"version":3,"file":"shader.d.ts","sourceRoot":"","sources":["../src/shader.ts"],"names":[],"mappings":"AAqCA;;;;;;;;;;;;GAYG;AACH,eAAO,MAAM,cAAc;;;;;;;;;;;;;CAajB,CAAC;AAEX;;;;;;;;;;;;;;;;GAgBG;AACH,eAAO,MAAM,qBAAqB,QA4PjC,CAAC"}
+{"version":3,"file":"shader.d.ts","sourceRoot":"","sources":["../src/shader.ts"],"names":[],"mappings":"AAuCA;;;;;;;;;;;;;;;GAeG;AACH,eAAO,MAAM,cAAc;;;;;;;;;;;;;;CAcjB,CAAC;AAEX;;;;;;;;;;;;;;;;GAgBG;AACH,eAAO,MAAM,qBAAqB,QAkQjC,CAAC"}

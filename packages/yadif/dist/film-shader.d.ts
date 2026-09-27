@@ -101,4 +101,42 @@ export declare const METRICS_UNIFORMS: {
  * keeps the cycle's place but counts only once the cycle is believed.
  */
 export declare const METRICS_FRAGMENT_SHADER: string;
+/** The side of the square blocks the comb check counts in, in frame pixels. */
+export declare const COMB_BLOCK = 16;
+/**
+ * Combed pixels on a block's second-field lines at which the whole block is
+ * interpolated rather than woven. Half a block's lines are the second field's,
+ * so this is 8 of 128. A thin horizontal line lies on one of them and moves
+ * with the picture, so it takes more than one line's worth to trip the block,
+ * and a stray pixel of mismatch is not worth breaking up a woven block for.
+ */
+export declare const COMB_BLOCK_PIXELS = 8;
+export declare const COMB_UNIFORMS: {
+    readonly prev: "uPrev";
+    readonly cur: "uCur";
+    readonly first: "uFirst";
+    readonly size: "uSize";
+};
+/**
+ * Count, block by block, the pixels a woven film frame would show combed.
+ *
+ * Film reconstruction trusts the cadence: a frame whose phase says it is one
+ * film frame goes out as it is, and the frame that holds two gets the previous
+ * frame's second field. A cut made after pulldown, a fade or a wipe done at
+ * field rate, or a telop scrolled over the film breaks that
+ * for part of a frame or for one frame at a cut, and a field from another
+ * moment laid between the first field's lines is combing wherever anything
+ * moved. The cadence cannot see it: it is decided from whole-frame repeats.
+ *
+ * Both ways of weaving are measured, the frame as it stands (red) and with
+ * the previous frame's second field (green). A second-field pixel counts where
+ * it stands apart from the first-field lines either side of it in the same
+ * direction by more than the threshold, the five-line test (the same pattern
+ * two lines apart) agrees that it alternates rather than being a thin line,
+ * and it changed since the previous frame -- still detail is never combing,
+ * whatever its shape. The filter interpolates a block past COMB_BLOCK_PIXELS
+ * instead of weaving it; blocks rather than pixels, since weak combing left
+ * between the pixels that crossed the threshold looks worse than either.
+ */
+export declare const COMB_FRAGMENT_SHADER = "#version 300 es\nprecision highp float;\nprecision highp int;\n\nuniform sampler2D uPrev;\nuniform sampler2D uCur;\n/** The parity of the lines of the field captured first. */\nuniform int uFirst;\nuniform ivec2 uSize;\n\nout vec4 outValue;\n\nconst float COMB = 8.0 / 255.0;\n\nfloat luma(sampler2D image, int x, int y) {\n  int line = y < 0 ? -y : (y >= uSize.y ? 2 * (uSize.y - 1) - y : y);\n  vec3 c = texelFetch(image, ivec2(x, clamp(line, 0, uSize.y - 1)), 0).rgb;\n  return dot(c, vec3(0.2126, 0.7152, 0.0722));\n}\n\nbool combed(float above2, float above, float pixel, float below, float below2) {\n  float d1 = pixel - above;\n  float d2 = pixel - below;\n  return ((d1 > COMB && d2 > COMB) || (d1 < -COMB && d2 < -COMB)) &&\n    abs(above2 + 4.0 * pixel + below2 - 3.0 * (above + below)) > 6.0 * COMB;\n}\n\nvoid main() {\n  // Block rows count from the top of the frame, as the filter reads them.\n  ivec2 block = ivec2(gl_FragCoord.xy);\n  ivec2 base = block * 16;\n  float standing = 0.0;\n  float woven = 0.0;\n  for (int dy = 0; dy < 16; ++dy) {\n    int y = base.y + dy;\n    if (y >= uSize.y || (y & 1) == uFirst) continue;\n    for (int dx = 0; dx < 16; ++dx) {\n      int x = base.x + dx;\n      if (x >= uSize.x) break;\n      float current = luma(uCur, x, y);\n      float previous = luma(uPrev, x, y);\n      if (abs(current - previous) <= COMB) continue;\n      // The first field's lines either side are the same whichever second\n      // field is woven between them.\n      float above = luma(uCur, x, y - 1);\n      float below = luma(uCur, x, y + 1);\n      if (combed(luma(uCur, x, y - 2), above, current, below, luma(uCur, x, y + 2)))\n        standing += 1.0;\n      if (combed(luma(uPrev, x, y - 2), above, previous, below, luma(uPrev, x, y + 2)))\n        woven += 1.0;\n    }\n  }\n  outValue = vec4(standing, woven, 0.0, 0.0);\n}\n";
 //# sourceMappingURL=film-shader.d.ts.map
