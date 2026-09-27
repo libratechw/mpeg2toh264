@@ -4,6 +4,23 @@ use crate::bitreader::BitReader;
 use crate::container::aac_huffman::*;
 use crate::error::{bail, Result};
 
+/// What a walk found out about the level of the channels it stepped over.
+///
+/// Every scalefactor of a channel is coded as a difference from its
+/// `global_gain`, and a band's spectral values are scaled by
+/// 2^((scalefactor - 100) / 4). So adding to each `global_gain` scales the whole
+/// decoded sound -- four doubles it -- without touching a spectral value, and
+/// with the field staying eight bits nothing after it moves. A decoder refuses a
+/// scalefactor outside 0..=255, which is what `max_scalefactor` is kept for.
+#[derive(Default, Debug)]
+pub struct GlobalGains {
+    /// The bit position of every channel's `global_gain`, in stream order.
+    pub positions: Vec<usize>,
+    /// The largest scalefactor any band reached, or `None` where no band
+    /// carried one.
+    pub max_scalefactor: Option<i32>,
+}
+
 #[derive(Clone)]
 struct IcsInfo {
     short: bool,
@@ -110,8 +127,18 @@ fn sections(r: &mut BitReader<'_>, info: &IcsInfo) -> Result<Vec<Vec<Section>>> 
     Ok(groups)
 }
 
-fn scale_factors(r: &mut BitReader<'_>, info: &IcsInfo, sections: &[Vec<Section>]) -> Result<()> {
+fn scale_factors(
+    r: &mut BitReader<'_>,
+    info: &IcsInfo,
+    sections: &[Vec<Section>],
+    global_gain: u32,
+    gains: &mut GlobalGains,
+) -> Result<()> {
     let mut first_noise = true;
+    // Only the spectral bands' scalefactors run on from `global_gain` and are
+    // held to 0..=255. Noise energies and intensity positions are differences
+    // of their own.
+    let mut scalefactor = global_gain as i32;
     for group in sections.iter().take(info.group_len.len()) {
         for section in group {
             for _ in section.start..section.end {
@@ -121,7 +148,15 @@ fn scale_factors(r: &mut BitReader<'_>, info: &IcsInfo, sections: &[Vec<Section>
                         r.skip(9);
                         first_noise = false;
                     }
-                    1..=11 | 13..=15 => {
+                    1..=11 => {
+                        scalefactor += vlc(r, &SCALEFACTORS)? as i32 - 60;
+                        gains.max_scalefactor = Some(
+                            gains
+                                .max_scalefactor
+                                .map_or(scalefactor, |m| m.max(scalefactor)),
+                        );
+                    }
+                    13..=15 => {
                         vlc(r, &SCALEFACTORS)?;
                     }
                     _ => bail!("unsupported AAC scalefactor codebook {}", section.cb),
@@ -216,8 +251,13 @@ fn spectral(r: &mut BitReader<'_>, info: &IcsInfo, groups: &[Vec<Section>]) -> R
 /// One `individual_channel_stream`. A channel pair whose `common_window` is set
 /// shares one `ics_info` between its two channels, and passes it in here rather
 /// than letting each read its own.
-fn skip_ics_sharing(r: &mut BitReader<'_>, shared: Option<&IcsInfo>) -> Result<()> {
-    r.skip(8); // global_gain
+fn skip_ics_sharing(
+    r: &mut BitReader<'_>,
+    shared: Option<&IcsInfo>,
+    gains: &mut GlobalGains,
+) -> Result<()> {
+    gains.positions.push(r.bit_pos());
+    let global_gain = r.u(8);
     let owned;
     let info = match shared {
         Some(info) => info,
@@ -227,7 +267,7 @@ fn skip_ics_sharing(r: &mut BitReader<'_>, shared: Option<&IcsInfo>) -> Result<(
         }
     };
     let sections = sections(r, info)?;
-    scale_factors(r, info, &sections)?;
+    scale_factors(r, info, &sections, global_gain, gains)?;
     if r.flag() {
         let pulses = r.u(2) + 1;
         r.skip(6 + pulses * 9);
@@ -241,17 +281,19 @@ fn skip_ics_sharing(r: &mut BitReader<'_>, shared: Option<&IcsInfo>) -> Result<(
     spectral(r, info, &sections)
 }
 
-fn skip_ics(r: &mut BitReader<'_>) -> Result<()> {
-    skip_ics_sharing(r, None)
+fn skip_ics(r: &mut BitReader<'_>, gains: &mut GlobalGains) -> Result<()> {
+    skip_ics_sharing(r, None, gains)
 }
 
 /// Bit position just past a one-channel element -- `single_channel_element` or
 /// the `lfe_channel_element` that shares its syntax -- starting at `start`.
+/// What the walk learns about the channel's level goes into `gains`.
 pub fn single_channel_end(
     data: &[u8],
     start: usize,
     frequency_index: u8,
     id: u32,
+    gains: &mut GlobalGains,
 ) -> Result<usize> {
     if frequency_index != 3 && frequency_index != 4 {
         bail!("AAC channel element walking currently requires 44.1 or 48 kHz");
@@ -261,19 +303,29 @@ pub fn single_channel_end(
         bail!("expected AAC element {id} at bit {start}");
     }
     r.skip(4); // element_instance_tag
-    skip_ics(&mut r)?;
+    skip_ics(&mut r, gains)?;
     if r.bits_left() < 0 {
         bail!("AAC element {id} overruns its raw_data_block");
     }
     Ok(r.bit_pos())
 }
 
-pub fn sce_end(data: &[u8], start: usize, frequency_index: u8) -> Result<usize> {
-    single_channel_end(data, start, frequency_index, 0)
+pub fn sce_end(
+    data: &[u8],
+    start: usize,
+    frequency_index: u8,
+    gains: &mut GlobalGains,
+) -> Result<usize> {
+    single_channel_end(data, start, frequency_index, 0, gains)
 }
 
 /// Bit position just past the `channel_pair_element` starting at `start`.
-pub fn cpe_end(data: &[u8], start: usize, frequency_index: u8) -> Result<usize> {
+pub fn cpe_end(
+    data: &[u8],
+    start: usize,
+    frequency_index: u8,
+    gains: &mut GlobalGains,
+) -> Result<usize> {
     if frequency_index != 3 && frequency_index != 4 {
         bail!("AAC CPE walking currently requires 44.1 or 48 kHz");
     }
@@ -297,8 +349,8 @@ pub fn cpe_end(data: &[u8], start: usize, frequency_index: u8) -> Result<usize> 
     } else {
         None
     };
-    skip_ics_sharing(&mut r, shared.as_ref())?;
-    skip_ics_sharing(&mut r, shared.as_ref())?;
+    skip_ics_sharing(&mut r, shared.as_ref(), gains)?;
+    skip_ics_sharing(&mut r, shared.as_ref(), gains)?;
     if r.bits_left() < 0 {
         bail!("AAC CPE overruns its raw_data_block");
     }

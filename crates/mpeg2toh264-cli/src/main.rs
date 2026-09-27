@@ -10,8 +10,8 @@ use std::time::Instant;
 use mpeg2toh264::job::PictureOutput;
 use mpeg2toh264::{
     extract_mpeg2_video_es, h264_to_fmp4, is_mpeg_transport_stream, mpeg2_passthrough_unit,
-    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, Fragment, OpenGopRecovery, PictureEncoder,
-    Progress, Session, TranscodeOptions, VideoMode,
+    mpeg2_to_fmp4, mpeg2_video_timeline, transcode, AudioGain, Fragment, OpenGopRecovery,
+    PictureEncoder, Progress, Session, TranscodeOptions, VideoMode,
 };
 
 const USAGE: &str = "\
@@ -42,6 +42,12 @@ Options:
                             Keep a complementary field pair in one MP4 sample
   -p, --passthrough         Carry the MPEG-2 video into the MP4 unconverted,
                             for a player that decodes it. MP4 output only
+      --audio-gain <n>      Raise the AAC audio by n steps of about 1.5 dB,
+                            4 doubling it, by rewriting each channel's
+                            global_gain (default: 0). MP4 output only
+      --surround-audio-gain <n>
+                            The same for audio of more than two channels
+                            (default: the --audio-gain value)
   -j, --threads <n>         Convert this many pictures at once (default: 1).
                             The output is the same whatever this is set to.
                             MP4 output from a transport stream only
@@ -55,6 +61,7 @@ struct CliOptions {
     quiet: bool,
     threads: usize,
     transcode: TranscodeOptions,
+    audio_gain: AudioGain,
 }
 
 /// What `parse_args` decided to do, since `--help` is a successful exit rather
@@ -79,6 +86,8 @@ fn parse_args(args: &[String]) -> Invocation {
     let mut quiet = false;
     let mut passthrough = false;
     let mut threads: usize = 1;
+    let mut audio_gain: Option<u8> = Some(0);
+    let mut surround_audio_gain: Option<Option<u8>> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -129,6 +138,23 @@ fn parse_args(args: &[String]) -> Invocation {
             _ if arg.starts_with("--threads=") => {
                 threads = arg["--threads=".len()..].parse().unwrap_or(0);
             }
+            "--audio-gain" | "--surround-audio-gain" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    fail(&format!("{arg} requires a value"));
+                };
+                if arg == "--audio-gain" {
+                    audio_gain = value.parse().ok();
+                } else {
+                    surround_audio_gain = Some(value.parse().ok());
+                }
+            }
+            _ if arg.starts_with("--audio-gain=") => {
+                audio_gain = arg["--audio-gain=".len()..].parse().ok();
+            }
+            _ if arg.starts_with("--surround-audio-gain=") => {
+                surround_audio_gain = Some(arg["--surround-audio-gain=".len()..].parse().ok());
+            }
             _ if arg.starts_with('-') => fail(&format!("unknown option '{arg}'")),
             _ => positional.push(arg),
         }
@@ -144,6 +170,10 @@ fn parse_args(args: &[String]) -> Invocation {
     if threads == 0 {
         fail("thread count must be a positive integer");
     }
+    let (Some(stereo), Some(surround)) = (audio_gain, surround_audio_gain.unwrap_or(audio_gain))
+    else {
+        fail("audio gain must be an integer from 0 to 255");
+    };
     if positional.len() != 2 {
         fail(&format!(
             "expected input and output paths, got {} positional argument(s)",
@@ -178,6 +208,7 @@ fn parse_args(args: &[String]) -> Invocation {
                 VideoMode::Transcode
             },
         },
+        audio_gain: AudioGain { stereo, surround },
     }))
 }
 
@@ -378,6 +409,7 @@ fn run_session_mp4_with(
     let started = Instant::now();
     let mut output = BufWriter::new(File::create(&options.output)?);
     let mut session = Session::new(options.transcode);
+    session.set_audio_gain(options.audio_gain);
     let mut totals = SessionTotals::default();
     let mut chunk = vec![0; 1 << 20];
 

@@ -7,7 +7,9 @@
 
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use mpeg2toh264::job::PictureOutput;
-use mpeg2toh264::{DualMono, Fragment, OpenGopRecovery, Progress, TranscodeOptions, VideoMode};
+use mpeg2toh264::{
+    AudioGain, DualMono, Fragment, OpenGopRecovery, Progress, TranscodeOptions, VideoMode,
+};
 use wasm_bindgen::prelude::*;
 
 /// The shape of what [`Session::push`] returns, declared so the browser sources
@@ -306,6 +308,28 @@ impl Session {
     pub fn select_dual_mono(&mut self, sub: bool) {
         self.inner
             .select_dual_mono(if sub { DualMono::Sub } else { DualMono::Main });
+    }
+
+    /// Raise the sound of every audio frame read from here on, in steps of
+    /// 2^(1/4) -- about 1.5 dB -- so that 4 doubles it. `surround` is the step
+    /// for sound of more than two channels, which a stereo listener hears
+    /// downmixed; mono and dual mono count as stereo, as they are handed out.
+    ///
+    /// Only each channel's `global_gain` changes: nothing is decoded or
+    /// re-encoded, and a frame the step would take out of range for a decoder
+    /// keeps its own level.
+    #[wasm_bindgen(js_name = setAudioGain)]
+    pub fn set_audio_gain(&mut self, stereo: f64, surround: f64) -> Result<(), JsError> {
+        let steps = |value: f64| {
+            (value.fract() == 0.0 && (0.0..=255.0).contains(&value)).then_some(value as u8)
+        };
+        let (Some(stereo), Some(surround)) = (steps(stereo), steps(surround)) else {
+            return Err(JsError::new(
+                "audio gain steps must be integers from 0 to 255",
+            ));
+        };
+        self.inner.set_audio_gain(AudioGain { stereo, surround });
+        Ok(())
     }
 
     /// The PES timestamp presentation time zero stands for, once the first

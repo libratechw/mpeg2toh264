@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use mpeg2toh264::container::adts::AdtsStream;
 use mpeg2toh264::mpeg2::gop_stream::Mpeg2GopStream;
 use mpeg2toh264::mpeg2::headers::parse_elementary_stream;
-use mpeg2toh264::{DualMono, Fragment, OpenGopRecovery, Session, TranscodeOptions};
+use mpeg2toh264::{AudioGain, DualMono, Fragment, OpenGopRecovery, Session, TranscodeOptions};
 use support::{
     adts_frame, adts_frame_with_payload, adts_stream, mux_programs, mux_transport_stream,
     read_fixture, wrap_mpeg2_es_in_ts, PesUnit, AUDIO_PID, STREAM_TYPE_AAC_ADTS,
@@ -338,6 +338,59 @@ fn takes_a_channel_pair_with_no_channel_configuration() {
     let frames = AdtsStream::new().push(&frame).expect("frame decodes");
     assert_eq!(frames[0].config.channel_count, 2);
     assert_eq!(frames[0].config.audio_specific_config, [0x11, 0x90]);
+}
+
+/// Raising the sound is a change to each channel's `global_gain` and to no other
+/// bit. The step is picked by what the listener gets: a mono service is a stereo
+/// pair by the time it is handed out, and 5.1 is counted apart.
+#[test]
+fn raises_every_channels_global_gain_by_the_steps_asked_for() {
+    let gain = AudioGain {
+        stereo: 4,
+        surround: 3,
+    };
+    let raised = |frame: &[u8]| {
+        let mut stream = AdtsStream::new();
+        stream.set_audio_gain(gain);
+        stream
+            .push(frame)
+            .expect("the frame decodes")
+            .remove(0)
+            .data
+    };
+
+    let stereo =
+        |a: u8, b: u8| packed_bits(&format!("00100000{}{}111", empty_ics(a), empty_ics(b)));
+    assert_eq!(
+        raised(&adts_frame_with_payload(3, 2, &stereo(100, 120))),
+        stereo(104, 124)
+    );
+
+    let mono = packed_bits(&format!("0000000{}111", empty_ics(150)));
+    assert_eq!(
+        raised(&adts_frame_with_payload(3, 0, &mono)),
+        stereo(154, 154),
+        "both copies of the rebuilt pair are raised, by the stereo step"
+    );
+
+    let surround = |g: u8| {
+        let ics = empty_ics(g);
+        packed_bits(
+            &format!("0000000{ics}0010000 0{ics}{ics}0010001 0{ics}{ics}0110000{ics}111")
+                .replace(' ', ""),
+        )
+    };
+    assert_eq!(
+        raised(&adts_frame_with_payload(3, 6, &surround(90))),
+        surround(93)
+    );
+
+    // A step that would take a gain past eight bits is a frame no decoder
+    // reads, so that frame keeps its own level.
+    assert_eq!(
+        raised(&adts_frame_with_payload(3, 2, &stereo(100, 253))),
+        stereo(100, 253)
+    );
 }
 
 /// Packet loss leaves a recording with the odd unreadable access unit, and one

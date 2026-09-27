@@ -124,6 +124,24 @@ export interface Mpeg2TsPlayerOptions {
    */
   splitFieldSamples?: boolean;
   /**
+   * Raise the sound, in steps of 2^(1/4) -- about 1.5 dB -- so that 4 doubles
+   * it. A broadcast leaves more headroom than playback wants, and a player
+   * that re-encodes the sound can turn it up on the way; this does the same
+   * without re-encoding, by adding to each channel's AAC `global_gain`. Mono
+   * and dual mono count as stereo, since that is how they are played.
+   *
+   * Nothing limits what is raised past full scale: it clips where the sound
+   * is output, as it would after any plain gain. 0 by default.
+   */
+  audioGainSteps?: number;
+  /**
+   * The same for sound of more than two channels, which a stereo listener
+   * hears downmixed -- the centre and surrounds are added into the front pair,
+   * so the same step takes it further towards clipping. Takes
+   * `audioGainSteps` by default.
+   */
+  surroundAudioGainSteps?: number;
+  /**
    * Carry the MPEG-2 video into the MP4 as it stands instead of converting it,
    * for a browser whose decoder takes MPEG-2 -- Safari on Apple platforms is
    * the one that does. Nothing is requantised, so the picture is the
@@ -549,6 +567,11 @@ export class Mpeg2TsPlayer extends EventTarget {
       recoveryInterval: this.#options.recoveryInterval,
       openGopRecovery: this.#options.openGopRecovery,
       splitFieldSamples: this.#options.splitFieldSamples,
+      audioGainSteps: this.#options.audioGainSteps ?? 0,
+      surroundAudioGainSteps:
+        this.#options.surroundAudioGainSteps ??
+        this.#options.audioGainSteps ??
+        0,
       passthrough: this.#options.passthrough ?? false,
       pictureWorkers: this.#options.pictureWorkers,
       serviceId: this.#options.serviceId ?? null,

@@ -603,6 +603,10 @@ class Playback {
       // this can go in before a byte has been read.
       if (this.#audioPid !== null) converter.selectAudio(this.#audioPid);
       if (this.#dualMonoSub) converter.selectDualMono(true);
+      converter.setAudioGain(
+        this.#command.audioGainSteps,
+        this.#command.surroundAudioGainSteps,
+      );
       this.#transcoder = converter;
       await this.#convert(leg, source, converter);
     } catch (error) {

@@ -164,6 +164,14 @@ export class Transcoder {
   }
 
   /**
+   * Raise the sound in steps of 2^(1/4), about 1.5 dB each: 4 doubles it.
+   * `surround` is the step for more than two channels.
+   */
+  setAudioGain(stereo: number, surround: number): void {
+    this.#session.setAudioGain(stereo, surround);
+  }
+
+  /**
    * Convert the pictures of every unit in a pool rather than here.
    *
    * Null puts them back on this thread, which is what happens where a worker

@@ -10,8 +10,8 @@
 use std::collections::VecDeque;
 
 use crate::container::adts::{
-    aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream, DualMono,
-    AAC_FRAME_SAMPLES,
+    aac_frame_count_through_video_time, silent_frame, AacConfig, AacFrame, AdtsStream, AudioGain,
+    DualMono, AAC_FRAME_SAMPLES,
 };
 use crate::container::fmp4::{
     h264_gop_to_fmp4, mpeg2_fragment_duration, mpeg2_gop_to_fmp4, timed_mpeg2_unit,
@@ -434,6 +434,13 @@ impl Session {
     /// readily as in two.
     pub fn select_dual_mono(&mut self, service: DualMono) {
         self.adts.select_dual_mono(service);
+    }
+
+    /// Raise the sound of every audio frame read from here on. See
+    /// [`AudioGain`]. Nothing about the sound's description changes, so this
+    /// can be set at any point without a new initialization segment.
+    pub fn set_audio_gain(&mut self, gain: AudioGain) {
+        self.adts.set_audio_gain(gain);
     }
 
     pub fn dropped(&self) -> u64 {

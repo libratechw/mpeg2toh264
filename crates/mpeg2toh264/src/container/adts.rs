@@ -3,8 +3,10 @@
 //! Spectral Huffman data is never re-encoded. Stereo CPE payloads pass through;
 //! mono and dual-mono SCE payloads are repackaged as a CPE containing two copies
 //! of the primary channel, then the ADTS header is removed for fragmented MP4.
+//! The sound can be raised on the way through, which is a change to each
+//! channel's `global_gain` and to nothing else.
 
-use super::aac::{cpe_end, sce_end, single_channel_end};
+use super::aac::{cpe_end, sce_end, single_channel_end, GlobalGains};
 use crate::error::{bail, Result};
 
 /// `sampling_frequency_index` to sample rate (ISO/IEC 14496-3 Table 1.16).
@@ -67,6 +69,8 @@ pub struct AdtsStream {
     /// header does not change, only the elements in the block -- so this is what
     /// the stream is now rather than what it was announced as.
     is_dual_mono: bool,
+    /// How far to raise the sound of every frame handed out.
+    audio_gain: AudioGain,
 }
 
 /// Where an ADTS header says its frame ends -- the part of it that frames the
@@ -266,7 +270,14 @@ fn raw_data_block_end(data: &[u8], mut at: usize) -> Result<usize> {
 ///
 /// Only the sample rates the element walker handles can be judged. At anything
 /// else the frame goes out unexamined, as it always did.
-fn raw_data_block_chain(data: &[u8], frequency_index: u8) -> Option<Vec<(u8, u8)>> {
+///
+/// What the walk learns about the level of each channel goes into `gains`,
+/// which is only complete where the chain comes back and is not empty.
+fn raw_data_block_chain(
+    data: &[u8],
+    frequency_index: u8,
+    gains: &mut GlobalGains,
+) -> Option<Vec<(u8, u8)>> {
     if frequency_index != 3 && frequency_index != 4 {
         return Some(Vec::new());
     }
@@ -289,8 +300,8 @@ fn raw_data_block_chain(data: &[u8], frequency_index: u8) -> Option<Vec<(u8, u8)
         }
         let next = match id {
             7 => return Some(chain),
-            0 | 3 => single_channel_end(data, at, frequency_index, id as u32),
-            1 => cpe_end(data, at, frequency_index),
+            0 | 3 => single_channel_end(data, at, frequency_index, id as u32, gains),
+            1 => cpe_end(data, at, frequency_index, gains),
             5 => parse_pce(data, at).map(|pce| pce.end),
             6 => Ok(fill_element_end(data, at)),
             _ => return None,
@@ -439,6 +450,65 @@ fn pce_audio_specific_config(
     out.data
 }
 
+/// How far to raise the sound, in steps of 2^(1/4) -- about 1.5 dB -- of each
+/// channel's `global_gain`. Four steps double it.
+///
+/// A broadcast is mixed with more headroom than playback wants, and a player
+/// that re-encodes it can turn it up on the way; this is the same without the
+/// re-encode. Nothing but the eight-bit `global_gain` fields changes, so every
+/// spectral value -- and the size of every frame -- stays as it was.
+///
+/// Surround is counted apart from stereo because a two-channel listener hears
+/// it downmixed: the centre and surrounds are added into the front pair, which
+/// already takes it further towards clipping than the same step takes stereo.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct AudioGain {
+    /// Steps for frames of up to two channels, mono and dual mono included,
+    /// since they are handed out as a stereo pair.
+    pub stereo: u8,
+    /// Steps for frames of more than two channels.
+    pub surround: u8,
+}
+
+/// Add `steps` to every channel's `global_gain` in a raw_data_block.
+///
+/// A frame that cannot be walked, or one that the steps would take past what a
+/// decoder accepts -- a `global_gain` or band scalefactor above 255 -- is left
+/// as it was. Broadcast scalefactors stay far below that, so leaving one frame
+/// at its own level is the lesser harm next to a frame no decoder will read.
+fn raise_global_gain(data: &mut [u8], frequency_index: u8, steps: u8) {
+    let mut gains = GlobalGains::default();
+    let walked = raw_data_block_chain(data, frequency_index, &mut gains)
+        .is_some_and(|chain| !chain.is_empty());
+    if !walked {
+        return;
+    }
+    let steps = steps as u32;
+    let field =
+        |data: &[u8], at: usize| (0..8).fold(0u32, |v, n| (v << 1) | bit(data, at + n) as u32);
+    if gains
+        .max_scalefactor
+        .is_some_and(|max| max + steps as i32 > 255)
+        || gains
+            .positions
+            .iter()
+            .any(|&at| field(data, at) + steps > 255)
+    {
+        return;
+    }
+    for &at in &gains.positions {
+        let raised = field(data, at) + steps;
+        for n in 0..8 {
+            let mask = 0x80u8 >> ((at + n) & 7);
+            if raised & (0x80 >> n) != 0 {
+                data[(at + n) >> 3] |= mask;
+            } else {
+                data[(at + n) >> 3] &= !mask;
+            }
+        }
+    }
+}
+
 /// Which service of a dual-mono stream the sound is taken from.
 ///
 /// ARIB carries a bilingual programme as two single channel elements in one
@@ -477,7 +547,7 @@ fn sce_to_cpe(
     pces: &[(usize, usize)],
     service: DualMono,
 ) -> Result<(Vec<u8>, bool)> {
-    let primary_end = sce_end(data, sce, frequency_index)?;
+    let primary_end = sce_end(data, sce, frequency_index, &mut GlobalGains::default())?;
     let mut tail = primary_end;
     let mut chosen = (sce + 7, primary_end);
     let dual_mono = tail + 7 <= data.len() * 8
@@ -485,7 +555,7 @@ fn sce_to_cpe(
         && bit(data, tail + 1) == 0
         && bit(data, tail + 2) == 0;
     if dual_mono {
-        let sub_end = sce_end(data, tail, frequency_index)?;
+        let sub_end = sce_end(data, tail, frequency_index, &mut GlobalGains::default())?;
         if service == DualMono::Sub {
             chosen = (tail + 7, sub_end);
         }
@@ -523,6 +593,11 @@ impl AdtsStream {
     /// by the same initialization segment and play one after the other.
     pub fn select_dual_mono(&mut self, service: DualMono) {
         self.dual_mono = service;
+    }
+
+    /// Raise the sound of every frame read from here on. See [`AudioGain`].
+    pub fn set_audio_gain(&mut self, gain: AudioGain) {
+        self.audio_gain = gain;
     }
 
     /// Whether the sound being read is two services in one stream rather than a
@@ -584,7 +659,11 @@ impl AdtsStream {
             }
 
             let raw_data = &self.pending[at + header_length..at + frame_length];
-            let chain = raw_data_block_chain(raw_data, sampling_frequency_index);
+            let chain = raw_data_block_chain(
+                raw_data,
+                sampling_frequency_index,
+                &mut GlobalGains::default(),
+            );
             // The header is the frame's own account of the service it belongs
             // to, and a broadcast switching between 5.1 and stereo at a
             // programme boundary changes it. The elements in the block change
@@ -703,7 +782,7 @@ impl AdtsStream {
             // read past it is what used to end the conversion there.
             self.current_config = Some(config.clone());
             self.announced = Some((sampling_frequency_index, channel_count));
-            let (data, is_dual_mono) = if sce_service {
+            let (mut data, is_dual_mono) = if sce_service {
                 sce_to_cpe(
                     raw_data,
                     channel_start,
@@ -715,6 +794,18 @@ impl AdtsStream {
                 (raw_data.to_vec(), false)
             };
             self.is_dual_mono = is_dual_mono;
+            // After the rebuild, so that what is raised is the frame as it is
+            // handed out: a mono or dual-mono service is a stereo pair by now,
+            // and it is the channel count the listener gets that decides the
+            // step.
+            let steps = if output_channels <= 2 {
+                self.audio_gain.stereo
+            } else {
+                self.audio_gain.surround
+            };
+            if steps != 0 {
+                raise_global_gain(&mut data, sampling_frequency_index, steps);
+            }
             output.push(AacFrame { data, config });
             at += frame_length;
         }
