@@ -137,6 +137,12 @@ export interface LoadCommand {
     /** Give each field of a complementary pair its own MP4 sample. */
     splitFieldSamples: boolean | undefined;
     /**
+     * Steps of 2^(1/4) to raise the sound by, for up to two channels and for
+     * more. See `Mpeg2TsPlayerOptions.audioGainSteps`.
+     */
+    audioGainSteps: number;
+    surroundAudioGainSteps: number;
+    /**
      * Whether to carry the MPEG-2 video through as it stands rather than
      * converting it, for a browser whose decoder takes MPEG-2.
      */
