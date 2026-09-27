@@ -1570,12 +1570,15 @@ export class Deinterlacer extends EventTarget {
 
   /** Detect the pulldown phase of the frame being filtered on the GPU. */
   #detect(): void {
-    const { cur, next } = this.#neighbours(false);
+    const { prev, cur, next } = this.#neighbours(false);
+    const prevTexture = this.#textures[prev];
     const curTexture = this.#textures[cur];
     const nextTexture = this.#textures[next];
-    if (!curTexture || !nextTexture) return;
+    if (!prevTexture || !curTexture || !nextTexture) return;
     const first = this.#scan?.topFieldFirst !== false ? 0 : 1;
     this.#detector?.detect(curTexture, nextTexture, first);
+    // The same two frames the film branch of the filter weaves from.
+    this.#detector?.measureComb(prevTexture, curTexture, first);
   }
 
   /**
@@ -2739,11 +2742,15 @@ export class Deinterlacer extends EventTarget {
     gl.uniform1i(this.#location.next, 2);
     // Use the detector's field metrics while film reconstruction is enabled.
     const metrics = this.#film ? (this.#detector?.texture ?? null) : null;
-    const film = metrics !== null;
-    if (metrics !== null) {
+    const comb = this.#film ? (this.#detector?.combTexture ?? null) : null;
+    const film = metrics !== null && comb !== null;
+    if (metrics !== null && comb !== null) {
       gl.activeTexture(gl.TEXTURE0 + 3);
       gl.bindTexture(gl.TEXTURE_2D, metrics);
       gl.uniform1i(this.#location.fieldMetrics, 3);
+      gl.activeTexture(gl.TEXTURE0 + 4);
+      gl.bindTexture(gl.TEXTURE_2D, comb);
+      gl.uniform1i(this.#location.comb, 4);
     }
     gl.uniform2i(this.#location.size, this.#width, this.#height);
     // The lines that survive are the ones of the field being shown: the first

@@ -351,3 +351,99 @@ void main()
   }
 }
 `;
+
+/** The side of the square blocks the comb check counts in, in frame pixels. */
+export const COMB_BLOCK = 16;
+
+/**
+ * Combed pixels on a block's second-field lines at which the whole block is
+ * interpolated rather than woven. Half a block's lines are the second field's,
+ * so this is 8 of 128. A thin horizontal line lies on one of them and moves
+ * with the picture, so it takes more than one line's worth to trip the block,
+ * and a stray pixel of mismatch is not worth breaking up a woven block for.
+ */
+export const COMB_BLOCK_PIXELS = 8;
+
+export const COMB_UNIFORMS = {
+  prev: "uPrev",
+  cur: "uCur",
+  first: "uFirst",
+  size: "uSize",
+} as const;
+
+/**
+ * Count, block by block, the pixels a woven film frame would show combed.
+ *
+ * Film reconstruction trusts the cadence: a frame whose phase says it is one
+ * film frame goes out as it is, and the frame that holds two gets the previous
+ * frame's second field. A cut made after pulldown, a fade or a wipe done at
+ * field rate, or a telop scrolled over the film breaks that
+ * for part of a frame or for one frame at a cut, and a field from another
+ * moment laid between the first field's lines is combing wherever anything
+ * moved. The cadence cannot see it: it is decided from whole-frame repeats.
+ *
+ * Both ways of weaving are measured, the frame as it stands (red) and with
+ * the previous frame's second field (green). A second-field pixel counts where
+ * it stands apart from the first-field lines either side of it in the same
+ * direction by more than the threshold, the five-line test (the same pattern
+ * two lines apart) agrees that it alternates rather than being a thin line,
+ * and it changed since the previous frame -- still detail is never combing,
+ * whatever its shape. The filter interpolates a block past COMB_BLOCK_PIXELS
+ * instead of weaving it; blocks rather than pixels, since weak combing left
+ * between the pixels that crossed the threshold looks worse than either.
+ */
+export const COMB_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+
+uniform sampler2D uPrev;
+uniform sampler2D uCur;
+/** The parity of the lines of the field captured first. */
+uniform int uFirst;
+uniform ivec2 uSize;
+
+out vec4 outValue;
+
+const float COMB = 8.0 / 255.0;
+
+float luma(sampler2D image, int x, int y) {
+  int line = y < 0 ? -y : (y >= uSize.y ? 2 * (uSize.y - 1) - y : y);
+  vec3 c = texelFetch(image, ivec2(x, clamp(line, 0, uSize.y - 1)), 0).rgb;
+  return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+bool combed(float above2, float above, float pixel, float below, float below2) {
+  float d1 = pixel - above;
+  float d2 = pixel - below;
+  return ((d1 > COMB && d2 > COMB) || (d1 < -COMB && d2 < -COMB)) &&
+    abs(above2 + 4.0 * pixel + below2 - 3.0 * (above + below)) > 6.0 * COMB;
+}
+
+void main() {
+  // Block rows count from the top of the frame, as the filter reads them.
+  ivec2 block = ivec2(gl_FragCoord.xy);
+  ivec2 base = block * ${COMB_BLOCK};
+  float standing = 0.0;
+  float woven = 0.0;
+  for (int dy = 0; dy < ${COMB_BLOCK}; ++dy) {
+    int y = base.y + dy;
+    if (y >= uSize.y || (y & 1) == uFirst) continue;
+    for (int dx = 0; dx < ${COMB_BLOCK}; ++dx) {
+      int x = base.x + dx;
+      if (x >= uSize.x) break;
+      float current = luma(uCur, x, y);
+      float previous = luma(uPrev, x, y);
+      if (abs(current - previous) <= COMB) continue;
+      // The first field's lines either side are the same whichever second
+      // field is woven between them.
+      float above = luma(uCur, x, y - 1);
+      float below = luma(uCur, x, y + 1);
+      if (combed(luma(uCur, x, y - 2), above, current, below, luma(uCur, x, y + 2)))
+        standing += 1.0;
+      if (combed(luma(uPrev, x, y - 2), above, previous, below, luma(uPrev, x, y + 2)))
+        woven += 1.0;
+    }
+  }
+  outValue = vec4(standing, woven, 0.0, 0.0);
+}
+`;

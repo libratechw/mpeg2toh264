@@ -28,6 +28,8 @@
  *
  */
 import {
+  COMB_BLOCK,
+  COMB_BLOCK_PIXELS,
   FIELD_METRICS,
   FILM_DUPLICATE_PHASE,
   FILM_LOCK_FRAMES,
@@ -46,7 +48,10 @@ import {
  * With `film`, a frame whose pulldown phase `fieldMetrics` (see
  * film-shader.ts) gives is put back together into its film frame instead of
  * filtered; a frame's `second` field is always filtered. `phase` is the
- * phase the page expects, for the debug overlay only.
+ * phase the page expects, for the debug overlay only. `comb` is the detector's
+ * count of the combing each way of weaving would leave, block by block (see
+ * COMB_FRAGMENT_SHADER), and a block past COMB_BLOCK_PIXELS is filtered
+ * instead of woven.
  */
 export const YADIF_UNIFORMS = {
   prev: "uPrev",
@@ -61,6 +66,7 @@ export const YADIF_UNIFORMS = {
   second: "uSecond",
   phase: "uPhase",
   fieldMetrics: "uFieldMetrics",
+  comb: "uComb",
 } as const;
 
 /**
@@ -88,6 +94,7 @@ uniform sampler2D uPrev;
 uniform sampler2D uCur;
 uniform sampler2D uNext;
 uniform sampler2D uFieldMetrics;
+uniform sampler2D uComb;
 /** The size of a frame in texels. */
 uniform ivec2 uSize;
 /** The parity of the lines that are kept; the others are interpolated. */
@@ -319,7 +326,12 @@ void main() {
     rgb = mixed && (y & 1) != firstParity()
       ? texelFetch(uPrev, ivec2(x, y), 0).rgb
       : texelFetch(uCur, ivec2(x, y), 0).rgb;
-    if (detectedPhase() == 4 && (y & 1) != uParity && movingComb(rgb, x, y))
+    // A block the weave would leave combed -- a cut, a fade or a telop that
+    // does not follow the cadence -- is filtered like video instead.
+    vec4 comb = texelFetch(uComb, ivec2(x / ${COMB_BLOCK}, y / ${COMB_BLOCK}), 0);
+    bool combedBlock = (mixed ? comb[1] : comb[0]) > ${COMB_BLOCK_PIXELS}.0;
+    if ((y & 1) != uParity &&
+        (combedBlock || (detectedPhase() == 4 && movingComb(rgb, x, y))))
       rgb = filterPixel(uPrev, uCur, x, y);
   } else if ((y & 1) == uParity) {
     rgb = texelFetch(uCur, ivec2(x, y), 0).rgb;
