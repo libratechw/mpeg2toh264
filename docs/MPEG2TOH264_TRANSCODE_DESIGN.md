@@ -465,6 +465,27 @@ S1・S2は個別選択できるCargo featureとして既定OFFにした。S2は�
 
 音声付き合成TS `/data/ssd/mpeg2-quality-hd-audio-20260909.ts`を`tools/compare-wasm.cjs`で2回交互実行し、保存済みS1有効Node buildと新しい通常buildの完全フラグメントdigestが一致した（607 video samples、50,645,508 bytes）。これは既定化による意図しない出力差の確認であり、新しい性能値や実機の保証ではない。独立差分レビューは依頼本文に差分が渡らず未完了だったため、レビュー済みとは扱わない。`dist`・dogfood branchはこの変更では更新していない。
 
+#### S1のbrowser・実機互換性確認（2026-09-09、2026-10-02記録）
+
+clean bit-exact PR branch `perf/symmetric-chroma-idct@93c3e295f768222713bab8b75e3b67e3794dc2a0`（S1だけ）を、親の`perf/bit-exact-transcode-hot-paths@581f2b78f398423d864b10a27040778595c6d289`を対照として、KonomiTV `ea1962f84c22265c1d31081dfe41cc3b53e9a555`に組み込んだ隔離serverで確認した。意図的なsource差分は`chroma.rs`と`tests/fixtures.rs`だけで、S2、interlaced geometryの変更、本番・dogfoodへの配備は含めていない。素材は実録画`madder-normal-60i.ts`（MPEG-2 1440x1080 TFF、SHA-256 `894c063b789a5bff24ec6441883ec6b11a024e553d62c2d367ef8123cfe9178e`）で、Originalの短い再生開始と30秒位置への1回のシークだけを試した。
+
+合格条件は、出力が1920x1080、短い再生中に時刻が進む、30秒シークが完了して32秒を超えて進む、`readyState`がHAVE_FUTURE_DATA以上、media errorがnull、の全てである。次の8環境で対照・S1とも合格し、判定は16回中16回合格だった。
+
+| 環境 | 対照 | S1 |
+|---|---|---|
+| macOS Safari 26.6.2 | 合格 | 合格 |
+| Ubuntu Chrome 152.0.7977.82 | 合格 | 合格 |
+| Windows 11 Chrome 152.0.7977.83 | 合格 | 合格 |
+| Galaxy Tab S11 Ultra Chrome 152.0.7977.75 | 合格 | 合格 |
+| POCO F3 Android 13 Chrome 152.0.7977.64 | 合格 | 合格 |
+| iPad Air 5 iPadOS 26.6.1 Safari 26.6.2 | 合格 | 合格 |
+| iPad mini 6 iPadOS 26.6.1 Safari 26.6.2 | 合格 | 合格 |
+| iPhone 15 iOS 26.6.1 Safari 26.6.2 | 合格 | 合格 |
+
+これは再生開始・シークの互換性確認であり、画素の目視確認、音声品質、長時間再生、性能、電力、メモリの証拠ではない。iPad・iPhoneは既存のWebKit inspector protocolを一時的に再利用したrunnerで操作し、試験後にrunnerを削除して配信distを復元した。
+
+結果の集計は`/data/ssd/konomitv/managed/konomi-s1-compat-20260909/compatibility-summary.json`（SHA-256 `28027642f0b179dd98e54a0814a41d86974541bcf5d8bcaa0d45722f8807417c`）にあったが、作業を当分再開しないため、2026-10-02に比較build・配信dist・各環境の証跡とともに削除した。再確認が必要な場合は、上記commitから同じ条件で再実行する。
+
 ### oversample 2→1.5の独立screen（2026-09-09）
 
 固定Bの同じnative binaryだけを使い、素材B全編でoversample=2と1.5を交互8組比較した。平均11.816399 → 11.636394秒、1.523%短縮、8/8組で短縮し、短縮時間の95% paired t区間は139.121〜220.889 msだった。出力は259,609,856 → 236,406,893 bytes。既存の`Quantiser8x8::choose_qp()`へ渡す設定値だけを変え、S1・S2・適応MBAFFは含めない。量子化精度を下げる操作なので、未検証の画質を犠牲にしてよい根拠にはしない。知覚可能な劣化に対する15%短縮目安には届かず、視聴上の別の利益も未確認である。
